@@ -1,6 +1,6 @@
 # wlroots — architecture note
 
-Research date: 2026-08-07. Sources: local clone `~/projects/freedesktop-wlroots-wlroots` (tag 0.18.3, commit f0ae9df, 2025-10-23),
+Research date: 2026-08-07. Sources: local clone `~/projects/freedesktop-wlroots-wlroots` (refreshed to tag 0.20.2, 2026-08-07),
 `docs/architecture.md`, `include/wlr/types/wlr_scene.h`, `types/scene/wlr_scene.c`, `tinywl/tinywl.c`, `meson_options.txt`; remote tags via
 `git ls-remote https://gitlab.freedesktop.org/wlroots/wlroots.git`; labwc/sway/zig-wlroots READMEs (raw.githubusercontent.com). Facts
 verified from these sources unless marked [UNVERIFIED].
@@ -8,7 +8,7 @@ verified from these sources unless marked [UNVERIFIED].
 ## Version state (verified 2026-08-07)
 
 - Current stable release: **0.20.2** (remote tags 0.20.0, 0.20.1, 0.20.2, plus 0.20.0-rc1..rc5); 0.19 line (0.19.0..0.19.3) also released. `master` is **0.21.0-dev** (meson.build) — unreleased.
-- Local clone is **0.18.3**, two majors behind; `origin/0.19` and `origin/0.20` branches exist but the working tree is on `0.18`.
+- Local clone refreshed to **0.20.2** (2026-08-07), the current stable line; `master` upstream is 0.21.0-dev.
 - Reconciliation with zig-wayland.md / zig-wlroots "wlroots 0.20": a **released line, not a master/branch target**. zig-wlroots versions
 encode the wlroots release (`major.minor.revision`, README), so zig-wlroots 0.20.x is compatible with wlroots 0.20.x — and 0.20.2, the
 current stable patch, is inside that line. zig-wlroots does not track master (0.21.0-dev).
@@ -19,7 +19,7 @@ current stable patch, is inside that line. zig-wlroots does not track master (0.
 renderers, protocol implementations, and helpers compose independently; a compositor may use only some modules (docs/architecture.md).
 - Build: meson, C11 (C23 optional). Toggles (meson_options.txt): `xwayland`, `renderers` (auto|gles2|vulkan; pixman always built),
 `backends` (auto|drm|libinput|x11; wayland/headless always built), `allocators` (auto|gbm; shm/drm_dumb always built), `session`,
-`color-management`, `xcb-errors`, `libliftoff`. Installs pkg-config `wlroots-0.18` with version script `wlroots.syms`.
+`color-management`, `xcb-errors`, `libliftoff`. Installs pkg-config `wlroots-0.20` with version script `wlroots.syms`.
 - `tinywl/` is the minimal reference compositor (xdg-shell only; moved out of `examples/` before 0.18). `examples/` holds single-feature
 demos (scene-graph.c, rotation.c, output-layout.c, pointer.c).
 
@@ -100,12 +100,13 @@ applied at render time (scene nodes have no transform/scale). Debug env vars (wl
 Direct scanout (wlr_scene.c:1616-1689, call site ~1854): only when — one render-list entry, `options->color_transform == NULL`,
 damage-highlight debug off, `scene->direct_scanout` on, entry is a BUFFER node, no mode/enabled/render-format state commit,
 `wlr_output_is_direct_scanout_allowed`, buffer present, no crop (src_box empty or full-buffer), buffer transform == output transform, node
-box covers the whole output logical box, and `wlr_output_test_state` passes. Opacity is **not** checked in the 0.18.3 scanout path (it only
-affects occlusion, wlr_scene.c:253); sibling notes' "opacity 1" condition is therefore not exact for this version.
+box covers the whole output logical box, and `wlr_output_test_state` passes. Opacity is **not** checked in the 0.20.2 scanout path
+(`scene_entry_try_direct_scanout`, wlr_scene.c:2061; opacity only affects occlusion/render-list construction, wlr_scene.c:276); sibling
+notes' "opacity 1" condition is therefore not exact for this version.
 
-## Minimal compositor assembly (tinywl, 0.18.3)
+## Minimal compositor assembly (tinywl, 0.20.2)
 
-Wiring order from `tinywl/tinywl.c` (setup ~905-1030; frame loop ~555-575):
+Wiring order from `tinywl/tinywl.c` (setup ~887-1040; frame loop ~579-587):
 
 1. `wl_display_create()`; 2. `wlr_backend_autocreate(wl_display_get_event_loop(display), NULL)` — picks DRM, nested Wayland/X11, or headless
 via `WLR_BACKENDS`; multi backend bundles DRM + libinput; 3. `wlr_renderer_autocreate(backend)` — Pixman, GLES2, or Vulkan (`WLR_RENDERER`),
@@ -140,10 +141,10 @@ search: 8 hits, only this one is maintained). README: "Idiomatic Zig bindings"; 
 enough for river"; "I only personally add bindings for new parts of the wlroots API as required by river". Deps: Zig 0.16, wlroots **0.20**,
 zig-wayland, zig-xkbcommon, zig-pixman. Version scheme `major.minor.revision` encodes the compatible wlroots release (e.g. 0.16.42 ↔ wlroots
 0.16). Ships `tinywl.zig` example. "See the C headers of wlroots for documentation" — bindings mirror headers.
-- river pins zig-wlroots v0.20.1 ↔ wlroots 0.20 (river build.zig.zon, per zig-wayland.md). [UNVERIFIED] whether zig-wlroots publishes a 0.18
-binding — the local 0.18.3 clone predates the pin.
+- river pins zig-wlroots v0.20.1 ↔ wlroots 0.20 (river build.zig.zon, per zig-wayland.md). A 0.18 binding line exists (v0.18.0..v0.18.2)
+but is Zig 0.13/0.14-era, not usable with Zig 0.16 (zig-wayland.md); the local clone (0.20.2) matches the pin.
 - Contrast with `@cImport`: zig-wlroots is hand-written idiomatic Zig, not translate-c output — ergonomic but coverage is river-driven
-(missing APIs must be added by hand). `@cImport` of `<wlr/...>` works if you link `wlroots-0.18` via pkg-config, add its include dir, and
+(missing APIs must be added by hand). `@cImport` of `<wlr/...>` works if you link `wlroots-0.20` via pkg-config, add its include dir, and
 define `WLR_USE_UNSTABLE`; friction is callback/varargs translation, opaque structs, and per-release churn of the unstable C API.
 - Maintenance risk: wlroots API is explicitly unstable (WLR_USE_UNSTABLE); bindings lag releases, are river-shaped, and Zig-toolchain churn
 compounds it. Pin both wlroots and zig-wlroots deliberately.

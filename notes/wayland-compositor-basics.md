@@ -7,7 +7,7 @@ Sources:
 - Core protocol XML: https://gitlab.freedesktop.org/wayland/wayland/-/raw/main/protocol/wayland.xml (fetched this session; 3442 lines)
 - Human-readable core reference: https://wayland.app/protocols/wayland
 - wayland-protocols XMLs (fetched this session): stable/xdg-shell, stable/linux-dmabuf (promoted from staging), stable/presentation-time, staging/fractional-scale
-- wlroots local clone: ~/projects/freedesktop-wlroots-wlroots (tag 0.18.3, branch 0.18 — NOT the current release; remote tags list 0.20.2 as latest stable, 2026-08-07. Sibling notes' "wlroots 0.20" claims match: river pins zig-wlroots v0.20.1 ↔ wlroots 0.20, which exists; 0.20.2 is the newest tag)
+- wlroots local clone: ~/projects/freedesktop-wlroots-wlroots (refreshed to tag 0.20.2, the current stable, 2026-08-07; master is 0.21.0-dev). Sibling notes' "wlroots 0.20" claims match: river pins zig-wlroots v0.20.1 ↔ wlroots 0.20, which exists; 0.20.2 is the newest tag)
 - weston repo (fetched this session): README.md, tests/meson.build, tests/harness/, protocol/weston-test.xml, tests/internal-screenshot-test.c
 
 ## 1. Protocol model
@@ -104,7 +104,7 @@ Sources:
 
 ### EGL/GBM/KMS pipeline
 
-GBM (Mesa's buffer-allocation API) produces dmabufs from the GPU; the renderer imports them as textures (wlroots: gles2/vulkan renderers, `render/allocator/gbm.c`). EGLStreams (NVIDIA's vendor scan-out/import path) is absent from wlroots 0.18 — no eglstream code in the tree — so the GBM/dmabuf path is the supported one. The compositor takes DRM master on the seat via the session (libseat; wlroots checks `drmIsMaster`/`drmDropMaster`), because only the master may commit KMS state. A frame is one atomic commit (`DRM_MODE_ATOMIC_ALLOW_MODESET` for mode changes, else plane/property updates) with `DRM_MODE_PAGE_FLIP_EVENT` to get the flip-completion callback that drives frame events and presentation feedback. Only damaged regions are re-rendered and re-uploaded (damage buffers), keeping the flip cheap.
+GBM (Mesa's buffer-allocation API) produces dmabufs from the GPU; the renderer imports them as textures (wlroots: gles2/vulkan renderers, `render/allocator/gbm.c`). EGLStreams (NVIDIA's vendor scan-out/import path) is absent from wlroots — no eglstream code in the 0.20.2 tree — so the GBM/dmabuf path is the supported one. The compositor takes DRM master on the seat via the session (libseat; wlroots checks `drmIsMaster`/`drmDropMaster`), because only the master may commit KMS state. A frame is one atomic commit (`DRM_MODE_ATOMIC_ALLOW_MODESET` for mode changes, else plane/property updates) with `DRM_MODE_PAGE_FLIP_EVENT` to get the flip-completion callback that drives frame events and presentation feedback. Only damaged regions are re-rendered and re-uploaded (damage buffers), keeping the flip cheap.
 
 ## 8. Input pipeline
 
@@ -137,7 +137,7 @@ GBM (Mesa's buffer-allocation API) produces dmabufs from the GPU; the renderer i
 - All protocols, browsable: https://wayland.app/protocols/ (e.g. /protocols/xdg-shell, /protocols/wlr-layer-shell-unstable-v1, /protocols/linux-dmabuf-v1, /protocols/fractional-scale-v1, /protocols/viewporter, /protocols/presentation-time)
 - wayland-protocols repo: https://gitlab.freedesktop.org/wayland/wayland-protocols
 - Wayland Book: https://wayland-book.com
-- wlroots: https://gitlab.freedesktop.org/wlroots/wlroots (local mirror: ~/projects/freedesktop-wlroots-wlroots, 0.18.3; stable is 0.20.2)
+- wlroots: https://gitlab.freedesktop.org/wlroots/wlroots (local mirror: ~/projects/freedesktop-wlroots-wlroots, 0.20.2)
 - weston: https://gitlab.freedesktop.org/wayland/weston (tests/, protocol/weston-test.xml)
 - libinput: https://gitlab.freedesktop.org/libinput/libinput
 - Wayland docs (server-side howto): https://wayland.freedesktop.org/docs/html/

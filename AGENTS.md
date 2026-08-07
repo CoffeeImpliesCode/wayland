@@ -28,7 +28,7 @@ wayland/
 | Read research | `notes/*.md`, indexed by README.md |
 | Verify wlroots claims | `~/projects/freedesktop-wlroots-wlroots` |
 | Verify smithay claims | `~/projects/github-Smithay-smithay` |
-| Check zig-wayland bindings | `~/projects/codeberg-ifreund-zig-wayland` (8 months stale — verify upstream first) |
+| Check zig-wayland bindings | `~/projects/codeberg-ifreund-zig-wayland` (v0.6.0, zig 0.16 — refreshed) |
 | Architecture questions | deepwiki MCP — smithay and wlroots have wikis |
 
 Foreign clones are read-only references. Never modify them.
@@ -145,8 +145,14 @@ Training data predates these changes. Check `zig env` and local std sources befo
 - `web_search` can hang in subagents. Prefer `read` on URLs for web content;
   use web_search sparingly in the main session only.
 - Foreign clones in `~/projects/<host>-<owner>-<repo>` are read-only:
-  - `freedesktop-wlroots-wlroots`, `github-Smithay-smithay` — fresh clones.
-  - `codeberg-ifreund-zig-wayland` — 8 months stale. Check upstream state before trusting anything in it. To use it as a dependency override, match its fingerprint and pass `zig build --fork`.
+  - `freedesktop-wlroots-wlroots` (0.20.2), `github-Smithay-smithay` (v0.7.0),
+    `codeberg-ifreund-zig-wayland` (v0.6.0, zig 0.16) — refreshed 2026-08-07.
+  - `freedesktop-wayland-wayland` (1.26.0), `freedesktop-wayland-wayland-protocols`
+    (1.49), `freedesktop-wayland-weston` (16.0.0), `codeberg-ifreund-zig-wlroots`
+    (v0.20.1), `codeberg-river-river` (v0.4.0), `github-WayfireWM-wayfire`
+    (v0.11.0), `github-YaLTeR-niri` (v26.04), `github-swaywm-sway` (1.11-rc2),
+    `github-labwc-labwc` (0.20.1), `github-wayvr-org-wayvr` (v26.7.1).
+  - To use a zig dependency override, match its fingerprint and pass `zig build --fork`.
 
 ## Development
 

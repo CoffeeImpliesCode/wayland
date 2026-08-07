@@ -2,7 +2,7 @@
 
 Research note. Date: 2026-08-07.
 Goal: pan/zoom over a large 2D canvas of Wayland surfaces (dynamicland-inspired).
-Primary sources read: wlroots `wlr_scene.h`, `wlr_output.h`, `wlr_renderer.h`, `render/pass.h` (local clone 0.18.3); smithay `desktop/space` + `backend/renderer/element/utils/elements.rs` (local clone, HEAD 5fb12b87); gnome-shell `magnifier.js` (2183 lines, fetched); egui `crates/egui/src/gui_zoom.rs` (fetched); niri/wayfire/wayvr READMEs; GitHub API search "infinite canvas window manager".
+Primary sources read: wlroots `wlr_scene.h`, `wlr_output.h`, `wlr_renderer.h`, `render/pass.h` (local clone 0.20.2); smithay `desktop/space` + `backend/renderer/element/utils/elements.rs` (local clone, HEAD 5fb12b87); gnome-shell `magnifier.js` (2183 lines, fetched); egui `crates/egui/src/gui_zoom.rs` (fetched); niri/wayfire/wayvr READMEs; GitHub API search "infinite canvas window manager".
 All facts below verified from these sources unless marked [UNVERIFIED].
 
 ## 1. Spatial model
@@ -84,7 +84,7 @@ One world, N outputs: `wlr_output_layout` positions outputs in layout space; `wl
 |---|---|---|---|
 | niri | Scrollable-tiling Wayland compositor (Rust) | Infinite horizontal column strip; overview zooming out workspaces; custom fragment shaders for open/close/resize; fractional scaling "pixel-perfect"; gestures; input-latency measurement | https://github.com/YaLTeR/niri |
 | wayfire | 3D Wayland compositor (C++, on wlroots) | Views as 3D-transformed surfaces: `cube`, `expo`, `wobbly`, `wrot` (rotate), `zoom` plugins; own render-instance tree above wlr_scene | https://github.com/WayfireWM/wayfire |
-| wayvr (ex WlxOverlay-S) | OpenXR/OpenVR overlay (Rust) | Wayland/X11 screens (PipeWire) freely repositioned/resized in 3D; laser→screen mouse remapping with fix modes; documented remapping bugs | https://github.com/wayvr/wayvr |
+| wayvr (ex WlxOverlay-S) | OpenXR/OpenVR overlay (Rust) | Wayland/X11 screens (PipeWire) freely repositioned/resized in 3D; laser→screen mouse remapping with fix modes; documented remapping bugs | https://github.com/wayvr-org/wayvr |
 | GNOME Magnifier | a11y zoom in gnome-shell (Clutter) | `ZoomRegion` actors; mag factor from GSettings; 60 Hz pointer watcher drives scroll-to-mouse (`interval = 1000/60`); `disable_unredirect()` while active; own scaled cursor sprite | https://gitlab.gnome.org/GNOME/gnome-shell/-/raw/main/js/ui/magnifier.js (2183 lines, read) |
 | egui | Immediate-mode GUI (Rust) | `Context::zoom_factor` / `set_zoom_factor` — global GUI zoom clamped 0.2–5.0, scales `pixels_per_point`; Cmd+/-/0 shortcuts; `Options::zoom_with_keyboard` (gui_zoom.rs). Browser-style whole-GUI zoom, not a per-canvas camera — canvas pan/zoom is app-level | https://raw.githubusercontent.com/emilk/egui/main/crates/egui/src/gui_zoom.rs (read) |
 | canvaswm | Infinite-canvas window manager (macOS) | Spatial window placement on an unbounded plane; closest living analog to the goal (not Wayland) | https://github.com/annieversary/canvaswm (via api.github.com search, 32 stars) |

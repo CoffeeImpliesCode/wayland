@@ -13,10 +13,10 @@ git ls-remote. No [UNVERIFIED] markers remain.
 | river | codeberg.org/riverwm/river | Zig 0.16 | — | Main consumer of both; pins zig-wlroots v0.20.1 |
 | zig-wayland forks | GitHub | — | seanpm2001/IFreund_Zig-WayLand (push 2022-06-02), kdchambers (2024-08-13), zoriya (2023-12-22) | ALL DEAD (none archived, unpushed >= 2 y, no 0.16 claims) |
 | wayland.zig (tiawl) | github.com/tiawl/wayland.zig | stable branch, active 2026-08-02 | not a fork; C-headers package | ALTERNATIVE, 5 stars |
-| Local clone | ~/projects/codeberg-ifreund-zig-wayland | Zig 0.13 (10 mo old) | — | STALE, do not use |
+| Local clone | ~/projects/codeberg-ifreund-zig-wayland | v0.6.0, zig 0.16 (2026-04-25) | — | CURRENT, refreshed |
 
-Local clone confirmed stale: README says "Zig 0.13", src files are 10 months
-old, build.zig uses removed 0.13-era API (`root_source_file`, `addCSource`). Delete or refresh it.
+Local clone refreshed to v0.6.0 (2026-04-25, zig 0.16), matching the upstream
+release line; usable as a reference and as a `zig build --fork` dependency override.
 
 ## What zig-wayland is
 
@@ -104,7 +104,7 @@ NixOS / hermetic: `PKG_CONFIG` env var honored, so dev-shells exporting it work.
 
 - zig-wlroots: idiomatic Zig bindings for wlroots. Version scheme `major.minor.revision` mirrors the wlroots release; revision bumps per zig-wlroots release. Deps (build.zig.zon): zig-wayland v0.6.0, zig-pixman v0.3.0, zig-xkbcommon v0.3.0.
 - wlroots 0.20 IS a released series, not a branch/master target: gitlab tags 0.20.0, 0.20.1, 0.20.2 exist (latest 0.20.2). Current zig-wlroots line: v0.20.1 (2026-04-25, "updates the required Zig version to 0.16"), master v0.20.2-dev. river pins zig-wlroots v0.20.1 (river build.zig.zon) <-> wlroots 0.20.x.
-- A wlroots 0.18 binding line EXISTS (v0.18.0 2024-07-22, v0.18.1 2024-12-09, v0.18.2 2025-03-07) but is Zig 0.13/0.14-era, not usable with Zig 0.16. The local wlroots clone (0.18.3) predates the pin; refresh to 0.20.x.
+- A wlroots 0.18 binding line EXISTS (v0.18.0 2024-07-22, v0.18.1 2024-12-09, v0.18.2 2025-03-07) but is Zig 0.13/0.14-era, not usable with Zig 0.16. The local wlroots clone is refreshed to 0.20.2 (2026-08-07), matching the zig-wlroots v0.20.1 pin.
 - Hand-written against wlroots C headers, added as river needs them (README: "I only personally add bindings for new parts of the wlroots API as required by river"). Recent additions: ext-foreign-toplevel-list-v1 (v0.19.2), Swapchain + ext-data-control-v1 (v0.19.4), xdg-foreign-v2 (v0.20.1).
 - wlrfx/zig-wlroots is a scenefx fork (Zig 0.11 + wlroots 0.16, rounded corners/shadows) — stale and off-version, do not use.
 - wlroots protocols (wlr-layer-shell, wlr-foreign-toplevel-management, wlr-screencopy, wlr-data-control, wlr-virtual-pointer, wlr-output-power-management, wlr-gamma-control, wlr-export-dmabuf, wlr-input-inhibitor, wlr-output-layout) are plain wayland XML in the wlroots repo (protocol/*.xml), built into one installed `wlroots.xml` and scanned like any other XML.
@@ -120,7 +120,7 @@ NixOS / hermetic: `PKG_CONFIG` env var honored, so dev-shells exporting it work.
 - Use upstream ifreund/zig-wayland (v0.6.0 tag or newer main) as a pinned build.zig.zon dependency; the only maintained line, already targets Zig 0.16.0, matching this repo's toolchain.
 - Take zig-wlroots v0.20.x (Zig 0.16 + wlroots 0.20) unless the plan is a from-scratch compositor; river + tinywl are working references.
 - Server-side protocol handling comes from the same scan (client + server namespaces), so xdg-shell / layer-shell / wlr protocols need no extra step.
-- Do NOT use the stale local clone (~/projects/codeberg-ifreund-zig-wayland, Zig 0.13) as a reference; read upstream main instead.
+- Local clone (~/projects/codeberg-ifreund-zig-wayland) refreshed to v0.6.0 (zig 0.16); matches the upstream release line.
 
 ## Risks
 
@@ -141,6 +141,6 @@ NixOS / hermetic: `PKG_CONFIG` env var honored, so dev-shells exporting it work.
 - codeberg.org/api/v1/repos/ifreund/zig-wlroots/tags — release-line history
 - raw.githubusercontent.com/riverwm/river/master/build.zig.zon — v0.20.1 pin
 - `git ls-remote --tags` gitlab.freedesktop.org/wlroots/wlroots.git — tags incl. 0.20.0/0.20.1/0.20.2
-- `git -C ~/projects/freedesktop-wlroots-wlroots describe --tags` — clone at 0.18.3
+- `git -C ~/projects/freedesktop-wlroots-wlroots describe --tags` — clone at 0.20.2
 - github.com/tiawl/wayland.zig
-- Local: ~/projects/codeberg-ifreund-zig-wayland — stale clone
+- Local: ~/projects/codeberg-ifreund-zig-wayland — v0.6.0 clone
