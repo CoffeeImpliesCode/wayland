@@ -7,6 +7,8 @@ Research-and-prototype repo for a future Wayland compositor on a large 2D/3D can
 - Goal: a Wayland compositor rendering onto an infinite 2D/3D canvas.
 - Compositor layer: wlroots/smithay-style.
 - Usage layer: dynamicland-inspired.
+- Usage layer: dynamicland-inspired.
+- **Always consult your inspirations** (wlroots/smithay for compositor design, dynamicland for canvas/usage design) before answering design or implementation questions — foreign clones and deepwiki are the reference material.
 - Stack: Zig 0.16.0 (stable).
 - Status: research. No compositor code yet.
 - VCS: jj. Never use git commands.
@@ -136,10 +138,12 @@ Training data predates these changes. Check `zig env` and local std sources befo
 
 ## Repo Conventions
 
-- `AGENTS.md` updates are welcome. Keep this file under 200 lines.
+- `AGENTS.md` updates are welcome. Keep this file under 260 lines.
 - `notes/`: one topic per file. Name as `NNN-topic.md`.
 - Note style: facts first, terse STE prose, no fluff, no emojis.
 - Cite sources: URL inline or a per-section source list. Unverified claims get `[INFERENCE]`. Never fabricate.
+- `web_search` can hang in subagents. Prefer `read` on URLs for web content;
+  use web_search sparingly in the main session only.
 - Foreign clones in `~/projects/<host>-<owner>-<repo>` are read-only:
   - `freedesktop-wlroots-wlroots`, `github-Smithay-smithay` — fresh clones.
   - `codeberg-ifreund-zig-wayland` — 8 months stale. Check upstream state before trusting anything in it. To use it as a dependency override, match its fingerprint and pass `zig build --fork`.
@@ -160,3 +164,67 @@ pkg-config --cflags --libs wlroots       # wlroots link flags
 zig build test                           # when code exists
 jj st / jj log                           # review changes
 ```
+
+
+## Hardcore quality bar (2026-08)
+
+Applies Tiger Style (loose) + aggressive linting/coverage/verification +
+mandatory post-implementation review. Read before coding:
+`zig-tiger-style`, `zig-best-practices`, `zig-project`, `zig-linting`,
+`zig-coverage`, `zig-testing`, `verification-before-completion`,
+`code-review`, `jj-core`, `using-git-worktrees`.
+
+- **Research repo**: notes are the deliverable — no build/test gates
+  for note-only changes; gates apply once code exists.
+- Foreign clones stay read-only references.
+- Line-limit convention above updated from 200 to 260 for this section.
+
+### Gates — definition of done (evidence in the same turn)
+1. `zig fmt --check .` — zero diffs.
+2. `zig build` Debug + ReleaseSafe — exit 0.
+3. `zig build test` Debug + ReleaseSafe — all green, zero leaks (`std.testing.allocator`).
+4. `zig ast-check` on every changed `.zig`.
+5. `test { std.testing.refAllDecls(@This()); }` in each root — unused decls still type-check.
+6. Linter — zero errors on changed files.
+7. Coverage (kcov 0.16): every uncovered path is test / refactor / accept-with-written-reason.
+8. Optional: `-fsanitize-c=full`, `-fsanitize-thread`, valgrind (`-fvalgrind`).
+9. Parser/decoder changes: `zig build test --fuzz=<bounded>` — no crashes, inputs replayed.
+
+Density rule: 12/357 covered paths is noise; 352/357 makes each missing
+path a judgment call. Coverage guides, never gates alone.
+
+### Reviewer workflow (mandatory after every implementation)
+1. Run the gates; attach raw output (exit codes, counts) — no summaries.
+2. Standards: tiger rules + Fowler smells (mysterious names, duplication,
+   feature envy, primitive obsession, repeated switches, shotgun surgery,
+   speculative generality, message chains, middle man, refused bequest).
+   Repo rules override; smells are judgment calls.
+3. Spec: re-read the task — missing requirements, scope creep, wrong
+   implementations; quote the spec line per finding.
+4. Spawn a reviewer subagent for non-trivial diffs; it re-runs gates
+   1–3, 6–7 and both axes independently.
+5. Fix at root cause; re-run failed gates.
+6. Report shape:
+   `GATES: fmt=… test=… leaks=… lint=… coverage=… | REVIEW: Standards N | Spec N | FIXED: … | SKIPPED (reason): … | DEBT: (ceiling + trigger)`
+   3 failed fix attempts on one file → stop, escalate.
+
+### Clean environment (jj)
+- New work starts on a clean change. Dirty? `jj commit -m "wip: ..."`
+  (checkpoint) or a fresh change — jj snapshots the working copy, so a
+  dirty tree mixes new work with WIP and restore/abandon sweeps both.
+- Parallel/risky work: `jj worktree add <path>`; detect existing
+  isolation first, never nest. Editing subagents get their own isolated
+  worktree/change.
+- Baseline tests must pass before the first edit — a red suite is
+  provably yours.
+
+### AI-slop guard
+- Obvious comments → remove; KEEP why-comments. Over-defensive checks →
+  prove redundancy (keep boundary validation). Nesting >3 / god fns
+  (>50 lines) / long param lists → restructure. Needless abstraction →
+  delete. Dead code (unused decls, `std.debug.print` in non-test) →
+  remove. Duplication → extract only shared intent. Missing tests → add
+  the narrowest regression test, never remove code. >250 pure LOC
+  modules → split by responsibility (never `utils.zig`). Performance
+  equivalences → only when provably equivalent; unsure → SKIP. Silent
+  skips forbidden; report `N/A` explicitly.

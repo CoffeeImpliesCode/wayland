@@ -1,21 +1,22 @@
 # Wayland Research — Index and Decisions
 
-Synthesis of the research phase (2026-08-07). Target: a Wayland compositor
-whose compositor layer is wlroots/smithay-style and whose usage layer is a
-dynamicland-inspired large 2D canvas. Stack: Zig 0.16.0. All facts come from
-the seven notes indexed below. Additions are marked `[INFERENCE]`.
+Synthesis of the research phase (2026-08-07), reconciled after the
+improvement round (same day). Target: a Wayland compositor whose compositor
+layer is wlroots/smithay-style and whose usage layer is a dynamicland-inspired
+large 2D canvas. Stack: Zig 0.16.0. All facts come from the seven notes
+indexed below. Additions are marked `[INFERENCE]`.
 
 ## Index
 
 | File | Topic | Key findings |
 |---|---|---|
-| `wayland-compositor-basics.md` | Core protocol, shells, render loop, input, outputs, testing | wl_surface atomic commit state machine; xdg-shell configure/ack handshake; render loop = damage accumulate → vblank → composite → present → frame_done; headless + pixman gives a deterministic unprivileged test env. |
-| `zig-wayland.md` | Spec parsing and codegen for Zig | ifreund/zig-wayland is an ACTIVE Zig-native scanner (v0.7.0-dev, min_zig 0.16.0, pushed 2026-07-14); no fork needed; all forks dead; zig-wlroots (Zig 0.16 + wlroots 0.20) is river-driven and hand-written. |
-| `wlroots.md` | wlroots architecture and wlr_scene | C library; wlr_scene is declarative basic-2D composition: integer positions, no node rotation/scale, opacity only on buffers, no shader hooks; damage ring, culling, texture caching, direct scanout built in; effects need a custom render pass. |
-| `smithay.md` | Rust compositor library | Broad protocol coverage and production DRM path, but no scene graph: flat `desktop::Space` with i32 positions, uniform scale only, no per-element rotation; Rust-vs-Zig porting cost is substantial. |
-| `canvas-compositing.md` | Presenting surfaces on a large canvas | wlr_scene cannot do rotation or float zoom; custom camera pass (world double coords → screen) is mandatory; viewporter/fractional-scale for sharp zoom; input = invert camera → world → surface-local. |
-| `zio.md` | Async I/O framework for Zig | lalinsky/zio is active, Zig 0.16-native, a `std.Io` implementation; verdict: DO NOT adopt for the compositor core loop (small fixed fd set, hand-rolled poll/epoll); revisit for companion network services only. |
-| `dynamicland.md` | Dynamicland / Realtalk | Take: spatial persistence, live always-current objects, multi-scale navigation as memory, in-place authorability, shared presence. Leave: paper/camera/projector substrate, anti-product philosophy. Implementation details not public. |
+| `wayland-compositor-basics.md` | Core protocol, shells, render loop, input, outputs, testing | wl_surface atomic commit state machine; xdg-shell configure/ack handshake; render loop = damage accumulate → vblank → composite → present → frame_done; headless + pixman gives a deterministic unprivileged test env; interface versions verified against wayland.xml; weston-test harness verified (in-process fixture compositor, TAP, 120 s timeout). |
+| `zig-wayland.md` | Spec parsing and codegen for Zig | ifreund/zig-wayland ACTIVE, tracks zig 0.16 (v0.6.0, 2026-04-25; churn evidence per zig release since 0.13); all forks verified dead (last push 2022-2024); zig-wlroots v0.20.1 pin (2026-04-25) ↔ wlroots 0.20 line; build.zig.zon + Scanner recipe documented; addCSource workaround gone since v0.3.0. |
+| `wlroots.md` | wlroots architecture and wlr_scene | Current stable wlroots = 0.20.2 (master 0.21.0-dev); local clone is 0.18.3 (stale). wlr_scene: integer positions, integer dest-size scale, 90° transforms, opacity, crop, filter; NO rotation/float zoom/shader hooks; damage ring, culling, texture caching, direct scanout built in (scanout conditions verified in wlr_scene.c); labcw + sway verified as scene users; tinywl is the minimal compositor reference. |
+| `smithay.md` | Rust compositor library | No scene graph: flat `desktop::Space`, i32 positions, uniform scale, no per-element rotation. Pass object is the `Frame` trait (no `RenderPass` type); effect hooks `is_framebuffer_effect`/`capture_framebuffer` exist, blur is DIY; Vulkan backend = init-only wrapper (no renderer); callbacks are sequentially invoked with `&mut State`. Rust-vs-Zig porting cost is substantial. |
+| `canvas-compositing.md` | Presenting surfaces on a large canvas | wlr_scene cannot do rotation or float zoom → custom camera pass mandatory: world `f64` coords, matrix `M = T·S·R·T`, camera rebase vs fp32 jitter, world-space damage + input via inverse camera; sharp zoom via fractional-scale/viewporter; 8-row prior-art table (niri, wayfire, wayvr, gnome magnifier.js, egui, ...); 9 risks. |
+| `zio.md` | Async I/O framework for Zig | lalinsky/zio verified from source: created 2025-09-16, pushed 2026-08-05, 575 stars, NOT archived; three layers `zio.ev`/`zio.coro`/`zio.Runtime` (std.Io impl); zig-libuv archived 2023, libxev active. Verdict: DO NOT adopt for the compositor core loop (small fixed fd set, std.posix.poll / std.os.linux.epoll_*); revisit for companion network services only. |
+| `dynamicland.md` | Dynamicland / Realtalk | Dead URLs recovered via Wayback (2019 Research Gallery capture, 2017 homepage); SAP/CDG affiliation VERIFIED via dynamicland.org/archive/2014/CDG + archived Bloomberg; no /2025/ /2026/ pages (404, verified 2026-08-07); commentary: Matuschak notes et al. Take: spatial persistence, live objects, multi-scale navigation, shared presence. Leave: paper/camera/projector substrate, anti-product philosophy. Impl details not public. |
 
 ## Stack recommendation
 
@@ -28,35 +29,37 @@ Recommendation: build on **wlroots via zig-wayland + zig-wlroots**, not smithay.
   Zig is substantial (smithay.md). Zig instead owns the render graph and
   shader plumbing directly — exactly where smithay is weakest (rotation,
   sub-pixel transforms, effects).
-- zig-wlroots tracks Zig 0.16 + wlroots 0.20; river is a full compositor
-  proving the bindings complete enough for real use (zig-wayland.md).
+- zig-wlroots tracks Zig 0.16 + the wlroots 0.20 line (v0.20.1 pin, river
+  is the proof of completeness) (zig-wayland.md, wlroots.md).
 - Both scene models cap at flat 2D integer composition; the canvas layer
   needs a custom render pass on either stack (smithay.md, canvas-compositing.md).
 
 ### (b) Wayland spec parsing: upstream zig-wayland scanner
 
-- Use upstream ifreund/zig-wayland (main, v0.7.0-dev or newer) as a
-  build.zig.zon dependency. It is the only maintained line and already
-  targets Zig 0.16.0.
+- Use upstream ifreund/zig-wayland (v0.6.0 or newer; current main tracks
+  zig 0.16) as a build.zig.zon dependency. Only maintained line — all forks
+  verified dead (seanpm2001 2022, zoriya 2023, kdchambers 2024).
 - Scanner is Zig-native (own code generator, not a wayland-scanner wrapper),
   integrated into build.zig; generates `client`/`server`/`common` namespaces
   per global (`scanner.generate("wl_seat", 4)` trims to reachable
   interfaces). Covers wayland core, wayland-protocols, wlr protocols, custom
-  XML.
-- Forks (seanpm2001, kdchambers, zoriya) are all dead; no fork needed.
-  Alternative tiawl/wayland.zig is a C-headers package, not a scanner.
+  XML. Options: `wayland_xml`, `wayland_protocols` (LazyPath), `ffi_import`.
+- Pin the dependency hash; upgrade deliberately — every zig release since
+  0.13 broke it (0.13→v0.2.0 2024-06-07, 0.14→v0.3.0 2025-03-07,
+  0.15→v0.4.0 2025-08-22, 0.16→v0.6.0 2026-04-25) (zig-wayland.md).
 - Do NOT use the stale local clone `~/projects/codeberg-ifreund-zig-wayland`
-  (Zig 0.13 era) as a reference.
-- For server-side handling the same scan yields xdg-shell, layer-shell, and
-  wlr protocols. Vendor the XMLs and pass `Options.wayland_xml` /
-  `Options.wayland_protocols` for hermetic NixOS builds.
+  (zig 0.13 era) as a reference.
+- Vendor the XMLs (wayland.xml, wayland-protocols, wlroots.xml) and pass
+  them via Options for hermetic NixOS builds; `PKG_CONFIG` is honored for
+  the libwayland ffi pieces.
 
 ### (c) zio verdict
 
 - Do NOT adopt zio for the compositor core loop. The loop is a small fixed
   fd set (wayland socket, libinput, DRM) driven synchronously by poll/epoll
   on one thread; zio adds a foreign event loop without benefit, and the
-  compositor must own the loop for frame timing control (zio.md).
+  compositor must own the loop for frame timing control. Verified std facts:
+  `std.posix.poll` exists; epoll lives at `std.os.linux.epoll_*` (zio.md).
 - Revisit zio only when network companion services (HTTP/WebSocket control,
   remote display forwarding) become a requirement; it is then the strongest
   candidate (active, Zig 0.16-native, `std.Io` drop-in) (zio.md).
@@ -81,9 +84,10 @@ Recommendation: build on **wlroots via zig-wayland + zig-wlroots**, not smithay.
 
 ### Named risks
 
-1. **Zig churn breaks the scanner.** Each Zig release historically broke
-   zig-wayland (0.13 → 0.14 → 0.16 all required updates). Pin the dependency
-   hash and upgrade deliberately (zig-wayland.md).
+1. **Zig churn breaks the scanner.** Every zig release since 0.13 required
+   a zig-wayland update (0.13→v0.2.0, 0.14→v0.3.0, 0.15→v0.4.0,
+   0.16→v0.6.0). Pin the dependency hash and upgrade deliberately
+   (zig-wayland.md).
 2. **zig-wlroots coverage is river-driven.** Bindings exist only for wlroots
    APIs river uses; missing parts must be added by hand. The wlroots C API is
    unstable (`WLR_USE_UNSTABLE`) and changes between releases
@@ -95,24 +99,26 @@ Recommendation: build on **wlroots via zig-wayland + zig-wlroots**, not smithay.
 
 ## Phased roadmap
 
-1. **Scaffold** — Zig 0.16 project with `build.zig.zon`; add zig-wayland as
-   a pinned dependency; wire the scanner step per `example/hello`.
-   Deliverable: buildable skeleton that generates `wayland.zig`.
-2. **Spec codegen pipeline** — Pin wayland.xml, wayland-protocols, wlroots
-   XML; generate client+server namespaces for wl_compositor, wl_shm,
-   xdg-shell; vendor XMLs for hermetic builds. Deliverable: reproducible
-   codegen, no configure-time pkg-config surprise.
+1. **Scaffold** — Zig 0.16 project with `build.zig.zon`; add zig-wayland
+   (v0.6.0+) as a pinned dependency; wire the Scanner step per the upstream
+   README recipe. Deliverable: buildable skeleton that generates
+   `wayland.zig`.
+2. **Spec codegen pipeline** — Decide the wlroots version target first
+   (recommend the 0.20 line, matching zig-wlroots; refresh the stale 0.18.3
+   local clone); pin wayland.xml, wayland-protocols, wlroots XML; generate
+   client+server namespaces for wl_compositor, wl_shm, xdg-shell; vendor
+   XMLs for hermetic builds. Deliverable: reproducible codegen, no
+   configure-time pkg-config surprise.
 3. **Minimal headless compositor** — Headless backend, wl_registry globals,
    xdg-shell handling, shm buffers; test with `WLR_BACKENDS=headless` +
-   `WLR_RENDERER=pixman` and a weston client. Deliverable: end-to-end
-   protocol roundtrip.
+   `WLR_RENDERER=pixman` and a weston client (weston-test harness verified
+   for this). Deliverable: end-to-end protocol roundtrip.
 4. **Output rendering with wlr_scene** — Outputs on the nested wayland
    backend (then DRM), wlr_scene tree, frame_done pacing, presentation
    timing. Deliverable: windows composite on a real output.
 5. **Canvas rendering spike** — Custom render pass: camera matrix
-   (world `double` → screen), pan/zoom, world-space frustum culling, reuse
-   cached textures. Deliverable: arbitrary scale/rotation proven on a
-   surface.
+   (world `f64` → screen), pan/zoom, world-space culling, reuse cached
+   textures. Deliverable: arbitrary scale/rotation proven on a surface.
 6. **Input remapping** — Pointer screen coords → invert camera → world →
    per-surface inverse transform → surface-local; focus rules in world
    space; tick `frame_done` during pan so clients repaint. Deliverable:
@@ -127,13 +133,18 @@ Recommendation: build on **wlroots via zig-wayland + zig-wlroots**, not smithay.
 
 ## Open questions and risks
 
-- **wlroots version target.** The local wlroots clone is 0.18.3; river pins
-  zig-wlroots v0.20.1 ↔ wlroots 0.20. `[UNVERIFIED]` whether zig-wlroots
-  publishes a 0.18 binding — decide the target wlroots version first, or
-  refresh the clone (wlroots.md, zig-wayland.md).
-- **C-table workaround (zig issue #131).** `[UNVERIFIED]` whether the 0.16
-  toolchain still needs `addCSource` for exotic protocols; current main and
-  `example/hello` build without it, so assume resolved (zig-wayland.md).
+- **wlroots version target — resolved.** Current stable is 0.20.2 (master
+  0.21.0-dev); zig-wlroots pins v0.20.1; the local clone (0.18.3) and the
+  zig-wayland local clone are stale — refresh both before phase 2
+  (wlroots.md, zig-wayland.md).
+- **C-table workaround (zig issue #131) — resolved.** Gone since zig-wayland
+  v0.3.0; current main and `example/hello` build without it (zig-wayland.md).
+- **Weston test harness — resolved.** Verified: in-process fixture compositor
+  via `wet_main`, weston-test protocol for input injection, screenshot
+  capture, TAP output (wayland-compositor-basics.md).
+- **Smithay pass API — resolved.** The pass object is the `Frame` trait
+  (no `RenderPass` type); documented in smithay.md. Relevant only if the
+  Rust path re-opens.
 - **Damage under camera motion.** Whole-screen damage on pan is simplest and
   correct but costly; partial damage needs a world→screen region transform
   with output-scale rounding (canvas-compositing.md).
@@ -149,19 +160,15 @@ Recommendation: build on **wlroots via zig-wayland + zig-wlroots**, not smithay.
 - **Realtalk implementation details are not public.** Anything beyond the
   FAQ-level description is `[UNVERIFIED]`; the usage layer must be designed
   from public narrative, not source (dynamicland.md).
-- **Weston test harness.** `weston-test` protocol and runner details are
-  `[UNVERIFIED]`; verify before relying on them for compositor tests
-  (wayland-compositor-basics.md).
-- **Smithay RenderPass API.** Skimmed only; relevant only if the Rust path
-  is re-opened (canvas-compositing.md).
 - **zio interop spike.** If companion services arrive, `zio.ev` embedding
   against the compositor's real fds needs a one-day proof before adoption
   (zio.md).
 
 ## Repo references
 
-- Foreign clones (read-only): `~/projects/freedesktop-wlroots-wlroots`,
-  `~/projects/github-Smithay-smithay`,
-  `~/projects/codeberg-ifreund-zig-wayland` (stale — verify upstream).
+- Foreign clones (read-only): `~/projects/freedesktop-wlroots-wlroots`
+  (0.18.3 — stale, refresh), `~/projects/github-Smithay-smithay` (0.7.0,
+  fresh), `~/projects/codeberg-ifreund-zig-wayland` (stale — verify
+  upstream).
 - Architecture questions: deepwiki MCP (smithay and wlroots have wikis).
 - VCS: jj only, never git.

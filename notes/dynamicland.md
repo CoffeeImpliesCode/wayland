@@ -1,6 +1,7 @@
 # Dynamicland (Bret Victor / CDG) — research note for a canvas compositor
 
-Date: 2026-08-07. Sources fetched live with the read tool; no web_search used.
+Date: 2026-08-07 (improvement round same day). Sources fetched with the read
+tool; two web_search calls used for critique/status discovery.
 Repo context: wayland compositor project, zig 0.16.0, jj. This note extracts
 ideas from Dynamicland that map to a virtual large-canvas compositor usage layer.
 
@@ -10,8 +11,14 @@ ideas from Dynamicland that map to a virtual large-canvas compositor usage layer
 - https://dynamicland.org/research — HTTP 404. /gallery — HTTP 404.
   https://dynamicland.org/Realtalk — HTTP 404. Current site has no such paths.
   [VERIFIED missing]
-- https://web.archive.org/web/2023|2024/https://dynamicland.org/research — 404,
-  no snapshot at that URL form. [UNVERIFIED whether an older /research page existed]
+- Wayback CDX API: no captures at those exact paths; the content moved into
+  the /2019/... path scheme. Recovered captures:
+  - 2019 Research Gallery note:
+    https://web.archive.org/web/20240928195752id_/https://dynamicland.org/2019/The_Research_Gallery/
+  - 2017-era homepage:
+    https://web.archive.org/web/20170801161054id_/http://dynamicland.org/
+- https://dynamicland.org/2025/ and /2026/ — HTTP 404 (checked 2026-08-07);
+  the 2024 FAQ is the newest site content.
 - https://en.wikipedia.org/wiki/Dynamicland — 404; Wikipedia search API confirms
   no article titled "Dynamicland" exists (only mentions inside other articles).
 - https://en.wikipedia.org/wiki/Bret_Victor — OK (via Wikipedia API).
@@ -123,6 +130,13 @@ ideas from Dynamicland that map to a virtual large-canvas compositor usage layer
   technology, protein and nanostructure design in Realtalk, wet-lab
   integration); Realtalk-2024; education and community practice rather than
   products. Source: FAQ, https://dynamicland.org/2024/The_communal_science_lab.pdf
+- Status 2024-2026: no /2025/ or /2026/ site pages (404, verified 2026-08-07);
+  the 2024 FAQ remains the newest public statement. The website itself is
+  organized and generated in Realtalk (Archive Kit):
+  https://dynamicland.org/archive/2024/Dynamicland_website
+  Publications index (incl. "Radical Decentralization, Radical Empowerment,
+  and Dynamicland", "Biomolecular design in Realtalk"):
+  https://dynamicland.org/publications/
 - Scale: "When we envision a humane dynamic medium at scale, we imagine a
   decentralized network of local communities, not a database serving millions
   of customers." Each site keeps an independent physical copy of Realtalk; no
@@ -130,11 +144,18 @@ ideas from Dynamicland that map to a virtual large-canvas compositor usage layer
 - Anti-AI stance: visibility, agency (minimize what the computer knows),
   human connection, and "outsourcing understanding" are cited as reasons
   current AI is incompatible with Realtalk values. Source: FAQ.
-- External critiques (cost of a dedicated room, in-person-only scaling,
-  cameras/privacy) are addressed only in-house; I found no neutral third-party
-  evaluation because there is no Wikipedia article. Cost facts available:
-  hardware is commodity parts (webcams, projectors, lamps); a dedicated room
-  was once required but is no longer. [UNVERIFIED for independent critiques]
+- Third-party commentary (secondary sources, not deep technical reviews):
+  - Andy Matuschak's working notes on Dynamicland (analysis; links to
+    Realtalk demos incl. the first scientific conference talk given in
+    Realtalk): https://notes.andymatuschak.org/zDpmsw9zxmk2eXsoHVUqidf
+  - notes.maskys.com "efforts/dynamicland" — long-running personal analysis:
+    https://notes.maskys.com/efforts/dynamicland
+  - Big Idea Initiative summary of the 2014 talk:
+    https://www.bigideainitiative.org/ideas/dynamicland
+  No neutral third-party technical evaluation exists (no Wikipedia article);
+  the in-house FAQ addresses cost/scale/privacy concerns. Hardware is
+  commodity parts (webcams, projectors, lamps); a dedicated room was once
+  required but is no longer.
 - Privacy: no user accounts, "the stuff doesn't know whose stuff it is";
   most personal information never enters the system. Source: FAQ.
 
@@ -144,8 +165,11 @@ ideas from Dynamicland that map to a virtual large-canvas compositor usage layer
   was produced there; the 35-page "CDG Research Agenda" is hosted on
   dynamicland.org. Source: https://dynamicland.org/2014/CDG_research_agendas
 - The cdg.co domain is dead (parked "for sale" in 2018 and 2025 archive
-  captures). The common statement that CDG was a research lab at SAP is not
-  confirmed by the sources I fetched. [UNVERIFIED: SAP affiliation]
+  captures). The SAP affiliation is VERIFIED by primary source: Dynamicland's
+  own archive page documents the CDG research group and its SAP context
+  (https://dynamicland.org/archive/2014/CDG), corroborated by an archived
+  Bloomberg article (2015-01-29) on SAP's idea lab:
+  https://web.archive.org/web/2015/https://www.bloomberg.com/news/articles/2015-01-29/sap-looks-to-xerox-for-r-d-inspiration-builds-idea-lab
 
 ## Mapping to a virtual large-canvas compositor
 
