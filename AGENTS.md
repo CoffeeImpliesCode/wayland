@@ -45,7 +45,7 @@ Training data predates these changes. Check `zig env` and local std sources befo
 - `std.Io` is the unified I/O interface. Thread `io: std.Io` through every function that does I/O, sleep, random, or time.
 - `std.net` is removed. Use `std.Io.net` (requires `io`).
 - Prefer `pub fn main(init: std.process.Init) !void`. `init.gpa`, `init.io`, `init.arena`, `init.environ_map`. Env vars and argv exist only through `init` — no globals.
-- `std.time.timestamp()/milliTimestamp()/nanoTimestamp()` removed. Use `std.c.clock_gettime(.REALTIME, &ts)` for wall time. Monotonic time: `std.Io.Clock.now(.monotonic, io)` / `std.Io.Timestamp.now(io, .monotonic)`. Sleep: `std.Io.sleep(io, duration, .monotonic)`.
+- `std.time.timestamp()/milliTimestamp()/nanoTimestamp()` removed. Use `std.c.clock_gettime(.REALTIME, &ts)` for wall time. Monotonic time (VERIFIED): `std.Io.Clock.now(.awake, io.*)` returns `Io.Timestamp{ nanoseconds: i96 }` (`.awake` = CLOCK_MONOTONIC; no `.monotonic` member); signed math needs `@divTrunc`. Sleep: `std.Io.sleep(io, duration, .clock)` — take `io` BY VALUE everywhere (`io.*` when the param is `*std.Io`).
 - `std.Thread.Mutex` / `Condition` / `sleep` removed. Use pthread shims (`std.c.pthread_mutex_*`, `std.c.nanosleep`) or `std.Io.Mutex` / `std.Io.Condition`.
 - `std.Thread.Pool` removed. Use `std.Io.Group` with `std.Io.async` / `std.Io.concurrent`.
 - `std.Thread.spawn` still exists: `std.Thread.spawn(.{}, fn, args)`.
@@ -54,10 +54,12 @@ Training data predates these changes. Check `zig env` and local std sources befo
 
   ```zig
   var buf: [4096]u8 = undefined;
-  var w = std.Io.File.stdout().writer(io, &buf);
+  var w = std.Io.File.stdout().writer(io.*, &buf); // Io by value
   try w.interface.print("x = {d}\n", .{x});
   try w.interface.flush(); // always flush
   ```
+- Prefer `std.Io.File.stderr().writerStreaming(io.*, &buf)` for logs: the positional `writer` pwrites at offset 0 per call on Io impls like zio's (lines overwrite each other); `writerStreaming` appends.
+- `union` is a keyword: quote fn names as `@"union"`.
 
 - Custom `format`: `pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void`. Call it with `{f}`.
 - `std.debug.print` works (stderr). Locked stderr: `std.debug.lockStderr(&buf)`.
@@ -68,8 +70,10 @@ Training data predates these changes. Check `zig env` and local std sources befo
 - Allocators are explicit parameters. No global allocator state.
 - `defer` cleanup next to acquisition; `errdefer` for error paths.
 - `std.ArrayList` is unmanaged by default: methods take the allocator (`list.append(allocator, x)`, `list.deinit(allocator)`). Use `initCapacity(allocator, n)` or `.empty`. The managed variant (`std.array_list.Managed`) is deprecated.
-- Hash maps likewise: `var map = std.StringHashMap(u32).empty; try map.put(allocator, k, v); map.deinit(allocator);`
+- Hash maps (VERIFIED): `std.StringHashMapUnmanaged(u32) = .empty; try map.put(allocator, k, v); map.deinit(allocator);` — `StringHashMap` is the MANAGED variant without `.empty`.
 - Init containers with `.empty` / `.init`, never `.{ }`.
+- Test collection (VERIFIED): `zig test` runs tests only from ANALYZED declarations — a root that only `pub const`-imports modules collects 0 tests. Add `comptime { _ = module; }` for each module in the root to force analysis (pattern used in src/root.zig).
+- Enum relational ops are illegal: compare with `@intFromEnum`.
 - `std.heap.DebugAllocator(.{})` (GPA alias) for leak-checked dev allocation. `ArenaAllocator` is thread-safe in 0.16 — no `ThreadSafe` wrapper.
 - Name allocators by contract: `gpa`, `arena`, `scratch`.
 

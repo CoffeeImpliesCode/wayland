@@ -1,0 +1,128 @@
+//! Backend abstraction (wlr_backend pattern).
+//!
+//! A Backend owns display devices (outputs) and input. The compositor
+//! attaches a `new_output` listener before starting the backend; outputs
+//! announced after start arrive through the signal. Backend teardown emits
+//! the `destroy` signal before impl teardown runs.
+//!
+//! Imports: utils/*, core/wire.zig, output/output.zig (sibling module).
+
+const std = @import("std");
+const log_mod = @import("../utils/log.zig");
+const wire = @import("../core/wire.zig");
+const output_mod = @import("../output/output.zig");
+
+pub const Backend = struct {
+    impl: *const Impl,
+    data: *anyopaque,
+    allocator: std.mem.Allocator,
+    io: *std.Io,
+    log_cfg: *const log_mod.Config,
+
+    events: struct {
+        /// A new output became available.
+        new_output: wire.Signal(*output_mod.Output),
+        /// The backend is being destroyed.
+        destroy: wire.Signal(*Backend),
+    },
+
+    pub const Impl = struct {
+        /// Start the backend (device init, timers, output enumeration).
+        start: *const fn (backend: *Backend) error{BackendFailed}!void,
+        /// Tear down backend-owned resources (not the Backend struct).
+        destroy: *const fn (backend: *Backend) void,
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: *std.Io,
+        log_cfg: *const log_mod.Config,
+        impl: *const Impl,
+        data: *anyopaque,
+    ) !*Backend {
+        const self = try allocator.create(Backend);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .impl = impl,
+            .data = data,
+            .allocator = allocator,
+            .io = io,
+            .log_cfg = log_cfg,
+            .events = undefined,
+        };
+        self.events.new_output.init();
+        self.events.destroy.init();
+        return self;
+    }
+
+    pub fn start(backend: *Backend) error{BackendFailed}!void {
+        try backend.impl.start(backend);
+    }
+
+    pub fn destroy(backend: *Backend) void {
+        backend.events.destroy.emit(backend);
+        backend.impl.destroy(backend);
+        const allocator = backend.allocator;
+        allocator.destroy(backend);
+    }
+
+    /// Announce an output to the compositor.
+    pub fn emitNewOutput(backend: *Backend, out: *output_mod.Output) void {
+        backend.events.new_output.emit(out);
+    }
+};
+
+const FakeImpl = struct {
+    starts: usize = 0,
+    destroyed: bool = false,
+
+    fn start(backend: *Backend) error{BackendFailed}!void {
+        const self: *FakeImpl = @ptrCast(@alignCast(backend.data));
+        self.starts += 1;
+    }
+
+    fn destroy(backend: *Backend) void {
+        const self: *FakeImpl = @ptrCast(@alignCast(backend.data));
+        self.destroyed = true;
+    }
+};
+
+const fake_impl = Backend.Impl{
+    .start = FakeImpl.start,
+    .destroy = FakeImpl.destroy,
+};
+
+const DestroyRecorder = struct {
+    destroys: usize = 0,
+    listener: wire.Listener(*Backend) = undefined,
+
+    fn onDestroy(listener: *wire.Listener(*Backend), _: *Backend) void {
+        const self: *DestroyRecorder = @fieldParentPtr("listener", listener);
+        self.destroys += 1;
+    }
+
+    fn init(self: *DestroyRecorder) void {
+        self.listener = wire.Listener(*Backend).init(onDestroy);
+    }
+};
+
+test "backend lifecycle" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg = log_mod.Config{};
+
+    var fake = FakeImpl{};
+    const backend = try Backend.init(allocator, &io, &log_cfg, &fake_impl, &fake);
+
+    var rec = DestroyRecorder{};
+    rec.init();
+    backend.events.destroy.add(&rec.listener);
+
+    try backend.start();
+    try std.testing.expectEqual(@as(usize, 1), fake.starts);
+
+    backend.destroy();
+    try std.testing.expect(fake.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), rec.destroys);
+}

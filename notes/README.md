@@ -110,10 +110,10 @@ Recommendation: build on **wlroots via zig-wayland + zig-wlroots**, not smithay.
    client namespaces generated (wl_compositor v7 … zwlr_layer_shell_v1 v5);
    explicit XML paths — no pkg-config needed for codegen, only for linking
    libwayland (devenv.nix sets PKG_CONFIG_PATH).
-3. **Minimal headless compositor** — Headless backend, wl_registry globals,
-   xdg-shell handling, shm buffers; test with `WLR_BACKENDS=headless` +
-   `WLR_RENDERER=pixman` and a weston client (weston-test harness verified
-   for this). Deliverable: end-to-end protocol roundtrip.
+3. **Minimal headless compositor** — done (2026-08-07, = spec M1): headless
+   backend, wl_registry globals, xdg-shell configure/ack, shm buffers, own
+   zig test client (no weston needed); pixman renderer; verified end-to-end
+   (client roundtrip → surface mapped → rendered, leak-free).
 4. **Output rendering with wlr_scene** — Outputs on the nested wayland
    backend (then DRM), wlr_scene tree, frame_done pacing, presentation
    timing. Deliverable: windows composite on a real output.

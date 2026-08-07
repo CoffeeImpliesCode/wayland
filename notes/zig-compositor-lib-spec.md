@@ -222,9 +222,20 @@ custom pass; we make the canvas the first-class compositing model.
 
 ## 6. Build order (milestones)
 
-M1 — core + utils + compositor/surface state + shm buffers + headless
-     backend + pixman renderer + xdg-shell: tinywl-equivalent end-to-end
-     (protocol roundtrip, one surface on a headless output).
+M1 — done (2026-08-07): core (display/wire) + utils (geom/damage/log) +
+     buffers (Buffer release semantics, shm via libwayland internal pipeline,
+     tracked ShmState wrappers) + compositor (surface pending/current state
+     machine, roles, regions, frame callbacks) + headless backend (timer
+     frame pacing) + pixman renderer (Framebuffer/Pass/Texture) + output
+     state machine + xdg-shell (configure/ack, toplevel/popup, positioner).
+     Test server: zio-driven (Runtime for Io, ev.Loop + PipePoll on the
+     wire loop fd), Tracy optional, protocol logger flag. Zig test client
+     (pure protocol bindings) does the roundtrip: surface → xdg configure/
+     ack → shm buffer attach/commit → frame callback → render (surfaces=1).
+     41 lib tests green; server + client exit 0; DebugAllocator leak-free.
+     M1 simplifications (documented in code): damage_buffer treated as
+     surface damage, no viewport, no subsurfaces, no seat, stateless
+     fromResource fallback when no ShmState attached.
 M2 — output state machine + damage ring + scene (int mode) + frame
      scheduling + presentation.
 M3 — seat/input: focus, serials, grabs, cursor, keyboard (xkb).

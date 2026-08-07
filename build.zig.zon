@@ -36,6 +36,14 @@
             .url = "https://codeberg.org/ifreund/zig-wayland/archive/v0.6.0.tar.gz",
             .hash = "wayland-0.6.0-lQa1kqz8AQADQmdNJsNhLoNHcnEGEUjrOaPV-dtEnEmX",
         },
+        .zio = .{
+            .url = "https://github.com/lalinsky/zio/archive/refs/tags/v0.17.0.tar.gz",
+            .hash = "zio-0.17.0-xHbVVI_jJQC3YbgU7JydwAV7MuASkOTd73YqBaKlFFUz",
+        },
+        .tracy = .{
+            .url = "git+https://codeberg.org/CoffeeImpliesCode/tracy_zig#39cf5b557438bafb64513e4f02546daaa1240599",
+            .hash = "tracy-1.0.0+0.13.1-R7l8BWxQAQB36bRaCuUfFu77XFrBOE2rTMRYTOjX574F",
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

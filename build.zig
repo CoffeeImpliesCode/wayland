@@ -45,6 +45,7 @@ pub fn build(b: *Build) void {
     const lib = b.addModule("wayland", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "protocol", .module = protocol },
         },
@@ -68,6 +69,68 @@ pub fn build(b: *Build) void {
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
+
+    // ------------------------------------------------------------------
+    // M1 test server + test client (src/server/).
+    // ------------------------------------------------------------------
+
+    // zio: the event loop driving the server.
+    const zio = b.dependency("zio", .{ .target = target, .optimize = optimize });
+
+    // Tracy profiler. OFF by default: the enabled path needs a C++ toolchain.
+    const tracy = b.dependency("tracy", .{ .target = target, .optimize = optimize });
+    const tracy_enabled = b.option(bool, "enable_tracy", "Enable the Tracy profiler") orelse false;
+
+    const server_exe = b.addExecutable(.{
+        .name = "wayland-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/server/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayland", .module = lib },
+                .{ .name = "zio", .module = zio.module("zio") },
+                .{ .name = "tracy", .module = tracy.module("tracy") },
+            },
+        }),
+    });
+    if (tracy_enabled) {
+        server_exe.root_module.addImport("tracy_impl", tracy.module("tracy_impl_enabled"));
+    } else {
+        server_exe.root_module.addImport("tracy_impl", tracy.module("tracy_impl_disabled"));
+    }
+    b.installArtifact(server_exe);
+
+    const server_run_step = b.step("run-server", "Run the M1 test server");
+    const server_run_cmd = b.addRunArtifact(server_exe);
+    server_run_step.dependOn(&server_run_cmd.step);
+    server_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| server_run_cmd.addArgs(args);
+
+    // Test client: pure protocol client (libwayland-client via the protocol
+    // module). Deliberately does NOT import the compositor library.
+    const client_exe = b.addExecutable(.{
+        .name = "wayland-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/server/client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "protocol", .module = protocol },
+            },
+        }),
+    });
+    b.installArtifact(client_exe);
+
+    const client_run_step = b.step("run-client", "Run the M1 test client");
+    const client_run_cmd = b.addRunArtifact(client_exe);
+    client_run_step.dependOn(&client_run_cmd.step);
+    client_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| client_run_cmd.addArgs(args);
+
+    // ------------------------------------------------------------------
+    // Tests
+    // ------------------------------------------------------------------
 
     const lib_tests = b.addTest(.{ .root_module = lib });
     const run_lib_tests = b.addRunArtifact(lib_tests);
