@@ -39,7 +39,14 @@ pub const Config = struct {
 
 /// Emit a log line to stderr with a monotonic timestamp.
 /// `tag` is a short module name, e.g. "compositor", "server".
-pub fn log(io: *std.Io, cfg: *const Config, level: Level, tag: []const u8, comptime fmt: []const u8, args: anytype) void {
+pub fn log(
+    comptime fmt: []const u8,
+    io: *std.Io,
+    cfg: *const Config,
+    level: Level,
+    tag: []const u8,
+    args: anytype,
+) void {
     if (@intFromEnum(level) > @intFromEnum(cfg.levelFor(tag))) return;
 
     const now_ns = std.Io.Clock.now(.awake, io.*).nanoseconds;
@@ -54,26 +61,32 @@ pub fn log(io: *std.Io, cfg: *const Config, level: Level, tag: []const u8, compt
         now_ms % 1000,
         level.label(),
         tag,
-    } ++ args) catch {};
-    w.interface.flush() catch {};
+    } ++ args) catch {
+        // stderr is unavailable; there is no fallback sink, so drop the line.
+        return;
+    };
+    w.interface.flush() catch {
+        // stderr is unavailable; there is no fallback sink, so drop the line.
+        return;
+    };
 }
 
-pub fn err(io: *std.Io, cfg: *const Config, tag: []const u8, comptime fmt: []const u8, args: anytype) void {
-    log(io, cfg, .err, tag, fmt, args);
+pub fn err(comptime fmt: []const u8, io: *std.Io, cfg: *const Config, tag: []const u8, args: anytype) void {
+    log(fmt, io, cfg, .err, tag, args);
 }
 
-pub fn warn(io: *std.Io, cfg: *const Config, tag: []const u8, comptime fmt: []const u8, args: anytype) void {
-    log(io, cfg, .warn, tag, fmt, args);
+pub fn warn(comptime fmt: []const u8, io: *std.Io, cfg: *const Config, tag: []const u8, args: anytype) void {
+    log(fmt, io, cfg, .warn, tag, args);
 }
 
-pub fn info(io: *std.Io, cfg: *const Config, tag: []const u8, comptime fmt: []const u8, args: anytype) void {
-    log(io, cfg, .info, tag, fmt, args);
+pub fn info(comptime fmt: []const u8, io: *std.Io, cfg: *const Config, tag: []const u8, args: anytype) void {
+    log(fmt, io, cfg, .info, tag, args);
 }
 
-pub fn debug(io: *std.Io, cfg: *const Config, tag: []const u8, comptime fmt: []const u8, args: anytype) void {
-    log(io, cfg, .debug, tag, fmt, args);
+pub fn debug(comptime fmt: []const u8, io: *std.Io, cfg: *const Config, tag: []const u8, args: anytype) void {
+    log(fmt, io, cfg, .debug, tag, args);
 }
 
-pub fn trace(io: *std.Io, cfg: *const Config, tag: []const u8, comptime fmt: []const u8, args: anytype) void {
-    log(io, cfg, .trace, tag, fmt, args);
+pub fn trace(comptime fmt: []const u8, io: *std.Io, cfg: *const Config, tag: []const u8, args: anytype) void {
+    log(fmt, io, cfg, .trace, tag, args);
 }

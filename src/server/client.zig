@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const registry = try display.getRegistry();
-    var state = ClientState{ .display = display, .registry = registry };
+    var state: ClientState = .{ .display = display, .registry = registry };
     registry.setListener(*ClientState, onRegistryEvent, &state);
 
     // Collect globals: another roundtrip processes the registry burst.
@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
         return error.FlushFailed;
     }
 
-    if (!try waitForEvent(&state, timeout_ms, hasConfigure)) {
+    if (!try waitForEvent(hasConfigure, &state, timeout_ms)) {
         verdict("CLIENT-TIMEOUT", "no xdg configure within {d}ms", .{timeout_ms});
         return error.ClientTimeout;
     }
@@ -155,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
     }
     step("committed buffer, waiting for frame callback", .{});
 
-    if (!try waitForEvent(&state, timeout_ms, hasFrame)) {
+    if (!try waitForEvent(hasFrame, &state, timeout_ms)) {
         verdict("CLIENT-TIMEOUT", "no frame callback within {d}ms", .{timeout_ms});
         return error.ClientTimeout;
     }
@@ -163,7 +163,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Hold the mapped surface briefly so the compositor renders it at least
     // once (the server logs render frames with the surface count).
-    std.Io.sleep(client_io, .fromMilliseconds(700), .awake) catch {};
+    std.Io.sleep(client_io, .fromMilliseconds(700), .awake) catch |err| {
+        verdict("CLIENT-ERROR", "hold sleep failed: {s}", .{@errorName(err)});
+        return err;
+    };
 
     // Drain remaining events so the server sees a clean client teardown.
     if (wl.Display.roundtrip(display) != .SUCCESS) {
@@ -239,9 +242,9 @@ fn hasFrame(state: *const ClientState) bool {
 /// Poll the display fd (bounded by the deadline) and dispatch until
 /// `predicate` returns true. Returns false on timeout.
 fn waitForEvent(
+    comptime predicate: fn (*const ClientState) bool,
     state: *const ClientState,
     ms: i64,
-    comptime predicate: fn (*const ClientState) bool,
 ) !bool {
     const display = state.display;
     const start_ns = std.Io.Clock.now(.awake, client_io).nanoseconds;

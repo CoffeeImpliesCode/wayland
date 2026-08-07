@@ -14,14 +14,19 @@ pub const client = protocol.client;
 
 pub const wire = @import("core/wire.zig");
 
+const geom_mod = @import("utils/geom.zig");
+const damage_mod = @import("utils/damage.zig");
+const log_mod = @import("utils/log.zig");
+const display_mod = @import("core/display.zig");
+
 pub const utils = struct {
-    pub const geom = @import("utils/geom.zig");
-    pub const damage = @import("utils/damage.zig");
-    pub const log = @import("utils/log.zig");
+    pub const geom = geom_mod;
+    pub const damage = damage_mod;
+    pub const log = log_mod;
 };
 
 pub const core = struct {
-    pub const display = @import("core/display.zig");
+    pub const display = display_mod;
 };
 
 pub const buffers = @import("buffers/buffer.zig");

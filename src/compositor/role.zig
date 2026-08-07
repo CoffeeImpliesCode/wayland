@@ -53,10 +53,11 @@ pub fn assignRole(surface: *Surface, role: *const SurfaceRole, role_resource: ?*
     if (surface.role) |current| {
         if (current != role) {
             var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(
+            const msg = std.fmt.bufPrintSentinel(
                 &buf,
                 "cannot assign role '{s}' to wl_surface@{d}, already has role '{s}'",
                 .{ role.name, surface.resource.getId(), current.name },
+                0,
             ) catch "role conflict";
             @as(*wire.Resource, @ptrCast(surface.resource)).postError(role_error_code, msg);
             return error.RoleConflict;
@@ -76,7 +77,7 @@ test "assign role and re-assign the same role" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try surface_mod.TestWire.init();
     const comp = try surface_mod.testCompositor(allocator, io, &log_cfg);
@@ -84,8 +85,8 @@ test "assign role and re-assign the same role" {
     defer tw.deinit();
     const s = try surface_mod.testSurface(allocator, io, &log_cfg, comp, &tw);
 
-    var role_a = SurfaceRole{ .name = "role-a" };
-    var role_b = SurfaceRole{ .name = "role-b" };
+    var role_a: SurfaceRole = .{ .name = "role-a" };
+    var role_b: SurfaceRole = .{ .name = "role-b" };
 
     try assignRole(s, &role_a, null);
     try testing.expect(s.role == &role_a);

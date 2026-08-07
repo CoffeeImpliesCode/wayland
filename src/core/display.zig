@@ -39,7 +39,7 @@ pub const CompositorDisplay = struct {
             .log_cfg = log_cfg,
             .server = server,
         };
-        log.info(io, log_cfg, "display", "compositor display created", .{});
+        log.info("compositor display created", io, log_cfg, "display", .{});
         return display;
     }
 
@@ -48,8 +48,9 @@ pub const CompositorDisplay = struct {
         self.destroyed = true;
         // Server.destroy tears down clients, globals and the event loop.
         self.server.destroy();
-        if (self.socket_name) |name| self.allocator.free(name);
-        self.allocator.destroy(self);
+        const allocator = self.allocator;
+        if (self.socket_name) |name| allocator.free(name);
+        allocator.destroy(self);
     }
 
     /// Enable the wl_shm protocol. wl_display_init_shm registers libwayland's
@@ -66,7 +67,7 @@ pub const CompositorDisplay = struct {
         _ = try self.server.addShmFormat(0); // argb8888
         _ = try self.server.addShmFormat(1); // xrgb8888
         self.shm_initialized = true;
-        log.info(self.io, self.log_cfg, "display", "wl_shm initialized", .{});
+        log.info("wl_shm initialized", self.io, self.log_cfg, "display", .{});
     }
 
     /// Create a listen socket with an auto-generated name (wayland-N, N >= 1,
@@ -122,10 +123,10 @@ pub const CompositorDisplay = struct {
     pub fn addGlobal(
         self: *CompositorDisplay,
         comptime T: type,
-        version: u32,
         comptime DataT: type,
-        data: DataT,
         comptime bind: fn (client: *wire.Client, data: DataT, version: u32, id: u32) void,
+        version: u32,
+        data: DataT,
     ) error{GlobalCreateFailed}!*wire.Global {
         return wire.Global.create(self.server, T, version, DataT, data, bind);
     }
@@ -146,7 +147,7 @@ fn protocolLog(
     const dir = if (direction == .request) "request" else "event";
     const class = std.mem.span(message.resource.getClass());
     const name = std.mem.span(message.message.name);
-    log.debug(display.io, display.log_cfg, "wire", "{s} {s}.{s}", .{ dir, class, name });
+    log.debug("{s} {s}.{s}", display.io, display.log_cfg, "wire", .{ dir, class, name });
 }
 
 const assert = std.debug.assert;
@@ -156,7 +157,7 @@ test "display init deinit" {
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     var io = threaded.io();
-    var cfg = log.Config{};
+    var cfg: log.Config = .{};
 
     const display = try CompositorDisplay.init(allocator, &io, &cfg);
     defer display.deinit();
@@ -174,7 +175,7 @@ test "display shm init is idempotent and free of sockets" {
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     var io = threaded.io();
-    var cfg = log.Config{};
+    var cfg: log.Config = .{};
 
     const display = try CompositorDisplay.init(allocator, &io, &cfg);
     defer display.deinit();

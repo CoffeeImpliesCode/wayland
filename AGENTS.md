@@ -203,10 +203,11 @@ mandatory post-implementation review. Read before coding:
 3. `zig build test` Debug + ReleaseSafe — all green, zero leaks (`std.testing.allocator`).
 4. `zig ast-check` on every changed `.zig`.
 5. `test { std.testing.refAllDecls(@This()); }` in each root — unused decls still type-check.
-6. Linter — zero errors on changed files.
-7. Coverage (kcov 0.16): every uncovered path is test / refactor / accept-with-written-reason.
+6. Linter — **ziglint** (project linter, house convention): `nix shell nixpkgs#ziglint -c ziglint src` — zero findings (Bugs + Style, minus unsafe-undefined; Z-rules, no .ziglint.zon, defaults).
+7. Coverage on 0.16 = **kcov** (zcov/zig-cov needs 0.17-dev): `kcov kcov-out $(find ~/.cache/zig/o -name test -type f | head -1)` — every uncovered path is test / refactor / accept-with-written-reason.
 8. Optional: `-fsanitize-c=full`, `-fsanitize-thread`, valgrind (`-fvalgrind`).
-9. Parser/decoder changes: `zig build test --fuzz=<bounded>` — no crashes, inputs replayed.
+9. Parser/decoder changes: `zig build test --fuzz=<bounded>` (e.g. `--fuzz=10K`, Smith generators: value/valueRangeLessThan/eos/bytes/slice; crash inputs auto-replayed) — no crashes.
+10. `zig build test --test-timeout 500ms` — catches hanging tests (run in CI/gates).
 
 Density rule: 12/357 covered paths is noise; 352/357 makes each missing
 path a judgment call. Coverage guides, never gates alone.

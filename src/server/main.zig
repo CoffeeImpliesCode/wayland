@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
     var io_value = runtime.io();
     const io: *std.Io = &io_value;
 
-    log.info(io, &log_cfg, "server", "m1 test server starting (zio runtime, pixman)", .{});
+    log.info("m1 test server starting (zio runtime, pixman)", io, &log_cfg, "server", .{});
 
     // --- library wiring ---------------------------------------------------
     const display = try wayland.core.display.CompositorDisplay.init(allocator, io, &log_cfg);
@@ -108,12 +108,12 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("WAYLAND_PROTOCOL_LOG")) |v| {
         if (std.mem.eql(u8, v, "1")) {
             display.attachProtocolLogger();
-            log.info(io, &log_cfg, "server", "protocol logger attached (WAYLAND_PROTOCOL_LOG=1)", .{});
+            log.info("protocol logger attached (WAYLAND_PROTOCOL_LOG=1)", io, &log_cfg, "server", .{});
         }
     }
 
     const socket_name = try display.addSocketAuto();
-    log.info(io, &log_cfg, "server", "created socket {s}", .{socket_name});
+    log.info("created socket {s}", io, &log_cfg, "server", .{socket_name});
 
     const compositor = try wayland.compositor.Compositor.init(allocator, io, &log_cfg, display);
     defer compositor.deinit();
@@ -136,7 +136,7 @@ pub fn main(init: std.process.Init) !void {
     const framebuffer = try pixman.Framebuffer.create(allocator, output_width, output_height);
     defer framebuffer.deinit();
 
-    var state = ServerState{
+    var state: ServerState = .{
         .allocator = allocator,
         .io = io,
         .log_cfg = &log_cfg,
@@ -162,7 +162,7 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("WAYLAND_RUN_FRAMES")) |frames| {
         state.run_frames = std.fmt.parseInt(u32, frames, 10) catch 0;
         if (state.run_frames > 0) {
-            log.info(io, &log_cfg, "server", "WAYLAND_RUN_FRAMES: stopping after {d} frames", .{state.run_frames});
+            log.info("WAYLAND_RUN_FRAMES: stopping after {d} frames", io, &log_cfg, "server", .{state.run_frames});
         }
     }
 
@@ -172,8 +172,14 @@ pub fn main(init: std.process.Init) !void {
         const stdout_file = std.Io.File.stdout();
         var buf: [128]u8 = undefined;
         var w = stdout_file.writer(io.*, &buf);
-        w.interface.print("WAYLAND_SOCKET={s}\n", .{socket_name}) catch {};
-        w.interface.flush() catch {};
+        w.interface.print("WAYLAND_SOCKET={s}\n", .{socket_name}) catch |err| {
+            log.err("failed to write socket name to stdout: {s}", io, &log_cfg, "server", .{@errorName(err)});
+            return err;
+        };
+        w.interface.flush() catch |err| {
+            log.err("failed to flush socket name to stdout: {s}", io, &log_cfg, "server", .{@errorName(err)});
+            return err;
+        };
     }
 
     try backend.start(); // fires new_output; the headless timer paces frames
@@ -201,14 +207,14 @@ pub fn main(init: std.process.Init) !void {
     state.watchdog = &watchdog;
     loop.add(&watchdog.c);
 
-    log.info(io, &log_cfg, "server", "entering event loop (display fd {d})", .{display.loopFd()});
+    log.info("entering event loop (display fd {d})", io, &log_cfg, "server", .{display.loopFd()});
     while (!loop.stopped()) {
         loop.poll(.max) catch |err| {
-            log.err(io, &log_cfg, "server", "loop poll error: {s}", .{@errorName(err)});
+            log.err("loop poll error: {s}", io, &log_cfg, "server", .{@errorName(err)});
             break;
         };
     }
-    log.info(io, &log_cfg, "server", "event loop exited: frames={d} watchdog_fired={}", .{
+    log.info("event loop exited: frames={d} watchdog_fired={}", io, &log_cfg, "server", .{
         state.frames_rendered,
         state.watchdog_fired,
     });
@@ -222,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
 fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.output.Output) void {
     const self: *ServerState = @fieldParentPtr("new_output_listener", listener);
     self.output = out;
-    log.info(self.io, self.log_cfg, "server", "new output {d}x{d} refresh={d}ms", .{
+    log.info("new output {d}x{d} refresh={d}ms", self.io, self.log_cfg, "server", .{
         out.mode.width, out.mode.height, out.mode.refresh_msec,
     });
     out.events.frame.add(&self.frame_listener);
@@ -230,8 +236,10 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
 
 fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
     const self: *ServerState = @fieldParentPtr("new_toplevel_listener", listener);
-    self.toplevels.append(self.allocator, t) catch {};
-    log.info(self.io, self.log_cfg, "server", "new toplevel (title={s} app_id={s}) total={d}", .{
+    self.toplevels.append(self.allocator, t) catch |err| {
+        log.warn("failed to track toplevel: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+    };
+    log.info("new toplevel (title={s} app_id={s}) total={d}", self.io, self.log_cfg, "server", .{
         t.title orelse "(none)",
         t.app_id orelse "(none)",
         self.toplevels.items.len,
@@ -240,7 +248,7 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
 
 fn onNewPopup(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.shell.XdgPopup) void {
     const self: *ServerState = @fieldParentPtr("new_popup_listener", listener);
-    log.info(self.io, self.log_cfg, "server", "new popup at {d},{d} {d}x{d}", .{
+    log.info("new popup at {d},{d} {d}x{d}", self.io, self.log_cfg, "server", .{
         p.geometry.x, p.geometry.y, p.geometry.width, p.geometry.height,
     });
 }
@@ -258,7 +266,7 @@ fn onDisplayReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     // Non-blocking dispatch: processes client requests and wire timers
     // (the headless frame timer fires output.frame signals here).
     self.display.dispatch(0) catch |err| {
-        log.err(self.io, self.log_cfg, "server", "dispatch failed: {s}", .{@errorName(err)});
+        log.err("dispatch failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
     self.display.flushClients();
@@ -266,7 +274,7 @@ fn onDisplayReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
 
 fn onWatchdog(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
-    log.err(self.io, self.log_cfg, "server", "watchdog: no rendered frame for {d}ms; stopping", .{watchdog_timeout_ms});
+    log.err("watchdog: no rendered frame for {d}ms; stopping", self.io, self.log_cfg, "server", .{watchdog_timeout_ms});
     self.watchdog_fired = true;
     loop.stop();
 }
@@ -287,7 +295,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // M1: single fixed-size framebuffer, reused across frames.
     const fb = self.framebuffer;
     const pass = self.renderer.beginPass(fb) orelse {
-        log.err(self.io, self.log_cfg, "server", "begin_pass failed", .{});
+        log.err("begin_pass failed", self.io, self.log_cfg, "server", .{});
         return;
     };
 
@@ -339,13 +347,13 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     state.buffer = @ptrCast(fb);
     state.damage.addWhole();
     out.commitState(&state) catch |err| {
-        log.err(self.io, self.log_cfg, "server", "output commit failed: {s}", .{@errorName(err)});
+        log.err("output commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
 
     self.frames_rendered += 1;
     tracy.frameMark(null);
-    log.debug(self.io, self.log_cfg, "server", "render frame={d} surfaces={d}", .{
+    log.debug("render frame={d} surfaces={d}", self.io, self.log_cfg, "server", .{
         self.frames_rendered,
         n_surfaces,
     });
@@ -356,7 +364,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         self.loop.?.setTimer(t, .{ .duration = zio.Duration.fromMilliseconds(watchdog_timeout_ms) });
     }
     if (self.run_frames != 0 and self.frames_rendered >= self.run_frames) {
-        log.info(self.io, self.log_cfg, "server", "reached WAYLAND_RUN_FRAMES={d}, stopping", .{self.run_frames});
+        log.info("reached WAYLAND_RUN_FRAMES={d}, stopping", self.io, self.log_cfg, "server", .{self.run_frames});
         self.loop.?.stop();
     }
 }
@@ -385,13 +393,13 @@ fn parseLogConfig(
     allocator: std.mem.Allocator,
     environ_map: *std.process.Environ.Map,
 ) !log.Config {
-    var cfg = log.Config{ .min_level = .debug };
+    var cfg: log.Config = .{ .min_level = .debug };
     const raw = environ_map.get("WAYLAND_LOG") orelse return cfg;
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |part| {
         const p = std.mem.trim(u8, part, " \t");
         if (p.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, p, '=')) |eq| {
+        if (std.mem.findScalar(u8, p, '=')) |eq| {
             const lvl = parseLevel(p[eq + 1 ..]) orelse continue;
             try cfg.tags.put(allocator, p[0..eq], lvl);
         } else if (parseLevel(p)) |lvl| {

@@ -78,7 +78,7 @@ pub const ShmState = struct {
             .display = display,
             .buffers = std.AutoHashMap(*wire.Resource, *Buffer).init(allocator),
         };
-        log.info(io, log_cfg, "shm", "shm state ready", .{});
+        log.info("shm state ready", io, log_cfg, "shm", .{});
         return state;
     }
 
@@ -92,8 +92,9 @@ pub const ShmState = struct {
             const buf = state.buffers.get(key).?;
             Buffer.destroy(buf);
         }
+        const allocator = state.allocator;
         state.buffers.deinit();
-        state.allocator.destroy(state);
+        allocator.destroy(state);
     }
 
     /// Wrap a client wl_buffer resource as a tracked Buffer. Repeated calls
@@ -140,7 +141,7 @@ const ShmBufferData = struct {
     release: wire.Listener(*Buffer),
 };
 
-const shm_impl = Impl{
+const shm_impl: Impl = .{
     .get_dmabuf = null,
     .get_shm = shmGetShm,
     .begin_data_ptr_access = shmBeginDataPtrAccess,
@@ -252,7 +253,7 @@ test "fromResource rejects non-shm resources" {
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     var io = threaded.io();
-    var cfg = log.Config{};
+    var cfg: log.Config = .{};
 
     const display = try display_mod.CompositorDisplay.init(allocator, &io, &cfg);
     defer display.deinit();
@@ -281,7 +282,7 @@ test "shm state init deinit" {
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     var io = threaded.io();
-    var cfg = log.Config{};
+    var cfg: log.Config = .{};
 
     const display = try display_mod.CompositorDisplay.init(allocator, &io, &cfg);
     defer display.deinit();

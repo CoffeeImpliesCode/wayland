@@ -80,7 +80,7 @@ pub const Compositor = struct {
             .shm = null,
         };
         errdefer c.surfaces.deinit(allocator);
-        c.global = try display.addGlobal(server.wl.Compositor, compositor_version, *Compositor, c, bindCompositor);
+        c.global = try display.addGlobal(server.wl.Compositor, *Compositor, bindCompositor, compositor_version, c);
         return c;
     }
 
@@ -91,8 +91,9 @@ pub const Compositor = struct {
         while (c.surfaces.items.len > 0) {
             c.surfaces.items[0].destroy();
         }
-        c.surfaces.deinit(c.allocator);
-        c.allocator.destroy(c);
+        const allocator = c.allocator;
+        c.surfaces.deinit(allocator);
+        allocator.destroy(c);
     }
 
     /// Remove a surface from the tracked list; called by Surface.destroy.
@@ -118,7 +119,7 @@ pub const Compositor = struct {
             client.postNoMemory();
             return;
         };
-        log.debug(c.io, c.log_cfg, "compositor", "wl_surface@{d} created", .{id});
+        log.debug("wl_surface@{d} created", c.io, c.log_cfg, "compositor", .{id});
     }
 
     fn createRegion(c: *Compositor, client: *wire.Client, version: u32, id: u32) void {
@@ -133,7 +134,7 @@ pub const Compositor = struct {
             client.postNoMemory();
             return;
         };
-        log.debug(c.io, c.log_cfg, "compositor", "wl_region@{d} created", .{id});
+        log.debug("wl_region@{d} created", c.io, c.log_cfg, "compositor", .{id});
     }
 };
 
@@ -167,7 +168,7 @@ test "compositor tracks and removes surfaces" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     const c = try allocator.create(Compositor);
     c.* = .{

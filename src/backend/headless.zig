@@ -20,12 +20,12 @@ const Headless = struct {
     mode: output.Mode,
 };
 
-const backend_impl = backend.Backend.Impl{
+const backend_impl: backend.Backend.Impl = .{
     .start = start,
     .destroy = destroy,
 };
 
-const output_impl = output.Output.Impl{
+const output_impl: output.Output.Impl = .{
     .@"test" = testState,
     .commit = commit,
     .destroy = destroyOutput,
@@ -42,7 +42,9 @@ pub const HeadlessBackend = struct {
         loop: *wire.EventLoop,
         mode: output.Mode,
     ) !*backend.Backend {
-        std.debug.assert(mode.width > 0 and mode.height > 0 and mode.refresh_msec > 0);
+        std.debug.assert(mode.width > 0);
+        std.debug.assert(mode.height > 0);
+        std.debug.assert(mode.refresh_msec > 0);
 
         const headless = try allocator.create(Headless);
         errdefer allocator.destroy(headless);
@@ -71,7 +73,7 @@ fn start(base: *backend.Backend) error{BackendFailed}!void {
     timer.timerUpdate(headless.mode.refresh_msec) catch return error.BackendFailed;
     headless.timer = timer;
 
-    log_mod.info(base.io, base.log_cfg, "headless", "started {d}x{d} @ {d}ms", .{
+    log_mod.info("started {d}x{d} @ {d}ms", base.io, base.log_cfg, "headless", .{
         headless.mode.width, headless.mode.height, headless.mode.refresh_msec,
     });
     base.emitNewOutput(headless.out);
@@ -98,13 +100,25 @@ fn testState(_: *output.Output, _: *const output.Output.State) error{InvalidStat
 fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFailed}!void {
     if (state.committed & output.Output.State.committed_mode != 0) {
         if (state.mode) |m| {
-            log_mod.info(out.io, out.log_cfg, "headless", "commit: bits=0x{x} enabled={} scale={d} mode={d}x{d}@{d}ms damage_rects={d}", .{
-                state.committed, state.enabled, state.scale, m.width, m.height, m.refresh_msec, state.damage.rects.items.len,
-            });
+            log_mod.info(
+                "commit: bits=0x{x} enabled={} scale={d} mode={d}x{d}@{d}ms damage_rects={d}",
+                out.io,
+                out.log_cfg,
+                "headless",
+                .{
+                    state.committed,
+                    state.enabled,
+                    state.scale,
+                    m.width,
+                    m.height,
+                    m.refresh_msec,
+                    state.damage.rects.items.len,
+                },
+            );
             return;
         }
     }
-    log_mod.info(out.io, out.log_cfg, "headless", "commit: bits=0x{x} enabled={} scale={d} damage_rects={d}", .{
+    log_mod.info("commit: bits=0x{x} enabled={} scale={d} damage_rects={d}", out.io, out.log_cfg, "headless", .{
         state.committed, state.enabled, state.scale, state.damage.rects.items.len,
     });
 }
@@ -137,16 +151,16 @@ test "headless backend paces frames on the event loop" {
     const allocator = std.testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
 
     const loop = try wire.EventLoop.create();
     defer loop.destroy();
 
-    const mode = output.Mode{ .width = 320, .height = 240, .refresh_msec = 10 };
+    const mode: output.Mode = .{ .width = 320, .height = 240, .refresh_msec = 10 };
     const base = try HeadlessBackend.create(allocator, &io, &log_cfg, loop, mode);
     defer base.destroy();
 
-    var rec = FrameRecorder{};
+    var rec: FrameRecorder = .{};
     rec.init();
     base.events.new_output.add(&rec.listener);
 

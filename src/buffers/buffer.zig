@@ -70,7 +70,8 @@ pub const Buffer = struct {
         h: i32,
     ) error{OutOfMemory}!*Buffer {
         if (impl.begin_data_ptr_access != null or impl.end_data_ptr_access != null) {
-            assert(impl.begin_data_ptr_access != null and impl.end_data_ptr_access != null);
+            assert(impl.begin_data_ptr_access != null);
+            assert(impl.end_data_ptr_access != null);
         }
         const buf = try allocator.create(Buffer);
         buf.* = .{
@@ -125,8 +126,8 @@ pub const Buffer = struct {
 
 test "lock drop unlock release ordering" {
     const allocator = std.testing.allocator;
-    var data = TestBufferData{ .bytes = undefined };
-    var observer = TestObserver{};
+    var data: TestBufferData = .{ .bytes = undefined };
+    var observer: TestObserver = .{};
     observer.release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease);
     observer.destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy);
 
@@ -152,8 +153,8 @@ test "lock drop unlock release ordering" {
 
 test "drop with no locks releases immediately" {
     const allocator = std.testing.allocator;
-    var data = TestBufferData{ .bytes = undefined };
-    var observer = TestObserver{};
+    var data: TestBufferData = .{ .bytes = undefined };
+    var observer: TestObserver = .{};
     observer.release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease);
 
     const buf = try Buffer.init(allocator, &test_impl, &data, 16, 16);
@@ -166,8 +167,8 @@ test "drop with no locks releases immediately" {
 
 test "unlock without drop does not release" {
     const allocator = std.testing.allocator;
-    var data = TestBufferData{ .bytes = undefined };
-    var observer = TestObserver{};
+    var data: TestBufferData = .{ .bytes = undefined };
+    var observer: TestObserver = .{};
     observer.release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease);
 
     const buf = try Buffer.init(allocator, &test_impl, &data, 16, 16);
@@ -181,8 +182,8 @@ test "unlock without drop does not release" {
 
 test "destroy fires destroy signal before impl destroy" {
     const allocator = std.testing.allocator;
-    var data = TestBufferData{ .bytes = undefined };
-    var observer = TestObserver{};
+    var data: TestBufferData = .{ .bytes = undefined };
+    var observer: TestObserver = .{};
     observer.destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy);
 
     const buf = try Buffer.init(allocator, &test_impl, &data, 32, 32);
@@ -197,7 +198,7 @@ test "destroy fires destroy signal before impl destroy" {
 
 test "data ptr access roundtrip via impl" {
     const allocator = std.testing.allocator;
-    var data = TestBufferData{ .bytes = undefined };
+    var data: TestBufferData = .{ .bytes = undefined };
     const buf = try Buffer.init(allocator, &test_impl, &data, 4, 1);
     defer buf.destroy();
 
@@ -222,7 +223,7 @@ const TestBufferData = struct {
     destroyed: bool = false,
 };
 
-const test_impl = Impl{
+const test_impl: Impl = .{
     .get_dmabuf = null,
     .get_shm = null,
     .begin_data_ptr_access = testBeginData,

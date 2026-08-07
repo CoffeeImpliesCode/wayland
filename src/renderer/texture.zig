@@ -34,11 +34,11 @@ const FakeTexture = struct {
     }
 };
 
-const fake_impl = Texture.Impl{ .destroy = FakeTexture.onDestroy };
+const fake_impl: Texture.Impl = .{ .destroy = FakeTexture.onDestroy };
 
 test "texture destroy dispatches to impl" {
-    var fake = FakeTexture{};
-    var tex = Texture{ .impl = &fake_impl, .data = &fake, .width = 2, .height = 2 };
+    var fake: FakeTexture = .{};
+    var tex: Texture = .{ .impl = &fake_impl, .data = &fake, .width = 2, .height = 2 };
     tex.destroy();
     try std.testing.expect(fake.destroyed);
 }

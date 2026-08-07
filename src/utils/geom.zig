@@ -87,7 +87,7 @@ pub const Transform = enum(u32) {
 };
 
 test "rect contains" {
-    const r = Rect{ .x = 10, .y = 10, .width = 100, .height = 100 };
+    const r: Rect = .{ .x = 10, .y = 10, .width = 100, .height = 100 };
     try std.testing.expect(r.containsPoint(.{ .x = 10, .y = 10 }));
     try std.testing.expect(r.containsPoint(.{ .x = 109, .y = 109 }));
     try std.testing.expect(!r.containsPoint(.{ .x = 110, .y = 10 }));
@@ -95,11 +95,11 @@ test "rect contains" {
 }
 
 test "rect intersect" {
-    const a = Rect{ .x = 0, .y = 0, .width = 10, .height = 10 };
-    const b = Rect{ .x = 5, .y = 5, .width = 10, .height = 10 };
+    const a: Rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 };
+    const b: Rect = .{ .x = 5, .y = 5, .width = 10, .height = 10 };
     const i = a.intersect(b).?;
     try std.testing.expectEqual(Rect{ .x = 5, .y = 5, .width = 5, .height = 5 }, i);
-    const c = Rect{ .x = 20, .y = 0, .width = 1, .height = 1 };
+    const c: Rect = .{ .x = 20, .y = 0, .width = 1, .height = 1 };
     try std.testing.expect(a.intersect(c) == null);
 }
 

@@ -34,8 +34,9 @@ pub const Region = struct {
 
     /// Frees the region; called from the wire destructor.
     pub fn deinit(r: *Region) void {
-        r.rects.deinit(r.allocator);
-        r.allocator.destroy(r);
+        const allocator = r.allocator;
+        r.rects.deinit(allocator);
+        allocator.destroy(r);
     }
 
     /// Add a rectangle to the region (union semantics).
@@ -62,18 +63,38 @@ pub const Region = struct {
             // The parts are disjoint from `rect`, so they never intersect
             // it again and the loop terminates.
             if (inter.x > existing.x) {
-                r.appendPart(.{ .x = existing.x, .y = existing.y, .width = inter.x - existing.x, .height = existing.height });
+                r.appendPart(.{
+                    .x = existing.x,
+                    .y = existing.y,
+                    .width = inter.x - existing.x,
+                    .height = existing.height,
+                });
             }
             const right_x = inter.x + inter.width;
             if (right_x < existing.x + existing.width) {
-                r.appendPart(.{ .x = right_x, .y = existing.y, .width = existing.x + existing.width - right_x, .height = existing.height });
+                r.appendPart(.{
+                    .x = right_x,
+                    .y = existing.y,
+                    .width = existing.x + existing.width - right_x,
+                    .height = existing.height,
+                });
             }
             if (inter.y > existing.y) {
-                r.appendPart(.{ .x = existing.x, .y = existing.y, .width = existing.width, .height = inter.y - existing.y });
+                r.appendPart(.{
+                    .x = existing.x,
+                    .y = existing.y,
+                    .width = existing.width,
+                    .height = inter.y - existing.y,
+                });
             }
             const bottom_y = inter.y + inter.height;
             if (bottom_y < existing.y + existing.height) {
-                r.appendPart(.{ .x = existing.x, .y = bottom_y, .width = existing.width, .height = existing.y + existing.height - bottom_y });
+                r.appendPart(.{
+                    .x = existing.x,
+                    .y = bottom_y,
+                    .width = existing.width,
+                    .height = existing.y + existing.height - bottom_y,
+                });
             }
         }
     }
@@ -167,4 +188,41 @@ test "region subtract with disjoint rect leaves it alone" {
 
     try testing.expectEqual(@as(usize, 1), r.rects.items.len);
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 5, .height = 5 }, r.rects.items[0]);
+}
+
+test "fuzz region subtract" {
+    try testing.fuzz({}, fuzzSubtract, .{});
+}
+
+/// Invariant: after subtracting `b`, no listed rect may intersect the
+/// interior of `b` (edge contact reports as null via zero-area
+/// intersection). Leak-checked by std.testing.allocator.
+fn fuzzSubtract(context: void, smith: *testing.Smith) anyerror!void {
+    _ = context;
+    const r = try testing.allocator.create(Region);
+    r.* = .{
+        .allocator = testing.allocator,
+        .resource = @as(*server.wl.Region, @ptrFromInt(0x1)),
+    };
+    defer r.deinit();
+
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const a = randRect(smith);
+        const b = randRect(smith);
+        r.add(a);
+        r.subtract(b);
+        for (r.rects.items) |part| {
+            if (part.intersect(b) != null) return error.SubtractLeftOverlap;
+        }
+    }
+}
+
+fn randRect(smith: *testing.Smith) Rect {
+    return .{
+        .x = smith.valueRangeLessThan(i32, -100, 101),
+        .y = smith.valueRangeLessThan(i32, -100, 101),
+        .width = smith.valueRangeLessThan(i32, 0, 51),
+        .height = smith.valueRangeLessThan(i32, 0, 51),
+    };
 }

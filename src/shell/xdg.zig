@@ -100,20 +100,27 @@ pub const XdgShell = struct {
         shell.events.new_popup.init();
 
         // Register xdg_wm_base at the maximum version we implement.
-        shell.global = try display.addGlobal(server.xdg.WmBase, server.xdg.WmBase.generated_version, *XdgShell, shell, wmBaseBind);
+        shell.global = try display.addGlobal(
+            server.xdg.WmBase,
+            *XdgShell,
+            wmBaseBind,
+            server.xdg.WmBase.generated_version,
+            shell,
+        );
         return shell;
     }
 
     pub fn deinit(self: *XdgShell) void {
+        const allocator = self.allocator;
         if (self.global) |global| global.remove();
         // Destroying the wire resources cascades through their destroy
         // handlers, which remove entries from the lists and free the objects.
         while (self.toplevels.items.len > 0) self.toplevels.items[0].resource.destroy();
         while (self.popups.items.len > 0) self.popups.items[0].resource.destroy();
-        self.toplevels.deinit(self.allocator);
-        self.popups.deinit(self.allocator);
+        self.toplevels.deinit(allocator);
+        self.popups.deinit(allocator);
         // The wm_base global itself is owned by the display's registry.
-        self.allocator.destroy(self);
+        allocator.destroy(self);
     }
 };
 
@@ -142,7 +149,7 @@ fn wmBaseRequest(wm_base: *server.xdg.WmBase, request: server.xdg.WmBase.Request
             res.setHandler(*PositionerState, positionerRequest, positionerDestroy, state);
         },
         .get_xdg_surface => |r| wmBaseGetXdgSurface(wm_base, shell, r),
-        .pong => |r| log.debug(shell.io, shell.log_cfg, log_tag, "xdg_wm_base.pong serial={d}", .{r.serial}),
+        .pong => |r| log.debug("xdg_wm_base.pong serial={d}", shell.io, shell.log_cfg, log_tag, .{r.serial}),
     }
 }
 
@@ -175,7 +182,7 @@ fn wmBaseGetXdgSurface(wm_base: *server.xdg.WmBase, shell: *XdgShell, r: anytype
         res.destroy();
         return;
     };
-    log.info(shell.io, shell.log_cfg, log_tag, "new xdg_surface for wl_surface {*}", .{surface});
+    log.info("new xdg_surface for wl_surface {*}", shell.io, shell.log_cfg, log_tag, .{surface});
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +234,10 @@ pub const XdgSurface = struct {
         xdg.configured = true;
         xdg.acked_serial = serial;
         if (xdg.geometry_set) xdg.current_geometry = xdg.pending_geometry;
-        log.info(xdg.io, xdg.log_cfg, log_tag, "surface configured serial={d} role={s}", .{ serial, @tagName(xdg.role) });
+        log.info("surface configured serial={d} role={s}", xdg.io, xdg.log_cfg, log_tag, .{
+            serial,
+            @tagName(xdg.role),
+        });
         // Mapping happens on the next commit with a buffer: the compositor's
         // commit pipeline performs the map transition and fires the map hook
         // and signal (see the file header).
@@ -244,7 +254,7 @@ pub const XdgSurface = struct {
         // The next commit after a re-map must trigger a fresh configure.
         xdg.configure_sent = false;
         xdg.acked_serial = null;
-        log.info(xdg.io, xdg.log_cfg, log_tag, "surface unmapped role={s}", .{@tagName(xdg.role)});
+        log.info("surface unmapped role={s}", xdg.io, xdg.log_cfg, log_tag, .{@tagName(xdg.role)});
     }
 };
 
@@ -317,7 +327,7 @@ fn xdgSurfaceGetToplevel(xdg: *XdgSurface, id: u32) void {
         return;
     };
     shell.events.new_toplevel.emit(t);
-    log.info(xdg.io, xdg.log_cfg, log_tag, "new xdg_toplevel on wl_surface {*}", .{xdg.surface});
+    log.info("new xdg_toplevel on wl_surface {*}", xdg.io, xdg.log_cfg, log_tag, .{xdg.surface});
 }
 
 fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
@@ -330,7 +340,10 @@ fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
     if (!positioner.size_set or !positioner.anchor_rect_set) {
         // wlroots posts the wm_base invalid_positioner error on the
         // xdg_surface resource; the xdg_surface error enum has no code for it.
-        xdg.resource.postError(@enumFromInt(@intFromEnum(server.xdg.WmBase.Error.invalid_positioner)), "xdg_positioner is incomplete: set_size and set_anchor_rect are required");
+        xdg.resource.postError(
+            @enumFromInt(@intFromEnum(server.xdg.WmBase.Error.invalid_positioner)),
+            "xdg_positioner is incomplete: set_size and set_anchor_rect are required",
+        );
         return;
     }
     const res = server.xdg.Popup.create(xdg.resource.getClient(), xdg.resource.getVersion(), r.id) catch {
@@ -366,7 +379,7 @@ fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
         return;
     };
     shell.events.new_popup.emit(popup);
-    log.info(xdg.io, xdg.log_cfg, log_tag, "new xdg_popup on wl_surface {*} at ({d},{d}) {d}x{d}", .{
+    log.info("new xdg_popup on wl_surface {*} at ({d},{d}) {d}x{d}", xdg.io, xdg.log_cfg, log_tag, .{
         xdg.surface,
         popup.geometry.x,
         popup.geometry.y,
@@ -451,7 +464,7 @@ pub const XdgToplevel = struct {
         var buf: [4]u32 = undefined;
         const states = stateValues(&t.current, &buf);
         // libwayland marshals the array synchronously; a stack buffer is safe.
-        var array = server.wl.Array{
+        var array: server.wl.Array = .{
             .size = states.len * @sizeOf(u32),
             .alloc = buf.len * @sizeOf(u32),
             .data = &buf,
@@ -459,7 +472,7 @@ pub const XdgToplevel = struct {
         t.resource.sendConfigure(width, height, &array);
         xdg.sendConfigureEvent(serial);
         t.configured_size = .{ .w = width, .h = height };
-        log.info(xdg.io, xdg.log_cfg, log_tag, "toplevel configure serial={d} {d}x{d} states={d}", .{
+        log.info("toplevel configure serial={d} {d}x{d} states={d}", xdg.io, xdg.log_cfg, log_tag, .{
             serial, width, height, states.len,
         });
     }
@@ -515,10 +528,16 @@ fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Tople
     switch (request) {
         // Destructor: libwayland does not auto-destroy; we do (runs toplevelDestroy).
         .destroy => t.resource.destroy(),
-        .set_parent => log.debug(t.io, t.log_cfg, log_tag, "xdg_toplevel.set_parent ignored in M1", .{}),
+        .set_parent => log.debug("xdg_toplevel.set_parent ignored in M1", t.io, t.log_cfg, log_tag, .{}),
         .set_title => |r| t.setTitle(r.title),
         .set_app_id => |r| t.setAppId(r.app_id),
-        .show_window_menu => log.debug(t.io, t.log_cfg, log_tag, "xdg_toplevel.show_window_menu ignored (seat is M3)", .{}),
+        .show_window_menu => log.debug(
+            "xdg_toplevel.show_window_menu ignored (seat is M3)",
+            t.io,
+            t.log_cfg,
+            log_tag,
+            .{},
+        ),
         .move => t.events.request_move.emit(t),
         .resize => t.events.request_resize.emit(t),
         .set_max_size => |r| {
@@ -544,7 +563,7 @@ fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Tople
             t.pending.fullscreen = false;
             t.events.request_fullscreen.emit(t);
         },
-        .set_minimized => log.debug(t.io, t.log_cfg, log_tag, "xdg_toplevel.set_minimized ignored in M1", .{}),
+        .set_minimized => log.debug("xdg_toplevel.set_minimized ignored in M1", t.io, t.log_cfg, log_tag, .{}),
     }
     _ = toplevel_res;
 }
@@ -552,7 +571,7 @@ fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Tople
 fn toplevelDestroy(toplevel_res: *server.xdg.Toplevel, t: *XdgToplevel) void {
     _ = toplevel_res;
     const shell = t.xdg_surface.shell;
-    if (std.mem.indexOfScalar(*XdgToplevel, shell.toplevels.items, t)) |i| {
+    if (std.mem.findScalar(*XdgToplevel, shell.toplevels.items, t)) |i| {
         _ = shell.toplevels.swapRemove(i);
     }
     t.events.destroy.emit(t);
@@ -592,7 +611,7 @@ pub const XdgPopup = struct {
         const serial = xdg.shell.display.nextSerial();
         p.resource.sendConfigure(p.geometry.x, p.geometry.y, p.geometry.width, p.geometry.height);
         xdg.sendConfigureEvent(serial);
-        log.info(xdg.io, xdg.log_cfg, log_tag, "popup configure serial={d} at ({d},{d}) {d}x{d}", .{
+        log.info("popup configure serial={d} at ({d},{d}) {d}x{d}", xdg.io, xdg.log_cfg, log_tag, .{
             serial,
             p.geometry.x,
             p.geometry.y,
@@ -612,15 +631,21 @@ fn popupRequest(popup_res: *server.xdg.Popup, request: server.xdg.Popup.Request,
     switch (request) {
         // Destructor: libwayland does not auto-destroy; we do (runs popupDestroy).
         .destroy => popup.resource.destroy(),
-        .grab => log.debug(popup.io, popup.log_cfg, log_tag, "xdg_popup.grab ignored (popup grabs are M3)", .{}),
-        .reposition => log.debug(popup.io, popup.log_cfg, log_tag, "xdg_popup.reposition ignored (constraint adjustment is M4)", .{}),
+        .grab => log.debug("xdg_popup.grab ignored (popup grabs are M3)", popup.io, popup.log_cfg, log_tag, .{}),
+        .reposition => log.debug(
+            "xdg_popup.reposition ignored (constraint adjustment is M4)",
+            popup.io,
+            popup.log_cfg,
+            log_tag,
+            .{},
+        ),
     }
 }
 
 fn popupDestroy(popup_res: *server.xdg.Popup, popup: *XdgPopup) void {
     _ = popup_res;
     const shell = popup.xdg_surface.shell;
-    if (std.mem.indexOfScalar(*XdgPopup, shell.popups.items, popup)) |i| {
+    if (std.mem.findScalar(*XdgPopup, shell.popups.items, popup)) |i| {
         _ = shell.popups.swapRemove(i);
     }
     popup.events.destroy.emit(popup);
@@ -653,7 +678,7 @@ const PositionerState = struct {
     /// of the anchor rect, the gravity offset, then the surface offset.
     /// (M1: no constraint adjustment; matches xdg-shell's placement rules.)
     pub fn geometry(self: *const PositionerState) geom.Rect {
-        var box = geom.Rect{
+        var box: geom.Rect = .{
             .x = self.offset.x,
             .y = self.offset.y,
             .width = self.size.w,
@@ -713,7 +738,11 @@ fn positionerEdges(value: c_int) EdgeSet {
     };
 }
 
-fn positionerRequest(pos_res: *server.xdg.Positioner, request: server.xdg.Positioner.Request, state: *PositionerState) void {
+fn positionerRequest(
+    pos_res: *server.xdg.Positioner,
+    request: server.xdg.Positioner.Request,
+    state: *PositionerState,
+) void {
     switch (request) {
         // Destructor: libwayland does not auto-destroy; we do (runs positionerDestroy).
         .destroy => pos_res.destroy(),
@@ -727,7 +756,10 @@ fn positionerRequest(pos_res: *server.xdg.Positioner, request: server.xdg.Positi
         },
         .set_anchor_rect => |r| {
             if (r.width < 0 or r.height < 0) {
-                pos_res.postError(.invalid_input, "xdg_positioner.set_anchor_rect: width and height must not be negative");
+                pos_res.postError(
+                    .invalid_input,
+                    "xdg_positioner.set_anchor_rect: width and height must not be negative",
+                );
                 return;
             }
             state.anchor_rect = .{ .x = r.x, .y = r.y, .width = r.width, .height = r.height };
@@ -812,7 +844,7 @@ fn xdgSurfaceCommit(surface: *surface_mod.Surface) void {
 fn xdgSurfaceMap(surface: *surface_mod.Surface) void {
     const xdg = xdgFromSurface(surface) orelse return;
     // Window geometry was applied at ack_configure; nothing else to do in M1.
-    log.info(xdg.io, xdg.log_cfg, log_tag, "surface mapped role={s}", .{@tagName(xdg.role)});
+    log.info("surface mapped role={s}", xdg.io, xdg.log_cfg, log_tag, .{@tagName(xdg.role)});
 }
 
 /// The wl_surface is going away; tear down the xdg_surface (which cascades
@@ -836,7 +868,7 @@ const xdg_surface_role: role_mod.SurfaceRole = .{
 // ---------------------------------------------------------------------------
 
 test "positioner geometry" {
-    var pos = PositionerState{ .shell = undefined };
+    var pos: PositionerState = .{ .shell = undefined };
     pos.size = .{ .w = 100, .h = 50 };
     pos.anchor_rect = .{ .x = 10, .y = 20, .width = 200, .height = 100 };
 
@@ -870,7 +902,10 @@ test "positioner geometry" {
 
 test "positioner edge mapping" {
     try std.testing.expectEqual(EdgeSet{}, positionerEdges(@intFromEnum(server.xdg.Positioner.Anchor.none)));
-    try std.testing.expectEqual(EdgeSet{ .top = true }, positionerEdges(@intFromEnum(server.xdg.Positioner.Anchor.top)));
+    try std.testing.expectEqual(
+        EdgeSet{ .top = true },
+        positionerEdges(@intFromEnum(server.xdg.Positioner.Anchor.top)),
+    );
     try std.testing.expectEqual(
         EdgeSet{ .top = true, .left = true },
         positionerEdges(@intFromEnum(server.xdg.Positioner.Anchor.top_left)),
@@ -886,7 +921,7 @@ test "toplevel state values" {
     const empty = stateValues(&.{}, &buf);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
-    const st = ToplevelState{ .maximized = true, .activated = true };
+    const st: ToplevelState = .{ .maximized = true, .activated = true };
     const vals = stateValues(&st, &buf);
     try std.testing.expectEqual(@as(usize, 2), vals.len);
     try std.testing.expectEqual(@as(u32, 1), vals[0]); // maximized
@@ -1044,7 +1079,7 @@ const TestServer = struct {
 
         // Round 1: registry + global announcements.
         const registry = try ts.c_display.?.getRegistry();
-        var capture = RegistryCapture{};
+        var capture: RegistryCapture = .{};
         registry.setListener(*RegistryCapture, RegistryCapture.listener, &capture);
         try ts.pump();
         if (capture.compositor_name == null or capture.wm_base_name == null) return error.GlobalMissing;
@@ -1062,7 +1097,8 @@ const TestServer = struct {
         if (ts.shell) |s| s.deinit();
         if (ts.compositor) |c| c.deinit();
         if (ts.display) |d| d.deinit();
-        ts.allocator.destroy(ts);
+        const allocator = ts.allocator;
+        allocator.destroy(ts);
     }
 
     /// Client flush -> server event loop dispatch -> server flush -> client
@@ -1091,7 +1127,7 @@ test "xdg toplevel configure/ack roundtrip" {
     var ts = try TestServer.init(allocator);
     defer ts.deinit();
 
-    var new_toplevel = NewToplevelCapture{};
+    var new_toplevel: NewToplevelCapture = .{};
     new_toplevel.listener = wire.Listener(*XdgToplevel).init(NewToplevelCapture.notify);
     ts.shell.?.events.new_toplevel.add(&new_toplevel.listener);
 
@@ -1099,9 +1135,9 @@ test "xdg toplevel configure/ack roundtrip" {
     const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
     const toplevel = try xdg_surface.getToplevel();
 
-    var tl_events = ToplevelEvents{};
+    var tl_events: ToplevelEvents = .{};
     toplevel.setListener(*ToplevelEvents, ToplevelEvents.listener, &tl_events);
-    var xs_events = XdgSurfaceEvents{};
+    var xs_events: XdgSurfaceEvents = .{};
     xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
 
     toplevel.setTitle("hello");
@@ -1157,9 +1193,10 @@ test "xdg toplevel configure/ack roundtrip" {
     try ts.pump();
     try std.testing.expectEqual(serial2, xdg.acked_serial.?);
 
-    // Acking an unknown serial is a protocol error (invalid_serial = 4).
+    // Acking an unknown serial is a protocol error (invalid_serial = 4); the
+    // server destroys the client, so pump fails with ClientDispatchFailed.
     xdg_surface.ackConfigure(12345);
-    ts.pump() catch {};
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     // The client library records the protocol error code (invalid_serial = 4).
     try std.testing.expectEqual(@as(c_int, 4), wl_display_get_protocol_error(ts.c_display.?, null, null));
 }
@@ -1169,15 +1206,15 @@ test "xdg popup configure and positioner errors" {
     var ts = try TestServer.init(allocator);
     defer ts.deinit();
 
-    var new_popup = NewPopupCapture{};
+    var new_popup: NewPopupCapture = .{};
     new_popup.listener = wire.Listener(*XdgPopup).init(NewPopupCapture.notify);
     ts.shell.?.events.new_popup.add(&new_popup.listener);
 
     const wl_surface = try ts.wl_compositor.?.createSurface();
     const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
-    var xs_events = XdgSurfaceEvents{};
+    var xs_events: XdgSurfaceEvents = .{};
     xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
-    var popup_events = PopupEvents{};
+    var popup_events: PopupEvents = .{};
 
     // Complete positioner: a 100x50 popup anchored at the bottom-right corner
     // of a 200x100 anchor rect at (10, 20), gravity bottom-right.
@@ -1234,7 +1271,7 @@ test "xdg popup configure and positioner errors" {
     const bad_positioner = try ts.wm_base.?.createPositioner();
     bad_positioner.setAnchorRect(0, 0, 10, 10);
     _ = try xdg_surface2.getPopup(null, bad_positioner);
-    ts.pump() catch {};
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     // invalid_positioner (wm_base error code 5).
     try std.testing.expectEqual(@as(c_int, 5), wl_display_get_protocol_error(ts.c_display.?, null, null));
 }

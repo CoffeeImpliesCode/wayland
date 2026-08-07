@@ -209,7 +209,7 @@ pub const Surface = struct {
     /// Full teardown. Called from handleDestroy (the wire resource is
     /// dying); also used by the compositor at deinit.
     pub fn destroy(s: *Surface) void {
-        log.debug(s.io, s.log_cfg, "surface", "wl_surface@{d} destroyed", .{s.resource.getId()});
+        log.debug("wl_surface@{d} destroyed", s.io, s.log_cfg, "surface", .{s.resource.getId()});
         if (s.mapped) {
             s.mapped = false;
             if (s.role) |role| if (role.unmap) |f| f(s);
@@ -358,7 +358,13 @@ pub const Surface = struct {
             else
                 shm_mod.fromResource(s.allocator, res) catch null;
             if (wrapped == null) {
-                log.warn(s.io, s.log_cfg, "surface", "attach: unsupported wl_buffer, keeping previous pending buffer", .{});
+                log.warn(
+                    "attach: unsupported wl_buffer, keeping previous pending buffer",
+                    s.io,
+                    s.log_cfg,
+                    "surface",
+                    .{},
+                );
                 return;
             }
             break :blk wrapped;
@@ -565,6 +571,7 @@ pub const TestWire = struct {
         self.client.destroy();
         self.server.destroy();
         _ = std.os.linux.close(self.peer_fd);
+        self.* = undefined;
     }
 
     pub fn newId(self: *TestWire) u32 {
@@ -574,7 +581,11 @@ pub const TestWire = struct {
     }
 };
 
-pub fn testCompositor(allocator: std.mem.Allocator, io: *std.Io, log_cfg: *const log.Config) Allocator.Error!*Compositor {
+pub fn testCompositor(
+    allocator: std.mem.Allocator,
+    io: *std.Io,
+    log_cfg: *const log.Config,
+) Allocator.Error!*Compositor {
     const c = try allocator.create(Compositor);
     c.* = .{
         .allocator = allocator,
@@ -599,7 +610,7 @@ pub fn testSurface(
 /// Initialize a fabricated Buffer for tests (Buffer is a plain struct).
 /// The signals are initialized in place so drop/unlock release paths are
 /// safe (a by-value copy would carry stale self-pointers).
-pub fn testBuffer(b: *Buffer, allocator: std.mem.Allocator) void {
+pub fn testBuffer(allocator: std.mem.Allocator, b: *Buffer) void {
     b.* = .{
         .impl = &test_buffer_impl,
         .data = undefined,
@@ -618,7 +629,7 @@ fn fakeBufferDestroy(self: *Buffer) void {
     _ = self;
 }
 
-var test_buffer_impl = buffer_mod.Impl{
+var test_buffer_impl: buffer_mod.Impl = .{
     .get_dmabuf = null,
     .get_shm = null,
     .begin_data_ptr_access = null,
@@ -669,7 +680,7 @@ test "damage requests accumulate in pending surface damage" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try TestWire.init();
     const comp = try testCompositor(allocator, io, &log_cfg);
@@ -690,7 +701,7 @@ test "frame callbacks are completed at commit" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try TestWire.init();
     const comp = try testCompositor(allocator, io, &log_cfg);
@@ -713,7 +724,7 @@ test "attach, commit, map and unmap transitions" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try TestWire.init();
     const comp = try testCompositor(allocator, io, &log_cfg);
@@ -736,7 +747,7 @@ test "attach, commit, map and unmap transitions" {
 
     // First buffer commit maps the surface.
     var buffer: Buffer = undefined;
-    testBuffer(&buffer, allocator);
+    testBuffer(allocator, &buffer);
     s.attachBuffer(&buffer, 0, 0);
     try testing.expectEqual(@as(u32, State.committed_buffer), s.pending.committed & State.committed_buffer);
     s.commit();
@@ -789,7 +800,7 @@ test "commit releases the replaced buffer" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try TestWire.init();
     const comp = try testCompositor(allocator, io, &log_cfg);
@@ -798,9 +809,9 @@ test "commit releases the replaced buffer" {
     const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
 
     var b1: Buffer = undefined;
-    testBuffer(&b1, allocator);
+    testBuffer(allocator, &b1);
     var b2: Buffer = undefined;
-    testBuffer(&b2, allocator);
+    testBuffer(allocator, &b2);
     s.attachBuffer(&b1, 0, 0);
     s.commit();
     try testing.expectEqual(@as(u32, 1), b1.n_locks);
@@ -819,7 +830,7 @@ test "get_release callbacks fire when the buffer is released" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try TestWire.init();
     const comp = try testCompositor(allocator, io, &log_cfg);
@@ -828,7 +839,7 @@ test "get_release callbacks fire when the buffer is released" {
     const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
 
     var b1: Buffer = undefined;
-    testBuffer(&b1, allocator);
+    testBuffer(allocator, &b1);
     s.attachBuffer(&b1, 0, 0);
     s.handleGetRelease(tw.newId());
     try testing.expectEqual(@as(usize, 1), s.release_callbacks_pending.items.len);
@@ -838,7 +849,7 @@ test "get_release callbacks fire when the buffer is released" {
 
     // Replacing the buffer releases it: the callback is completed.
     var b2: Buffer = undefined;
-    testBuffer(&b2, allocator);
+    testBuffer(allocator, &b2);
     s.attachBuffer(&b2, 0, 0);
     s.commit();
     try testing.expectEqual(@as(usize, 0), s.release_callbacks_current.items.len);
@@ -849,7 +860,7 @@ test "get_release without a pending buffer is a protocol error" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try TestWire.init();
     const comp = try testCompositor(allocator, io, &log_cfg);
@@ -865,7 +876,7 @@ test "commit validation rejects a buffer not divisible by scale" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try TestWire.init();
     const comp = try testCompositor(allocator, io, &log_cfg);
@@ -874,7 +885,7 @@ test "commit validation rejects a buffer not divisible by scale" {
     const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
 
     var buffer: Buffer = undefined;
-    testBuffer(&buffer, allocator); // 10x10
+    testBuffer(allocator, &buffer); // 10x10
     s.handleSetBufferScale(3); // 10 % 3 != 0 -> invalid_size at commit
     s.attachBuffer(&buffer, 0, 0);
     s.commit();
@@ -888,7 +899,7 @@ test "set_buffer_scale rejects non-positive scale" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try TestWire.init();
     const comp = try testCompositor(allocator, io, &log_cfg);
@@ -908,7 +919,7 @@ test "role hooks fire at commit, map and unmap" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
-    var log_cfg = log.Config{ .min_level = .err };
+    var log_cfg: log.Config = .{ .min_level = .err };
 
     var tw = try TestWire.init();
     const comp = try testCompositor(allocator, io, &log_cfg);
@@ -923,7 +934,7 @@ test "role hooks fire at commit, map and unmap" {
     try testing.expect(s.role == &test_role);
 
     var buffer: Buffer = undefined;
-    testBuffer(&buffer, allocator);
+    testBuffer(allocator, &buffer);
     s.attachBuffer(&buffer, 0, 0);
     s.commit();
     try testing.expectEqual(@as(usize, 1), test_role_commits);
@@ -956,7 +967,7 @@ const TestRoleHooks = struct {
     }
 };
 
-var test_role = SurfaceRole{
+var test_role: SurfaceRole = .{
     .name = "test-role",
     .commit = TestRoleHooks.commit,
     .map = TestRoleHooks.map,

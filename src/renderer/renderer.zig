@@ -74,7 +74,7 @@ const FakeRenderer = struct {
     }
 };
 
-const fake_impl = Renderer.Impl{
+const fake_impl: Renderer.Impl = .{
     .begin_pass = FakeRenderer.onBeginPass,
     .destroy = FakeRenderer.onDestroy,
 };
@@ -82,10 +82,10 @@ const fake_impl = Renderer.Impl{
 test "renderer lifecycle" {
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
     const allocator = std.testing.allocator;
 
-    var fake = FakeRenderer{};
+    var fake: FakeRenderer = .{};
     const formats = [_]u32{ 0, 1 };
     const renderer = try Renderer.create(allocator, &io, &log_cfg, &fake_impl, &fake, &formats);
     defer renderer.destroy();

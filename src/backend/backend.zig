@@ -87,7 +87,7 @@ const FakeImpl = struct {
     }
 };
 
-const fake_impl = Backend.Impl{
+const fake_impl: Backend.Impl = .{
     .start = FakeImpl.start,
     .destroy = FakeImpl.destroy,
 };
@@ -110,12 +110,12 @@ test "backend lifecycle" {
     const allocator = std.testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
 
-    var fake = FakeImpl{};
+    var fake: FakeImpl = .{};
     const backend = try Backend.init(allocator, &io, &log_cfg, &fake_impl, &fake);
 
-    var rec = DestroyRecorder{};
+    var rec: DestroyRecorder = .{};
     rec.init();
     backend.events.destroy.add(&rec.listener);
 

@@ -72,12 +72,13 @@ pub const Output = struct {
         /// Damage attached to this state update (read by the impl).
         damage: damage_mod.Damage,
 
-        pub fn init(allocator: std.mem.Allocator) State {
+        pub fn init(allocator: std.mem.Allocator) Output.State {
             return .{ .damage = damage_mod.Damage.init(allocator) };
         }
 
         pub fn deinit(state: *State) void {
             state.damage.deinit();
+            state.* = undefined;
         }
     };
 
@@ -99,7 +100,9 @@ pub const Output = struct {
         data: *anyopaque,
         mode: Mode,
     ) !*Output {
-        std.debug.assert(mode.width > 0 and mode.height > 0 and mode.refresh_msec > 0);
+        std.debug.assert(mode.width > 0);
+        std.debug.assert(mode.height > 0);
+        std.debug.assert(mode.refresh_msec > 0);
 
         const self = try allocator.create(Output);
         errdefer allocator.destroy(self);
@@ -199,7 +202,7 @@ const FakeImpl = struct {
     }
 };
 
-const fake_impl = Output.Impl{
+const fake_impl: Output.Impl = .{
     .@"test" = FakeImpl.testState,
     .commit = FakeImpl.commit,
     .destroy = FakeImpl.destroy,
@@ -211,7 +214,7 @@ const FakeBackendImpl = struct {
     fn destroy(_: *backend_mod.Backend) void {}
 };
 
-const fake_backend_impl = backend_mod.Backend.Impl{
+const fake_backend_impl: backend_mod.Backend.Impl = .{
     .start = FakeBackendImpl.start,
     .destroy = FakeBackendImpl.destroy,
 };
@@ -246,10 +249,15 @@ const SignalRecorder = struct {
     }
 };
 
-fn makeOutput(allocator: std.mem.Allocator, io: *std.Io, log_cfg: *const log_mod.Config, fake: *FakeImpl) !struct { *Output, *backend_mod.Backend } {
+fn makeOutput(
+    allocator: std.mem.Allocator,
+    io: *std.Io,
+    log_cfg: *const log_mod.Config,
+    fake: *FakeImpl,
+) !struct { *Output, *backend_mod.Backend } {
     const backend = try backend_mod.Backend.init(allocator, io, log_cfg, &fake_backend_impl, fake);
     errdefer backend.destroy();
-    const mode = Mode{ .width = 1920, .height = 1080, .refresh_msec = 16 };
+    const mode: Mode = .{ .width = 1920, .height = 1080, .refresh_msec = 16 };
     const out = try Output.create(allocator, io, log_cfg, backend, &fake_impl, fake, mode);
     return .{ out, backend };
 }
@@ -258,15 +266,15 @@ test "state apply and signals" {
     const allocator = std.testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
 
-    var fake = FakeImpl{};
+    var fake: FakeImpl = .{};
     const created = try makeOutput(allocator, &io, &log_cfg, &fake);
     const out = created[0];
     const backend = created[1];
     defer backend.destroy();
 
-    var rec = SignalRecorder{};
+    var rec: SignalRecorder = .{};
     rec.init();
     out.events.commit.add(&rec.commit_listener);
     out.events.frame.add(&rec.frame_listener);
@@ -331,14 +339,14 @@ test "rejected state is not applied" {
     const allocator = std.testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
 
-    var fake = FakeImpl{ .reject = true };
+    var fake: FakeImpl = .{ .reject = true };
     const created = try makeOutput(allocator, &io, &log_cfg, &fake);
     const out = created[0];
     defer created[1].destroy();
 
-    var rec = SignalRecorder{};
+    var rec: SignalRecorder = .{};
     rec.init();
     out.events.commit.add(&rec.commit_listener);
 
@@ -359,14 +367,14 @@ test "failed commit is not applied" {
     const allocator = std.testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
 
-    var fake = FakeImpl{ .fail_commit = true };
+    var fake: FakeImpl = .{ .fail_commit = true };
     const created = try makeOutput(allocator, &io, &log_cfg, &fake);
     const out = created[0];
     defer created[1].destroy();
 
-    var rec = SignalRecorder{};
+    var rec: SignalRecorder = .{};
     rec.init();
     out.events.commit.add(&rec.commit_listener);
 

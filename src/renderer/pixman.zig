@@ -46,8 +46,9 @@ pub const Framebuffer = struct {
     }
 
     pub fn deinit(fb: *Framebuffer) void {
-        fb.allocator.free(fb.data);
-        fb.allocator.destroy(fb);
+        const allocator = fb.allocator;
+        allocator.free(fb.data);
+        allocator.destroy(fb);
     }
 
     /// Fill the whole framebuffer with a color (test helper).
@@ -86,18 +87,18 @@ const PixmanData = struct {
     pass_data: PixmanPassData,
 };
 
-const renderer_impl = renderer_mod.Renderer.Impl{
+const renderer_impl: renderer_mod.Renderer.Impl = .{
     .begin_pass = beginPass,
     .destroy = destroyRenderer,
 };
 
-const pass_impl = pass_mod.Pass.Impl{
+const pass_impl: pass_mod.Pass.Impl = .{
     .add_texture = addTexture,
     .add_rect = addRect,
     .submit = submitPass,
 };
 
-const texture_impl = texture_mod.Texture.Impl{
+const texture_impl: texture_mod.Texture.Impl = .{
     .destroy = destroyTexture,
 };
 
@@ -115,7 +116,13 @@ pub const PixmanRenderer = struct {
 
     /// Import an ARGB8888 pixel buffer as a texture. The pixels are copied
     /// into renderer-owned memory.
-    pub fn importMemory(renderer: *renderer_mod.Renderer, w: i32, h: i32, stride: i32, pixels: []const u8) !*texture_mod.Texture {
+    pub fn importMemory(
+        renderer: *renderer_mod.Renderer,
+        w: i32,
+        h: i32,
+        stride: i32,
+        pixels: []const u8,
+    ) !*texture_mod.Texture {
         if (w <= 0 or h <= 0 or stride <= 0) return error.InvalidSize;
         const data: *PixmanData = @ptrCast(@alignCast(renderer.data));
         const size = @as(usize, @intCast(stride)) * @as(usize, @intCast(h));
@@ -165,7 +172,7 @@ fn addTexture(pass: *pass_mod.Pass, texture: *texture_mod.Texture, src: ?geom.FR
     const th: f64 = @floatFromInt(texture.height);
     const src_whole = if (src) |s| s.x == 0 and s.y == 0 and s.width == tw and s.height == th else true;
     if (!src_whole or dst.width != tw or dst.height != th or dst.x != @floor(dst.x) or dst.y != @floor(dst.y)) {
-        log_mod.warn(data.io, data.log_cfg, "pixman", "add_texture: scaling/cropping unsupported (M2); skipping", .{});
+        log_mod.warn("add_texture: scaling/cropping unsupported (M2); skipping", data.io, data.log_cfg, "pixman", .{});
         return;
     }
 
@@ -234,7 +241,7 @@ fn blendPixel(dst: *[4]u8, src: [4]u8) void {
 
 fn submitPass(pass: *pass_mod.Pass) void {
     const data: *PixmanPassData = @ptrCast(@alignCast(pass.data));
-    log_mod.trace(data.io, data.log_cfg, "pixman", "submit: no-op (CPU blits are eager)", .{});
+    log_mod.trace("submit: no-op (CPU blits are eager)", data.io, data.log_cfg, "pixman", .{});
 }
 
 test "framebuffer create and fill" {
@@ -257,7 +264,7 @@ test "texture import copies pixels" {
     const allocator = std.testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
     const renderer = try PixmanRenderer.create(allocator, &io, &log_cfg);
     defer renderer.destroy();
 
@@ -283,7 +290,7 @@ test "1:1 blit" {
     const allocator = std.testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
     const renderer = try PixmanRenderer.create(allocator, &io, &log_cfg);
     defer renderer.destroy();
 
@@ -313,7 +320,7 @@ test "scaled texture blit is skipped" {
     const allocator = std.testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
     const renderer = try PixmanRenderer.create(allocator, &io, &log_cfg);
     defer renderer.destroy();
 
@@ -337,7 +344,7 @@ test "rect fill and alpha blend" {
     const allocator = std.testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
-    var log_cfg = log_mod.Config{};
+    var log_cfg: log_mod.Config = .{};
     const renderer = try PixmanRenderer.create(allocator, &io, &log_cfg);
     defer renderer.destroy();
 
