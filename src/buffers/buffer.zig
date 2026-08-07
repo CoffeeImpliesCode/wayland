@@ -88,10 +88,12 @@ pub const Buffer = struct {
         return buf;
     }
 
-    /// The producer is done with the buffer. Idempotency is the caller's
-    /// job: dropping an already-dropped buffer is a programmer error.
+    /// The surface stopped using the buffer (one attach cycle ended).
+    /// Drop is cycle-idempotent: a client may re-attach a released buffer
+    /// (double buffering), so the same Buffer is dropped once per replace
+    /// and can be dropped many times across its lifetime. The release
+    /// event fires when dropped and the last consumer lock is gone.
     pub fn drop(buf: *Buffer) void {
-        assert(!buf.dropped);
         buf.dropped = true;
         buf.maybeRelease();
     }
@@ -151,6 +153,33 @@ test "lock drop unlock release ordering" {
     // Last unlock: dropped and unlocked -> release fires exactly once.
     buf.unlock();
     try std.testing.expectEqual(@as(u32, 1), observer.release_count);
+}
+
+test "buffer reuse across attach cycles releases each cycle" {
+    const allocator = std.testing.allocator;
+    var data: TestBufferData = .{};
+    var observer: TestObserver = .{
+        .release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease),
+        .destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy),
+    };
+
+    const buf = try Buffer.init(allocator, &test_impl, &data, 64, 64);
+    defer buf.destroy();
+    buf.events.release.add(&observer.release_listener);
+
+    // Cycle 1: attach (lock), replace (drop+unlock) -> release.
+    try buf.lock();
+    buf.drop();
+    buf.unlock();
+    try std.testing.expectEqual(@as(u32, 1), observer.release_count);
+
+    // Cycle 2: the client re-attaches the SAME buffer (double buffering).
+    // A second drop of the same Buffer must not fail and must fire the
+    // release event again.
+    try buf.lock();
+    buf.drop();
+    buf.unlock();
+    try std.testing.expectEqual(@as(u32, 2), observer.release_count);
 }
 
 test "drop with no locks releases immediately" {

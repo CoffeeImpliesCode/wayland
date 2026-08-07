@@ -119,7 +119,10 @@ pub const RaylibBackend = struct {
 
         const out_data = try allocator.create(RaylibOutputData);
         errdefer allocator.destroy(out_data);
-        const scratch = try allocator.alloc(u8, @as(usize, @intCast(mode.width)) * @as(usize, @intCast(mode.height)) * 4);
+        const scratch = try allocator.alloc(
+            u8,
+            @as(usize, @intCast(mode.width)) * @as(usize, @intCast(mode.height)) * 4,
+        );
         errdefer allocator.free(scratch);
         out_data.* = .{
             .allocator = allocator,
