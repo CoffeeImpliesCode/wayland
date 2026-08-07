@@ -1,11 +1,12 @@
-//! M1 compositor test server (tinywl equivalent).
+//! M2 compositor test server (tinywl equivalent).
 //!
 //! Wires the `wayland` library end to end on a zio event loop:
-//!   - CompositorDisplay + wl_shm + xdg-shell + headless backend
-//!   - pixman CPU renderer: background rect + one blit per mapped surface
-//!   - zio ev loop watches the display fd (PipePoll); the headless
-//!     backend paces frames via the display's own wire event loop timer,
-//!     so rendering happens inside display.dispatch
+//!   - CompositorDisplay + wl_shm + xdg-shell + wp_presentation + backend
+//!   - pixman CPU renderer + the scene graph: a background rect plus one
+//!     SceneBufferNode per mapped surface (imported on commit)
+//!   - frame pacing by the backend's wire event loop timer (headless or
+//!     raylib), rendering inside display.dispatch on output.frame
+//!   - presentation feedback for every surface drawn in a frame
 //!   - 5s watchdog timer stops the loop when no frame has been rendered
 //!     (tests must not hang); WAYLAND_RUN_FRAMES=N stops after N frames
 //!
@@ -13,6 +14,9 @@
 //!   WAYLAND_LOG          log filter, e.g. "debug" or "wire=info,compositor=debug"
 //!   WAYLAND_PROTOCOL_LOG set to "1" to log every protocol message
 //!   WAYLAND_RUN_FRAMES   stop after N rendered frames (0/absent = run forever)
+//!   WAYLAND_BACKEND      "raylib" selects the windowed raylib debug backend
+//!                        (falls back to headless if the window cannot open);
+//!                        anything else selects the headless backend
 //!
 //! The socket name is printed on its own stdout line as
 //! `WAYLAND_SOCKET=<name>` (flushed) so test harnesses can read it.
@@ -21,6 +25,13 @@ const std = @import("std");
 const wayland = @import("wayland");
 const zio = @import("zio");
 const tracy = @import("tracy");
+
+const build_options = @import("build_options");
+/// The raylib debug backend is only linked when build.zig's
+/// -Denable_raylib option is on; main only references it behind a
+/// comptime guard on build_options.enable_raylib.
+const raylib_impl = @import("raylib.zig");
+const raylib_mod = if (build_options.enable_raylib) raylib_impl else null;
 
 // Tracy plumbing: the tracy package looks these up on the importing root.
 // The build swaps "tracy_impl" between the enabled/disabled module.
@@ -42,12 +53,33 @@ const log = wayland.utils.log;
 const wire = wayland.wire;
 const pixman = wayland.pixman;
 
+// Library types not re-exported from root.zig. Zig 0.16 module ownership
+// forbids importing a library file into the server module, so the types
+// are derived from public fields of exported structs instead.
+/// `*Surface` as stored in Compositor.surfaces (ArrayList(*Surface).items).
+// SAFETY: type-derivation only; the undefined value is never evaluated at runtime.
+const Surface = std.meta.Child(std.meta.Child(@TypeOf(@as(wayland.compositor.Compositor, undefined).surfaces.items)));
+/// `?*Texture` as stored in SceneBufferNode.texture.
+// SAFETY: type-derivation only; the undefined value is never evaluated at runtime.
+const Texture = std.meta.Child(std.meta.Child(@TypeOf(@as(wayland.scene.SceneBufferNode, undefined).texture)));
+
 const output_width: i32 = 1280;
 const output_height: i32 = 720;
 const output_refresh_msec: i32 = 16;
 const watchdog_timeout_ms: u64 = 5000;
 /// Background color (straight alpha RGBA).
 const background_color = [4]f32{ 0.1, 0.1, 0.12, 1.0 };
+
+/// Per-surface scene state: the SceneBufferNode that draws the surface's
+/// current buffer, plus the listeners that keep it in sync (commit
+/// updates the texture, destroy removes it and frees the entry).
+const SurfaceEntry = struct {
+    state: *ServerState,
+    surface: *Surface,
+    node: ?*wayland.scene.SceneNode = null,
+    commit_listener: wire.Listener(*Surface),
+    destroy_listener: wire.Listener(*Surface),
+};
 
 const ServerState = struct {
     allocator: std.mem.Allocator,
@@ -60,6 +92,15 @@ const ServerState = struct {
     renderer: *wayland.renderer.Renderer,
     backend: *wayland.backend.Backend,
     framebuffer: *pixman.Framebuffer,
+    /// M2 scene graph: one scene and one output view (single-output server).
+    scene: ?*wayland.scene.Scene = null,
+    scene_output: ?*wayland.scene.SceneOutput = null,
+    presentation: *wayland.presentation.Presentation,
+    /// Per-surface scene state, keyed by the compositor surface
+    /// (initialized in the state literal with the server allocator).
+    surface_entries: std.AutoHashMap(*Surface, *SurfaceEntry),
+    /// Surfaces drawn this frame (presentation feedback targets), reused.
+    presented: std.ArrayList(*Surface) = .empty,
     /// The zio loop, set once initialized (callbacks stop it).
     loop: ?*zio.ev.Loop = null,
     /// One-shot watchdog timer, re-armed on every render.
@@ -105,6 +146,11 @@ pub fn main(init: std.process.Init) !void {
     defer display.deinit();
     try display.initShm();
 
+    // wp_presentation (stable v2): one global, registered right after the
+    // display so feedback objects exist before any client commit.
+    const presentation = try wayland.presentation.Presentation.init(allocator, io, &log_cfg, display);
+    defer presentation.deinit();
+
     if (init.environ_map.get("WAYLAND_PROTOCOL_LOG")) |v| {
         if (std.mem.eql(u8, v, "1")) {
             display.attachProtocolLogger();
@@ -124,7 +170,44 @@ pub fn main(init: std.process.Init) !void {
     defer shell.deinit();
     const renderer = try pixman.PixmanRenderer.create(allocator, io, &log_cfg);
     defer renderer.destroy();
-    const backend = try wayland.headless.HeadlessBackend.create(
+    // Backend selection: WAYLAND_BACKEND=raylib uses the windowed raylib
+    // debug backend (falling back to headless when the window cannot
+    // open); anything else uses the headless backend. The raylib path is
+    // only reachable when built with -Denable_raylib (default on).
+    const backend = if (build_options.enable_raylib) blk: {
+        if (wantRaylibBackend(init.environ_map)) {
+            break :blk raylib_mod.RaylibBackend.create(
+                allocator,
+                io,
+                &log_cfg,
+                display.getServer().getEventLoop(),
+                .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
+                "wayland-m2",
+            ) catch |err| {
+                log.warn(
+                    "raylib backend init failed ({s}); falling back to headless",
+                    io,
+                    &log_cfg,
+                    "server",
+                    .{@errorName(err)},
+                );
+                break :blk try wayland.headless.HeadlessBackend.create(
+                    allocator,
+                    io,
+                    &log_cfg,
+                    display.getServer().getEventLoop(),
+                    .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
+                );
+            };
+        }
+        break :blk try wayland.headless.HeadlessBackend.create(
+            allocator,
+            io,
+            &log_cfg,
+            display.getServer().getEventLoop(),
+            .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
+        );
+    } else try wayland.headless.HeadlessBackend.create(
         allocator,
         io,
         &log_cfg,
@@ -147,6 +230,8 @@ pub fn main(init: std.process.Init) !void {
         .renderer = renderer,
         .backend = backend,
         .framebuffer = framebuffer,
+        .presentation = presentation,
+        .surface_entries = std.AutoHashMap(*Surface, *SurfaceEntry).init(allocator),
         .toplevels = .empty,
         .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
         .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
@@ -154,6 +239,13 @@ pub fn main(init: std.process.Init) !void {
         .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
     };
     defer state.toplevels.deinit(allocator);
+    // Scene teardown (LIFO): drop the per-surface scene state first, then
+    // the scene output view, then the scene tree itself. The compositor
+    // (deferred earlier in main) destroys its surfaces afterwards; the
+    // listeners were already removed, so no entry is freed twice.
+    defer if (state.scene) |scene| scene.deinit();
+    defer if (state.scene_output) |so| so.destroy();
+    defer cleanupSurfaceEntries(&state);
 
     backend.events.new_output.add(&state.new_output_listener);
     shell.events.new_toplevel.add(&state.new_toplevel_listener);
@@ -232,6 +324,37 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
     log.info("new output {d}x{d} refresh={d}ms", self.io, self.log_cfg, "server", .{
         out.mode.width, out.mode.height, out.mode.refresh_msec,
     });
+
+    // M2: build the scene for this output (one scene, one output view).
+    const scene = wayland.scene.Scene.init(self.allocator, self.io, self.log_cfg) catch |err| {
+        log.err("scene init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    const scene_output = wayland.scene.SceneOutput.create(
+        self.allocator,
+        self.io,
+        self.log_cfg,
+        scene,
+        out,
+    ) catch |err| {
+        scene.deinit();
+        log.err("scene output init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    // Background rect covering the whole output (draws first, under the
+    // surface nodes).
+    const bg = wayland.scene.SceneNode.create(self.allocator, scene.root, .rect) catch |err| {
+        scene_output.destroy();
+        scene.deinit();
+        log.err("scene background init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    bg.kind.rect.width = out.mode.width;
+    bg.kind.rect.height = out.mode.height;
+    bg.kind.rect.color = background_color;
+
+    self.scene = scene;
+    self.scene_output = scene_output;
     out.events.frame.add(&self.frame_listener);
 }
 
@@ -293,49 +416,33 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     const zone = tracy.Zone.begin(.{ .src = @src() });
     defer zone.end();
 
-    // M1: single fixed-size framebuffer, reused across frames.
-    const fb = self.framebuffer;
-    const pass = self.renderer.beginPass(fb) orelse {
-        log.err("begin_pass failed", self.io, self.log_cfg, "server", .{});
+    // M2: surfaces created since the last frame get scene nodes.
+    syncSurfaces(self);
+
+    const so = self.scene_output orelse {
+        log.err("render: no scene output", self.io, self.log_cfg, "server", .{});
         return;
     };
 
-    // Background clears the previous frame (alpha 1 overwrites).
-    pass.addRect(.{ .x = 0, .y = 0, .width = fb.width, .height = fb.height }, background_color);
+    // Single reused framebuffer; repaint everything every frame.
+    so.damage_ring.addWhole();
 
-    // One 1:1 blit per mapped surface at (0, 0) (M1: no transforms).
-    var n_surfaces: usize = 0;
-    for (self.compositor.surfaces.items) |s| {
-        if (!s.mapped) continue;
-        const buf = s.buffer orelse continue;
-        const get_shm = buf.impl.get_shm orelse continue;
-        const shm = get_shm(buf) orelse continue;
-        const begin = buf.impl.begin_data_ptr_access orelse continue;
-        const end = buf.impl.end_data_ptr_access orelse continue;
-
-        const pixels = begin(buf) catch continue;
-        defer end(buf);
-        const ptr = pixels orelse continue;
-        const stride = wire.shm.Buffer.getStride(shm);
-        const byte_len = @as(usize, @intCast(stride)) * @as(usize, @intCast(buf.height));
-        const tex = pixman.PixmanRenderer.importMemory(
-            self.renderer,
-            buf.width,
-            buf.height,
-            stride,
-            ptr[0..byte_len],
-        ) catch continue;
-        defer tex.destroy();
-
-        pass.addTexture(tex, null, .{
-            .x = 0,
-            .y = 0,
-            .width = @floatFromInt(buf.width),
-            .height = @floatFromInt(buf.height),
-        }, 1.0);
-        n_surfaces += 1;
+    // The surfaces about to be drawn this frame (presentation feedback
+    // targets): every tracked surface with an active scene node.
+    // Rebuilt each frame; the compositor drives this loop.
+    self.presented.clearRetainingCapacity();
+    var entry_it = self.surface_entries.valueIterator();
+    while (entry_it.next()) |entry| {
+        if (entry.*.node != null) {
+            self.presented.append(self.allocator, entry.*.surface) catch |err| {
+                log.warn("presented list append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            };
+        }
     }
-    pass.submit();
+
+    // Composite the scene into the framebuffer, then present it.
+    so.render(self.renderer, self.framebuffer);
+    _ = so.damage_ring.rotate();
 
     // Present: hand the framebuffer to the output, damage the whole screen.
     var state = wayland.output.Output.State.init(self.allocator);
@@ -345,18 +452,21 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         wayland.output.Output.State.committed_buffer;
     state.enabled = true;
     state.mode = .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec };
-    state.buffer = @ptrCast(fb);
+    state.buffer = @ptrCast(self.framebuffer);
     state.damage.addWhole();
     out.commitState(&state) catch |err| {
         log.err("output commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
 
+    // wp_presentation: every surface drawn this frame was presented.
+    self.presentation.present(self.presented.items, @intCast(output_refresh_msec), 0);
+
     self.frames_rendered += 1;
     tracy.frameMark(null);
     log.debug("render frame={d} surfaces={d}", self.io, self.log_cfg, "server", .{
         self.frames_rendered,
-        n_surfaces,
+        self.presented.items.len,
     });
 
     // Progress: keep the watchdog from firing. A wedged loop stops instead
@@ -368,6 +478,142 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         log.info("reached WAYLAND_RUN_FRAMES={d}, stopping", self.io, self.log_cfg, "server", .{self.run_frames});
         self.loop.?.stop();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scene surface tracking
+// ---------------------------------------------------------------------------
+
+/// Subscribe to commit/destroy on every compositor surface we do not
+/// track yet, and initialize the scene node from its current state (the
+/// surface may have committed before we subscribed). Called from the
+/// frame handler, so surfaces created in the same dispatch are caught.
+fn syncSurfaces(self: *ServerState) void {
+    for (self.compositor.surfaces.items) |s| {
+        if (self.surface_entries.contains(s)) continue;
+        const entry = self.allocator.create(SurfaceEntry) catch |err| {
+            log.warn("failed to track surface: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            continue;
+        };
+        entry.* = .{
+            .state = self,
+            .surface = s,
+            .node = null,
+            .commit_listener = wire.Listener(*Surface).init(onSurfaceCommit),
+            .destroy_listener = wire.Listener(*Surface).init(onSurfaceDestroy),
+        };
+        self.surface_entries.put(s, entry) catch |err| {
+            self.allocator.destroy(entry);
+            log.warn("failed to track surface: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            continue;
+        };
+        s.events.commit.add(&entry.commit_listener);
+        s.events.destroy.add(&entry.destroy_listener);
+        updateSurfaceNode(self, entry);
+    }
+}
+
+/// wl_surface.commit applied: refresh the surface's scene node from its
+/// current buffer. A committed buffer means the surface maps (or keeps
+/// mapping) with content; a null buffer unmaps it.
+fn onSurfaceCommit(listener: *wire.Listener(*Surface), _: *Surface) void {
+    const entry: *SurfaceEntry = @fieldParentPtr("commit_listener", listener);
+    updateSurfaceNode(entry.state, entry);
+}
+
+/// wl_surface destroyed: drop the scene node, deliver discarded feedback,
+/// and free the tracking entry. The surface is still valid inside the
+/// destroy signal (its buffers are released after the signal).
+fn onSurfaceDestroy(listener: *wire.Listener(*Surface), s: *Surface) void {
+    const entry: *SurfaceEntry = @fieldParentPtr("destroy_listener", listener);
+    const self = entry.state;
+    removeSurfaceNode(self, entry);
+    self.presentation.discard(s);
+    _ = self.surface_entries.remove(s);
+    self.allocator.destroy(entry);
+}
+
+/// Ensure the surface's scene node exists and shows its current buffer;
+/// remove it when the surface has no buffer (unmapped).
+fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
+    const s = entry.surface;
+    const buf = s.buffer orelse {
+        removeSurfaceNode(self, entry);
+        return;
+    };
+    const texture = importSurfaceTexture(self, buf) orelse return;
+    if (entry.node) |node| {
+        // Update in place: swap in the new texture (1:1, dst = buffer size).
+        const bn = node.kind.buffer;
+        if (bn.texture) |old| old.destroy();
+        bn.texture = texture;
+        bn.dst_width = buf.width;
+        bn.dst_height = buf.height;
+        node.enable(true);
+    } else {
+        const node = wayland.scene.SceneNode.create(self.allocator, self.scene.?.root, .buffer) catch |err| {
+            texture.destroy();
+            log.warn("scene node create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            return;
+        };
+        node.kind.buffer.texture = texture;
+        node.kind.buffer.dst_width = buf.width;
+        node.kind.buffer.dst_height = buf.height;
+        entry.node = node;
+    }
+}
+
+/// Remove (and free) the surface's scene node; the entry keeps tracking
+/// the surface for a future remap.
+fn removeSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
+    if (entry.node) |node| {
+        if (node.kind.buffer.texture) |texture| texture.destroy();
+        node.destroy(self.allocator);
+        entry.node = null;
+    }
+}
+
+/// Copy the surface's current buffer into a renderer texture (same import
+/// path the M1 render loop used per frame; the scene node owns the copy).
+fn importSurfaceTexture(self: *ServerState, buf: *wayland.buffers.Buffer) ?*Texture {
+    const get_shm = buf.impl.get_shm orelse return null;
+    const shm = get_shm(buf) orelse return null;
+    const begin = buf.impl.begin_data_ptr_access orelse return null;
+    const end = buf.impl.end_data_ptr_access orelse return null;
+
+    const pixels = begin(buf) catch return null;
+    defer end(buf);
+    const ptr = pixels orelse return null;
+    const stride = wire.shm.Buffer.getStride(shm);
+    const byte_len = @as(usize, @intCast(stride)) * @as(usize, @intCast(buf.height));
+    return pixman.PixmanRenderer.importMemory(
+        self.renderer,
+        buf.width,
+        buf.height,
+        stride,
+        ptr[0..byte_len],
+    ) catch null;
+}
+
+/// Tear down every surface entry (listeners, scene nodes, allocations).
+/// Runs before the scene and compositor teardown in main().
+fn cleanupSurfaceEntries(self: *ServerState) void {
+    var it = self.surface_entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        entry.commit_listener.link.remove();
+        entry.destroy_listener.link.remove();
+        removeSurfaceNode(self, entry);
+        self.allocator.destroy(entry);
+    }
+    self.surface_entries.deinit();
+    self.presented.deinit(self.allocator);
+}
+
+/// WAYLAND_BACKEND=raylib selects the windowed raylib debug backend.
+fn wantRaylibBackend(environ_map: *std.process.Environ.Map) bool {
+    const v = environ_map.get("WAYLAND_BACKEND") orelse return false;
+    return std.mem.eql(u8, v, "raylib");
 }
 
 // ---------------------------------------------------------------------------

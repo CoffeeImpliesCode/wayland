@@ -44,6 +44,8 @@ pub const renderer = @import("renderer/renderer.zig");
 /// for consumers that render with pixman (test servers, examples).
 pub const pixman = @import("renderer/pixman.zig");
 pub const shell = @import("shell/xdg.zig");
+pub const scene = @import("scene/scene.zig");
+pub const presentation = @import("presentation.zig");
 
 // zig 0.16 collects `test` blocks only from analyzed declarations;
 // force analysis of every module so `zig build test` runs all tests.
@@ -58,6 +60,8 @@ comptime {
     _ = output;
     _ = renderer;
     _ = shell;
+    _ = scene;
+    _ = presentation;
 }
 
 test "generated server bindings compile" {

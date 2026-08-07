@@ -15,6 +15,7 @@ pub fn build(b: *Build) void {
     });
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
+    scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-layer-shell-unstable-v1.xml"));
 
@@ -29,6 +30,7 @@ pub fn build(b: *Build) void {
     scanner.generate("xdg_wm_base", 7);
     scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("wp_viewporter", 1);
+    scanner.generate("wp_presentation", 2);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
 
     const protocol = b.createModule(.{
@@ -81,6 +83,15 @@ pub fn build(b: *Build) void {
     const tracy = b.dependency("tracy", .{ .target = target, .optimize = optimize });
     const tracy_enabled = b.option(bool, "enable_tracy", "Enable the Tracy profiler") orelse false;
 
+    // Raylib debug backend (src/server/raylib.zig): windowed output
+    // visualization for the test server. ON by default. When disabled the
+    // server builds without raylib (main.zig guards the import through the
+    // build_options module below).
+    const enable_raylib = b.option(bool, "enable_raylib", "Link the raylib debug backend into wayland-server") orelse true;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_raylib", enable_raylib);
+
     const server_exe = b.addExecutable(.{
         .name = "wayland-server",
         .root_module = b.createModule(.{
@@ -91,6 +102,7 @@ pub fn build(b: *Build) void {
                 .{ .name = "wayland", .module = lib },
                 .{ .name = "zio", .module = zio.module("zio") },
                 .{ .name = "tracy", .module = tracy.module("tracy") },
+                .{ .name = "build_options", .module = build_options.createModule() },
             },
         }),
     });
@@ -98,6 +110,30 @@ pub fn build(b: *Build) void {
         server_exe.root_module.addImport("tracy_impl", tracy.module("tracy_impl_enabled"));
     } else {
         server_exe.root_module.addImport("tracy_impl", tracy.module("tracy_impl_disabled"));
+    }
+    if (enable_raylib) {
+        // Translate the raylib C API through a shim header so the backend
+        // imports a small stable namespace ("raylib_c"). The include path
+        // comes from pkg-config at configure time: PKG_CONFIG_PATH must
+        // list raylib's lib/pkgconfig (nix: nixpkgs#raylib) when building
+        // outside the devenv shell. Linking also goes through pkg-config
+        // (use_pkg_config = .force), so the same PKG_CONFIG_PATH applies.
+        const raylib_c = b.addTranslateC(.{
+            .root_source_file = b.path("src/server/raylib_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const cflags = b.run(&.{ "pkg-config", "--cflags", "raylib" });
+        var it = std.mem.tokenizeAny(u8, cflags, " \t\n");
+        while (it.next()) |tok| {
+            if (std.mem.startsWith(u8, tok, "-I") and tok.len > 2) {
+                raylib_c.addSystemIncludePath(.{ .cwd_relative = b.dupe(tok[2..]) });
+                break;
+            }
+        }
+        server_exe.root_module.addImport("raylib_c", raylib_c.createModule());
+        server_exe.root_module.linkSystemLibrary("raylib", .{ .use_pkg_config = .force });
     }
     b.installArtifact(server_exe);
 

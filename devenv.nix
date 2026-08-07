@@ -6,6 +6,7 @@
     pkgs.pkg-config
     pkgs.wayland
     pkgs.wayland-protocols
+    pkgs.raylib # debug backend (windowed output visualization)
   ];
 
   # .pc files live in the dev output; the zig build links via pkg-config.
