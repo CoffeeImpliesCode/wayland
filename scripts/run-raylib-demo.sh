@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 FRAMES="${1:-0}"
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/m1xdg}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SERVER_BIN=./zig-out/bin/wayland-server
 CLIENT_BIN=~/projects/freedesktop-wayland-weston/build/clients/weston-simple-shm
 WAYLAND_LIB_PATH=/tmp/wlprefix/usr/local/lib # libwayland for the C client
@@ -33,7 +33,6 @@ if [ ! -x "$CLIENT_BIN" ]; then
 fi
 
 mkdir -p "$RUNTIME_DIR"
-unset WAYLAND_DISPLAY # let SDL pick the X11 driver for the window
 
 echo "starting raylib compositor (window: wayland-m2, ${FRAMES:-unlimited} frames)..."
 XDG_RUNTIME_DIR="$RUNTIME_DIR" \

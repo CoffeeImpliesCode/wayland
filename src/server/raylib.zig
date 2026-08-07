@@ -39,6 +39,9 @@ const RaylibOutputData = struct {
     io: *std.Io,
     log_cfg: *const log_mod.Config,
     texture: raylib.Texture2D,
+    /// BGRA-in-memory (ARGB8888 u32) -> RGBA byte swap scratch for the
+    /// R8G8B8A8 raylib texture; width*height*4 bytes.
+    scratch: []u8,
 };
 
 const backend_impl: backend.Backend.Impl = .{
@@ -116,11 +119,14 @@ pub const RaylibBackend = struct {
 
         const out_data = try allocator.create(RaylibOutputData);
         errdefer allocator.destroy(out_data);
+        const scratch = try allocator.alloc(u8, @as(usize, @intCast(mode.width)) * @as(usize, @intCast(mode.height)) * 4);
+        errdefer allocator.free(scratch);
         out_data.* = .{
             .allocator = allocator,
             .io = io,
             .log_cfg = log_cfg,
             .texture = texture,
+            .scratch = scratch,
         };
 
         const base = try backend.Backend.init(allocator, io, log_cfg, &backend_impl, rl);
@@ -174,8 +180,17 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
     const od: *RaylibOutputData = @ptrCast(@alignCast(out.data));
     if (state.buffer) |buf| {
         const fb: *pixman.Framebuffer = @ptrCast(@alignCast(buf));
+        // ARGB8888 u32 (BGRA bytes in little-endian memory) -> RGBA bytes
+        // for the R8G8B8A8 raylib texture.
+        const pixels = std.mem.bytesAsSlice(u32, fb.data);
+        for (pixels, 0..) |px, i| {
+            od.scratch[i * 4 + 0] = @truncate(px >> 16);
+            od.scratch[i * 4 + 1] = @truncate(px >> 8);
+            od.scratch[i * 4 + 2] = @truncate(px);
+            od.scratch[i * 4 + 3] = @truncate(px >> 24);
+        }
         raylib.PollInputEvents();
-        raylib.UpdateTexture(od.texture, fb.data.ptr);
+        raylib.UpdateTexture(od.texture, od.scratch.ptr);
         raylib.BeginDrawing();
         raylib.ClearBackground(white);
         raylib.DrawTexture(od.texture, 0, 0, white);
@@ -189,5 +204,6 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
 fn destroyOutput(allocator: std.mem.Allocator, data: *anyopaque) void {
     const od: *RaylibOutputData = @ptrCast(@alignCast(data));
     raylib.UnloadTexture(od.texture);
+    allocator.free(od.scratch);
     allocator.destroy(od);
 }
