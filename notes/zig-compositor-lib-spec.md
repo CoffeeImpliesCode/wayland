@@ -236,6 +236,13 @@ M1 — done (2026-08-07): core (display/wire) + utils (geom/damage/log) +
      M1 simplifications (documented in code): damage_buffer treated as
      surface damage, no viewport, no subsurfaces, no seat, stateless
      fromResource fallback when no ShmState attached.
+     Interop (2026-08-07): reference C clients validated against the
+     server — wayland-info lists globals (wl_shm v2, wl_compositor v7,
+     xdg_wm_base v7); weston-simple-shm runs the full cycle (xdg
+     configure/ack, shm attach/commit, wl_buffer.release delivery, frame
+     callback pacing, buffer recycling) with exit 0. wl_output global NOT
+     registered yet (M2). Client build recipe: weston clone + devenv.nix
+     (meson minimal config, simple-clients=shm).
 M2 — output state machine + damage ring + scene (int mode) + frame
      scheduling + presentation.
 M3 — seat/input: focus, serials, grabs, cursor, keyboard (xkb).
