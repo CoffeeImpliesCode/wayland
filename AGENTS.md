@@ -17,9 +17,11 @@ Research-and-prototype repo for a future Wayland compositor on a large 2D/3D can
 
 ```
 wayland/
-├── build.zig, build.zig.zon   # zig-init defaults; extend, do not delete
-├── src/                       # main.zig, root.zig — zig-init defaults
+├── build.zig, build.zig.zon   # scanner wiring (zig-wayland v0.6.0 dep)
+├── protocols/                 # vendored protocol XMLs (wayland, wayland-protocols, wlroots)
+├── src/                       # root.zig (lib re-exports bindings), main.zig (skeleton)
 ├── notes/                     # research notes, one topic per file
+├── devenv.nix, .envrc         # nix dev shell (sets PKG_CONFIG_PATH for wayland)
 └── README.md                  # indexes notes/
 ```
 
@@ -87,7 +89,7 @@ Training data predates these changes. Check `zig env` and local std sources befo
 - Libraries: `b.addLibrary(.{ .linkage = .dynamic, ... })`. `addSharedLibrary` is gone.
 - C-linkage methods moved to the module: `root_module.addIncludePath(...)`, `root_module.linkSystemLibrary("wlroots", .{})` (two-arg form), `root_module.addCSourceFile(.{...})`. Link libc via `.link_libc = true` in `createModule`.
 - build.zig.zon: `.name` is an enum literal (`.wayland`, not `"wayland"`), `.fingerprint` required, dependencies use `.url` + `name-version-<hash>` hash.
-- Fetch deps: `zig build` auto-fetches; `zig build --fetch` fetches only; `zig fetch <url>` prints the hash to paste. Fetched deps land in local `zig-pkg/` — do not commit.
+- Fetch deps: `zig build` auto-fetches; `zig build --fetch` fetches only; `zig fetch <url>` prints the hash to paste. Fetched deps land in local `zig-pkg/` — commit them (house convention; hermetic builds).
 - Local override: `zig build --fork=/path/to/fork` swaps any dependency with matching name + fingerprint.
 - Add a dep:
 
@@ -165,11 +167,16 @@ Training data predates these changes. Check `zig env` and local std sources befo
 
 ```bash
 zig version                              # expect 0.16.0
+zig build                                # fetches zig-wayland, runs scanner, builds
+zig build test                           # includes bindings compile-check test
+devenv shell -c "zig build"              # or rely on direnv; PKG_CONFIG_PATH set there
 zig translate-c -I include/ wlroots.h    # inspect C header translation
 pkg-config --cflags --libs wlroots       # wlroots link flags
-zig build test                           # when code exists
 jj st / jj log                           # review changes
 ```
+
+Generated bindings (from the scanner) live in `.zig-cache/` — never commit or
+edit them. `protocols/` is the vendored spec source; regenerate by building.
 
 
 ## Hardcore quality bar (2026-08)

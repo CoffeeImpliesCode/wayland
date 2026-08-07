@@ -17,6 +17,7 @@ indexed below. Additions are marked `[INFERENCE]`.
 | `canvas-compositing.md` | Presenting surfaces on a large canvas | wlr_scene cannot do rotation or float zoom → custom camera pass mandatory: world `f64` coords, matrix `M = T·S·R·T`, camera rebase vs fp32 jitter, world-space damage + input via inverse camera; sharp zoom via fractional-scale/viewporter; 8-row prior-art table (niri, wayfire, wayvr, gnome magnifier.js, egui, ...); 9 risks. |
 | `zio.md` | Async I/O framework for Zig | lalinsky/zio verified from source: created 2025-09-16, pushed 2026-08-05, 575 stars, NOT archived; three layers `zio.ev`/`zio.coro`/`zio.Runtime` (std.Io impl); zig-libuv archived 2023, libxev active. Verdict: DO NOT adopt for the compositor core loop (small fixed fd set, std.posix.poll / std.os.linux.epoll_*); revisit for companion network services only. |
 | `dynamicland.md` | Dynamicland / Realtalk | Dead URLs recovered via Wayback (2019 Research Gallery capture, 2017 homepage); SAP/CDG affiliation VERIFIED via dynamicland.org/archive/2014/CDG + archived Bloomberg; no /2025/ /2026/ pages (404, verified 2026-08-07); commentary: Matuschak notes et al. Take: spatial persistence, live objects, multi-scale navigation, shared presence. Leave: paper/camera/projector substrate, anti-product philosophy. Impl details not public. |
+| `zig-wayland-stack.md` | Zig wayland stack | Layered stack: wlroots 0.20.2 / zig-wlroots v0.20.1 / zig-wayland v0.6.0 / vendored XMLs; gaps (canvas pass DIY); reference reads. Now wired into build.zig: scanner generates ~13k-line bindings from protocols/ (server + client namespaces). |
 
 ## Stack recommendation
 
@@ -99,16 +100,14 @@ Recommendation: build on **wlroots via zig-wayland + zig-wlroots**, not smithay.
 
 ## Phased roadmap
 
-1. **Scaffold** — Zig 0.16 project with `build.zig.zon`; add zig-wayland
-   (v0.6.0+) as a pinned dependency; wire the Scanner step per the upstream
-   README recipe. Deliverable: buildable skeleton that generates
-   `wayland.zig`.
-2. **Spec codegen pipeline** — Decide the wlroots version target first
-   (recommend the 0.20 line, matching zig-wlroots; the local wlroots clone is
-   refreshed to 0.20.2); pin wayland.xml, wayland-protocols, wlroots XML; generate
-   client+server namespaces for wl_compositor, wl_shm, xdg-shell; vendor
-   XMLs for hermetic builds. Deliverable: reproducible codegen, no
-   configure-time pkg-config surprise.
+1. **Scaffold** — done (2026-08-07): zig 0.16 project, zig-wayland v0.6.0
+   pinned dep, Scanner wired, buildable skeleton generating `wayland.zig`.
+2. **Spec codegen pipeline** — done (2026-08-07): wlroots target = 0.20
+   line (clone refreshed at 0.20.2); wayland.xml, xdg-shell, viewporter,
+   fractional-scale, wlr-layer-shell vendored in `protocols/`; server+
+   client namespaces generated (wl_compositor v7 … zwlr_layer_shell_v1 v5);
+   explicit XML paths — no pkg-config needed for codegen, only for linking
+   libwayland (devenv.nix sets PKG_CONFIG_PATH).
 3. **Minimal headless compositor** — Headless backend, wl_registry globals,
    xdg-shell handling, shm buffers; test with `WLR_BACKENDS=headless` +
    `WLR_RENDERER=pixman` and a weston client (weston-test harness verified
