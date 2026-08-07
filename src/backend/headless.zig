@@ -80,12 +80,12 @@ fn start(base: *backend.Backend) error{BackendFailed}!void {
     base.emitNewOutput(headless.out);
 }
 
-fn destroy(base: *backend.Backend) void {
-    const headless: *Headless = @ptrCast(@alignCast(base.data));
+fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
+    const headless: *Headless = @ptrCast(@alignCast(data));
     // Stop the timer first so no callback can run against a torn-down output.
     if (headless.timer) |timer| timer.remove();
     headless.out.destroy();
-    base.allocator.destroy(headless);
+    allocator.destroy(headless);
 }
 
 fn frameCb(headless: *Headless) c_int {
@@ -124,7 +124,7 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
     });
 }
 
-fn destroyOutput(_: *output.Output) void {}
+fn destroyOutput(_: std.mem.Allocator, _: *anyopaque) void {}
 
 const FrameRecorder = struct {
     frames: usize = 0,

@@ -88,7 +88,7 @@ pub const Output = struct {
         /// Apply a validated state at the backend level.
         commit: *const fn (output: *Output, state: *const State) error{CommitFailed}!void,
         /// Tear down backend resources owned by this output.
-        destroy: *const fn (output: *Output) void,
+        destroy: *const fn (allocator: std.mem.Allocator, data: *anyopaque) void,
     };
 
     pub fn create(
@@ -130,7 +130,7 @@ pub const Output = struct {
 
     pub fn destroy(output: *Output) void {
         output.events.destroy.emit(output);
-        output.impl.destroy(output);
+        output.impl.destroy(output.allocator, output.data);
         const allocator = output.allocator;
         allocator.destroy(output);
     }
@@ -197,8 +197,9 @@ const FakeImpl = struct {
         if (self.fail_commit) return error.CommitFailed;
     }
 
-    fn destroy(out: *Output) void {
-        const self: *FakeImpl = @ptrCast(@alignCast(out.data));
+    fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
+        _ = allocator;
+        const self: *FakeImpl = @ptrCast(@alignCast(data));
         self.destroyed = true;
     }
 };
@@ -212,7 +213,7 @@ const fake_impl: Output.Impl = .{
 const FakeBackendImpl = struct {
     fn start(_: *backend_mod.Backend) error{BackendFailed}!void {}
 
-    fn destroy(_: *backend_mod.Backend) void {}
+    fn destroy(_: std.mem.Allocator, _: *anyopaque) void {}
 };
 
 const fake_backend_impl: backend_mod.Backend.Impl = .{

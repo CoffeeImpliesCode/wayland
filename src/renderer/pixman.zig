@@ -150,9 +150,9 @@ fn beginPass(renderer: *renderer_mod.Renderer, target: *anyopaque) ?*pass_mod.Pa
     return &data.pass;
 }
 
-fn destroyRenderer(renderer: *renderer_mod.Renderer) void {
-    const data: *PixmanData = @ptrCast(@alignCast(renderer.data));
-    renderer.allocator.destroy(data);
+fn destroyRenderer(allocator: std.mem.Allocator, data: *anyopaque) void {
+    const d: *PixmanData = @ptrCast(@alignCast(data));
+    allocator.destroy(d);
 }
 
 fn destroyTexture(texture: *texture_mod.Texture) void {
@@ -177,8 +177,8 @@ fn addTexture(pass: *pass_mod.Pass, texture: *texture_mod.Texture, src: ?geom.FR
         return;
     }
 
-    const dst_x: i32 = @intFromFloat(dst.x);
-    const dst_y: i32 = @intFromFloat(dst.y);
+    const dst_x: i32 = std.math.lossyCast(i32, dst.x);
+    const dst_y: i32 = std.math.lossyCast(i32, dst.y);
     const x0 = @max(dst_x, 0);
     const y0 = @max(dst_y, 0);
     const x1 = @min(dst_x + texture.width, fb.width);

@@ -88,7 +88,7 @@ pub const ShmState = struct {
     pub fn deinit(state: *ShmState) void {
         while (state.buffers.count() > 0) {
             var it = state.buffers.keyIterator();
-            const key = it.next().?.*;
+            const key = (it.next() orelse unreachable).*;
             const buf = state.buffers.get(key).?;
             Buffer.destroy(buf);
         }
@@ -175,14 +175,14 @@ fn shmEndDataPtrAccess(buf: *Buffer) void {
     if (d.shm) |shm| wire.shm.Buffer.endAccess(shm);
 }
 
-fn shmDestroy(buf: *Buffer) void {
-    const d = shmData(buf);
+fn shmDestroy(allocator: std.mem.Allocator, data: *anyopaque) void {
+    const d: *ShmBufferData = @ptrCast(@alignCast(data));
     if (d.state) |state| _ = state.buffers.remove(d.resource_key);
     // Detach listeners before freeing so a later signal emission cannot
     // touch freed memory. Only safe while the resource is still alive.
     if (d.resource != null) d.resource_destroy.link.remove();
     d.release.link.remove();
-    d.allocator.destroy(d);
+    allocator.destroy(d);
 }
 
 /// The client destroyed the wl_buffer resource: libwayland frees the shm

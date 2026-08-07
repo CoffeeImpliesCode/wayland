@@ -24,7 +24,7 @@ pub const Renderer = struct {
         /// Begin a render pass targeting `target`; null when unsupported.
         begin_pass: *const fn (renderer: *Renderer, target: *anyopaque) ?*pass_mod.Pass,
         /// Release renderer-owned resources (not the Renderer struct).
-        destroy: *const fn (renderer: *Renderer) void,
+        destroy: *const fn (allocator: std.mem.Allocator, data: *anyopaque) void,
     };
 
     pub fn create(
@@ -52,7 +52,7 @@ pub const Renderer = struct {
     }
 
     pub fn destroy(renderer: *Renderer) void {
-        renderer.impl.destroy(renderer);
+        renderer.impl.destroy(renderer.allocator, renderer.data);
         const allocator = renderer.allocator;
         allocator.destroy(renderer);
     }
@@ -68,8 +68,9 @@ const FakeRenderer = struct {
         return null;
     }
 
-    fn onDestroy(renderer: *Renderer) void {
-        const self: *FakeRenderer = @ptrCast(@alignCast(renderer.data));
+    fn onDestroy(allocator: std.mem.Allocator, data: *anyopaque) void {
+        _ = allocator;
+        const self: *FakeRenderer = @ptrCast(@alignCast(data));
         self.destroyed = true;
     }
 };

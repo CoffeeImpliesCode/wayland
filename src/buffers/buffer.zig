@@ -38,7 +38,7 @@ pub const Impl = struct {
     end_data_ptr_access: ?*const fn (self: *Buffer) void = null,
     /// Release impl-private resources. The Buffer itself is freed by
     /// `Buffer.destroy`, never here.
-    destroy: *const fn (self: *Buffer) void,
+    destroy: *const fn (allocator: std.mem.Allocator, data: *anyopaque) void,
 };
 
 pub const Buffer = struct {
@@ -120,7 +120,7 @@ pub const Buffer = struct {
     /// frees the Buffer. Must not be called from inside a signal handler.
     pub fn destroy(buf: *Buffer) void {
         buf.events.destroy.emit(buf);
-        buf.impl.destroy(buf);
+        buf.impl.destroy(buf.allocator, buf.data);
         buf.allocator.destroy(buf);
     }
 };
@@ -248,8 +248,9 @@ fn testEndData(buf: *Buffer) void {
     _ = buf;
 }
 
-fn testDestroy(buf: *Buffer) void {
-    const d: *TestBufferData = @ptrCast(@alignCast(buf.data));
+fn testDestroy(allocator: std.mem.Allocator, data: *anyopaque) void {
+    _ = allocator;
+    const d: *TestBufferData = @ptrCast(@alignCast(data));
     d.destroyed = true;
 }
 

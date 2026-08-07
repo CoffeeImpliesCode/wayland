@@ -632,9 +632,7 @@ pub fn testBuffer(allocator: std.mem.Allocator, b: *Buffer) void {
     b.events.destroy.init();
 }
 
-fn fakeBufferDestroy(self: *Buffer) void {
-    _ = self;
-}
+fn fakeBufferDestroy(_: std.mem.Allocator, _: *anyopaque) void {}
 
 var test_buffer_impl: buffer_mod.Impl = .{
     .get_dmabuf = null,

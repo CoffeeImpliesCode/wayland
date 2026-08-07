@@ -30,7 +30,7 @@ pub const Backend = struct {
         /// Start the backend (device init, timers, output enumeration).
         start: *const fn (backend: *Backend) error{BackendFailed}!void,
         /// Tear down backend-owned resources (not the Backend struct).
-        destroy: *const fn (backend: *Backend) void,
+        destroy: *const fn (allocator: std.mem.Allocator, data: *anyopaque) void,
     };
 
     pub fn init(
@@ -62,7 +62,7 @@ pub const Backend = struct {
 
     pub fn destroy(backend: *Backend) void {
         backend.events.destroy.emit(backend);
-        backend.impl.destroy(backend);
+        backend.impl.destroy(backend.allocator, backend.data);
         const allocator = backend.allocator;
         allocator.destroy(backend);
     }
@@ -82,8 +82,9 @@ const FakeImpl = struct {
         self.starts += 1;
     }
 
-    fn destroy(backend: *Backend) void {
-        const self: *FakeImpl = @ptrCast(@alignCast(backend.data));
+    fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
+        _ = allocator;
+        const self: *FakeImpl = @ptrCast(@alignCast(data));
         self.destroyed = true;
     }
 };
