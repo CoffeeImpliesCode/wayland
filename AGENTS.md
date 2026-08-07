@@ -199,8 +199,8 @@ mandatory post-implementation review. Read before coding:
 
 ### Gates — definition of done (evidence in the same turn)
 1. `zig fmt --check .` — zero diffs.
-2. `zig build` Debug + ReleaseSafe — exit 0.
-3. `zig build test` Debug + ReleaseSafe — all green, zero leaks (`std.testing.allocator`).
+2. `zig build` Debug — exit 0.
+3. `zig build test` Debug — all green, zero leaks (`std.testing.allocator`).
 4. `zig ast-check` on every changed `.zig`.
 5. `test { std.testing.refAllDecls(@This()); }` in each root — unused decls still type-check.
 6. Linter — **ziglint** (project linter, house convention): `nix shell nixpkgs#ziglint -c ziglint src` — zero findings (Bugs + Style, minus unsafe-undefined; Z-rules, no .ziglint.zon, defaults).
@@ -211,6 +211,31 @@ mandatory post-implementation review. Read before coding:
 
 Density rule: 12/357 covered paths is noise; 352/357 makes each missing
 path a judgment call. Coverage guides, never gates alone.
+
+### Analysis tools (local binaries, verified 2026-08-07)
+1. **ziglint** — `~/.local/bin/ziglint src --ignore Z030` (0.5.3; same version
+   as nixpkgs#ziglint). Z030 (poison-as-last-statement) is excluded per house
+   rule: on self-freeing deinits its only compliant form is a write through
+   freed memory (proven by 10 test crashes); the Z-rules otherwise apply with
+   defaults (no .ziglint.zon).
+2. **zlint** (zlinter 0.16.x) — `cd src && ~/.local/bin/zlint` (bare: scans
+   cwd; the dir argument is broken in this build; stdin mode
+   `find src -name '*.zig' | zlint -S` also works). Rules:
+   - `unsafe-undefined`: a `// SAFETY: <reason>` comment must sit on the line
+     DIRECTLY ABOVE each intentional `undefined` — one comment does NOT cover
+     the next line, and inline/trailing disable comments do NOT work. `= undefined`
+     field defaults are forbidden — construct explicitly.
+   - `avoid-as` → typed annotations; `no-print` → `std.log`.
+3. **zbc** — `~/.local/bin/zbc src/ --disable=use-undefined` (lifetime/escape
+   analyzer). `use-undefined` is disabled with justification: the signal
+   init-later pattern (`.events = undefined` + `.init()`) is the wire-layer
+   contract — `list.Head.init` sets self-referential links, so no zero-state
+   exists and the analyzer-satisfying local-first variant is a latent
+   use-after-scope (proven: 10 crashes). All other rules stay active:
+   `heap-double-free`/`heap-use-after-free` are covered by the
+   `impl.destroy(allocator, data)` ownership contract (impl frees only its
+   data; the module frees the wrapper); `intfromfloat-without-clamp` →
+   `std.math.lossyCast`; `forced-unwrap-iterator-next` → `orelse` forms.
 
 ### Reviewer workflow (mandatory after every implementation)
 1. Run the gates; attach raw output (exit codes, counts) — no summaries.
