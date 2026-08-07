@@ -125,12 +125,12 @@ pub const Buffer = struct {
 
 test "lock drop unlock release ordering" {
     const allocator = std.testing.allocator;
-    const data = TestBufferData{ .bytes = undefined };
+    var data = TestBufferData{ .bytes = undefined };
     var observer = TestObserver{};
     observer.release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease);
     observer.destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy);
 
-    const buf = try Buffer.init(allocator, &test_impl, @constCast(&data), 640, 480);
+    const buf = try Buffer.init(allocator, &test_impl, &data, 640, 480);
     defer buf.destroy();
     buf.events.release.add(&observer.release_listener);
     buf.events.destroy.add(&observer.destroy_listener);
@@ -152,11 +152,11 @@ test "lock drop unlock release ordering" {
 
 test "drop with no locks releases immediately" {
     const allocator = std.testing.allocator;
-    const data = TestBufferData{ .bytes = undefined };
+    var data = TestBufferData{ .bytes = undefined };
     var observer = TestObserver{};
     observer.release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease);
 
-    const buf = try Buffer.init(allocator, &test_impl, @constCast(&data), 16, 16);
+    const buf = try Buffer.init(allocator, &test_impl, &data, 16, 16);
     defer buf.destroy();
     buf.events.release.add(&observer.release_listener);
 
@@ -166,11 +166,11 @@ test "drop with no locks releases immediately" {
 
 test "unlock without drop does not release" {
     const allocator = std.testing.allocator;
-    const data = TestBufferData{ .bytes = undefined };
+    var data = TestBufferData{ .bytes = undefined };
     var observer = TestObserver{};
     observer.release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease);
 
-    const buf = try Buffer.init(allocator, &test_impl, @constCast(&data), 16, 16);
+    const buf = try Buffer.init(allocator, &test_impl, &data, 16, 16);
     defer buf.destroy();
     buf.events.release.add(&observer.release_listener);
 

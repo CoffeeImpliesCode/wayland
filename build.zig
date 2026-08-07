@@ -140,4 +140,11 @@ pub fn build(b: *Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // House convention (nogui/skript): compile everything without
+    // installing — for ZLS build-on-save.
+    const check_step = b.step("check", "Check all targets compile (ZLS)");
+    check_step.dependOn(&exe.step);
+    check_step.dependOn(&lib_tests.step);
+    check_step.dependOn(&exe_tests.step);
 }
