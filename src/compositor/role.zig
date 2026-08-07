@@ -36,7 +36,7 @@ pub const SurfaceRole = struct {
     destroy: ?*const fn (surface: *Surface) void = null,
 };
 
-pub const RoleError = error{ RoleConflict };
+pub const RoleError = error{RoleConflict};
 
 /// wl_surface protocol error code posted for an illegal role switch. The
 /// wl_surface error enum has no dedicated "role" member (generated enum:

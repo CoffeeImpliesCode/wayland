@@ -22,7 +22,7 @@ const assert = std.debug.assert;
 const wire = @import("../core/wire.zig");
 
 /// Error set for `Impl.begin_data_ptr_access`.
-pub const DataAccessError = error{ Unsupported };
+pub const DataAccessError = error{Unsupported};
 
 /// Buffer implementation vtable (wlr_buffer_impl equivalent). Each function
 /// receives the Buffer itself; per-buffer state lives in `Buffer.data`.

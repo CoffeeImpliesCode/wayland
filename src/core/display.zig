@@ -29,7 +29,7 @@ pub const CompositorDisplay = struct {
         allocator: std.mem.Allocator,
         io: *std.Io,
         log_cfg: *const log.Config,
-    ) error{OutOfMemory, ServerCreateFailed}!*CompositorDisplay {
+    ) error{ OutOfMemory, ServerCreateFailed }!*CompositorDisplay {
         const server = try wire.Server.create();
         errdefer server.destroy();
         const display = try allocator.create(CompositorDisplay);
@@ -72,7 +72,7 @@ pub const CompositorDisplay = struct {
     /// Create a listen socket with an auto-generated name (wayland-N, N >= 1,
     /// skipping wayland-0). The returned name is owned by the display and
     /// freed on deinit.
-    pub fn addSocketAuto(self: *CompositorDisplay) error{AddSocketFailed, OutOfMemory}![]const u8 {
+    pub fn addSocketAuto(self: *CompositorDisplay) error{ AddSocketFailed, OutOfMemory }![]const u8 {
         var buf: [11]u8 = undefined;
         const name = try self.server.addSocketAuto(&buf);
         const dup = try self.allocator.dupeZ(u8, name);

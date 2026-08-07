@@ -42,7 +42,7 @@ const FakePass = struct {
     rects: usize = 0,
     submits: usize = 0,
 
-    fn onTexture(pass: *Pass, _ : *texture_mod.Texture, _: ?geom.FRect, _: geom.FRect, _: f32) void {
+    fn onTexture(pass: *Pass, _: *texture_mod.Texture, _: ?geom.FRect, _: geom.FRect, _: f32) void {
         const self: *FakePass = @ptrCast(@alignCast(pass.data));
         self.textures += 1;
     }

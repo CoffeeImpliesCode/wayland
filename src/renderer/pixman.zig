@@ -55,7 +55,7 @@ pub const Framebuffer = struct {
         const row_len: usize = @intCast(fb.width * 4);
         var y: usize = 0;
         while (y < @as(usize, @intCast(fb.height))) : (y += 1) {
-            const row = fb.data[y * @as(usize, @intCast(fb.stride))..][0..row_len];
+            const row = fb.data[y * @as(usize, @intCast(fb.stride)) ..][0..row_len];
             var x: usize = 0;
             while (x < row_len) : (x += 4) row[x..][0..4].* = color;
         }
@@ -208,10 +208,10 @@ fn addRect(pass: *pass_mod.Pass, rect: geom.Rect, color: [4]f32) void {
     const fb_stride: usize = @intCast(fb.stride);
     var y = y0;
     while (y < y1) : (y += 1) {
-        const row = fb.data[@as(usize, @intCast(y)) * fb_stride..];
+        const row = fb.data[@as(usize, @intCast(y)) * fb_stride ..];
         var x = x0;
         while (x < x1) : (x += 1) {
-            blendPixel(row[@as(usize, @intCast(x)) * 4..][0..4], src);
+            blendPixel(row[@as(usize, @intCast(x)) * 4 ..][0..4], src);
         }
     }
 }
@@ -262,7 +262,7 @@ test "texture import copies pixels" {
     defer renderer.destroy();
 
     var pixels = [_]u8{
-        1, 2, 3, 4, 5, 6, 7, 8,
+        1, 2,  3,  4,  5,  6,  7,  8,
         9, 10, 11, 12, 13, 14, 15, 16,
     }; // 2x2, stride 8
     const tex = try PixmanRenderer.importMemory(renderer, 2, 2, 8, &pixels);
@@ -291,8 +291,8 @@ test "1:1 blit" {
     defer fb.deinit();
 
     const pattern = [_]u8{
-        255, 0, 0, 255, 0, 255, 0, 255,
-        0, 0, 255, 255, 255, 255, 255, 255,
+        255, 0, 0,   255, 0,   255, 0,   255,
+        0,   0, 255, 255, 255, 255, 255, 255,
     };
     const tex = try PixmanRenderer.importMemory(renderer, 2, 2, 8, &pattern);
     defer tex.destroy();
