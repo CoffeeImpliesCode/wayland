@@ -80,6 +80,7 @@ pub const Buffer = struct {
             .allocator = allocator,
             .width = w,
             .height = h,
+            // SAFETY: events signals are initialized via .init() immediately below, before any emit.
             .events = undefined,
         };
         wire.Signal(*Buffer).init(&buf.events.release);
@@ -126,10 +127,11 @@ pub const Buffer = struct {
 
 test "lock drop unlock release ordering" {
     const allocator = std.testing.allocator;
-    var data: TestBufferData = .{ .bytes = undefined };
-    var observer: TestObserver = .{};
-    observer.release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease);
-    observer.destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy);
+    var data: TestBufferData = .{};
+    var observer: TestObserver = .{
+        .release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease),
+        .destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy),
+    };
 
     const buf = try Buffer.init(allocator, &test_impl, &data, 640, 480);
     defer buf.destroy();
@@ -153,9 +155,11 @@ test "lock drop unlock release ordering" {
 
 test "drop with no locks releases immediately" {
     const allocator = std.testing.allocator;
-    var data: TestBufferData = .{ .bytes = undefined };
-    var observer: TestObserver = .{};
-    observer.release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease);
+    var data: TestBufferData = .{};
+    var observer: TestObserver = .{
+        .release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease),
+        .destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy),
+    };
 
     const buf = try Buffer.init(allocator, &test_impl, &data, 16, 16);
     defer buf.destroy();
@@ -167,9 +171,11 @@ test "drop with no locks releases immediately" {
 
 test "unlock without drop does not release" {
     const allocator = std.testing.allocator;
-    var data: TestBufferData = .{ .bytes = undefined };
-    var observer: TestObserver = .{};
-    observer.release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease);
+    var data: TestBufferData = .{};
+    var observer: TestObserver = .{
+        .release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease),
+        .destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy),
+    };
 
     const buf = try Buffer.init(allocator, &test_impl, &data, 16, 16);
     defer buf.destroy();
@@ -182,9 +188,11 @@ test "unlock without drop does not release" {
 
 test "destroy fires destroy signal before impl destroy" {
     const allocator = std.testing.allocator;
-    var data: TestBufferData = .{ .bytes = undefined };
-    var observer: TestObserver = .{};
-    observer.destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy);
+    var data: TestBufferData = .{};
+    var observer: TestObserver = .{
+        .release_listener = wire.Listener(*Buffer).init(TestObserver.onRelease),
+        .destroy_listener = wire.Listener(*Buffer).init(TestObserver.onDestroy),
+    };
 
     const buf = try Buffer.init(allocator, &test_impl, &data, 32, 32);
     buf.events.destroy.add(&observer.destroy_listener);
@@ -198,7 +206,7 @@ test "destroy fires destroy signal before impl destroy" {
 
 test "data ptr access roundtrip via impl" {
     const allocator = std.testing.allocator;
-    var data: TestBufferData = .{ .bytes = undefined };
+    var data: TestBufferData = .{};
     const buf = try Buffer.init(allocator, &test_impl, &data, 4, 1);
     defer buf.destroy();
 
@@ -219,7 +227,7 @@ test "data ptr access roundtrip via impl" {
 
 /// Test fixture: impl state observed by the test impl.
 const TestBufferData = struct {
-    bytes: [16]u8 = undefined,
+    bytes: [16]u8 = [_]u8{0} ** 16,
     destroyed: bool = false,
 };
 
@@ -248,8 +256,8 @@ fn testDestroy(buf: *Buffer) void {
 const TestObserver = struct {
     release_count: u32 = 0,
     destroy_count: u32 = 0,
-    release_listener: wire.Listener(*Buffer) = undefined,
-    destroy_listener: wire.Listener(*Buffer) = undefined,
+    release_listener: wire.Listener(*Buffer),
+    destroy_listener: wire.Listener(*Buffer),
 
     fn onRelease(listener: *wire.Listener(*Buffer), buf: *Buffer) void {
         _ = buf;

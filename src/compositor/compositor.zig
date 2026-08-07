@@ -180,8 +180,8 @@ test "compositor tracks and removes surfaces" {
     defer allocator.destroy(c);
     defer c.surfaces.deinit(allocator);
 
-    const fake_a = @as(*Surface, @ptrFromInt(0x100));
-    const fake_b = @as(*Surface, @ptrFromInt(0x200));
+    const fake_a: *Surface = @ptrFromInt(0x100);
+    const fake_b: *Surface = @ptrFromInt(0x200);
     try c.surfaces.append(allocator, fake_a);
     try c.surfaces.append(allocator, fake_b);
 

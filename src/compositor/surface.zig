@@ -190,10 +190,15 @@ pub const Surface = struct {
             .role = null,
             .role_resource = null,
             .events = .{
+                // SAFETY: initialized via .init() immediately after construction, before any emit.
                 .client_commit = undefined,
+                // SAFETY: initialized via .init() immediately after construction, before any emit.
                 .commit = undefined,
+                // SAFETY: initialized via .init() immediately after construction, before any emit.
                 .map = undefined,
+                // SAFETY: initialized via .init() immediately after construction, before any emit.
                 .unmap = undefined,
+                // SAFETY: initialized via .init() immediately after construction, before any emit.
                 .destroy = undefined,
             },
         };
@@ -613,12 +618,14 @@ pub fn testSurface(
 pub fn testBuffer(allocator: std.mem.Allocator, b: *Buffer) void {
     b.* = .{
         .impl = &test_buffer_impl,
+        // SAFETY: test fixture; never dereferenced before assignment.
         .data = undefined,
         .width = 10,
         .height = 10,
         .dropped = false,
         .n_locks = 0,
         .allocator = allocator,
+        // SAFETY: both signals are initialized via .init() below, before any emit.
         .events = .{ .release = undefined, .destroy = undefined },
     };
     b.events.release.init();
@@ -774,8 +781,11 @@ test "attach, commit, map and unmap transitions" {
 var test_map_count: usize = 0;
 var test_unmap_count: usize = 0;
 var test_commit_count: usize = 0;
+// SAFETY: test fixture; initialized via .init(handler) inside the tests before use.
 var test_map_listener: wire.Listener(*Surface) = undefined;
+// SAFETY: test fixture; initialized via .init(handler) inside the tests before use.
 var test_unmap_listener: wire.Listener(*Surface) = undefined;
+// SAFETY: test fixture; initialized via .init(handler) inside the tests before use.
 var test_commit_listener: wire.Listener(*Surface) = undefined;
 
 fn testMapNotify(listener: *wire.Listener(*Surface), surface: *Surface) void {

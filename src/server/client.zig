@@ -27,6 +27,7 @@ const timeout_ms: i64 = 5000;
 
 /// Set from main so the step/verdict log helpers can read the clock
 /// (0.16 has no std.time.milliTimestamp; the Io provides it).
+// SAFETY: assigned from the runtime (init.io in main) before first use.
 var client_io: std.Io = undefined;
 
 const ClientState = struct {

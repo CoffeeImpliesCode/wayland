@@ -72,10 +72,10 @@ const ServerState = struct {
     run_frames: u32 = 0,
     watchdog_fired: bool = false,
 
-    new_output_listener: wire.Listener(*wayland.output.Output) = undefined,
-    frame_listener: wire.Listener(*wayland.output.Output) = undefined,
-    new_toplevel_listener: wire.Listener(*wayland.shell.XdgToplevel) = undefined,
-    new_popup_listener: wire.Listener(*wayland.shell.XdgPopup) = undefined,
+    new_output_listener: wire.Listener(*wayland.output.Output),
+    frame_listener: wire.Listener(*wayland.output.Output),
+    new_toplevel_listener: wire.Listener(*wayland.shell.XdgToplevel),
+    new_popup_listener: wire.Listener(*wayland.shell.XdgPopup),
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -148,13 +148,13 @@ pub fn main(init: std.process.Init) !void {
         .backend = backend,
         .framebuffer = framebuffer,
         .toplevels = .empty,
+        .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
+        .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
+        .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
+        .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
     };
     defer state.toplevels.deinit(allocator);
 
-    state.new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput);
-    state.frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame);
-    state.new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel);
-    state.new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup);
     backend.events.new_output.add(&state.new_output_listener);
     shell.events.new_toplevel.add(&state.new_toplevel_listener);
     shell.events.new_popup.add(&state.new_popup_listener);
@@ -185,6 +185,7 @@ pub fn main(init: std.process.Init) !void {
     try backend.start(); // fires new_output; the headless timer paces frames
 
     // --- zio event loop ---------------------------------------------------
+    // SAFETY: initialized by loop.init() immediately below, before any use.
     var loop: zio.ev.Loop = undefined;
     try loop.init(.{});
     defer loop.deinit();

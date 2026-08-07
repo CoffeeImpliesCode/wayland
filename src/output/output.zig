@@ -119,6 +119,7 @@ pub const Output = struct {
             .io = io,
             .log_cfg = log_cfg,
             .backend = backend,
+            // SAFETY: initialized via .init() immediately after construction, before any emit.
             .events = undefined,
         };
         self.events.frame.init();
@@ -223,9 +224,9 @@ const SignalRecorder = struct {
     commits: usize = 0,
     frames: usize = 0,
     destroys: usize = 0,
-    commit_listener: wire.Listener(*Output) = undefined,
-    frame_listener: wire.Listener(*Output) = undefined,
-    destroy_listener: wire.Listener(*Output) = undefined,
+    commit_listener: wire.Listener(*Output),
+    frame_listener: wire.Listener(*Output),
+    destroy_listener: wire.Listener(*Output),
 
     fn onCommit(listener: *wire.Listener(*Output), _: *Output) void {
         const self: *SignalRecorder = @fieldParentPtr("commit_listener", listener);
@@ -240,12 +241,6 @@ const SignalRecorder = struct {
     fn onDestroy(listener: *wire.Listener(*Output), _: *Output) void {
         const self: *SignalRecorder = @fieldParentPtr("destroy_listener", listener);
         self.destroys += 1;
-    }
-
-    fn init(self: *SignalRecorder) void {
-        self.commit_listener = wire.Listener(*Output).init(onCommit);
-        self.frame_listener = wire.Listener(*Output).init(onFrame);
-        self.destroy_listener = wire.Listener(*Output).init(onDestroy);
     }
 };
 
@@ -274,8 +269,11 @@ test "state apply and signals" {
     const backend = created[1];
     defer backend.destroy();
 
-    var rec: SignalRecorder = .{};
-    rec.init();
+    var rec: SignalRecorder = .{
+        .commit_listener = wire.Listener(*Output).init(SignalRecorder.onCommit),
+        .frame_listener = wire.Listener(*Output).init(SignalRecorder.onFrame),
+        .destroy_listener = wire.Listener(*Output).init(SignalRecorder.onDestroy),
+    };
     out.events.commit.add(&rec.commit_listener);
     out.events.frame.add(&rec.frame_listener);
     out.events.destroy.add(&rec.destroy_listener);
@@ -346,8 +344,11 @@ test "rejected state is not applied" {
     const out = created[0];
     defer created[1].destroy();
 
-    var rec: SignalRecorder = .{};
-    rec.init();
+    var rec: SignalRecorder = .{
+        .commit_listener = wire.Listener(*Output).init(SignalRecorder.onCommit),
+        .frame_listener = wire.Listener(*Output).init(SignalRecorder.onFrame),
+        .destroy_listener = wire.Listener(*Output).init(SignalRecorder.onDestroy),
+    };
     out.events.commit.add(&rec.commit_listener);
 
     var state = Output.State.init(allocator);
@@ -374,8 +375,11 @@ test "failed commit is not applied" {
     const out = created[0];
     defer created[1].destroy();
 
-    var rec: SignalRecorder = .{};
-    rec.init();
+    var rec: SignalRecorder = .{
+        .commit_listener = wire.Listener(*Output).init(SignalRecorder.onCommit),
+        .frame_listener = wire.Listener(*Output).init(SignalRecorder.onFrame),
+        .destroy_listener = wire.Listener(*Output).init(SignalRecorder.onDestroy),
+    };
     out.events.commit.add(&rec.commit_listener);
 
     var state = Output.State.init(allocator);

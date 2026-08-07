@@ -3,11 +3,11 @@ const wayland = @import("wayland");
 
 pub fn main() !void {
     const wl = wayland.server.wl;
-    std.debug.print(
+    std.log.info(
         "wayland skeleton — generated server bindings\n",
         .{},
     );
-    std.debug.print(
+    std.log.info(
         "  wl_compositor v{d}  wl_surface v{d}  wl_shm v{d}  " ++
             "wl_seat v{d}  wl_output v{d}\n",
         .{
@@ -18,7 +18,7 @@ pub fn main() !void {
             wl.Output.generated_version,
         },
     );
-    std.debug.print(
+    std.log.info(
         "  xdg_wm_base v{d}  wp_viewporter v{d}  wp_fractional_scale_v1 " ++
             "v{d}  zwlr_layer_shell_v1 v{d}\n",
         .{

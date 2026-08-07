@@ -83,7 +83,7 @@ const PixmanPassData = struct {
 
 const PixmanData = struct {
     allocator: std.mem.Allocator,
-    pass: pass_mod.Pass = undefined,
+    pass: pass_mod.Pass,
     pass_data: PixmanPassData,
 };
 
@@ -108,6 +108,7 @@ pub const PixmanRenderer = struct {
         errdefer allocator.destroy(data);
         data.* = .{
             .allocator = allocator,
+            // SAFETY: pass.impl/data are filled by begin_pass before use.
             .pass = undefined,
             .pass_data = .{ .io = io, .log_cfg = log_cfg },
         };

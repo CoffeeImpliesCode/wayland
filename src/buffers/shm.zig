@@ -221,8 +221,11 @@ fn shmFromResource(
         .resource = wl_buffer,
         .shm = shm,
         .state = state,
+        // SAFETY: assigned from Buffer.init below before any use.
         .buf = undefined,
+        // SAFETY: assigned during wrapper setup below before the resource is used.
         .resource_destroy = undefined,
+        // SAFETY: assigned during wrapper setup below before any emit.
         .release = undefined,
     };
 

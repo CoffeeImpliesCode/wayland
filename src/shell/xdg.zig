@@ -90,6 +90,7 @@ pub const XdgShell = struct {
             .compositor = compositor,
             .toplevels = .empty,
             .popups = .empty,
+            // SAFETY: initialized via .init() immediately after construction, before any emit.
             .events = undefined,
         };
         errdefer {
@@ -172,6 +173,7 @@ fn wmBaseGetXdgSurface(wm_base: *server.xdg.WmBase, shell: *XdgShell, r: anytype
         .shell = shell,
         .resource = res,
         .surface = surface,
+        // SAFETY: initialized via .init() immediately after construction, before any emit.
         .events = undefined,
     };
     xdg.events.destroy.init();
@@ -308,6 +310,7 @@ fn xdgSurfaceGetToplevel(xdg: *XdgSurface, id: u32) void {
         .log_cfg = xdg.log_cfg,
         .xdg_surface = xdg,
         .resource = res,
+        // SAFETY: initialized via .init() immediately after construction, before any emit.
         .events = undefined,
     };
     t.events.request_move.init();
@@ -365,6 +368,7 @@ fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
             @as(*XdgSurface, @ptrCast(@alignCast(p.getUserData())))
         else
             null,
+        // SAFETY: initialized via .init() immediately after construction, before any emit.
         .events = undefined,
     };
     popup.events.destroy.init();
@@ -1021,7 +1025,7 @@ const PopupEvents = struct {
 
 const NewToplevelCapture = struct {
     count: usize = 0,
-    listener: wire.Listener(*XdgToplevel) = undefined,
+    listener: wire.Listener(*XdgToplevel),
 
     fn notify(listener: *wire.Listener(*XdgToplevel), toplevel: *XdgToplevel) void {
         _ = toplevel;
@@ -1031,7 +1035,7 @@ const NewToplevelCapture = struct {
 
 const NewPopupCapture = struct {
     count: usize = 0,
-    listener: wire.Listener(*XdgPopup) = undefined,
+    listener: wire.Listener(*XdgPopup),
 
     fn notify(listener: *wire.Listener(*XdgPopup), popup: *XdgPopup) void {
         _ = popup;
@@ -1127,8 +1131,9 @@ test "xdg toplevel configure/ack roundtrip" {
     var ts = try TestServer.init(allocator);
     defer ts.deinit();
 
-    var new_toplevel: NewToplevelCapture = .{};
-    new_toplevel.listener = wire.Listener(*XdgToplevel).init(NewToplevelCapture.notify);
+    var new_toplevel: NewToplevelCapture = .{
+        .listener = wire.Listener(*XdgToplevel).init(NewToplevelCapture.notify),
+    };
     ts.shell.?.events.new_toplevel.add(&new_toplevel.listener);
 
     const wl_surface = try ts.wl_compositor.?.createSurface();
@@ -1206,8 +1211,9 @@ test "xdg popup configure and positioner errors" {
     var ts = try TestServer.init(allocator);
     defer ts.deinit();
 
-    var new_popup: NewPopupCapture = .{};
-    new_popup.listener = wire.Listener(*XdgPopup).init(NewPopupCapture.notify);
+    var new_popup: NewPopupCapture = .{
+        .listener = wire.Listener(*XdgPopup).init(NewPopupCapture.notify),
+    };
     ts.shell.?.events.new_popup.add(&new_popup.listener);
 
     const wl_surface = try ts.wl_compositor.?.createSurface();

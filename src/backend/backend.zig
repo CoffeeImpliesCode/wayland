@@ -48,6 +48,7 @@ pub const Backend = struct {
             .allocator = allocator,
             .io = io,
             .log_cfg = log_cfg,
+            // SAFETY: initialized via .init() immediately after construction, before any emit.
             .events = undefined,
         };
         self.events.new_output.init();
@@ -94,15 +95,11 @@ const fake_impl: Backend.Impl = .{
 
 const DestroyRecorder = struct {
     destroys: usize = 0,
-    listener: wire.Listener(*Backend) = undefined,
+    listener: wire.Listener(*Backend),
 
     fn onDestroy(listener: *wire.Listener(*Backend), _: *Backend) void {
         const self: *DestroyRecorder = @fieldParentPtr("listener", listener);
         self.destroys += 1;
-    }
-
-    fn init(self: *DestroyRecorder) void {
-        self.listener = wire.Listener(*Backend).init(onDestroy);
     }
 };
 
@@ -115,8 +112,9 @@ test "backend lifecycle" {
     var fake: FakeImpl = .{};
     const backend = try Backend.init(allocator, &io, &log_cfg, &fake_impl, &fake);
 
-    var rec: DestroyRecorder = .{};
-    rec.init();
+    var rec: DestroyRecorder = .{
+        .listener = wire.Listener(*Backend).init(DestroyRecorder.onDestroy),
+    };
     backend.events.destroy.add(&rec.listener);
 
     try backend.start();

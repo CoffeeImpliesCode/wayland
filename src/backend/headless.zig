@@ -51,6 +51,7 @@ pub const HeadlessBackend = struct {
         headless.* = .{
             .loop = loop,
             .timer = null,
+            // SAFETY: assigned via `headless.out = out` right after output creation.
             .out = undefined,
             .mode = mode,
         };
@@ -128,8 +129,8 @@ fn destroyOutput(_: *output.Output) void {}
 const FrameRecorder = struct {
     frames: usize = 0,
     out: ?*output.Output = null,
-    listener: wire.Listener(*output.Output) = undefined,
-    frame_listener: wire.Listener(*output.Output) = undefined,
+    listener: wire.Listener(*output.Output),
+    frame_listener: wire.Listener(*output.Output),
 
     fn onNewOutput(listener: *wire.Listener(*output.Output), out: *output.Output) void {
         const self: *FrameRecorder = @fieldParentPtr("listener", listener);
@@ -139,11 +140,6 @@ const FrameRecorder = struct {
     fn onFrame(listener: *wire.Listener(*output.Output), _: *output.Output) void {
         const self: *FrameRecorder = @fieldParentPtr("frame_listener", listener);
         self.frames += 1;
-    }
-
-    fn init(self: *FrameRecorder) void {
-        self.listener = wire.Listener(*output.Output).init(onNewOutput);
-        self.frame_listener = wire.Listener(*output.Output).init(onFrame);
     }
 };
 
@@ -160,8 +156,10 @@ test "headless backend paces frames on the event loop" {
     const base = try HeadlessBackend.create(allocator, &io, &log_cfg, loop, mode);
     defer base.destroy();
 
-    var rec: FrameRecorder = .{};
-    rec.init();
+    var rec: FrameRecorder = .{
+        .listener = wire.Listener(*output.Output).init(FrameRecorder.onNewOutput),
+        .frame_listener = wire.Listener(*output.Output).init(FrameRecorder.onFrame),
+    };
     base.events.new_output.add(&rec.listener);
 
     try base.start();
