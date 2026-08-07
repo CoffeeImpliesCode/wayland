@@ -226,8 +226,8 @@ path a judgment call. Coverage guides, never gates alone.
      the next line, and inline/trailing disable comments do NOT work. `= undefined`
      field defaults are forbidden — construct explicitly.
    - `avoid-as` → typed annotations; `no-print` → `std.log`.
-3. **zbc** — `~/.local/bin/zbc src/ --disable=use-undefined` (lifetime/escape
-   analyzer). `use-undefined` is disabled with justification: the signal
+3. **zbc** — `~/.local/bin/zbc src/ --disable=use_undefined` (lifetime/escape
+   analyzer). `use_undefined` is disabled with justification: the signal
    init-later pattern (`.events = undefined` + `.init()`) is the wire-layer
    contract — `list.Head.init` sets self-referential links, so no zero-state
    exists and the analyzer-satisfying local-first variant is a latent
