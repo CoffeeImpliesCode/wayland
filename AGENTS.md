@@ -28,6 +28,7 @@ wayland/
 | Task | Location |
 | --- | --- |
 | Read research | `notes/*.md`, indexed by README.md |
+| Design authority | `notes/zig-compositor-lib-spec.md` — the own zig compositor library spec |
 | Verify wlroots claims | `~/projects/freedesktop-wlroots-wlroots` |
 | Verify smithay claims | `~/projects/github-Smithay-smithay` |
 | Check zig-wayland bindings | `~/projects/codeberg-ifreund-zig-wayland` (v0.6.0, zig 0.16 — refreshed) |
