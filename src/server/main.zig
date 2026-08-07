@@ -32,6 +32,10 @@ const build_options = @import("build_options");
 /// comptime guard on build_options.enable_raylib.
 const raylib_impl = @import("raylib.zig");
 const raylib_mod = if (build_options.enable_raylib) raylib_impl else null;
+/// The raylib input source feeds the seat from the window's keyboard and
+/// mouse; same -Denable_raylib guard.
+const raylib_input_impl = @import("raylib_input.zig");
+const raylib_input_mod = if (build_options.enable_raylib) raylib_input_impl else null;
 
 // Tracy plumbing: the tracy package looks these up on the importing root.
 // The build swaps "tracy_impl" between the enabled/disabled module.
@@ -69,6 +73,9 @@ const output_refresh_msec: i32 = 16;
 const watchdog_timeout_ms: u64 = 5000;
 /// Background color (straight alpha RGBA).
 const background_color = [4]f32{ 0.1, 0.1, 0.12, 1.0 };
+/// Fallback cursor: a small light rect when no client cursor surface.
+const cursor_size: i32 = 8;
+const cursor_color = [4]f32{ 0.95, 0.95, 0.95, 1.0 };
 
 /// Per-surface scene state: the SceneBufferNode that draws the surface's
 /// current buffer, plus the listeners that keep it in sync (commit
@@ -95,6 +102,23 @@ const ServerState = struct {
     /// M2 scene graph: one scene and one output view (single-output server).
     scene: ?*wayland.scene.Scene = null,
     scene_output: ?*wayland.scene.SceneOutput = null,
+    /// M3 input: the seat (keyboard + pointer) and its input source (the
+    /// raylib window when the raylib backend is active).
+    seat: *wayland.seat.Seat,
+    /// wl_subcompositor: subsurface surfaces render over their parents.
+    subcompositor: *wayland.subsurface.Subcompositor,
+    /// wl_data_device_manager: clipboard selection relay.
+    data_device: *wayland.data_device.DataDeviceManager,
+    /// The raylib input poll object (null in headless mode).
+    raylib_input: ?*raylib_input_mod.RaylibInput = null,
+    /// wl_output protocol global for the backend output.
+    wl_output: ?*wayland.wl_output.WlOutput = null,
+    screencopy: ?*wayland.screencopy.Screencopy = null,
+    /// Cursor rendering: a fallback rect node plus a buffer node showing
+    /// the client cursor surface (wl_pointer.set_cursor). Non-pickable.
+    cursor_rect_node: ?*wayland.scene.SceneNode = null,
+    cursor_buf_node: ?*wayland.scene.SceneNode = null,
+    cursor_texture: ?*Texture = null,
     presentation: *wayland.presentation.Presentation,
     /// Per-surface scene state, keyed by the compositor surface
     /// (initialized in the state literal with the server allocator).
@@ -112,11 +136,16 @@ const ServerState = struct {
     /// Stop after this many frames; 0 = run until watchdog/error.
     run_frames: u32 = 0,
     watchdog_fired: bool = false,
+    /// WAYLAND_SYNTH_INPUT=1: synthesize one pointer click + key press
+    /// once the first surface is mapped (headless input E2E).
+    synth_input: bool = false,
+    synth_fired: bool = false,
 
     new_output_listener: wire.Listener(*wayland.output.Output),
     frame_listener: wire.Listener(*wayland.output.Output),
     new_toplevel_listener: wire.Listener(*wayland.shell.XdgToplevel),
     new_popup_listener: wire.Listener(*wayland.shell.XdgPopup),
+    seat_key_listener: wire.Listener(*wayland.seat.Seat),
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -168,15 +197,25 @@ pub fn main(init: std.process.Init) !void {
     compositor.setShm(shm_state);
     const shell = try wayland.shell.XdgShell.init(allocator, io, &log_cfg, display, compositor);
     defer shell.deinit();
+    // M3: the seat (keyboard + pointer) with the xkbcommon us keymap.
+    const seat = try wayland.seat.Seat.init(allocator, io, &log_cfg, display);
+    defer seat.deinit();
+    // Subcompositor (foot needs wl_subcompositor).
+    const subcompositor = try wayland.subsurface.Subcompositor.init(allocator, io, &log_cfg, display, compositor);
+    defer subcompositor.deinit();
+    // Data device manager (foot requires it; clipboard selection relay).
+    const data_device = try wayland.data_device.DataDeviceManager.init(allocator, io, &log_cfg, display, seat);
+    defer data_device.deinit();
     const renderer = try pixman.PixmanRenderer.create(allocator, io, &log_cfg);
     defer renderer.destroy();
     // Backend selection: WAYLAND_BACKEND=raylib uses the windowed raylib
     // debug backend (falling back to headless when the window cannot
     // open); anything else uses the headless backend. The raylib path is
     // only reachable when built with -Denable_raylib (default on).
-    const backend = if (build_options.enable_raylib) blk: {
-        if (wantRaylibBackend(init.environ_map)) {
-            break :blk raylib_mod.RaylibBackend.create(
+    var backend_is_raylib = false;
+    const backend = blk: {
+        if (build_options.enable_raylib and wantRaylibBackend(init.environ_map)) {
+            const b = raylib_mod.RaylibBackend.create(
                 allocator,
                 io,
                 &log_cfg,
@@ -199,6 +238,8 @@ pub fn main(init: std.process.Init) !void {
                     .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
                 );
             };
+            backend_is_raylib = true;
+            break :blk b;
         }
         break :blk try wayland.headless.HeadlessBackend.create(
             allocator,
@@ -207,13 +248,7 @@ pub fn main(init: std.process.Init) !void {
             display.getServer().getEventLoop(),
             .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
         );
-    } else try wayland.headless.HeadlessBackend.create(
-        allocator,
-        io,
-        &log_cfg,
-        display.getServer().getEventLoop(),
-        .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
-    );
+    };
     defer backend.destroy();
 
     const framebuffer = try pixman.Framebuffer.create(allocator, output_width, output_height);
@@ -227,6 +262,9 @@ pub fn main(init: std.process.Init) !void {
         .compositor = compositor,
         .shm_state = shm_state,
         .shell = shell,
+        .seat = seat,
+        .subcompositor = subcompositor,
+        .data_device = data_device,
         .renderer = renderer,
         .backend = backend,
         .framebuffer = framebuffer,
@@ -237,6 +275,7 @@ pub fn main(init: std.process.Init) !void {
         .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
         .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
         .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
+        .seat_key_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKey),
     };
     defer state.toplevels.deinit(allocator);
     // Scene teardown (LIFO): drop the per-surface scene state first, then
@@ -250,12 +289,46 @@ pub fn main(init: std.process.Init) !void {
     backend.events.new_output.add(&state.new_output_listener);
     shell.events.new_toplevel.add(&state.new_toplevel_listener);
     shell.events.new_popup.add(&state.new_popup_listener);
+    seat.events.key.add(&state.seat_key_listener);
+    // The compositor hit-tests over the scene graph: surfaces map to
+    // scene nodes through the surface entries.
+    seat.setPick(pickSurface, &state);
+
+    // zwlr_screencopy_v1: captures the compositor framebuffer (shm only).
+    state.screencopy = try wayland.screencopy.Screencopy.init(
+        allocator,
+        io,
+        &log_cfg,
+        display,
+        shm_state,
+        getFramebuffer,
+        &state,
+        ownsOutput,
+        &state,
+        captureClock,
+        &state,
+    );
+    defer if (state.screencopy) |sc| sc.deinit();
 
     if (init.environ_map.get("WAYLAND_RUN_FRAMES")) |frames| {
         state.run_frames = std.fmt.parseInt(u32, frames, 10) catch 0;
         if (state.run_frames > 0) {
             log.info("WAYLAND_RUN_FRAMES: stopping after {d} frames", io, &log_cfg, "server", .{state.run_frames});
         }
+    }
+    if (init.environ_map.get("WAYLAND_SYNTH_INPUT")) |v| {
+        if (std.mem.eql(u8, v, "1")) state.synth_input = true;
+    }
+
+    // The raylib window is the M3 input source: the backend polls raylib
+    // state every commit and feeds the seat through raylib_input.poll.
+    // Only when the raylib backend actually owns the backend object (the
+    // headless fallback has no input source).
+    if (backend_is_raylib) {
+        const input = try raylib_input_mod.create(allocator, state.seat);
+        state.raylib_input = input;
+        raylib_mod.RaylibBackend.setInputHook(state.backend, raylib_input_mod.poll, input);
+        log.info("raylib input source attached", io, &log_cfg, "server", .{});
     }
 
     // The socket name must be a single flushed stdout line, first thing
@@ -356,6 +429,38 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
     self.scene = scene;
     self.scene_output = scene_output;
     out.events.frame.add(&self.frame_listener);
+
+    // M3: expose the output to clients (geometry/mode/scale/name) and
+    // build the cursor nodes (drawn above the surfaces, never picked).
+    self.wl_output = wayland.wl_output.WlOutput.create(
+        self.allocator,
+        self.io,
+        self.log_cfg,
+        self.display,
+        out,
+        "WL-1",
+        "wayland debug output",
+    ) catch |err| {
+        log.err("wl_output create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    const cursor_rect = wayland.scene.SceneNode.create(self.allocator, scene.root, .rect) catch |err| {
+        log.err("cursor rect create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    cursor_rect.pickable = false;
+    cursor_rect.kind.rect.width = cursor_size;
+    cursor_rect.kind.rect.height = cursor_size;
+    cursor_rect.kind.rect.color = cursor_color;
+    cursor_rect.enable(false);
+    self.cursor_rect_node = cursor_rect;
+    const cursor_buf = wayland.scene.SceneNode.create(self.allocator, scene.root, .buffer) catch |err| {
+        log.err("cursor buffer create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    cursor_buf.pickable = false;
+    cursor_buf.enable(false);
+    self.cursor_buf_node = cursor_buf;
 }
 
 fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
@@ -418,6 +523,36 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
 
     // M2: surfaces created since the last frame get scene nodes.
     syncSurfaces(self);
+    // Subsurfaces: position child nodes over their mapped parent.
+    syncSubsurfaceNodes(self);
+
+    // M3 synth input: one pointer click + key press once the first
+    // surface is mapped (headless E2E). Event-driven: the map time varies
+    // with client startup, so a fixed frame number would race.
+    if (self.synth_input and !self.synth_fired) {
+        var any_mapped = false;
+        var entry_it = self.surface_entries.valueIterator();
+        while (entry_it.next()) |ep| {
+            if (ep.*.node != null) {
+                any_mapped = true;
+                break;
+            }
+        }
+        if (any_mapped) {
+            self.synth_fired = true;
+            const seat = self.seat;
+            seat.pointerMotion(50, 50);
+            seat.pointerButton(wayland.seat.btn_left, true);
+            seat.pointerButton(wayland.seat.btn_left, false);
+            seat.keyEvent(38, true); // 'a' (evdev A + 8)
+            seat.keyEvent(38, false);
+            log.info("synth input: pointer click + key 'a' at 50,50", self.io, self.log_cfg, "server", .{});
+        }
+    }
+
+    // M3 cursor: follow the seat pointer, show the client cursor surface
+    // or the fallback rect.
+    updateCursor(self);
 
     const so = self.scene_output orelse {
         log.err("render: no scene output", self.io, self.log_cfg, "server", .{});
@@ -560,6 +695,25 @@ fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
         node.kind.buffer.dst_width = buf.width;
         node.kind.buffer.dst_height = buf.height;
         entry.node = node;
+
+        // First map: give the toplevel its real size. The initial
+        // configure was 0x0 ("client decides"); after the client acked it
+        // and mapped, a configure with the output size makes well-behaved
+        // clients (foot, simple-shm) fill the output.
+        if (s.role != null) {
+            for (self.toplevels.items) |t| {
+                if (t.xdg_surface.surface == s and
+                    t.configured_size.w == 0 and t.configured_size.h == 0)
+                {
+                    t.configure(output_width, output_height) catch |err| {
+                        log.warn("toplevel reconfigure failed: {s}", self.io, self.log_cfg, "server", .{
+                            @errorName(err),
+                        });
+                    };
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -598,6 +752,8 @@ fn importSurfaceTexture(self: *ServerState, buf: *wayland.buffers.Buffer) ?*Text
 /// Tear down every surface entry (listeners, scene nodes, allocations).
 /// Runs before the scene and compositor teardown in main().
 fn cleanupSurfaceEntries(self: *ServerState) void {
+    if (self.cursor_texture) |t| t.destroy();
+    self.cursor_texture = null;
     var it = self.surface_entries.valueIterator();
     while (it.next()) |entry_ptr| {
         const entry = entry_ptr.*;
@@ -614,6 +770,141 @@ fn cleanupSurfaceEntries(self: *ServerState) void {
 fn wantRaylibBackend(environ_map: *std.process.Environ.Map) bool {
     const v = environ_map.get("WAYLAND_BACKEND") orelse return false;
     return std.mem.eql(u8, v, "raylib");
+}
+
+// ---------------------------------------------------------------------------
+// M3: seat hit-test, screencopy sources, input bindings
+// ---------------------------------------------------------------------------
+
+/// Seat hit test: the topmost surface scene node under (x, y), mapped
+/// back to its surface with surface-local coordinates.
+fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    const scene = self.scene orelse return null;
+    const node = scene.pick(x, y) orelse return null;
+    var it = self.surface_entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry.node == node) {
+            const rect = node.absolutePosition();
+            return .{
+                .surface = entry.surface,
+                .sx = x - rect.x,
+                .sy = y - rect.y,
+            };
+        }
+    }
+    return null;
+}
+
+fn getFramebuffer(ctx: *anyopaque) ?*pixman.Framebuffer {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    return self.framebuffer;
+}
+
+fn ownsOutput(ctx: *anyopaque, resource: *wayland.server.wl.Output) bool {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    const wl_output = self.wl_output orelse return false;
+    return wl_output.owns(resource);
+}
+
+/// Capture timestamp: monotonic nanoseconds split into the protocol's
+/// tv_sec_hi / tv_sec_lo / tv_nsec triple.
+fn captureClock(ctx: *anyopaque, out: *[3]u32) void {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    const ms: i64 = std.Io.Clock.now(.awake, self.io.*).toMilliseconds();
+    const sec: u64 = @intCast(@max(ms, 0) / 1000);
+    const ms_rem: u64 = @intCast(@max(@rem(ms, @as(i64, 1000)), 0));
+    const nsec: u64 = ms_rem * std.time.ns_per_ms;
+    out[0] = @truncate(sec >> 32);
+    out[1] = @truncate(sec);
+    out[2] = @truncate(nsec);
+}
+
+/// Seat key signal: Mod4+Escape quits the server (keysym binding).
+fn onSeatKey(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
+    const self: *ServerState = @fieldParentPtr("seat_key_listener", listener);
+    if (seat.last_keysym == wayland.xkb.keysym_escape and seat.mod4Active()) {
+        log.info("Mod4+Escape pressed: stopping", self.io, self.log_cfg, "server", .{});
+        if (self.loop) |loop| loop.stop();
+    }
+}
+
+/// Sync the cursor nodes with the seat state: position at the pointer
+/// minus the hotspot; client cursor surface texture when one is set and
+/// has a buffer, else the fallback rect.
+fn updateCursor(self: *ServerState) void {
+    const seat = self.seat;
+    const x = seat.pointer_x;
+    const y = seat.pointer_y;
+
+    // Keep the cursor on top of every surface: re-append both nodes to
+    // the scene root (appendChild reparents, moving them to draw last).
+    self.scene.?.root.appendChild(self.allocator, self.cursor_rect_node.?) catch |err| {
+        log.warn("cursor z-order failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+    };
+    self.scene.?.root.appendChild(self.allocator, self.cursor_buf_node.?) catch |err| {
+        log.warn("cursor z-order failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+    };
+
+    const cursor_surface_res = seat.cursorSurface();
+    var surface_texture: ?*Texture = null;
+    if (cursor_surface_res) |res| {
+        // Resolve the wire resource to the compositor surface (the
+        // cursor surface may belong to any client).
+        for (self.compositor.surfaces.items) |s| {
+            if (s.resource == res) {
+                if (s.buffer) |buf| {
+                    surface_texture = importSurfaceTexture(self, buf) orelse null;
+                }
+                break;
+            }
+        }
+    }
+    if (self.cursor_texture) |old| {
+        if (old != surface_texture) old.destroy();
+        self.cursor_texture = null;
+    }
+    if (surface_texture) |tex| {
+        self.cursor_texture = tex;
+        const node = self.cursor_buf_node.?;
+        node.kind.buffer.texture = tex;
+        node.kind.buffer.dst_width = tex.width;
+        node.kind.buffer.dst_height = tex.height;
+        node.x = x - seat.cursor_hotspot_x;
+        node.y = y - seat.cursor_hotspot_y;
+        node.enable(true);
+        self.cursor_rect_node.?.enable(false);
+    } else {
+        self.cursor_rect_node.?.x = x;
+        self.cursor_rect_node.?.y = y;
+        self.cursor_rect_node.?.enable(true);
+        self.cursor_buf_node.?.enable(false);
+    }
+}
+
+/// Position every subsurface node over its mapped parent: the child node
+/// follows the parent's absolute position plus the subsurface offset, and
+/// always draws above the parent (re-appended at the end of the tree).
+fn syncSubsurfaceNodes(self: *ServerState) void {
+    const scene = self.scene orelse return;
+    for (self.subcompositor.subsurfaces.items) |ss| {
+        const child_entry = self.surface_entries.get(ss.surface) orelse continue;
+        const child_node = child_entry.node orelse continue;
+        const parent_entry = self.surface_entries.get(ss.parent) orelse continue;
+        if (parent_entry.node) |parent_node| {
+            const pr = parent_node.absolutePosition();
+            child_node.x = pr.x + ss.x;
+            child_node.y = pr.y + ss.y;
+            child_node.enable(true);
+            // Draw the child above its parent (and everything else).
+            scene.root.appendChild(self.allocator, child_node) catch |err| {
+                log.warn("subsurface z-order failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            };
+        } else {
+            child_node.enable(false);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

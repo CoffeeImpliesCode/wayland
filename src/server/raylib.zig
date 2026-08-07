@@ -5,7 +5,11 @@
 //! The output's framebuffer (pixman ARGB8888 = BGRA bytes on
 //! little-endian) is uploaded into a raylib texture on every commit and
 //! drawn full-screen. This is a *debug* view: no DRM, no vsync
-//! synchronization, one window, no input forwarding.
+//! synchronization, one window.
+//!
+//! Input (M3): each commit polls raylib input events and calls the
+//! server-installed poll hook (raylib_input.zig) which feeds the seat —
+//! keyboard, pointer motion/buttons and the wheel.
 //!
 //! On environments without a display/GL context, create() returns
 //! error.WindowInitFailed; the test server then falls back to the
@@ -30,6 +34,10 @@ const Raylib = struct {
     timer: ?*wire.EventSource,
     out: *output.Output,
     mode: output.Mode,
+    /// Input poll hook: called right after PollInputEvents in every
+    /// commit (server-side raylib_input.zig feeds the seat from it).
+    poll_hook: ?*const fn (ctx: *anyopaque) void = null,
+    poll_ctx: ?*anyopaque = null,
 };
 
 /// Per-output raylib state: the window texture the compositor framebuffer
@@ -56,6 +64,14 @@ const output_impl: output.Output.Impl = .{
 };
 
 pub const RaylibBackend = struct {
+    /// Install the per-frame input poll hook (see raylib_input.zig). The
+    /// hook runs after PollInputEvents in each commit, on the main thread.
+    pub fn setInputHook(base: *backend.Backend, hook: ?*const fn (ctx: *anyopaque) void, ctx: ?*anyopaque) void {
+        const rl: *Raylib = @ptrCast(@alignCast(base.data));
+        rl.poll_hook = hook;
+        rl.poll_ctx = ctx;
+    }
+
     /// Create a single-output raylib backend running at `mode`, with the
     /// window titled `title`. Frames are paced by a wire event loop timer
     /// at `mode.refresh_msec` (like the headless backend); the window
@@ -193,6 +209,8 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
             od.scratch[i * 4 + 3] = @truncate(px >> 24);
         }
         raylib.PollInputEvents();
+        const rl: *Raylib = @ptrCast(@alignCast(out.backend.data));
+        if (rl.poll_hook) |hook| hook(rl.poll_ctx.?);
         raylib.UpdateTexture(od.texture, od.scratch.ptr);
         raylib.BeginDrawing();
         raylib.ClearBackground(white);

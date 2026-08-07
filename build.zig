@@ -18,6 +18,7 @@ pub fn build(b: *Build) void {
     scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-layer-shell-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-screencopy-unstable-v1.xml"));
 
     // Maximum versions implemented by this server. Interfaces reachable
     // from these globals (wl_surface, wl_region, xdg_surface, xdg_toplevel,
@@ -26,9 +27,12 @@ pub fn build(b: *Build) void {
     scanner.generate("wl_compositor", 7);
     scanner.generate("wl_shm", 3);
     scanner.generate("wl_seat", 11);
+    scanner.generate("wl_subcompositor", 1);
+    scanner.generate("wl_data_device_manager", 3);
     scanner.generate("wl_output", 4);
     scanner.generate("xdg_wm_base", 7);
     scanner.generate("zwlr_layer_shell_v1", 5);
+    scanner.generate("zwlr_screencopy_manager_v1", 3);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_presentation", 2);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
@@ -52,6 +56,10 @@ pub fn build(b: *Build) void {
             .{ .name = "protocol", .module = protocol },
         },
     });
+    // xkbcommon: the seat builds the wl_keyboard keymap and tracks
+    // modifier/keysym state with it (libxkbcommon is in the devenv
+    // packages; the .pc comes from its dev output).
+    lib.linkSystemLibrary("xkbcommon", .{});
 
     const exe = b.addExecutable(.{
         .name = "wayland",
@@ -135,6 +143,7 @@ pub fn build(b: *Build) void {
         server_exe.root_module.addImport("raylib_c", raylib_c.createModule());
         server_exe.root_module.linkSystemLibrary("raylib", .{ .use_pkg_config = .force });
     }
+    server_exe.root_module.linkSystemLibrary("xkbcommon", .{});
     b.installArtifact(server_exe);
 
     const server_run_step = b.step("run-server", "Run the M1 test server");

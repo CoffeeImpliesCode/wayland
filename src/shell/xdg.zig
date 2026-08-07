@@ -226,10 +226,12 @@ pub const XdgSurface = struct {
         xdg.configure_sent = true;
     }
 
-    /// Handle xdg_surface.ack_configure. Only the most recent configure serial
-    /// may be acked, and only once (matching the wlroots acked-serial list).
+    /// Handle xdg_surface.ack_configure. The serial must have been sent
+    /// (<= the latest) and must be newer than the last acked one — a
+    /// client may ack a configure that was superseded by a newer one
+    /// (wlroots-style serial list; re-configures race client acks).
     fn ackConfigure(xdg: *XdgSurface, serial: u32) void {
-        if (serial != xdg.configure_serial or (xdg.acked_serial != null and xdg.acked_serial.? == serial)) {
+        if (serial > xdg.configure_serial or (xdg.acked_serial != null and serial <= xdg.acked_serial.?)) {
             xdg.resource.postError(.invalid_serial, "ack_configure: invalid or already-acked serial");
             return;
         }

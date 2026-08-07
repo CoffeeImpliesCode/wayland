@@ -32,12 +32,21 @@ pub const core = struct {
 pub const buffers = @import("buffers/buffer.zig");
 pub const shm = @import("buffers/shm.zig");
 pub const compositor = @import("compositor/compositor.zig");
+pub const seat = @import("compositor/seat.zig");
+pub const xkb = @import("compositor/xkb.zig");
+/// wl_subcompositor (compositor/subsurface.zig): nested surfaces.
+pub const subsurface = @import("compositor/subsurface.zig");
+/// wl_data_device_manager (compositor/data_device.zig): clipboard relay.
+pub const data_device = @import("compositor/data_device.zig");
 pub const backend = @import("backend/backend.zig");
 /// Headless backend implementation (backend/headless.zig): one virtual
 /// output paced by a wire event loop timer. Exported for consumers that
 /// run without a GPU (test servers, examples).
 pub const headless = @import("backend/headless.zig");
 pub const output = @import("output/output.zig");
+/// wl_output protocol global (output/wl_output.zig): exposes an Output
+/// to clients (geometry/mode/scale/name/description).
+pub const wl_output = @import("output/wl_output.zig");
 pub const renderer = @import("renderer/renderer.zig");
 /// The pixman CPU renderer implementation (renderer/pixman.zig): the
 /// Framebuffer target plus PixmanRenderer.create/importMemory. Exported
@@ -46,6 +55,8 @@ pub const pixman = @import("renderer/pixman.zig");
 pub const shell = @import("shell/xdg.zig");
 pub const scene = @import("scene/scene.zig");
 pub const presentation = @import("presentation.zig");
+/// zwlr_screencopy_manager_v1 (screencopy.zig): shm-based output capture.
+pub const screencopy = @import("screencopy.zig");
 
 // zig 0.16 collects `test` blocks only from analyzed declarations;
 // force analysis of every module so `zig build test` runs all tests.
@@ -56,12 +67,18 @@ comptime {
     _ = buffers;
     _ = shm;
     _ = compositor;
+    _ = seat;
+    _ = xkb;
+    _ = subsurface;
+    _ = data_device;
     _ = backend;
     _ = output;
+    _ = wl_output;
     _ = renderer;
     _ = shell;
     _ = scene;
     _ = presentation;
+    _ = screencopy;
 }
 
 test "generated server bindings compile" {

@@ -1,12 +1,17 @@
-//! M1 test client: drives the compositor test server end to end.
+//! M1+ test client: drives the compositor test server end to end.
 //!
 //! Pure protocol client (generated `client.*` bindings + libwayland-client,
 //! no compositor library import):
 //!   1. connect via WAYLAND_DISPLAY, roundtrip
-//!   2. bind wl_compositor (v7), wl_shm (v3), xdg_wm_base (v7)
+//!   2. bind wl_compositor (v7), wl_shm (v3), xdg_wm_base (v7), wl_seat,
+//!      wl_output, zwlr_screencopy_manager_v1
 //!   3. xdg toplevel "m1-test"; empty commit; wait for configure, ack it
 //!   4. shm buffer (memfd, 1280x720x4, red gradient), attach, damage, commit
-//!   5. one frame callback; on done -> "CLIENT-OK", exit 0
+//!   5. one frame callback; on done -> CLIENT-OK, exit 0
+//!   6. M3 (WAYLAND_SYNTH_INPUT=1 on the server): waits for the pointer
+//!      enter + keyboard focus + key press, then captures the output via
+//!      zwlr_screencopy_v1 and verifies the composited pixels (gradient,
+//!      cursor overlay).
 //!
 //! On failure prints CLIENT-ERROR/CLIENT-TIMEOUT and exits nonzero.
 //! All progress lines go to stderr; the CLIENT-* verdicts to stdout.
@@ -45,6 +50,39 @@ const ClientState = struct {
     got_configure: bool = false,
     configure_serial: ?u32 = null,
     frame_done: bool = false,
+
+    // M3: seat + output + screencopy coverage.
+    seat: ?*wl.Seat = null,
+    output: ?*wl.Output = null,
+    screencopy_mgr: ?*client.zwlr.ScreencopyManagerV1 = null,
+    keyboard: ?*wl.Keyboard = null,
+    pointer: ?*wl.Pointer = null,
+    seat_caps: u32 = 0,
+    keymap_ok: bool = false,
+    keyboard_entered: bool = false,
+    got_pointer_enter: bool = false,
+    got_pointer_motion: bool = false,
+    got_button: bool = false,
+    got_key_press: bool = false,
+    got_key_release: bool = false,
+    output_mode: ?struct { width: i32, height: i32 } = null,
+    /// Screencopy capture state (filled when the frame advertises its
+    /// buffer and completed on ready).
+    capture: ?CaptureState = null,
+};
+
+const CaptureState = struct {
+    frame: *client.zwlr.ScreencopyFrameV1,
+    fd: std.posix.fd_t,
+    pixels: []align(std.heap.page_size_min) u8,
+    pool: *wl.ShmPool,
+    buffer: *wl.Buffer,
+    stride: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    sent_copy: bool = false,
+    ready: bool = false,
+    failed: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -83,7 +121,24 @@ pub fn main(init: std.process.Init) !void {
         });
         return error.MissingGlobals;
     }
-    step("bound wl_compositor, wl_shm, xdg_wm_base", .{});
+    if (state.seat == null or state.output == null or state.screencopy_mgr == null) {
+        verdict("CLIENT-ERROR", "missing M3 globals (seat={} output={} screencopy={})", .{
+            state.seat != null, state.output != null, state.screencopy_mgr != null,
+        });
+        return error.MissingGlobals;
+    }
+    step("bound wl_compositor, wl_shm, xdg_wm_base, wl_seat, wl_output, screencopy", .{});
+
+    // --- M3 seat + output ------------------------------------------------
+    const seat = state.seat.?;
+    seat.setListener(*ClientState, onSeatEvent, &state);
+    state.keyboard = seat.getKeyboard() catch null;
+    if (state.keyboard) |kbd| kbd.setListener(*ClientState, onKeyboardEvent, &state);
+    state.pointer = seat.getPointer() catch null;
+    if (state.pointer) |ptr| ptr.setListener(*ClientState, onPointerEvent, &state);
+    const out = state.output.?;
+    out.setListener(*ClientState, onOutputEvent, &state);
+    step("seat+output listeners attached (caps so far: 0x{x})", .{state.seat_caps});
 
     // --- xdg toplevel -----------------------------------------------------
     const surface = try state.compositor.?.createSurface();
@@ -169,6 +224,56 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
+    // --- M3: synth input + screencopy verification ------------------------
+    if (!try waitForEvent(hasPointerEnter, &state, timeout_ms)) {
+        verdict("CLIENT-TIMEOUT", "no pointer enter (server synth input?)", .{});
+        return error.ClientTimeout;
+    }
+    if (!try waitForEvent(hasKeyPress, &state, timeout_ms)) {
+        verdict("CLIENT-TIMEOUT", "no key press (click-to-focus?)", .{});
+        return error.ClientTimeout;
+    }
+    if (!state.keyboard_entered or !state.got_button or !state.got_pointer_motion) {
+        verdict("CLIENT-ERROR", "missing input events (kbd_enter={} button={} motion={})", .{
+            state.keyboard_entered, state.got_button, state.got_pointer_motion,
+        });
+        return error.InputEventsMissing;
+    }
+    if (!state.keymap_ok) {
+        verdict("CLIENT-ERROR", "keymap event missing or malformed", .{});
+        return error.KeymapBad;
+    }
+    const mode = state.output_mode orelse {
+        verdict("CLIENT-ERROR", "no wl_output mode received", .{});
+        return error.OutputModeMissing;
+    };
+    if (mode.width != surface_width or mode.height != surface_height) {
+        verdict("CLIENT-ERROR", "unexpected output mode {d}x{d}", .{ mode.width, mode.height });
+        return error.OutputModeBad;
+    }
+    step("input verified: pointer enter+motion, button, key 38, keymap, output {d}x{d}", .{
+        mode.width, mode.height,
+    });
+
+    // Screencopy: capture the whole output, verify composited pixels.
+    const frame = try setupCapture(&state);
+    frame.setListener(*ClientState, onCaptureFrameEvent, &state);
+    step("screencopy frame requested", .{});
+    if (wl.Display.flush(display) != .SUCCESS) {
+        verdict("CLIENT-ERROR", "flush after capture failed", .{});
+        return error.FlushFailed;
+    }
+    if (!try waitForEvent(hasCaptureDone, &state, timeout_ms)) {
+        verdict("CLIENT-TIMEOUT", "no screencopy ready/failed within {d}ms", .{timeout_ms});
+        return error.ClientTimeout;
+    }
+    const cap = &state.capture.?;
+    if (cap.failed or !cap.ready) {
+        verdict("CLIENT-ERROR", "screencopy failed", .{});
+        return error.CaptureFailed;
+    }
+    try verifyCapturePixels(cap, &state);
+
     // Drain remaining events so the server sees a clean client teardown.
     if (wl.Display.roundtrip(display) != .SUCCESS) {
         verdict("CLIENT-ERROR", "final roundtrip failed", .{});
@@ -191,9 +296,144 @@ fn onRegistryEvent(registry: *wl.Registry, event: wl.Registry.Event, state: *Cli
                 state.shm = registry.bind(g.name, wl.Shm, g.version) catch null;
             } else if (std.mem.eql(u8, name, "xdg_wm_base") and state.wm_base == null) {
                 state.wm_base = registry.bind(g.name, xdg.WmBase, 7) catch null;
+            } else if (std.mem.eql(u8, name, "wl_seat") and state.seat == null) {
+                state.seat = registry.bind(g.name, wl.Seat, 7) catch null;
+            } else if (std.mem.eql(u8, name, "wl_output") and state.output == null) {
+                state.output = registry.bind(g.name, wl.Output, 4) catch null;
+            } else if (std.mem.eql(u8, name, "zwlr_screencopy_manager_v1") and state.screencopy_mgr == null) {
+                state.screencopy_mgr = registry.bind(g.name, client.zwlr.ScreencopyManagerV1, 3) catch null;
             }
         },
         .global_remove => {},
+    }
+}
+
+fn onSeatEvent(seat: *wl.Seat, event: wl.Seat.Event, state: *ClientState) void {
+    _ = seat;
+    switch (event) {
+        .capabilities => |c| {
+            state.seat_caps = @as(u32, @bitCast(c.capabilities));
+            step("seat capabilities=0x{x}", .{state.seat_caps});
+        },
+        .name => |n| step("seat name={s}", .{std.mem.span(n.name)}),
+    }
+}
+
+fn onKeyboardEvent(keyboard: *wl.Keyboard, event: wl.Keyboard.Event, state: *ClientState) void {
+    _ = keyboard;
+    switch (event) {
+        .keymap => |k| {
+            // Verify the payload is an XKB keymap: read the fd (the
+            // server rewound it to 0) and check the header.
+            var buf: [32]u8 = undefined;
+            const n = std.os.linux.read(k.fd, &buf, buf.len);
+            // A real read returns 1..32 bytes; a negated errno is huge.
+            if (n <= buf.len and n > 0) {
+                const head = buf[0..n];
+                state.keymap_ok = std.mem.startsWith(u8, head, "xkb_keymap");
+            }
+            _ = std.os.linux.close(k.fd);
+            step("keymap event format={d} size={d} ok={}", .{ @intFromEnum(k.format), k.size, state.keymap_ok });
+        },
+        .enter => |e| {
+            state.keyboard_entered = true;
+            step("keyboard enter serial={d} keys={d}", .{ e.serial, e.keys.size });
+        },
+        .leave => {},
+        .key => |k| {
+            if (k.key == 38) {
+                if (@intFromEnum(k.state) == 1) state.got_key_press = true else state.got_key_release = true;
+                step("key 38 state={d} time={d}", .{ @intFromEnum(k.state), k.time });
+            }
+        },
+        .modifiers => |m| step("modifiers dep=0x{x} lat=0x{x} lock=0x{x}", .{
+            m.mods_depressed, m.mods_latched, m.mods_locked,
+        }),
+        .repeat_info => |r| step("repeat_info rate={d} delay={d}", .{ r.rate, r.delay }),
+    }
+}
+
+fn onPointerEvent(pointer: *wl.Pointer, event: wl.Pointer.Event, state: *ClientState) void {
+    _ = pointer;
+    switch (event) {
+        .enter => |e| {
+            state.got_pointer_enter = true;
+            step("pointer enter at {d},{d}", .{ e.surface_x.toInt(), e.surface_y.toInt() });
+        },
+        .leave => {},
+        .motion => |m| {
+            state.got_pointer_motion = true;
+            step("pointer motion to {d},{d}", .{ m.surface_x.toInt(), m.surface_y.toInt() });
+        },
+        .button => |b| {
+            if (b.button == 272 and @intFromEnum(b.state) == 1) state.got_button = true;
+            step("pointer button {d} state={d}", .{ b.button, @intFromEnum(b.state) });
+        },
+        .axis => |a| step("pointer axis {d} value={d}", .{ @intFromEnum(a.axis), a.value.toInt() }),
+        .frame => {},
+        .axis_source => |s| step("axis_source={d}", .{@intFromEnum(s.axis_source)}),
+        .axis_stop => |s| step("axis_stop {d}", .{@intFromEnum(s.axis)}),
+        .axis_discrete => |d| step("axis_discrete {d} ticks={d}", .{ @intFromEnum(d.axis), d.discrete }),
+        .axis_relative_direction => |d| step("axis_relative_direction {d}", .{@intFromEnum(d.direction)}),
+        .axis_value120 => |v| step("axis_value120 {d} v120={d}", .{ @intFromEnum(v.axis), v.value120 }),
+        .warp => |w| step("warp {d},{d}", .{ w.surface_x.toInt(), w.surface_y.toInt() }),
+    }
+}
+
+fn onOutputEvent(output: *wl.Output, event: wl.Output.Event, state: *ClientState) void {
+    _ = output;
+    switch (event) {
+        .geometry => |g| step("output geometry {s} {s} transform={d}", .{
+            std.mem.span(g.make), std.mem.span(g.model), @intFromEnum(g.transform),
+        }),
+        .mode => |m| {
+            state.output_mode = .{ .width = m.width, .height = m.height };
+            step("output mode {d}x{d}@{d} flags=0x{x}", .{ m.width, m.height, m.refresh, @as(u32, @bitCast(m.flags)) });
+        },
+        .done => {},
+        .scale => |s| step("output scale={d}", .{s.factor}),
+        .name => |n| step("output name={s}", .{std.mem.span(n.name)}),
+        .description => |d| step("output description={s}", .{std.mem.span(d.description)}),
+    }
+}
+
+fn onCaptureFrameEvent(
+    frame: *client.zwlr.ScreencopyFrameV1,
+    event: client.zwlr.ScreencopyFrameV1.Event,
+    state: *ClientState,
+) void {
+    switch (event) {
+        .buffer => |b| {
+            // Advertised shm buffer: allocate it and send the copy request.
+            const cap = &state.capture.?;
+            cap.width = b.width;
+            cap.height = b.height;
+            cap.stride = b.stride;
+            cap.buffer = cap.pool.createBuffer(
+                0,
+                @intCast(b.width),
+                @intCast(b.height),
+                @intCast(b.stride),
+                .argb8888,
+            ) catch return;
+            cap.sent_copy = true;
+            frame.copy(cap.buffer);
+            _ = wl.Display.flush(state.display);
+            step("capture buffer {d}x{d} stride={d}, copy sent", .{ b.width, b.height, b.stride });
+        },
+        .linux_dmabuf => |d| step("capture linux_dmabuf {d}x{d}", .{ d.width, d.height }),
+        .buffer_done => {},
+        .damage => |d| step("capture damage {d}x{d}@{d},{d}", .{ d.width, d.height, d.x, d.y }),
+        .flags => |f| step("capture flags=0x{x}", .{@as(u32, @bitCast(f.flags))}),
+        .ready => |r| {
+            const cap = &state.capture.?;
+            cap.ready = true;
+            step("capture ready ts={d},{d},{d}", .{ r.tv_sec_hi, r.tv_sec_lo, r.tv_nsec });
+        },
+        .failed => {
+            state.capture.?.failed = true;
+            step("capture failed", .{});
+        },
     }
 }
 
@@ -238,6 +478,91 @@ fn hasConfigure(state: *const ClientState) bool {
 
 fn hasFrame(state: *const ClientState) bool {
     return state.frame_done;
+}
+
+fn hasPointerEnter(state: *const ClientState) bool {
+    return state.got_pointer_enter;
+}
+
+fn hasKeyPress(state: *const ClientState) bool {
+    return state.got_key_press;
+}
+
+fn hasCaptureDone(state: *const ClientState) bool {
+    const cap = state.capture orelse return false;
+    return cap.ready or cap.failed;
+}
+
+/// Allocate the capture buffer (second memfd + shm pool) and the frame
+/// state; the frame object is created by captureOutput afterwards.
+fn setupCapture(state: *ClientState) !*client.zwlr.ScreencopyFrameV1 {
+    const fd = try std.posix.memfd_create("m3-capture", std.os.linux.MFD.CLOEXEC);
+    errdefer _ = std.os.linux.close(fd);
+    {
+        const rc = std.os.linux.ftruncate(fd, @intCast(pool_size));
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
+    }
+    const pixels = try std.posix.mmap(
+        null,
+        pool_size,
+        std.posix.PROT{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED },
+        fd,
+        0,
+    );
+    errdefer std.posix.munmap(pixels);
+    const pool = try state.shm.?.createPool(fd, @intCast(pool_size));
+    errdefer pool.destroy();
+    const frame = try state.screencopy_mgr.?.captureOutput(1, state.output.?);
+    state.capture = .{
+        .frame = frame,
+        .fd = fd,
+        .pixels = pixels,
+        .pool = pool,
+        // SAFETY: the buffer event fills this field before any read.
+        .buffer = undefined,
+        .stride = 0,
+    };
+    return frame;
+}
+
+/// Verify the captured framebuffer: the client's red gradient (R=255,
+/// B ramping with x) plus the compositor's fallback cursor (a light rect
+/// at the synth pointer position 50,50).
+fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !void {
+    _ = state;
+    if (cap.width != surface_width or cap.height != surface_height) {
+        verdict("CLIENT-ERROR", "capture size {d}x{d} != {d}x{d}", .{
+            cap.width, cap.height, surface_width, surface_height,
+        });
+        return error.CaptureSizeBad;
+    }
+    const px = struct {
+        fn at(c: *const CaptureState, x: usize, y: usize) [4]u8 {
+            const off = y * c.stride + x * 4;
+            return .{ c.pixels[off], c.pixels[off + 1], c.pixels[off + 2], c.pixels[off + 3] };
+        }
+    }.at;
+
+    // (5,5): the gradient at x=5 -> B=0, G=0, R=255, A=255.
+    const g = px(cap, 5, 5);
+    if (g[2] != 255 or g[1] != 0 or g[0] != 0 or g[3] != 255) {
+        verdict("CLIENT-ERROR", "pixel (5,5) = {d},{d},{d},{d}, expected gradient start", .{ g[0], g[1], g[2], g[3] });
+        return error.PixelMismatch;
+    }
+    // (1000,600): gradient B = 1000*255/1280 = 199.
+    const m = px(cap, 1000, 600);
+    if (m[2] != 255 or m[1] != 0 or m[0] != 199 or m[3] != 255) {
+        verdict("CLIENT-ERROR", "pixel (1000,600) = {d},{d},{d},{d}, expected B=199", .{ m[0], m[1], m[2], m[3] });
+        return error.PixelMismatch;
+    }
+    // (53,53): inside the 8x8 fallback cursor at (50,50) -> light grey.
+    const c = px(cap, 53, 53);
+    if (c[0] < 200 or c[1] < 200 or c[2] < 200) {
+        verdict("CLIENT-ERROR", "cursor pixel (53,53) = {d},{d},{d},{d}, expected light", .{ c[0], c[1], c[2], c[3] });
+        return error.PixelMismatch;
+    }
+    verdict("CLIENT-CAPTURE", "pixels verified: gradient + cursor overlay", .{});
 }
 
 /// Poll the display fd (bounded by the deadline) and dispatch until

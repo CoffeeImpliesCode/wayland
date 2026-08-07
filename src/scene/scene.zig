@@ -56,6 +56,15 @@ pub const Scene = struct {
         const allocator = scene.allocator;
         allocator.destroy(scene);
     }
+
+    /// Topmost drawable node whose absolute rect contains (x, y): the
+    /// seat's hit test. Walks children in reverse draw order (the last
+    /// child draws on top); skips disabled and non-pickable nodes and
+    /// their subtrees. Returns only .buffer nodes (surface content) —
+    /// rect nodes are decoration. Null when the point hits nothing.
+    pub fn pick(scene: *Scene, x: i32, y: i32) ?*SceneNode {
+        return pickNode(scene.root, x, y);
+    }
 };
 
 /// A node in the scene tree. Position (x/y) is relative to the parent.
@@ -66,6 +75,9 @@ pub const SceneNode = struct {
     parent: ?*SceneNode,
     children: std.ArrayList(*SceneNode) = .empty,
     enabled: bool = true,
+    /// Pickable by the seat's hit test. Decoration nodes (the cursor)
+    /// disable this so the pointer never targets them.
+    pickable: bool = true,
     x: i32 = 0,
     y: i32 = 0,
 
@@ -198,6 +210,23 @@ pub const SceneNode = struct {
         return .{ .x = x, .y = y, .width = nodeWidth(node), .height = nodeHeight(node) };
     }
 };
+
+/// Recursive hit test: children in reverse draw order; tree nodes recurse,
+/// buffer nodes win on containment, rect nodes are skipped.
+fn pickNode(node: *SceneNode, x: i32, y: i32) ?*SceneNode {
+    var i = node.children.items.len;
+    while (i > 0) {
+        i -= 1;
+        const child = node.children.items[i];
+        if (!child.enabled or !child.pickable) continue;
+        if (child.kind == .tree) {
+            if (pickNode(child, x, y)) |hit| return hit;
+            continue;
+        }
+        if (child.kind == .buffer and child.absolutePosition().containsPoint(.{ .x = x, .y = y })) return child;
+    }
+    return null;
+}
 
 /// Texture blit node: draws `texture` (cropped to `src`, null = whole
 /// texture) at the absolute position, sized dst_width x dst_height
