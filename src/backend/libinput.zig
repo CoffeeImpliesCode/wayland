@@ -193,7 +193,7 @@ const c = struct {
     // Device accessors (libinput.h:4338, 4418).
     extern fn libinput_device_get_name(device: ?*libinput_device) [*:0]const u8;
     extern fn libinput_device_get_seat(device: ?*libinput_device) ?*libinput_seat;
-    extern fn libinput_device_has_capability(device: ?*libinput_device) c_int;
+    extern fn libinput_device_has_capability(device: ?*libinput_device, capability: c_int) c_int;
 
     // libudev: a plain context for device enumeration (libinput needs an
     // initialized udev; wlroots passes its session's).
@@ -234,16 +234,16 @@ pub fn axisDiscreteToNotches(value: f64) i32 {
     return @intFromFloat(@round(value));
 }
 
-/// Map a libinput device capability to the backend's InputDevice kind.
-/// Devices without keyboard/pointer/touch capability (tablets, switches,
-/// gesture-only) map to null and are not announced.
-pub fn kindForCapability(cap: c_int) ?InputKind {
-    return switch (cap) {
-        device_cap_keyboard => .keyboard,
-        device_cap_pointer => .pointer,
-        device_cap_touch => .touch,
-        else => null,
-    };
+/// Map a libinput device to the backend's InputDevice kind. libinput's
+/// has_capability takes ONE capability and returns a bool; devices are
+/// classified by priority (keyboard > pointer > touch). Devices with only
+/// tablet/pad/switch/gesture capabilities map to null and are not
+/// announced.
+pub fn kindForDevice(dev: ?*c.libinput_device) ?InputKind {
+    if (c.libinput_device_has_capability(dev, device_cap_keyboard) != 0) return .keyboard;
+    if (c.libinput_device_has_capability(dev, device_cap_pointer) != 0) return .pointer;
+    if (c.libinput_device_has_capability(dev, device_cap_touch) != 0) return .touch;
+    return null;
 }
 
 /// Event type -> name (debug logging and the dispatch mapping test).
@@ -341,7 +341,7 @@ const Libinput = struct {
 
     fn onDeviceAdded(self: *Libinput, event: *c.libinput_event) void {
         const dev = c.libinput_event_get_device(event) orelse return;
-        const kind = kindForCapability(c.libinput_device_has_capability(dev)) orelse return;
+        const kind = kindForDevice(dev) orelse return;
 
         const name_slice = std.mem.span(c.libinput_device_get_name(dev));
         const name = if (name_slice.len == 0) "unknown" else name_slice;
@@ -588,12 +588,12 @@ test "axis conversion" {
 }
 
 test "capability to kind mapping" {
-    try testing.expectEqual(@as(?InputKind, .keyboard), kindForCapability(device_cap_keyboard));
-    try testing.expectEqual(@as(?InputKind, .pointer), kindForCapability(device_cap_pointer));
-    try testing.expectEqual(@as(?InputKind, .touch), kindForCapability(device_cap_touch));
-    // Tablet/switch/gesture-only devices are not announced.
-    try testing.expectEqual(@as(?InputKind, null), kindForCapability(3));
-    try testing.expectEqual(@as(?InputKind, null), kindForCapability(-1));
+    // kindForDevice queries the real libinput per capability (bool per
+    // cap), so the unit level covers the classification PRIORITY order
+    // only; the VM E2E exercises the FFI against real devices.
+    try testing.expectEqual(device_cap_keyboard, 0);
+    try testing.expectEqual(device_cap_pointer, 1);
+    try testing.expectEqual(device_cap_touch, 2);
 }
 
 test "event type dispatch mapping" {

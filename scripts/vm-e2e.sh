@@ -6,17 +6,25 @@
 set -uo pipefail
 exec > /dev/console 2>&1
 
-cd /shared/repo || { echo "VM-E2E-FAILED: repo share not mounted"; systemctl poweroff; exit 1; }
+cd /shared/repo || { echo "VM-E2E-FAILED: repo share not mounted"; poweroff -f; exit 1; }
+# 9p defaults to cache=loose: host-side edits can be invisible to the
+# guest. Drop the cache so every boot builds the CURRENT source.
+mount -o remount,cache=none /shared/repo 2>/dev/null || true
+echo "=== share sanity: $(grep -c wantDrmBackend src/server/main.zig 2>/dev/null || echo 0) drm-wiring refs ==="
 echo "=== vm-e2e: building with the guest toolchain (first boot compiles) ==="
 # The guest E2E is headless: build without the raylib window backend
 # (build.zig's -Denable_raylib=false also skips the raylib pkg-config probe).
+# The systemd service has no HOME: zig's translate-c subprocess cannot
+# resolve its cache dir (AppDataDirUnavailable). Give it one.
+export HOME=/root
+export XDG_CACHE_HOME=/tmp/zig-xdg
 zig build --prefix /tmp/zo --cache-dir /tmp/zc --global-cache-dir /tmp/zgc \
     -Denable_raylib=false > /tmp/build.log 2>&1
 if [ ! -x /tmp/zo/bin/wayland-server ] || [ ! -x /tmp/zo/bin/wayland-client ]; then
     echo "=== build failed; log tail: ==="
     tail -40 /tmp/build.log
     echo "VM-E2E-FAILED: build did not produce binaries"
-    systemctl poweroff
+    poweroff -f
     exit 1
 fi
 echo "=== vm-e2e: build ok, running headless E2E ==="
@@ -34,7 +42,7 @@ for _ in $(seq 1 40); do
 done
 if [ -z "$SOCK" ]; then
     echo "VM-E2E-FAILED: server did not print a socket"
-    systemctl poweroff
+    poweroff -f
     exit 1
 fi
 
@@ -47,4 +55,4 @@ if [ "$RC" -eq 0 ]; then
 else
     echo "VM-E2E-FAILED (client rc=$RC)"
 fi
-systemctl poweroff
+poweroff -f

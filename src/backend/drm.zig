@@ -58,7 +58,7 @@ const c = @import("drm_c");
 /// Framebuffer is an ARGB8888 u32 in little-endian memory — bytes
 /// B,G,R,A — which is exactly the layout DRM_FORMAT_ARGB8888 specifies
 /// ([31:0] A:R:G:B 8:8:8:8 little endian), so rows copy verbatim.
-pub const drm_format_argb8888: u32 = 0x34325241;
+pub const drm_format_xrgb8888: u32 = 0x34325258;
 
 const default_device_path = "/dev/dri/card0";
 
@@ -328,7 +328,7 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
         var fb2: c.struct_drm_mode_fb_cmd2 = .{
             .width = width,
             .height = height,
-            .pixel_format = drm_format_argb8888,
+            .pixel_format = drm_format_xrgb8888,
             .handles = .{ create_dumb.handle, 0, 0, 0 },
             .pitches = .{ create_dumb.pitch, 0, 0, 0 },
             .offsets = .{ 0, 0, 0, 0 },
@@ -380,8 +380,40 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
             log_mod.err("drm: atomic modeset property add failed", self.io, self.log_cfg, "drm", .{});
             return error.BackendFailed;
         }
-        if (c.drmModeAtomicCommit(fd, req, c.DRM_MODE_ATOMIC_ALLOW_MODESET, null) != 0) {
-            log_mod.err("drm: atomic modeset commit failed", self.io, self.log_cfg, "drm", .{});
+        const commit_rc = c.drmModeAtomicCommit(fd, req, c.DRM_MODE_ATOMIC_ALLOW_MODESET, null);
+        if (commit_rc != 0) {
+            log_mod.err(
+                "drm: atomic modeset commit failed (errno {s}); props: " ++
+                    "conn{{id={d},crtc_prop={d},crtc={d}}} " ++
+                    "crtc{{id={d},mode_prop={d},mode={d},active_prop={d}}} " ++
+                    "plane{{id={d},crtc_prop={d},crtc={d},fb_prop={d},fb={d},src={d},{d},{d},{d},dst={d},{d},{d},{d}}}",
+                self.io,
+                self.log_cfg,
+                "drm",
+                .{
+                    @tagName(std.os.linux.errno(@as(usize, @bitCast(@as(isize, @intCast(commit_rc)))))),
+                    found.connector_id,
+                    drm_out.connector_crtc_id,
+                    found.crtc_id,
+                    found.crtc_id,
+                    drm_out.crtc_mode_id,
+                    drm_out.mode_blob,
+                    drm_out.crtc_active,
+                    plane_id,
+                    plane.crtc_id,
+                    found.crtc_id,
+                    plane.fb_id,
+                    drm_out.fb_id,
+                    plane.src_x,
+                    plane.src_y,
+                    plane.src_w,
+                    plane.src_h,
+                    plane.crtc_x,
+                    plane.crtc_y,
+                    plane.crtc_w,
+                    plane.crtc_h,
+                },
+            );
             return error.BackendFailed;
         }
     }
@@ -781,7 +813,7 @@ const testing = std.testing;
 test "fourcc constant matches drm_fourcc.h" {
     // ARGB8888 fourcc 'A' 'R' '2' '4' = 0x34325241; the pixman framebuffer
     // byte order (B,G,R,A in memory) equals DRM_FORMAT_ARGB8888's.
-    try testing.expectEqual(drm_format_argb8888, c.DRM_FORMAT_ARGB8888);
+    try testing.expectEqual(drm_format_xrgb8888, c.DRM_FORMAT_XRGB8888);
     try testing.expectEqual(@as(u32, 0x34325241), c.DRM_FORMAT_ARGB8888);
 }
 

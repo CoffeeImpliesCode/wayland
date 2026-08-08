@@ -1,9 +1,10 @@
-# Minimal NixOS VM for native compositor testing.
-#
-# Run (from a flake wrapper that points `nixpkgs` at your registry entry):
-#   nix build /tmp/wl-vm#nixosConfigurations.wlvm.config.system.build.vm
-#   ./result/bin/run-wlvm-vm -nographic
-#
+{ config, pkgs, ... }:
+{
+  # Minimal NixOS VM for native compositor testing.
+  #
+  # Run (from a flake wrapper that points `nixpkgs` at your registry entry):
+  #   nix build /tmp/wl-vm#nixosConfigurations.wlvm.config.system.build.vm
+  #   ./result/bin/run-wlvm-vm -nographic
 # The VM shares the repo read-write via 9p (/shared/repo) and builds it
 # with the guest toolchain. Two E2E modes run as boot-time oneshot
 # services, each printing its OK line before powering off:
@@ -15,10 +16,8 @@
 #     headless E2E (libinput-capable seat + virtual pixman framebuffer).
 #     Prints VM-E2E-OK.
 # The host desktop (niri) is never in the loop.
-{ config, pkgs, ... }:
-{
   # Serial console only: no graphics stack in the guest.
-  boot.kernelParams = [ "console=ttyS0" ];
+  boot.kernelParams = [ "console=ttyS0" "drm.debug=0xf" ];
   boot.loader.grub.device = "/dev/vda";
   virtualisation.graphics = false;
   # Guest DRM + input devices for the DRM/libinput E2E: virtio-gpu-pci is
@@ -26,9 +25,10 @@
   # evdev devices (/dev/input/*). Serial console only; pixel verification
   # is guest-side.
   virtualisation.qemu.options = [
-    "-device virtio-gpu-pci"
+    "-device virtio-gpu-pci,xres=1280,yres=720"
     "-device virtio-keyboard-pci"
     "-device virtio-mouse-pci"
+    "-no-reboot"
   ];
   virtualisation.memorySize = 2048;
   virtualisation.diskSize = 4096;
@@ -59,7 +59,7 @@
     pkgs.libevdev
   ];
   environment.variables.PKG_CONFIG_PATH =
-    "${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
+    "${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
 
   # Boot-time E2Es: build the repo in the guest (isolated caches so the
   # shared dir stays host-clean) and run the DRM + libinput E2E at boot
@@ -77,7 +77,7 @@
       StandardError = "journal+console";
       # environment.variables does not reliably reach systemd services;
       # give the build the .pc search path explicitly.
-      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
+      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
     };
     # The minimal systemd service PATH does not include the system
     # packages: give the script the toolchain it needs.
@@ -97,7 +97,7 @@
       StandardError = "journal+console";
       # environment.variables does not reliably reach systemd services;
       # give the build the .pc search path explicitly.
-      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig";
+      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig";
     };
     # The minimal systemd service PATH does not include the system
     # packages: give the script the toolchain it needs.

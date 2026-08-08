@@ -128,7 +128,7 @@ const ServerState = struct {
     /// The DRM backend (when WAYLAND_BACKEND=drm).
     drm_backend: ?*wayland.backend.Backend = null,
     // SAFETY: initialized in main() before the backend starts.
-    new_input_listener: wire.Listener(*wayland.backend.Backend.InputDevice) = undefined,
+    new_input_listener: wire.Listener(*wayland.backend.Backend.InputDevice),
     /// wl_output protocol global for the backend output.
     wl_output: ?*wayland.wl_output.WlOutput = null,
     screencopy: ?*wayland.screencopy.Screencopy = null,
@@ -319,6 +319,7 @@ pub fn main(init: std.process.Init) !void {
         .surface_entries = std.AutoHashMap(*Surface, *SurfaceEntry).init(allocator),
         .toplevels = .empty,
         .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
+        .new_input_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onNewInput),
         .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
         .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
         .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
@@ -616,6 +617,7 @@ fn onDisplayReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
         log.err("dispatch failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
+    log.debug("display ready: dispatch done", self.io, self.log_cfg, "server", .{});
     self.display.flushClients();
 }
 
@@ -786,6 +788,14 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         self.presented.items.len,
     });
 
+    // Frame-done and presentation events were marshalled above; push them
+    // out now. onDisplayReady flushes after dispatching client requests,
+    // but a DRM-driven frame loop runs from the flip event instead, where
+    // the display fd may be idle (a silent client) — without this the
+    // callbacks sit in the outbound buffer forever. Idempotent when the
+    // headless timer path already flushed.
+    self.display.flushClients();
+
     // Progress: keep the watchdog from firing. A wedged loop stops instead
     // of hanging tests.
     if (self.watchdog) |t| {
@@ -855,10 +865,14 @@ fn onSurfaceDestroy(listener: *wire.Listener(*Surface), s: *Surface) void {
 fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
     const s = entry.surface;
     const buf = s.buffer orelse {
+        log.debug("surfnode: no buffer", self.io, self.log_cfg, "server", .{});
         removeSurfaceNode(self, entry);
         return;
     };
-    const pixels = surfacePixels(self, buf) orelse return;
+    const pixels = surfacePixels(self, buf) orelse {
+        log.debug("surfnode: no pixels", self.io, self.log_cfg, "server", .{});
+        return;
+    };
     if (entry.node) |node| {
         // Same-size commit: update the texture in place (no alloc, no
         // texture churn — the per-frame hot path).
@@ -958,7 +972,12 @@ fn importSurfacePixels(self: *ServerState, buf: *wayland.buffers.Buffer, pixels:
         buf.height,
         pixels.stride,
         pixels.ptr[0..byte_len],
-    ) catch null;
+    ) catch |err| {
+        log.err("texture import failed: {s} ({d}x{d} stride={d})", self.io, self.log_cfg, "server", .{
+            @errorName(err), buf.width, buf.height, pixels.stride,
+        });
+        return null;
+    };
     if (self.perf) {
         log.info("perf import={d}us buf={d}x{d}", self.io, self.log_cfg, "perf", .{
             (perfNs(self) - t0) / 1000, buf.width, buf.height,
