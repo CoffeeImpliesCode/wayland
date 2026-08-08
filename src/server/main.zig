@@ -36,6 +36,9 @@ const raylib_mod = if (build_options.enable_raylib) raylib_impl else null;
 /// mouse; same -Denable_raylib guard.
 const raylib_input_impl = @import("raylib_input.zig");
 const raylib_input_mod = if (build_options.enable_raylib) raylib_input_impl else null;
+/// The ServerState field type: real pointer with raylib, void without
+/// (a bare `?*null.RaylibInput` would not compile headless-only builds).
+const RaylibInputPtr = if (build_options.enable_raylib) ?*raylib_input_mod.RaylibInput else void;
 
 // Tracy plumbing: the tracy package looks these up on the importing root.
 // The build swaps "tracy_impl" between the enabled/disabled module.
@@ -111,7 +114,7 @@ const ServerState = struct {
     /// wl_data_device_manager: clipboard selection relay.
     data_device: *wayland.data_device.DataDeviceManager,
     /// The raylib input poll object (null in headless mode).
-    raylib_input: ?*raylib_input_mod.RaylibInput = null,
+    raylib_input: RaylibInputPtr = if (build_options.enable_raylib) null else {},
     /// wl_output protocol global for the backend output.
     wl_output: ?*wayland.wl_output.WlOutput = null,
     screencopy: ?*wayland.screencopy.Screencopy = null,
@@ -331,7 +334,7 @@ pub fn main(init: std.process.Init) !void {
     // state every commit and feeds the seat through raylib_input.poll.
     // Only when the raylib backend actually owns the backend object (the
     // headless fallback has no input source).
-    if (backend_is_raylib) {
+    if (backend_is_raylib and build_options.enable_raylib) {
         const input = try raylib_input_mod.create(allocator, state.seat);
         state.raylib_input = input;
         raylib_mod.RaylibBackend.setInputHook(state.backend, raylib_input_mod.poll, input);
