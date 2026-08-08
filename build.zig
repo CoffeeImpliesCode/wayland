@@ -4,7 +4,10 @@ const Scanner = @import("zig_wayland").Scanner;
 
 pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // The demo server runs at ReleaseSafe (house directive): Debug is the
+    // slow mode (per-pixel loops with safety checks measured 55-70ms/frame
+    // vs ~32ms at ReleaseSafe). Pass -Doptimize=Debug for test runs.
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
 
     // Protocol codegen: zig-wayland scanner over vendored XML specs
     // (protocols/). The generated bindings (server + client namespaces)
@@ -153,13 +156,15 @@ pub fn build(b: *Build) void {
     if (b.args) |args| server_run_cmd.addArgs(args);
 
     // Test client: pure protocol client (libwayland-client via the protocol
-    // module). Deliberately does NOT import the compositor library.
+    // module). Deliberately does NOT import the compositor library. A test
+    // tool: always ReleaseFast (it must not skew E2E timing); the server
+    // stays at the session's optimize (ReleaseSafe for demos).
     const client_exe = b.addExecutable(.{
         .name = "wayland-client",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/server/client.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "protocol", .module = protocol },
             },

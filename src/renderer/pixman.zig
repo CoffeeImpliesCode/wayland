@@ -141,6 +141,25 @@ pub const PixmanRenderer = struct {
         tex.* = .{ .impl = &texture_impl, .data = tex_data, .width = w, .height = h };
         return tex;
     }
+
+    /// Overwrite an imported texture's pixels in place when the geometry
+    /// matches. Returns false when the texture must be re-imported (size
+    /// or stride changed). The hot path for per-frame surface updates:
+    /// no allocation, no texture churn.
+    pub fn updateMemory(
+        texture: *texture_mod.Texture,
+        w: i32,
+        h: i32,
+        stride: i32,
+        pixels: []const u8,
+    ) bool {
+        const tex_data: *PixmanTextureData = @ptrCast(@alignCast(texture.data));
+        if (texture.width != w or texture.height != h or tex_data.stride != stride) return false;
+        const size = @as(usize, @intCast(stride)) * @as(usize, @intCast(h));
+        if (pixels.len < size) return false;
+        @memcpy(tex_data.pixels[0..size], pixels[0..size]);
+        return true;
+    }
 };
 
 fn beginPass(renderer: *renderer_mod.Renderer, target: *anyopaque) ?*pass_mod.Pass {

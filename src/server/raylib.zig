@@ -47,6 +47,8 @@ const RaylibOutputData = struct {
     io: *std.Io,
     log_cfg: *const log_mod.Config,
     texture: raylib.Texture2D,
+    /// WAYLAND_PERF=1: log present-stage timings.
+    perf: bool = false,
     /// BGRA-in-memory (ARGB8888 u32) -> RGBA byte swap scratch for the
     /// R8G8B8A8 raylib texture; width*height*4 bytes.
     scratch: []u8,
@@ -146,6 +148,11 @@ pub const RaylibBackend = struct {
             .log_cfg = log_cfg,
             .texture = texture,
             .scratch = scratch,
+            .perf = std.mem.eql(
+                u8,
+                std.mem.span(std.c.getenv("WAYLAND_PERF") orelse ""),
+                "1",
+            ),
         };
 
         const base = try backend.Backend.init(allocator, io, log_cfg, &backend_impl, rl);
@@ -184,11 +191,21 @@ fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
 }
 
 fn frameCb(rl: *Raylib) c_int {
+    const t0 = frameMs();
     rl.out.sendFrame();
-    // libwayland does not re-arm timer sources after they fire; re-arm for
-    // the next period. On failure, drop the source (return 0).
-    rl.timer.?.timerUpdate(rl.mode.refresh_msec) catch return 0;
+    // libwayland does not re-arm timer sources after they fire; re-arm so
+    // the NEXT fire lands refresh_msec after THIS callback started (the
+    // fixed-period re-arm drifts by the frame work: period = work + 16ms).
+    // On failure, drop the source (return 0).
+    const elapsed: i32 = @intCast(@max(frameMs() - t0, 0));
+    const remain: u32 = @intCast(@max(rl.mode.refresh_msec - elapsed, 1));
+    rl.timer.?.timerUpdate(@intCast(remain)) catch return 0;
     return 1;
+}
+
+/// Monotonic milliseconds for the frame-pacing feedback.
+fn frameMs() i64 {
+    return std.Io.Clock.now(.awake, std.Io.Threaded.global_single_threaded.io()).toMilliseconds();
 }
 
 fn testState(_: *output.Output, _: *const output.Output.State) error{InvalidState}!void {}
@@ -199,14 +216,30 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
     const od: *RaylibOutputData = @ptrCast(@alignCast(out.data));
     if (state.buffer) |buf| {
         const fb: *pixman.Framebuffer = @ptrCast(@alignCast(buf));
+        const perf_t0 = perfNs(out.io);
         // ARGB8888 u32 (BGRA bytes in little-endian memory) -> RGBA bytes
         // for the R8G8B8A8 raylib texture.
-        const pixels = std.mem.bytesAsSlice(u32, fb.data);
-        for (pixels, 0..) |px, i| {
-            od.scratch[i * 4 + 0] = @truncate(px >> 16);
-            od.scratch[i * 4 + 1] = @truncate(px >> 8);
-            od.scratch[i * 4 + 2] = @truncate(px);
-            od.scratch[i * 4 + 3] = @truncate(px >> 24);
+        bgraToRgba(std.mem.bytesAsSlice(u32, od.scratch), std.mem.bytesAsSlice(u32, fb.data));
+        const perf_t_poll = perfNs(out.io);
+        raylib.PollInputEvents();
+        const rl_b: *Raylib = @ptrCast(@alignCast(out.backend.data));
+        if (rl_b.poll_hook) |hook| hook(rl_b.poll_ctx.?);
+        const perf_t_swap = perfNs(out.io);
+        raylib.UpdateTexture(od.texture, od.scratch.ptr);
+        const perf_t_upload = perfNs(out.io);
+        raylib.BeginDrawing();
+        raylib.ClearBackground(white);
+        raylib.DrawTexture(od.texture, 0, 0, white);
+        raylib.EndDrawing();
+        const perf_t_draw = perfNs(out.io);
+        if (od.perf) {
+            log_mod.info("perf raylib pre={d}us poll={d}us swap={d}us upload={d}us draw={d}us", out.io, out.log_cfg, "perf", .{
+                (perf_t_poll - perf_t0) / 1000,
+                (perf_t_swap - perf_t_poll) / 1000,
+                (perf_t_upload - perf_t_swap) / 1000,
+                (perf_t_draw - perf_t_upload) / 1000,
+                (perf_t_draw - perf_t0) / 1000,
+            });
         }
         raylib.PollInputEvents();
         const rl: *Raylib = @ptrCast(@alignCast(out.backend.data));
@@ -220,6 +253,22 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
     log_mod.info("commit: bits=0x{x} enabled={} scale={d} damage_rects={d}", out.io, out.log_cfg, "raylib", .{
         state.committed, state.enabled, state.scale, state.damage.rects.items.len,
     });
+}
+
+/// ARGB8888 u32 (BGRA bytes in little-endian memory) -> RGBA bytes for
+/// the R8G8B8A8 raylib texture. The present hot path (921k pixels/frame):
+/// runtime safety is disabled so the shuffle compiles to plain stores —
+/// the slices are sized by the fixed 1280x720 framebuffer and scratch.
+fn bgraToRgba(dst: []align(1) u32, src: []align(1) const u32) void {
+    @setRuntimeSafety(false);
+    for (src, 0..) |px, i| {
+        dst[i] = (px & 0xFF00FF00) | ((px & 0x000000FF) << 16) | ((px >> 16) & 0x000000FF);
+    }
+}
+
+/// Monotonic nanoseconds for the perf trace.
+fn perfNs(io: *std.Io) u64 {
+    return @intCast(@max(std.Io.Clock.now(.awake, io.*).toNanoseconds(), 0));
 }
 
 fn destroyOutput(allocator: std.mem.Allocator, data: *anyopaque) void {

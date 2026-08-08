@@ -140,6 +140,9 @@ const ServerState = struct {
     /// once the first surface is mapped (headless input E2E).
     synth_input: bool = false,
     synth_fired: bool = false,
+    /// WAYLAND_PERF=1: log per-frame pipeline timings (import -> render
+    /// -> present) in microseconds.
+    perf: bool = false,
 
     new_output_listener: wire.Listener(*wayland.output.Output),
     frame_listener: wire.Listener(*wayland.output.Output),
@@ -318,6 +321,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (init.environ_map.get("WAYLAND_SYNTH_INPUT")) |v| {
         if (std.mem.eql(u8, v, "1")) state.synth_input = true;
+    }
+    if (init.environ_map.get("WAYLAND_PERF")) |v| {
+        if (std.mem.eql(u8, v, "1")) state.perf = true;
     }
 
     // The raylib window is the M3 input source: the backend polls raylib
@@ -520,9 +526,11 @@ fn onOutputFrame(listener: *wire.Listener(*wayland.output.Output), out: *wayland
 fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     const zone = tracy.Zone.begin(.{ .src = @src() });
     defer zone.end();
+    const perf_t0 = perfNs(self);
 
     // M2: surfaces created since the last frame get scene nodes.
     syncSurfaces(self);
+    const perf_t_sync = perfNs(self);
     // Subsurfaces: position child nodes over their mapped parent.
     syncSubsurfaceNodes(self);
 
@@ -553,6 +561,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // M3 cursor: follow the seat pointer, show the client cursor surface
     // or the fallback rect.
     updateCursor(self);
+    const perf_t_cursor = perfNs(self);
 
     const so = self.scene_output orelse {
         log.err("render: no scene output", self.io, self.log_cfg, "server", .{});
@@ -578,6 +587,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // Composite the scene into the framebuffer, then present it.
     so.render(self.renderer, self.framebuffer);
     _ = so.damage_ring.rotate();
+    const perf_t_render = perfNs(self);
 
     // Present: hand the framebuffer to the output, damage the whole screen.
     var state = wayland.output.Output.State.init(self.allocator);
@@ -593,6 +603,18 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         log.err("output commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
+    const perf_t_present = perfNs(self);
+
+    if (self.perf) {
+        log.info("perf frame={d} sync={d}us cursor={d}us render={d}us present={d}us total={d}us", self.io, self.log_cfg, "perf", .{
+            self.frames_rendered,
+            (perf_t_sync - perf_t0) / 1000,
+            (perf_t_cursor - perf_t_sync) / 1000,
+            (perf_t_render - perf_t_cursor) / 1000,
+            (perf_t_present - perf_t_render) / 1000,
+            (perf_t_present - perf_t0) / 1000,
+        });
+    }
 
     // wp_presentation: every surface drawn this frame was presented.
     self.presentation.present(self.presented.items, @intCast(output_refresh_msec), 0);
@@ -676,7 +698,28 @@ fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
         removeSurfaceNode(self, entry);
         return;
     };
-    const texture = importSurfaceTexture(self, buf) orelse return;
+    const pixels = surfacePixels(self, buf) orelse return;
+    if (entry.node) |node| {
+        // Same-size commit: update the texture in place (no alloc, no
+        // texture churn — the per-frame hot path).
+        const bn = node.kind.buffer;
+        if (bn.texture) |tex| {
+            const byte_len = @as(usize, @intCast(pixels.stride)) * @as(usize, @intCast(buf.height));
+            if (wayland.pixman.PixmanRenderer.updateMemory(
+                tex,
+                buf.width,
+                buf.height,
+                pixels.stride,
+                pixels.ptr[0..byte_len],
+            )) {
+                node.enable(true);
+                return;
+            }
+            tex.destroy();
+            bn.texture = null;
+        }
+    }
+    const texture = importSurfacePixels(self, buf, pixels) orelse return;
     if (entry.node) |node| {
         // Update in place: swap in the new texture (1:1, dst = buffer size).
         const bn = node.kind.buffer;
@@ -727,26 +770,46 @@ fn removeSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
     }
 }
 
-/// Copy the surface's current buffer into a renderer texture (same import
-/// path the M1 render loop used per frame; the scene node owns the copy).
-fn importSurfaceTexture(self: *ServerState, buf: *wayland.buffers.Buffer) ?*Texture {
+/// The surface's shm pixels (with SIGBUS guard active) + stride.
+const SurfacePixels = struct {
+    ptr: [*]u8,
+    stride: i32,
+};
+
+fn surfacePixels(_: *ServerState, buf: *wayland.buffers.Buffer) ?SurfacePixels {
     const get_shm = buf.impl.get_shm orelse return null;
     const shm = get_shm(buf) orelse return null;
     const begin = buf.impl.begin_data_ptr_access orelse return null;
     const end = buf.impl.end_data_ptr_access orelse return null;
-
     const pixels = begin(buf) catch return null;
     defer end(buf);
     const ptr = pixels orelse return null;
-    const stride = wire.shm.Buffer.getStride(shm);
-    const byte_len = @as(usize, @intCast(stride)) * @as(usize, @intCast(buf.height));
-    return pixman.PixmanRenderer.importMemory(
+    return .{ .ptr = ptr, .stride = wire.shm.Buffer.getStride(shm) };
+}
+
+/// Copy the surface's current buffer into a renderer texture (same import
+/// path the M1 render loop used per frame; the scene node owns the copy).
+fn importSurfacePixels(self: *ServerState, buf: *wayland.buffers.Buffer, pixels: SurfacePixels) ?*Texture {
+    const t0 = perfNs(self);
+    const byte_len = @as(usize, @intCast(pixels.stride)) * @as(usize, @intCast(buf.height));
+    const tex = pixman.PixmanRenderer.importMemory(
         self.renderer,
         buf.width,
         buf.height,
-        stride,
-        ptr[0..byte_len],
+        pixels.stride,
+        pixels.ptr[0..byte_len],
     ) catch null;
+    if (self.perf) {
+        log.info("perf import={d}us buf={d}x{d}", self.io, self.log_cfg, "perf", .{
+            (perfNs(self) - t0) / 1000, buf.width, buf.height,
+        });
+    }
+    return tex;
+}
+
+/// Monotonic nanoseconds for the perf trace.
+fn perfNs(self: *ServerState) u64 {
+    return @intCast(@max(std.Io.Clock.now(.awake, self.io.*).toNanoseconds(), 0));
 }
 
 /// Tear down every surface entry (listeners, scene nodes, allocations).
@@ -855,7 +918,9 @@ fn updateCursor(self: *ServerState) void {
         for (self.compositor.surfaces.items) |s| {
             if (s.resource == res) {
                 if (s.buffer) |buf| {
-                    surface_texture = importSurfaceTexture(self, buf) orelse null;
+                    if (surfacePixels(self, buf)) |sp| {
+                        surface_texture = importSurfacePixels(self, buf, sp) orelse null;
+                    }
                 }
                 break;
             }
