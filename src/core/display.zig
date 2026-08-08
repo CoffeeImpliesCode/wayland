@@ -147,7 +147,23 @@ fn protocolLog(
     const dir = if (direction == .request) "request" else "event";
     const class = std.mem.span(message.resource.getClass());
     const name = std.mem.span(message.message.name);
-    log.debug("{s} {s}.{s}", display.io, display.log_cfg, "wire", .{ dir, class, name });
+    const res_id = message.resource.getId();
+    // wl_surface.attach's first argument is the wl_buffer object: print
+    // its id so buffer lifecycles are traceable end to end. The union
+    // args are untyped, so only inspect the one known object slot.
+    if (message.arguments_count > 0 and message.arguments != null and
+        std.mem.eql(u8, name, "attach"))
+    {
+        const obj = message.arguments.?[0].o;
+        if (obj) |o| {
+            const res: *wire.Resource = @ptrCast(@alignCast(o));
+            log.debug("{s} {s}.{s} id={d} buf={d}", display.io, display.log_cfg, "wire", .{
+                dir, class, name, res_id, res.getId(),
+            });
+            return;
+        }
+    }
+    log.debug("{s} {s}.{s} id={d}", display.io, display.log_cfg, "wire", .{ dir, class, name, res_id });
 }
 
 const assert = std.debug.assert;

@@ -51,7 +51,7 @@ pub const Buffer = struct {
     /// The producer has dropped the buffer.
     dropped: bool = false,
     /// Number of consumers currently reading the buffer.
-    n_locks: u32 = 0,
+    n_locks: u32 = 0, // public: the surface guards unlocks after early releases
     events: struct {
         /// Fires once when `dropped && n_locks == 0`.
         release: wire.Signal(*Buffer),

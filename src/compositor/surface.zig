@@ -140,6 +140,10 @@ pub const Surface = struct {
     compositor: *Compositor,
     /// Current buffer (mirror of current.buffer) for quick access.
     buffer: ?*Buffer = null,
+    /// Whether the pending slot holds a locked reference (attach took a
+    /// lock). False when the pending buffer is a lockless re-attach of
+    /// the current buffer (which already holds the surface's reference).
+    pending_locked: bool = false,
     current: State,
     pending: State,
     /// Whether the surface currently presents content (buffer != null).
@@ -228,14 +232,15 @@ pub const Surface = struct {
         // Buffer may be destroyed by the buffers module — do not touch it.
         if (s.current.buffer) |b| {
             b.drop();
-            b.unlock();
+            if (b.n_locks > 0) b.unlock();
         }
         if (s.pending.buffer) |b| {
             b.drop();
-            b.unlock();
+            if (b.n_locks > 0) b.unlock();
         }
         s.current.buffer = null;
         s.pending.buffer = null;
+        s.pending_locked = false;
         s.buffer = null;
         s.fireReleaseCallbacksCurrent();
         s.fireReleaseCallbacksPending();
@@ -259,22 +264,37 @@ pub const Surface = struct {
     /// removes the surface content at the next commit.
     pub fn attachBuffer(s: *Surface, buffer: ?*Buffer, x: i32, y: i32) void {
         if (buffer) |b| {
-            b.lock() catch {
-                // Could not take a reference; nothing to present.
-                b.drop();
-                s.resource.postNoMemory();
-                return;
-            };
+            // Re-attaching the CURRENT buffer: the current state already
+            // holds the surface's reference. Taking another lock would
+            // strand the buffer — the commit sees old == new and never
+            // releases it (weston-simple-shm hits this on resize).
+            if (s.pending.buffer == null and s.current.buffer == b) {
+                s.pending_locked = false;
+            } else {
+                b.lock() catch {
+                    // Could not take a reference; nothing to present.
+                    b.drop();
+                    s.resource.postNoMemory();
+                    return;
+                };
+                s.pending_locked = true;
+            }
+        } else {
+            s.pending_locked = false;
         }
         if (s.pending.buffer) |old| {
             if (old != buffer) {
                 // The previously attached (never committed) buffer is done.
                 s.fireReleaseCallbacksPending();
                 old.drop();
-                old.unlock();
+                if (old.n_locks > 0) old.unlock();
             } else {
-                // Re-attaching the same buffer: undo the extra lock.
-                buffer.?.unlock();
+                // Re-attaching the same buffer: undo the extra lock (only
+                // when the previous attach actually took one).
+                if (s.pending_locked) {
+                    buffer.?.unlock();
+                    s.pending_locked = false;
+                }
             }
         }
         s.pending.buffer = buffer;
@@ -297,7 +317,10 @@ pub const Surface = struct {
             if (old != s.current.buffer) {
                 s.fireReleaseCallbacksCurrent();
                 old.drop();
-                old.unlock();
+                // The pending path may already have released this buffer
+                // (a lockless re-attach of the current one was replaced
+                // before the commit); never unlock a zero-count buffer.
+                if (old.n_locks > 0) old.unlock();
             }
         }
         // Release callbacks ride along with the current buffer.

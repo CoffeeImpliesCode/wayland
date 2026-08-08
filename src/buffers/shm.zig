@@ -187,11 +187,15 @@ fn shmDestroy(allocator: std.mem.Allocator, data: *anyopaque) void {
 
 /// The client destroyed the wl_buffer resource: libwayland frees the shm
 /// buffer backing, so mark the wrapper dead and drop it (the producer is
-/// done). Consumers still holding locks keep a dead wrapper until their
-/// final unlock; the wrapper is reclaimed by ShmState.deinit.
+/// done). The map entry is removed so a REUSED resource pointer (libwayland
+/// recycles freed resource memory) gets a fresh wrapper instead of this
+/// dead one — without this, the release event for the recycled buffer is
+/// silently dropped and the client's buffer stays busy forever
+/// (weston-simple-shm: "Both buffers busy at redraw()").
 fn resourceDestroy(listener: *wire.Listener(*wire.Resource), resource: *wire.Resource) void {
     _ = resource;
     const d: *ShmBufferData = @fieldParentPtr("resource_destroy", listener);
+    if (d.state) |state| _ = state.buffers.remove(d.resource_key);
     d.resource = null;
     d.shm = null;
     if (!d.buf.dropped) d.buf.drop();
