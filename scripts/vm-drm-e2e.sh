@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# In-guest DRM/KMS + libinput E2E (run by the compositor-demo-drm systemd
+# service). Builds the repo with the guest toolchain into /tmp (the shared
+# 9p dir stays untouched), then runs the DRM backend on /dev/dri/card0
+# (virtio-gpu) with the libinput source on /dev/input/* (virtio keyboard +
+# mouse) plus the test client. Verdicts go to the console; CLIENT-OK plus
+# drm:/libinput: lines in the server log are the pass signals. Powers off.
+set -uo pipefail
+exec > /dev/console 2>&1
+
+cd /shared/repo || { echo "VM-DRM-E2E-FAILED: repo share not mounted"; systemctl poweroff; exit 1; }
+echo "=== vm-drm-e2e: building with the guest toolchain ==="
+# Same flags as the headless E2E: the drm + libinput backends compile
+# unconditionally, so no extra -D options are needed (guest has no raylib).
+zig build --prefix /tmp/zo --cache-dir /tmp/zc --global-cache-dir /tmp/zgc \
+    -Denable_raylib=false > /tmp/build.log 2>&1
+if [ ! -x /tmp/zo/bin/wayland-server ] || [ ! -x /tmp/zo/bin/wayland-client ]; then
+    echo "=== build failed; log tail: ==="
+    tail -40 /tmp/build.log
+    echo "VM-DRM-E2E-FAILED: build did not produce binaries"
+    systemctl poweroff
+    exit 1
+fi
+echo "=== vm-drm-e2e: build ok, running DRM E2E ==="
+
+mkdir -p /tmp/rt
+# Server log (stderr) goes to /tmp/srv.out so the drm:/libinput: lines are
+# greppable. WAYLAND_LOG=err would hide info-level lines; keep the rest of
+# the log quiet but let the drm + libinput tags through.
+XDG_RUNTIME_DIR=/tmp/rt WAYLAND_BACKEND=drm WAYLAND_LIBINPUT=1 \
+    WAYLAND_LOG=err,drm=info,libinput=info WAYLAND_RUN_FRAMES=600 \
+    /tmp/zo/bin/wayland-server > /tmp/srv.out 2>&1 &
+SRV=$!
+SOCK=""
+for _ in $(seq 1 120); do
+    SOCK=$(grep -m1 '^WAYLAND_SOCKET=' /tmp/srv.out 2>/dev/null | cut -d= -f2)
+    [ -n "$SOCK" ] && break
+    sleep 0.5
+done
+if [ -z "$SOCK" ]; then
+    echo "VM-DRM-E2E-FAILED: server did not print a socket"
+    systemctl poweroff
+    exit 1
+fi
+
+XDG_RUNTIME_DIR=/tmp/rt WAYLAND_DISPLAY="$SOCK" /tmp/zo/bin/wayland-client \
+    > /tmp/cli.out 2>&1
+RC=$?
+# The server stops itself after WAYLAND_RUN_FRAMES; wait briefly, then kill.
+for _ in $(seq 1 40); do
+    kill -0 "$SRV" 2>/dev/null || break
+    sleep 0.5
+done
+kill "$SRV" 2>/dev/null
+wait "$SRV" 2>/dev/null
+
+DRM_LINES=$(grep -c "drm:" /tmp/srv.out 2>/dev/null || true)
+LIBINPUT_LINES=$(grep -c "libinput:" /tmp/srv.out 2>/dev/null || true)
+echo "=== vm-drm-e2e: client rc=$RC drm_lines=$DRM_LINES libinput_lines=$LIBINPUT_LINES ==="
+if [ "$RC" -eq 0 ] && grep -q "CLIENT-OK" /tmp/cli.out &&
+   [ "$DRM_LINES" -gt 0 ] && [ "$LIBINPUT_LINES" -gt 0 ]; then
+    echo "VM-DRM-E2E-OK"
+else
+    echo "=== server log tail: ==="
+    tail -40 /tmp/srv.out
+    echo "=== client log tail: ==="
+    tail -40 /tmp/cli.out
+    echo "VM-DRM-E2E-FAILED"
+fi
+systemctl poweroff

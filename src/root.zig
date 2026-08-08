@@ -39,6 +39,12 @@ pub const subsurface = @import("compositor/subsurface.zig");
 /// wl_data_device_manager (compositor/data_device.zig): clipboard relay.
 pub const data_device = @import("compositor/data_device.zig");
 pub const backend = @import("backend/backend.zig");
+/// libinput input backend (backend/libinput.zig): evdev devices via
+/// libinput (udev context). Exported for the test server.
+pub const libinput = @import("backend/libinput.zig");
+/// DRM/KMS backend (backend/drm.zig): native output on /dev/dri/cardN
+/// with dumb-buffer scanout + atomic modeset/page flip.
+pub const drm = @import("backend/drm.zig");
 /// Headless backend implementation (backend/headless.zig): one virtual
 /// output paced by a wire event loop timer. Exported for consumers that
 /// run without a GPU (test servers, examples).
@@ -72,6 +78,8 @@ comptime {
     _ = subsurface;
     _ = data_device;
     _ = backend;
+    _ = libinput;
+    _ = drm;
     _ = output;
     _ = wl_output;
     _ = renderer;

@@ -63,6 +63,32 @@ pub fn build(b: *Build) void {
     // modifier/keysym state with it (libxkbcommon is in the devenv
     // packages; the .pc comes from its dev output).
     lib.linkSystemLibrary("xkbcommon", .{});
+    // DRM/KMS backend (src/backend/drm.zig): libdrm via a translate-c shim
+    // (house pattern, cf. raylib_c). The include root + root/libdrm come
+    // from pkg-config at configure time (nix: nixpkgs#libdrm.dev).
+    {
+        const drm_c = b.addTranslateC(.{
+            .root_source_file = b.path("src/backend/drm_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const cflags = b.run(&.{ "pkg-config", "--cflags", "libdrm" });
+        var it = std.mem.tokenizeAny(u8, cflags, " \t\n");
+        while (it.next()) |tok| {
+            if (std.mem.startsWith(u8, tok, "-I") and tok.len > 2) {
+                drm_c.addSystemIncludePath(.{ .cwd_relative = b.dupe(tok[2..]) });
+            }
+        }
+        lib.addImport("drm_c", drm_c.createModule());
+        lib.linkSystemLibrary("drm", .{ .use_pkg_config = .force });
+    }
+    // libinput backend (src/backend/libinput.zig): udev context, evdev
+    // devices; the runtime lib is in the devenv/nix closure.
+    lib.linkSystemLibrary("libinput", .{});
+    // libinput's udev context needs libudev (ships with systemd; the .pc
+    // comes from systemd's dev output, in PKG_CONFIG_PATH for the build).
+    lib.linkSystemLibrary("udev", .{ .use_pkg_config = .force });
 
     const exe = b.addExecutable(.{
         .name = "wayland",

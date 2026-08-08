@@ -32,6 +32,12 @@ const build_options = @import("build_options");
 /// comptime guard on build_options.enable_raylib.
 const raylib_impl = @import("raylib.zig");
 const raylib_mod = if (build_options.enable_raylib) raylib_impl else null;
+/// DRM/KMS backend (src/backend/drm.zig): native output on /dev/dri/cardN
+/// with dumb-buffer scanout (WAYLAND_BACKEND=drm).
+const drm_mod = @import("wayland").drm;
+/// libinput backend (src/backend/libinput.zig): evdev devices through
+/// libinput (WAYLAND_LIBINPUT=1).
+const libinput_mod = @import("wayland").libinput;
 /// The raylib input source feeds the seat from the window's keyboard and
 /// mouse; same -Denable_raylib guard.
 const raylib_input_impl = @import("raylib_input.zig");
@@ -115,6 +121,14 @@ const ServerState = struct {
     data_device: *wayland.data_device.DataDeviceManager,
     /// The raylib input poll object (null in headless mode).
     raylib_input: RaylibInputPtr = if (build_options.enable_raylib) null else {},
+    /// The libinput backend (evdev input source), when active.
+    input_backend: ?*wayland.backend.Backend = null,
+    /// The DRM backend's poll fd watcher state (page-flip events).
+    drm_poll_fd: c_int = -1,
+    /// The DRM backend (when WAYLAND_BACKEND=drm).
+    drm_backend: ?*wayland.backend.Backend = null,
+    // SAFETY: initialized in main() before the backend starts.
+    new_input_listener: wire.Listener(*wayland.backend.Backend.InputDevice) = undefined,
     /// wl_output protocol global for the backend output.
     wl_output: ?*wayland.wl_output.WlOutput = null,
     screencopy: ?*wayland.screencopy.Screencopy = null,
@@ -220,7 +234,15 @@ pub fn main(init: std.process.Init) !void {
     // open); anything else uses the headless backend. The raylib path is
     // only reachable when built with -Denable_raylib (default on).
     var backend_is_raylib = false;
+    var backend_is_drm = false;
     const backend = blk: {
+        // DRM/KMS native output (tested in the NixOS VM on virtio-gpu).
+        if (wantDrmBackend(init.environ_map)) {
+            const device = init.environ_map.get("WAYLAND_DRM_DEVICE");
+            const b = try drm_mod.DrmBackend.create(allocator, io, &log_cfg, device);
+            backend_is_drm = true;
+            break :blk b;
+        }
         if (build_options.enable_raylib and wantRaylibBackend(init.environ_map)) {
             const b = raylib_mod.RaylibBackend.create(
                 allocator,
@@ -261,6 +283,24 @@ pub fn main(init: std.process.Init) !void {
     const framebuffer = try pixman.Framebuffer.create(allocator, output_width, output_height);
     defer framebuffer.deinit();
 
+    // libinput input source (evdev devices; VM: virtio keyboard/mouse).
+    // A second Backend whose only role is announcing devices + the poll fd
+    // the zio loop watches; events flow into the seat via its dispatch.
+    var input_backend: ?*wayland.backend.Backend = null;
+    if (init.environ_map.get("WAYLAND_LIBINPUT") != null and
+        std.mem.eql(u8, init.environ_map.get("WAYLAND_LIBINPUT").?, "1"))
+    {
+        input_backend = try libinput_mod.LibinputBackend.create(
+            allocator,
+            io,
+            &log_cfg,
+            seat,
+            "seat0",
+            output_width,
+            output_height,
+        );
+    }
+
     var state: ServerState = .{
         .allocator = allocator,
         .io = io,
@@ -284,6 +324,7 @@ pub fn main(init: std.process.Init) !void {
         .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
         .seat_key_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKey),
     };
+    if (backend_is_drm) state.drm_backend = backend;
     defer state.toplevels.deinit(allocator);
     // Scene teardown (LIFO): drop the per-surface scene state first, then
     // the scene output view, then the scene tree itself. The compositor
@@ -294,6 +335,10 @@ pub fn main(init: std.process.Init) !void {
     defer cleanupSurfaceEntries(&state);
 
     backend.events.new_output.add(&state.new_output_listener);
+    if (input_backend) |ib| {
+        state.input_backend = ib;
+        ib.events.new_input.add(&state.new_input_listener);
+    }
     shell.events.new_toplevel.add(&state.new_toplevel_listener);
     shell.events.new_popup.add(&state.new_popup_listener);
     seat.events.key.add(&state.seat_key_listener);
@@ -358,6 +403,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try backend.start(); // fires new_output; the headless timer paces frames
+    if (input_backend) |ib| try ib.start();
 
     // --- zio event loop ---------------------------------------------------
     // SAFETY: initialized by loop.init() immediately below, before any use.
@@ -373,6 +419,26 @@ pub fn main(init: std.process.Init) !void {
     display_poll.c.callback = onDisplayReady;
     display_poll.c.flags.rearm = true;
     loop.add(&display_poll.c);
+
+    // libinput: watch the udev/evdev fd; dispatch drains events into the seat.
+    if (input_backend) |ib| {
+        const input_fd = libinput_mod.LibinputBackend.fromBackend(ib).pollFd();
+        var input_poll = zio.ev.PipePoll.init(input_fd, .read);
+        input_poll.c.userdata = &state;
+        input_poll.c.callback = onInputReady;
+        input_poll.c.flags.rearm = true;
+        loop.add(&input_poll.c);
+    }
+    // DRM: watch the card fd for page-flip events (the frame pacing).
+    if (backend_is_drm) {
+        const drm_fd = drm_mod.pollFd(drm_mod.DrmBackend.fromBackend(backend));
+        state.drm_poll_fd = drm_fd;
+        var drm_poll = zio.ev.PipePoll.init(drm_fd, .read);
+        drm_poll.c.userdata = &state;
+        drm_poll.c.callback = onDrmReady;
+        drm_poll.c.flags.rearm = true;
+        loop.add(&drm_poll.c);
+    }
 
     // Watchdog: fires when no frame was rendered for the full window. The
     // render path re-arms it, so a healthy server runs forever; a wedged
@@ -401,12 +467,36 @@ pub fn main(init: std.process.Init) !void {
 // Listeners
 // ---------------------------------------------------------------------------
 
+/// A backend announced an input device (libinput udev enumeration).
+fn onNewInput(
+    listener: *wire.Listener(*wayland.backend.Backend.InputDevice),
+    device: *wayland.backend.Backend.InputDevice,
+) void {
+    const self: *ServerState = @fieldParentPtr("new_input_listener", listener);
+    log.info("libinput: device {s} ({s})", self.io, self.log_cfg, "libinput", .{
+        device.name, @tagName(device.kind),
+    });
+}
+
 fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.output.Output) void {
     const self: *ServerState = @fieldParentPtr("new_output_listener", listener);
     self.output = out;
     log.info("new output {d}x{d} refresh={d}ms", self.io, self.log_cfg, "server", .{
         out.mode.width, out.mode.height, out.mode.refresh_msec,
     });
+    // The DRM backend drives its connector's preferred mode: resize the
+    // render framebuffer to match (headless/raylib stay at the defaults).
+    if (out.mode.width != output_width or out.mode.height != output_height) {
+        const fb = pixman.Framebuffer.create(self.allocator, out.mode.width, out.mode.height) catch |err| {
+            log.err("framebuffer resize failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            return;
+        };
+        self.framebuffer.deinit();
+        self.framebuffer = fb;
+        log.info("framebuffer resized to {d}x{d}", self.io, self.log_cfg, "server", .{
+            out.mode.width, out.mode.height,
+        });
+    }
 
     // M2: build the scene for this output (one scene, one output view).
     const scene = wayland.scene.Scene.init(self.allocator, self.io, self.log_cfg) catch |err| {
@@ -495,6 +585,24 @@ fn onNewPopup(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.she
 // ---------------------------------------------------------------------------
 // zio loop callbacks
 // ---------------------------------------------------------------------------
+
+fn onInputReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
+    _ = loop;
+    const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
+    if (self.input_backend) |ib| {
+        libinput_mod.LibinputBackend.fromBackend(ib).dispatch() catch |err| {
+            log.err("libinput dispatch failed: {s}", self.io, self.log_cfg, "libinput", .{@errorName(err)});
+        };
+    }
+}
+
+fn onDrmReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
+    _ = loop;
+    const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
+    if (self.drm_poll_fd >= 0) {
+        drm_mod.dispatch(drm_mod.DrmBackend.fromBackend(self.drm_backend.?));
+    }
+}
 
 fn onDisplayReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     _ = loop;
@@ -630,7 +738,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         wayland.output.Output.State.committed_mode |
         wayland.output.Output.State.committed_buffer;
     state.enabled = true;
-    state.mode = .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec };
+    state.mode = .{ .width = out.mode.width, .height = out.mode.height, .refresh_msec = out.mode.refresh_msec };
     state.buffer = @ptrCast(self.framebuffer);
     const damage_rects = so.takeDamage();
     if (damage_rects.len == 0) {
@@ -882,6 +990,12 @@ fn cleanupSurfaceEntries(self: *ServerState) void {
     }
     self.surface_entries.deinit();
     self.presented.deinit(self.allocator);
+}
+
+/// WAYLAND_BACKEND=drm selects the DRM/KMS backend (native output).
+fn wantDrmBackend(environ_map: *std.process.Environ.Map) bool {
+    const v = environ_map.get("WAYLAND_BACKEND") orelse return false;
+    return std.mem.eql(u8, v, "drm");
 }
 
 /// WAYLAND_BACKEND=raylib selects the windowed raylib debug backend.
