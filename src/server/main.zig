@@ -606,7 +606,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     const perf_t_present = perfNs(self);
 
     if (self.perf) {
-        log.info("perf frame={d} sync={d}us cursor={d}us render={d}us present={d}us total={d}us", self.io, self.log_cfg, "perf", .{
+        log.info(perf_frame_fmt, self.io, self.log_cfg, "perf", .{
             self.frames_rendered,
             (perf_t_sync - perf_t0) / 1000,
             (perf_t_cursor - perf_t_sync) / 1000,
@@ -806,6 +806,9 @@ fn importSurfacePixels(self: *ServerState, buf: *wayland.buffers.Buffer, pixels:
     }
     return tex;
 }
+
+/// Frame-level perf trace format (WAYLAND_PERF=1).
+const perf_frame_fmt = "perf frame={d} sync={d}us cursor={d}us render={d}us present={d}us total={d}us";
 
 /// Monotonic nanoseconds for the perf trace.
 fn perfNs(self: *ServerState) u64 {

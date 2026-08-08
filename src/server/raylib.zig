@@ -233,7 +233,7 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
         raylib.EndDrawing();
         const perf_t_draw = perfNs(out.io);
         if (od.perf) {
-            log_mod.info("perf raylib pre={d}us poll={d}us swap={d}us upload={d}us draw={d}us", out.io, out.log_cfg, "perf", .{
+            log_mod.info(perf_raylib_fmt, out.io, out.log_cfg, "perf", .{
                 (perf_t_poll - perf_t0) / 1000,
                 (perf_t_swap - perf_t_poll) / 1000,
                 (perf_t_upload - perf_t_swap) / 1000,
@@ -265,6 +265,9 @@ fn bgraToRgba(dst: []align(1) u32, src: []align(1) const u32) void {
         dst[i] = (px & 0xFF00FF00) | ((px & 0x000000FF) << 16) | ((px >> 16) & 0x000000FF);
     }
 }
+
+/// Present-stage perf trace format (WAYLAND_PERF=1).
+const perf_raylib_fmt = "perf raylib pre={d}us poll={d}us swap={d}us upload={d}us draw={d}us";
 
 /// Monotonic nanoseconds for the perf trace.
 fn perfNs(io: *std.Io) u64 {
