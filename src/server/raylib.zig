@@ -211,7 +211,10 @@ fn frameMs() i64 {
 fn testState(_: *output.Output, _: *const output.Output.State) error{InvalidState}!void {}
 
 /// Upload the committed framebuffer into the window texture and draw it.
-/// No-op (beyond logging) when the state carries no buffer.
+/// No-op (beyond logging) when the state carries no buffer. When the
+/// state's damage rects union into a box smaller than the framebuffer,
+/// only that box is byte-swapped and uploaded (UpdateTextureRec); whole,
+/// empty, or full-screen damage keeps the full UpdateTexture path.
 fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFailed}!void {
     const od: *RaylibOutputData = @ptrCast(@alignCast(out.data));
     if (state.buffer) |buf| {
@@ -219,13 +222,40 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
         const perf_t0 = perfNs(out.io);
         // ARGB8888 u32 (BGRA bytes in little-endian memory) -> RGBA bytes
         // for the R8G8B8A8 raylib texture.
-        bgraToRgba(std.mem.bytesAsSlice(u32, od.scratch), std.mem.bytesAsSlice(u32, fb.data));
+        const scratch = std.mem.bytesAsSlice(u32, od.scratch);
+        const fb_px = std.mem.bytesAsSlice(u32, fb.data);
+        const full_w: usize = @intCast(fb.width);
+        const upload = uploadRegion(&state.damage, fb.width, fb.height);
+        if (upload) |region| {
+            // Byte-swap only the damaged box's rows into the scratch
+            // (offset into fb.data; tight w*h rows), then upload the box.
+            bgraToRgbaRegion(
+                scratch[0 .. region.w * region.h],
+                fb_px,
+                full_w,
+                region.x,
+                region.y,
+                region.w,
+                region.h,
+            );
+        } else {
+            bgraToRgba(scratch, fb_px);
+        }
         const perf_t_poll = perfNs(out.io);
         raylib.PollInputEvents();
         const rl_b: *Raylib = @ptrCast(@alignCast(out.backend.data));
         if (rl_b.poll_hook) |hook| hook(rl_b.poll_ctx.?);
         const perf_t_swap = perfNs(out.io);
-        raylib.UpdateTexture(od.texture, od.scratch.ptr);
+        if (upload) |region| {
+            raylib.UpdateTextureRec(od.texture, .{
+                .x = @floatFromInt(region.x),
+                .y = @floatFromInt(region.y),
+                .width = @floatFromInt(region.w),
+                .height = @floatFromInt(region.h),
+            }, scratch.ptr);
+        } else {
+            raylib.UpdateTexture(od.texture, od.scratch.ptr);
+        }
         const perf_t_upload = perfNs(out.io);
         raylib.BeginDrawing();
         raylib.ClearBackground(white);
@@ -241,18 +271,38 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
                 (perf_t_draw - perf_t0) / 1000,
             });
         }
-        raylib.PollInputEvents();
-        const rl: *Raylib = @ptrCast(@alignCast(out.backend.data));
-        if (rl.poll_hook) |hook| hook(rl.poll_ctx.?);
-        raylib.UpdateTexture(od.texture, od.scratch.ptr);
-        raylib.BeginDrawing();
-        raylib.ClearBackground(white);
-        raylib.DrawTexture(od.texture, 0, 0, white);
-        raylib.EndDrawing();
     }
     log_mod.info("commit: bits=0x{x} enabled={} scale={d} damage_rects={d}", out.io, out.log_cfg, "raylib", .{
         state.committed, state.enabled, state.scale, state.damage.rects.items.len,
     });
+}
+
+/// The upload region for this commit: the damage rects' bounding box
+/// clamped to the framebuffer, when it is non-empty and smaller than the
+/// full framebuffer. Null means the full UpdateTexture path: whole or
+/// empty damage, damage covering everything, or all damage off-screen
+/// (the visible framebuffer content is then unchanged).
+const UploadRegion = struct { x: usize, y: usize, w: usize, h: usize };
+
+fn uploadRegion(damage: *const wayland.utils.damage.Damage, fb_w: i32, fb_h: i32) ?UploadRegion {
+    if (damage.whole) return null;
+    const box = damage.boundingRect() orelse return null;
+    // Saturate the box edges in i64: damage rects are a hint and can lie
+    // outside the framebuffer or overflow i32 arithmetic.
+    const x0: i64 = @max(@as(i64, box.x), 0);
+    const y0: i64 = @max(@as(i64, box.y), 0);
+    const x1: i64 = @min(x0 + @as(i64, box.width), fb_w);
+    const y1: i64 = @min(y0 + @as(i64, box.height), fb_h);
+    if (x1 <= x0 or y1 <= y0) return null;
+    const w: i64 = x1 - x0;
+    const h: i64 = y1 - y0;
+    if (w * h >= @as(i64, fb_w) * @as(i64, fb_h)) return null;
+    return .{
+        .x = @intCast(x0),
+        .y = @intCast(y0),
+        .w = @intCast(w),
+        .h = @intCast(h),
+    };
 }
 
 /// ARGB8888 u32 (BGRA bytes in little-endian memory) -> RGBA bytes for
@@ -263,6 +313,31 @@ fn bgraToRgba(dst: []align(1) u32, src: []align(1) const u32) void {
     @setRuntimeSafety(false);
     for (src, 0..) |px, i| {
         dst[i] = (px & 0xFF00FF00) | ((px & 0x000000FF) << 16) | ((px >> 16) & 0x000000FF);
+    }
+}
+
+/// Region variant of bgraToRgba: byte-swaps only the box (x, y, w, h)
+/// within `src` (stride `src_stride` pixels per row) into the first w*h
+/// entries of `dst` — the layout UpdateTextureRec expects for a sub-rect
+/// upload (tight rows). Same hot-path safety profile: the box is clamped
+/// to the framebuffer by uploadRegion and the slices are fixed-size.
+fn bgraToRgbaRegion(
+    dst: []align(1) u32,
+    src: []align(1) const u32,
+    src_stride: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) void {
+    @setRuntimeSafety(false);
+    var row: usize = 0;
+    while (row < h) : (row += 1) {
+        const src_row = src[(y + row) * src_stride + x ..][0..w];
+        const dst_row = dst[row * w ..][0..w];
+        for (src_row, 0..) |px, i| {
+            dst_row[i] = (px & 0xFF00FF00) | ((px & 0x000000FF) << 16) | ((px >> 16) & 0x000000FF);
+        }
     }
 }
 

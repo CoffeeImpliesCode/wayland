@@ -54,6 +54,7 @@ pub const tracy_options: tracy.Options = .{
 };
 
 const log = wayland.utils.log;
+const geom = wayland.utils.geom;
 const wire = wayland.wire;
 const pixman = wayland.pixman;
 
@@ -558,30 +559,57 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         }
     }
 
-    // M3 cursor: follow the seat pointer, show the client cursor surface
-    // or the fallback rect.
-    updateCursor(self);
-    const perf_t_cursor = perfNs(self);
-
     const so = self.scene_output orelse {
         log.err("render: no scene output", self.io, self.log_cfg, "server", .{});
         return;
     };
 
-    // Single reused framebuffer; repaint everything every frame.
-    so.damage_ring.addWhole();
+    // M3 cursor: follow the seat pointer, show the client cursor surface
+    // or the fallback rect. Capture the previous frame's cursor footprints
+    // BEFORE updateCursor moves the nodes: a partial upload must repaint
+    // both the old and the new position.
+    const old_cursor = cursorFootprints(self);
+    updateCursor(self);
+    const new_cursor = cursorFootprints(self);
+    const perf_t_cursor = perfNs(self);
 
+    // Damage accumulation: this frame's surface damage translated into
+    // output coordinates, plus the cursor's old+new footprints. The ring
+    // is the upload region for the raylib backend; the pixman repaint
+    // below stays a full repaint. The first frame damages the whole
+    // output — the window texture starts blank, so a partial first upload
+    // would leave the background uninitialized.
+    if (self.frames_rendered == 0) {
+        so.addDamage(.{ .x = 0, .y = 0, .width = output_width, .height = output_height });
+    }
+    const out_rect: geom.Rect = .{ .x = 0, .y = 0, .width = output_width, .height = output_height };
     // The surfaces about to be drawn this frame (presentation feedback
     // targets): every tracked surface with an active scene node.
     // Rebuilt each frame; the compositor drives this loop.
     self.presented.clearRetainingCapacity();
     var entry_it = self.surface_entries.valueIterator();
     while (entry_it.next()) |entry| {
-        if (entry.*.node != null) {
-            self.presented.append(self.allocator, entry.*.surface) catch |err| {
-                log.warn("presented list append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        const node = entry.*.node orelse continue;
+        self.presented.append(self.allocator, entry.*.surface) catch |err| {
+            log.warn("presented list append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        };
+        // Translate the surface's damaged rects (surface coordinates) by
+        // the node's absolute position into output coordinates, clipped
+        // to the output (damage is a hint; clipping is safe).
+        const abs = node.absolutePosition();
+        for (entry.*.surface.current.surface_damage.rects.items) |rect| {
+            const translated: geom.Rect = .{
+                .x = addSat(abs.x, rect.x),
+                .y = addSat(abs.y, rect.y),
+                .width = rect.width,
+                .height = rect.height,
             };
+            if (out_rect.intersect(translated)) |visible| so.addDamage(visible);
         }
+    }
+    if (!std.meta.eql(old_cursor[0], new_cursor[0]) or !std.meta.eql(old_cursor[1], new_cursor[1])) {
+        for (old_cursor) |r| if (r) |rr| so.addDamage(rr);
+        for (new_cursor) |r| if (r) |rr| so.addDamage(rr);
     }
 
     // Composite the scene into the framebuffer, then present it.
@@ -589,7 +617,10 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     _ = so.damage_ring.rotate();
     const perf_t_render = perfNs(self);
 
-    // Present: hand the framebuffer to the output, damage the whole screen.
+    // Present: hand the framebuffer to the output. The output damage is
+    // the ring's rects for this frame — the raylib backend uploads only
+    // that region. An empty ring (nothing changed, or whole damage) falls
+    // back to a whole-output damage.
     var state = wayland.output.Output.State.init(self.allocator);
     defer state.deinit();
     state.committed = wayland.output.Output.State.committed_enabled |
@@ -598,12 +629,30 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     state.enabled = true;
     state.mode = .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec };
     state.buffer = @ptrCast(self.framebuffer);
-    state.damage.addWhole();
+    const damage_rects = so.takeDamage();
+    if (damage_rects.len == 0) {
+        state.damage.addWhole();
+    } else {
+        for (damage_rects) |rect| {
+            state.damage.add(rect) catch {
+                state.damage.addWhole();
+                break;
+            };
+        }
+    }
     out.commitState(&state) catch |err| {
         log.err("output commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
     const perf_t_present = perfNs(self);
+
+    // Frame callbacks: the surfaces presented this frame get
+    // wl_callback.done at present time (wlroots wlr_surface_send_frame_done,
+    // wlr_compositor.c:1131-1139). The time is the monotonic clock in ms
+    // (.awake = CLOCK_MONOTONIC in the 0.16 std.Io.Clock); the u32
+    // wrap-around is fine — the protocol defines an undefined base.
+    const now_ms: u32 = @truncate(@as(u64, @bitCast(std.Io.Clock.now(.awake, self.io.*).toMilliseconds())));
+    for (self.presented.items) |s| s.sendFrameDone(now_ms);
 
     if (self.perf) {
         log.info(perf_frame_fmt, self.io, self.log_cfg, "perf", .{
@@ -949,6 +998,29 @@ fn updateCursor(self: *ServerState) void {
         self.cursor_rect_node.?.enable(true);
         self.cursor_buf_node.?.enable(false);
     }
+}
+
+/// The cursor nodes' absolute rects (fallback rect + client cursor
+/// buffer), or null for a disabled node. renderFrame captures the old
+/// footprints before updateCursor moves the nodes so a partial upload
+/// repaints both the old and the new position.
+fn cursorFootprints(self: *ServerState) [2]?geom.Rect {
+    var out: [2]?geom.Rect = .{ null, null };
+    inline for (.{ self.cursor_rect_node, self.cursor_buf_node }, 0..) |node, i| {
+        if (node) |n| {
+            if (n.enabled) out[i] = n.absolutePosition();
+        }
+    }
+    return out;
+}
+
+/// Saturating i32 add: surface damage rects are client-controlled and may
+/// overflow when translated by the node position. Damage is a hint, so a
+/// saturated value is a safe over-report (clipped to the output below).
+fn addSat(a: i32, b: i32) i32 {
+    return std.math.add(i32, a, b) catch blk: {
+        break :blk if (b < 0) std.math.minInt(i32) else std.math.maxInt(i32);
+    };
 }
 
 /// Position every subsurface node over its mapped parent: the child node

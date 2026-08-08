@@ -4,23 +4,29 @@
 //! Commit pipeline order:
 //!   1. validate pending state (posts wl_surface protocol errors and
 //!      discards the commit on failure)
-//!   2. swap pending -> current (scalar copy; damage lists and frame
-//!      callbacks transfer so the pending state restarts empty)
+//!   2. swap pending -> current (scalar copy; damage lists transfer so
+//!      the pending state restarts empty; frame callbacks accumulate on
+//!      current across commits — each waits for the next present)
 //!   3. drop the buffer the surface stopped using (its lock was already
 //!      released at the end of the previous commit)
 //!   4. translate the committed surface damage into buffer coordinates
 //!      (scale + inverse transform) and union into current.buffer_damage
 //!   5. role.client_commit hook
-//!   6. send frame callback done(ms) with the monotonic timestamp
-//!   7. role.commit hook
-//!   8. emit client_commit + commit signals
-//!   9. map/unmap transition: mapped = (current.buffer != null and
+//!   6. role.commit hook
+//!   7. emit client_commit + commit signals
+//!   8. map/unmap transition: mapped = (current.buffer != null and
 //!      width/height > 0); on change, run the role.map/role.unmap hook
 //!      and the map/unmap signal
-//!  10. unlock the current buffer (wlroots wlr_compositor.c:570-574) so
+//!   9. unlock the current buffer (wlroots wlr_compositor.c:570-574) so
 //!      the client may reuse it (double buffering); the release signal
 //!      fires here (buffers/buffer.zig) and completes get_release
 //!      callbacks
+//!
+//! Frame callbacks are NOT completed at commit: they accumulate in
+//! current.frame_callbacks and are sent with wl_callback.done by
+//! sendFrameDone at present time (wlroots wlr_surface_send_frame_done,
+//! wlr_compositor.c:1131-1139). wl_surface.frame is a pacing hint, not a
+//! commit acknowledgement.
 //!
 //! M1 simplifications (documented at each site):
 //! - opaque/input regions are snapshotted as the region's rect list at
@@ -124,8 +130,9 @@ pub const State = struct {
     transform: geom.Transform = .normal,
     /// Scale the client rendered the buffer at.
     scale: i32 = 1,
-    /// wl_callback resources created by wl_surface.frame, completed with
-    /// done(ms) at commit.
+    /// wl_callback resources created by wl_surface.frame. Completed with
+    /// done(ms) at present time by Surface.sendFrameDone (wlroots
+    /// wlr_surface_send_frame_done); they accumulate here until then.
     frame_callbacks: std.ArrayList(*server.wl.Callback) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) State {
@@ -330,6 +337,16 @@ pub const Surface = struct {
         const old_buffer = s.current.buffer;
         swapState(&s.current, s.allocator, &s.pending);
 
+        // Frame callbacks accumulate across commits until the next
+        // present: each wl_surface.frame waits for the present that
+        // follows its commit (wlroots surface_state_move appends the
+        // pending list to current, wlr_compositor.c:341-348).
+        s.current.frame_callbacks.appendSlice(s.allocator, s.pending.frame_callbacks.items) catch {
+            s.resource.postNoMemory();
+            return;
+        };
+        s.pending.frame_callbacks.clearRetainingCapacity();
+
         // 3. The surface stopped using the previous buffer. Its lock was
         // already released at the end of the previous commit, so this only
         // marks the producer done; the guard keeps a zero-count buffer
@@ -352,19 +369,14 @@ pub const Surface = struct {
         // 5. Role-specific processing of the committed state.
         if (s.role) |role| if (role.client_commit) |f| f(s);
 
-        // 6. Complete frame callbacks with the monotonic time (ms).
-        // .awake is CLOCK_MONOTONIC in the 0.16 std.Io.Clock. The u32
-        // wrap-around is fine: the protocol defines an undefined base.
-        const now_ms: u32 = @truncate(@as(u64, @bitCast(std.Io.Clock.now(.awake, s.io.*).toMilliseconds())));
-        for (s.current.frame_callbacks.items) |cb| cb.destroySendDone(now_ms);
-        s.current.frame_callbacks.clearRetainingCapacity();
-
-        // 7-8. Role commit hook, then the commit signals.
+        // 6. Role commit hook, then the commit signals. Frame callbacks
+        // are not completed here: sendFrameDone fires them at present
+        // time (wlroots wlr_surface_send_frame_done).
         if (s.role) |role| if (role.commit) |f| f(s);
         s.events.client_commit.emit(s);
         s.events.commit.emit(s);
 
-        // 9. Map/unmap transition. wlroots maps only when the buffer has a
+        // 7. Map/unmap transition. wlroots maps only when the buffer has a
         // positive size (wlr_surface_state_has_buffer, wlr_compositor.h:356);
         // the unmap transition stays buffer == null.
         const now_mapped = blk: {
@@ -381,7 +393,7 @@ pub const Surface = struct {
             s.events.unmap.emit(s);
         }
 
-        // 10. Unlock the current buffer (wlroots wlr_compositor.c:570-574)
+        // 8. Unlock the current buffer (wlroots wlr_compositor.c:570-574)
         // so the client can reuse it immediately (double buffering). The
         // lockless re-attach special case leaves n_locks at 0, so guard the
         // unlock; the release signal fires here (buffers/buffer.zig) and
@@ -390,6 +402,18 @@ pub const Surface = struct {
             if (b.n_locks > 0) b.unlock();
             s.fireReleaseCallbacksCurrent();
         }
+    }
+
+    /// Complete every frame callback accumulated since the last present
+    /// with the given monotonic time (ms) and destroy the callback
+    /// resources (wlroots wlr_surface_send_frame_done,
+    /// wlr_compositor.c:1131-1139). Called by the compositor after the
+    /// surface's content was presented; the callbacks queue until then.
+    /// The u32 wrap-around is fine: the protocol defines an undefined
+    /// base for the time.
+    pub fn sendFrameDone(s: *Surface, time_ms: u32) void {
+        for (s.current.frame_callbacks.items) |cb| cb.destroySendDone(time_ms);
+        s.current.frame_callbacks.clearRetainingCapacity();
     }
 
     fn validatePending(s: *Surface) bool {
@@ -583,9 +607,10 @@ pub const Surface = struct {
     }
 };
 
-/// Apply pending to current. Scalar state copies; the damage lists and
-/// frame callbacks transfer so the pending state restarts empty (the old
-/// current damage is stale — M2's damage ring accumulates properly).
+/// Apply pending to current. Scalar state copies; the damage lists
+/// transfer so the pending state restarts empty (the old current damage
+/// is stale — M2's damage ring accumulates properly). Frame callbacks do
+/// NOT transfer here: Surface.commit accumulates them across commits.
 pub fn swapState(current: *State, allocator: Allocator, pending: *State) void {
     current.committed = pending.committed;
     pending.committed = 0;
@@ -608,8 +633,9 @@ pub fn swapState(current: *State, allocator: Allocator, pending: *State) void {
     pending.surface_damage.clear();
     std.mem.swap(Damage, &current.buffer_damage, &pending.buffer_damage);
     pending.buffer_damage.clear();
-    std.mem.swap(std.ArrayList(*server.wl.Callback), &current.frame_callbacks, &pending.frame_callbacks);
-    pending.frame_callbacks.clearRetainingCapacity();
+    // Frame callbacks are NOT transferred here: they accumulate on
+    // current in Surface.commit until the next present (a commit must not
+    // drop callbacks that are still waiting for wl_callback.done).
 }
 
 fn regionModFromResource(resource: *server.wl.Region) ?*region_mod.Region {
@@ -836,7 +862,7 @@ var test_buffer_impl: buffer_mod.Impl = .{
 
 // --- Tests --------------------------------------------------------------
 
-test "state swap transfers damage and callbacks, resets pending" {
+test "state swap transfers damage and regions, resets pending" {
     const allocator = testing.allocator;
     var current = State.init(allocator);
     defer current.deinit(allocator);
@@ -882,8 +908,10 @@ test "state swap transfers damage and callbacks, resets pending" {
     try testing.expect(pending.surface_damage.isEmpty());
     try testing.expectEqual(@as(usize, 1), current.buffer_damage.rects.items.len);
     try testing.expect(pending.buffer_damage.isEmpty());
-    try testing.expectEqual(@as(usize, 1), current.frame_callbacks.items.len);
-    try testing.expectEqual(@as(usize, 0), pending.frame_callbacks.items.len);
+    // Frame callbacks are NOT moved by swapState: Surface.commit
+    // accumulates them on current across commits until the next present.
+    try testing.expectEqual(@as(usize, 0), current.frame_callbacks.items.len);
+    try testing.expectEqual(@as(usize, 1), pending.frame_callbacks.items.len);
 }
 
 test "damage requests accumulate in separate coordinate spaces" {
@@ -908,7 +936,7 @@ test "damage requests accumulate in separate coordinate spaces" {
     try testing.expect(s.pending.committed & State.committed_damage != 0);
 }
 
-test "frame callbacks are completed at commit" {
+test "frame callbacks are deferred until sendFrameDone" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
@@ -926,8 +954,26 @@ test "frame callbacks are completed at commit" {
 
     s.commit();
 
-    // done was sent and the callbacks were destroyed; lists are empty.
+    // Commit only stores the callbacks (moved to current); the done event
+    // fires later, at present time, via sendFrameDone (wlroots
+    // wlr_surface_send_frame_done, wlr_compositor.c:1131-1139).
     try testing.expectEqual(@as(usize, 0), s.pending.frame_callbacks.items.len);
+    try testing.expectEqual(@as(usize, 2), s.current.frame_callbacks.items.len);
+
+    // Multiple commits accumulate callbacks until the present.
+    s.handleFrame(tw.newId());
+    s.commit();
+    try testing.expectEqual(@as(usize, 3), s.current.frame_callbacks.items.len);
+
+    // sendFrameDone completes and destroys them.
+    s.sendFrameDone(1234);
+    try testing.expectEqual(@as(usize, 0), s.current.frame_callbacks.items.len);
+
+    // A later frame callback is held again until the next sendFrameDone.
+    s.handleFrame(tw.newId());
+    s.commit();
+    try testing.expectEqual(@as(usize, 1), s.current.frame_callbacks.items.len);
+    s.sendFrameDone(2345);
     try testing.expectEqual(@as(usize, 0), s.current.frame_callbacks.items.len);
 }
 

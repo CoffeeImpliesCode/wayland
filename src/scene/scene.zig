@@ -262,7 +262,10 @@ pub const SceneRectNode = struct {
 
 /// A view of the scene onto one output: the output rect in scene space is
 /// (x, y, output.width, output.height). render() composites the tree into
-/// the renderer target for this output.
+/// the renderer target for this output. The damage ring tracks what
+/// changed on this output: the compositor accumulates per-surface damage
+/// via addDamage before render, rotates the ring after render, and reads
+/// the frame's rects back via takeDamage for the output commit.
 pub const SceneOutput = struct {
     output: *output_mod.Output,
     scene: *Scene,
@@ -305,6 +308,35 @@ pub const SceneOutput = struct {
         const allocator = so.scene.allocator;
         so.damage_ring.deinit();
         allocator.destroy(so);
+    }
+
+    /// Accumulate `rect` (in output coordinates) into this frame's
+    /// damage. Called by the compositor for every damaged surface region
+    /// (and cursor move) before render; takeDamage after rotate carries
+    /// the frame's region to the output commit (wlr_damage_ring_add_box,
+    /// types/wlr_damage_ring.c:40).
+    pub fn addDamage(so: *SceneOutput, rect: geom.Rect) void {
+        so.damage_ring.add(rect) catch {
+            // Out of memory: whole-output damage is the conservative
+            // fallback (the full region gets repainted/uploaded).
+            so.damage_ring.addWhole();
+        };
+    }
+
+    /// The rects accumulated for the frame that was just rotated out —
+    /// i.e. THIS frame's damage after `damage_ring.rotate()`. Empty when
+    /// the frame carried no rect damage (nothing, or whole damage that
+    /// degenerates to a full repaint); callers fall back to whole-output
+    /// damage then. The returned slice is valid until the next
+    /// add/rotate on this output.
+    pub fn takeDamage(so: *SceneOutput) []const geom.Rect {
+        const ring = &so.damage_ring;
+        // rotate() moved this frame's accumulation into the newest history
+        // slot; num_buffers=1 disables history entirely (no slot).
+        if (ring.history.items.len == 0) return &.{};
+        const frame = &ring.history.items[0];
+        if (frame.whole) return &.{};
+        return frame.rects.items;
     }
 
     /// Composite the scene into the renderer target (framebuffer) for this
@@ -709,6 +741,42 @@ test "render composites background rect and buffer nodes" {
     }, rec.textures.items[1]);
 
     try testing.expectEqual(@as(usize, 1), rec.submits);
+}
+
+test "SceneOutput damage ring accumulates and takeDamage returns the frame's rects" {
+    const allocator = testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    const scene = try makeScene(allocator, &io, &log_cfg);
+    defer scene.deinit();
+    const created = try makeOutput(allocator, &io, &log_cfg);
+    const out = created[0];
+    defer out.destroy();
+    defer created[1].destroy();
+
+    const so = try SceneOutput.create(allocator, &io, &log_cfg, scene, out);
+    defer so.destroy();
+    try testing.expect(so.damage_ring.isEmpty());
+
+    // Frame A: two rects accumulate; rotate ages them out of current.
+    so.addDamage(.{ .x = 1, .y = 2, .width = 3, .height = 4 });
+    so.addDamage(.{ .x = 5, .y = 6, .width = 7, .height = 8 });
+    so.damage_ring.rotate();
+    const rects = so.takeDamage();
+    try testing.expectEqual(@as(usize, 2), rects.len);
+    try testing.expectEqual(Rect{ .x = 1, .y = 2, .width = 3, .height = 4 }, rects[0]);
+    try testing.expectEqual(Rect{ .x = 5, .y = 6, .width = 7, .height = 8 }, rects[1]);
+
+    // Frame B: no damage -> empty takeDamage (caller falls back to whole).
+    so.damage_ring.rotate();
+    try testing.expectEqual(@as(usize, 0), so.takeDamage().len);
+
+    // Frame C: whole damage degenerates to empty too.
+    so.damage_ring.addWhole();
+    so.damage_ring.rotate();
+    try testing.expectEqual(@as(usize, 0), so.takeDamage().len);
 }
 
 test "render culls nodes outside the output rect" {
