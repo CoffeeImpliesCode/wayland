@@ -1,0 +1,75 @@
+# Data Device — wlroots/smithay diff
+
+Our module: src/compositor/data_device.zig (wl_data_device_manager v3: clipboard selection relay only, no DnD).
+wlroots 0.20.2: types/data_device/ (wlr_data_device.c, wlr_data_offer.c, wlr_data_source.c, wlr_drag.c).
+smithay 0.7.0: src/wayland/selection/ (data_device/{mod,device,source}.rs, seat_data.rs, offer.rs, source.rs) + src/input/dnd/grab.rs.
+
+## Surface
+
+Flat inventory of every type/fn in src/compositor/data_device.zig (public + top-level private):
+
+- `pub const data_device_version: u32 = 3` — src/compositor/data_device.zig:30
+- `pub const DataDeviceManager` struct — :32 (allocator, io, log_cfg, display, seat, global, devices list, focus_listener)
+- `pub fn DataDeviceManager.init` — :43 (registers global, subscribes keyboard_focus)
+- `pub fn DataDeviceManager.deinit` — :75
+- `const DataDevice` struct — :84 (manager, resource, selection_source)
+- `const DataSource` struct — :92 (manager, resource, mime_types list, selected flag)
+- `const DataOffer` struct — :103 (manager, resource, source ptr)
+- `fn bindManager` — :109
+- `fn managerRequest` — :117 (create_data_source :122-138; get_data_device :140-167)
+- `fn sourceRequest` — :169 (offer, set_actions, destroy)
+- `fn sourceDestroy` — :188
+- `fn deviceRequest` — :210 (set_selection :212-234; start_drag :236-241; release :243)
+- `fn deviceDestroy` — :247
+- `fn onKeyboardFocus` — :264
+- `fn deliverSelectionToFocus` — :272
+- `fn offerRequest` — :303 (accept, receive :310-318, destroy, finish, set_actions)
+- `fn offerDestroy` — :328
+
+## Comparison
+
+| Our fn | Our semantics | wlroots | smithay | Verdict | Note |
+|---|---|---|---|---|---|
+| data_device_version (data_device.zig:30) | Manager global version 3 | DATA_DEVICE_MANAGER_VERSION 3, types/data_device/wlr_data_device.c:13 | `create_global::<D, WlDataDeviceManager, _>(3, ...)`, src/wayland/selection/data_device/mod.rs:585 | same | — |
+| DataDeviceManager.init (data_device.zig:43) | Create global, wire keyboard_focus listener | wlr_data_device_manager_create, wlr_data_device.c:295-319 | DataDeviceState::new, data_device/mod.rs:580-592 | close | smithay keeps state inside compositor State; wlroots on display destroy hook |
+| DataDeviceManager.deinit (data_device.zig:75) | Remove global, free devices | handle_display_destroy, wlr_data_device.c:283-293 | GlobalId drop (global removed on state drop), data_device/mod.rs:594-599 | close | — |
+| DataDevice struct (data_device.zig:84) | Per-client device holding its own selection_source | No per-device selection: `seat->selection_source`, wlr_data_device.c:184-215; per-seat-client device lists, wlr_data_device.c:226-252 | SelectionDevice + SeatData.known_devices, seat_data.rs:11-18, 31-44; `clipboard_selection` per seat | divergent | Selection stored per client device, not per seat; breaks cross-client clipboard |
+| DataSource struct (data_device.zig:92) | mime list + selected flag | wlr_client_data_source / wlr_data_source (mime wl_array, actions, finalized, accepted), wlr_data_source.c:82-274 | DataSourceUserData + SourceMetadata (mime_types, dnd_actions), data_device/source.rs:32-46 | close | Ours lacks actions, finalized, accepted state |
+| DataOffer struct (data_device.zig:103) | offer resource + source ptr | wlr_data_offer (type, source, source_destroy listener), wlr_data_offer.c:239-284 | WlDataOffer + OfferReplyData (Arc source), offer.rs:122-195; WlDndDataOffer for DnD, data_device/mod.rs:212-241 | close | Ours has no source_destroy unlink; dangling ptr hazard |
+| bindManager (data_device.zig:109) | Bind wl_data_device_manager | data_device_manager_bind, wlr_data_device.c:269-281 | GlobalDispatch2::bind, data_device/mod.rs:778-800 | same | — |
+| managerRequest.create_data_source (data_device.zig:122) | Create DataSource resource at v3 | data_device_manager_create_data_source, wlr_data_device.c:254-261 | handlers CreateDataSource, data_device/mod.rs:801-807 | close | Ours hardcodes v3; wlroots/smithay pass client/global version |
+| managerRequest.get_data_device (data_device.zig:140) | Create device, ignore seat arg, no bind-time delivery | data_device_manager_get_data_device, wlr_data_device.c:226-252 (binds to seat_client, sends selection if already focused) | handlers GetDataDevice, data_device/mod.rs:810-830 (requires managed Seat) | divergent | Seat argument ignored (single-seat assumption); no immediate selection on bind |
+| sourceRequest.offer (data_device.zig:169) | Append mime (no dedup) | data_source_offer, wlr_data_source.c:184-220 (dedups, warns after finalize) | DataSourceUserData::request Offer, data_device/source.rs:53-63 (push, no dedup) | close | Duplicate offers match smithay, diverge wlroots |
+| sourceRequest.set_actions (data_device.zig:224) | No-op | data_source_set_actions, wlr_data_source.c:152-182 (validates mask, stores actions, finalized check) | Store dnd_actions in metadata, data_device/source.rs:64-70 | divergent | Action state dropped |
+| sourceRequest.destroy (data_device.zig:226) | Destroy resource | data_source_destroy, wlr_data_source.c:147-150 → resource destroy → wlr_data_source_destroy (cancelled + seat cleanup), wlr_data_source.c:227-234 | Request::Destroy no-op; cleanup in destroyed(), data_device/source.rs:71-110 | close | — |
+| sourceDestroy (data_device.zig:188) | Clear stored selection, send cancelled if selected, free | client_data_source_destroy (sends cancelled), wlr_data_source.c:114-120; seat_handle_selection_source_destroy (re-broadcast NULL), wlr_data_device.c:167-182 | DataSourceUserData::destroyed clears clipboard selection → re-broadcast, data_device/source.rs:81-110 | divergent | No re-broadcast of selection(NULL) to focused client |
+| deviceRequest.set_selection (data_device.zig:212) | Cancel old source, store new on this device, deliver to focus | data_device_set_selection, wlr_data_device.c:24-45; wlr_seat_request_set_selection (serial + superseded validation), wlr_data_device.c:144-165; wlr_seat_set_selection (destroys old source, re-broadcast), wlr_data_device.c:184-215 | device.rs SetSelection (requires device client keyboard-focused, handler.new_selection, SeatData::set_clipboard_selection cancels old), data_device/device.rs:102-136; seat_data.rs:59-78 | divergent | No serial validation, no focus requirement, per-device storage, no NULL selection on clear |
+| deviceRequest.start_drag (data_device.zig:236) | Cancel source only | data_device_start_drag (role check, icon), wlr_data_device.c:47-87; wlr_drag_create, wlr_drag.c:444-491; wlr_seat_start_pointer/touch_drag, wlr_drag.c:541-561 | device.rs StartDrag (serial vs pointer/touch implicit grab, DND_ICON_ROLE, dnd_requested), data_device/device.rs:63-146; DnDGrab, src/input/dnd/grab.rs:41+ | divergent | No DnD at all |
+| deviceRequest.release (data_device.zig:243) | Destroy device | data_device_release, wlr_data_device.c:89-92 | Release removes device from seat_data, data_device/device.rs:137-143 | same | — |
+| deviceDestroy (data_device.zig:247) | Cancel stored selection, unlink, free | data_device_handle_resource_destroy (unlink only; seat selection persists), wlr_data_device.c:100-103 | destroyed() removes device; selection persists, data_device/device.rs:199-209 | divergent | Ours cancels the selection when the device dies |
+| onKeyboardFocus (data_device.zig:264) | Re-deliver selection on every focus change | Focus change triggers seat_client_send_selection from seat code, wlr_data_device.c:125-143 | set_data_device_focus called from compositor focus hook, data_device/mod.rs:625-643; re-offer only if focus changed, seat_data.rs:47-57 | close | Ours re-delivers even when focus unchanged |
+| deliverSelectionToFocus (data_device.zig:272) | Offer + selection to focused client's own device only | device_resource_send_selection (sends offer or NULL), wlr_data_device.c:105-123; seat_client_send_selection (destroys all old selection offers first), wlr_data_device.c:125-143 | send_selection (creates offer, sends offer + mimes + selection to focused client), seat_data.rs:125-217 | divergent | Per-device source lookup (cross-client broken); no old-offer destroy; no selection(NULL); early return on unfocus |
+| offerRequest.accept (data_device.zig:305) | Ignored | data_offer_handle_accept (ignored for selection offers), wlr_data_offer.c:78-92 | Selection offers: OfferReplyData ignores; DnD: handle_dnd Accept, data_device/mod.rs:259-270 | close | All ignore accept for selection |
+| offerRequest.receive (data_device.zig:310) | Relay mime+fd to source client, close fd | data_offer_handle_receive → wlr_data_source_send, wlr_data_offer.c:94-102; client_data_source_send (send + close), wlr_data_source.c:24-27, 106-112 | OfferReplyData::request (validates mime, source.send with OwnedFd, RAII close), offer.rs:126-193 | close | Ours/wlroots do not validate mime; smithay does; fd handling equivalent |
+| offerRequest.destroy (data_device.zig:319) | Destroy offer | data_offer_handle_destroy, wlr_data_offer.c:118-121 | DnD: handle_dnd Destroy, data_device/mod.rs:271-276; selection offers have no destroy handler | same | — |
+| offerRequest.finish (data_device.zig:320) | No-op | data_offer_handle_finish (post_error INVALID_FINISH on selection offers), wlr_data_offer.c:123-153 | DnD: handle_dnd Finish (post_error on invalid), data_device/mod.rs:278-296 | divergent | Ours silently ignores instead of protocol error |
+| offerRequest.set_actions (data_device.zig:322) | No-op | data_offer_handle_set_actions (mask/action validation, post_error on selection offers, action update), wlr_data_offer.c:155-189; data_offer_update_action, wlr_data_offer.c:57-76 | DnD: handle_dnd SetActions (action_choice, action/source.choose_action), data_device/mod.rs:298-347 | divergent | Ours ignores instead of erroring on selection offers |
+| offerDestroy (data_device.zig:328) | Free offer only | data_offer_destroy (dnd_finish cleanup, inert resource, source_destroy listener), wlr_data_offer.c:191-214; data_offer_handle_source_destroy, wlr_data_offer.c:230-236 | OfferReplyData::destroyed no-op, offer.rs:195; WlDndDataOffer::destroyed no-op, data_device/mod.rs:233-241 | close | Ours never unlinks live offers from a destroyed source |
+
+## Gaps
+
+1. Selection is per client device, not per seat. The stored selection lives on the device that set it (src/compositor/data_device.zig:84-90), and deliverSelectionToFocus reads the focused client's own device source and breaks when it is null (:272-301). A client can never receive another client's selection: cross-client copy/paste is broken. wlroots stores `seat->selection_source` (types/data_device/wlr_data_device.c:184-215); smithay stores `SeatData.clipboard_selection` (src/wayland/selection/seat_data.rs:11-18).
+2. No serial validation on set_selection; the request's serial is ignored (src/compositor/data_device.zig:212-234). wlroots validates the serial and rejects superseded selections (types/data_device/wlr_data_device.c:144-165). smithay instead requires the device client to hold keyboard focus (src/wayland/selection/data_device/device.rs:103-123).
+3. Offer lifetime is unmanaged. Every focus change / set_selection creates a fresh wl_data_offer (src/compositor/data_device.zig:272-301) and old offers are never destroyed, so they accumulate on the target client. Offers hold a raw `source` pointer with no source-destroy listener; a live offer after its source dies dereferences freed memory in receive (src/compositor/data_device.zig:303-326, 328-333). wlroots destroys all old selection offers before re-sending (types/data_device/wlr_data_device.c:125-143) and nulls the source via a destroy listener (types/data_device/wlr_data_offer.c:230-236).
+4. No selection(NULL) event. When the selection is cleared or the focused client has none, deliverSelectionToFocus returns early (src/compositor/data_device.zig:273) or breaks (:278-279); the focused client keeps its stale offer. wlroots sends selection(NULL) (types/data_device/wlr_data_device.c:105-123); smithay sends unset_selection (src/wayland/selection/seat_data.rs:147-149).
+5. No drag-and-drop. start_drag only cancels the source (src/compositor/data_device.zig:236-241). wlroots implements drag icons (drag_icon_surface_role, types/data_device/wlr_drag.c:411-415), pointer/touch/keyboard grabs with enter/leave/motion (:30-121, :182-352), drop (:213-232), and dnd_drop_performed/dnd_finished via the source impl (types/data_device/wlr_data_source.c:122-145, 59-77). smithay validates the serial against the implicit pointer/touch grab, assigns DND_ICON_ROLE, and routes to WaylandDndGrabHandler::dnd_requested + DnDGrab (src/wayland/selection/data_device/device.rs:63-146; src/input/dnd/grab.rs:41+). We never send dnd_drop_performed or dnd_finished.
+6. No action negotiation. source.set_actions and offer.set_actions are no-ops (src/compositor/data_device.zig:224, 322-325); no source_actions/action events, no chosen-action state. wlroots stores and validates actions and computes the negotiated action (types/data_device/wlr_data_source.c:152-182; types/data_device/wlr_data_offer.c:57-76, 155-189). smithay stores dnd_actions and negotiates via action_choice (src/wayland/selection/data_device/source.rs:64-70; data_device/mod.rs:298-347).
+7. finish and set_actions on a selection offer are silently ignored instead of producing the protocol error wlroots posts (src/compositor/data_device.zig:320-326 vs types/data_device/wlr_data_offer.c:123-153, 155-189). smithay selection offers also ignore them (N/A for the error path).
+8. Device destroy cancels the stored selection (src/compositor/data_device.zig:247-254); wlroots and smithay keep the seat selection alive when the device dies (types/data_device/wlr_data_device.c:100-103; src/wayland/selection/data_device/device.rs:199-209).
+9. get_data_device ignores the seat argument and does not deliver the current selection to a client that binds while already focused (src/compositor/data_device.zig:129-131). wlroots sends the selection at bind time for the focused seat client (types/data_device/wlr_data_device.c:247-249). smithay also omits bind-time delivery.
+10. receive does not validate the requested mime type (src/compositor/data_device.zig:310-318). smithay denies invalid mime types (src/wayland/selection/offer.rs:165-168); wlroots relays without validation like us.
+11. No per-version negotiation: data source, device, and offer resources are created at hardcoded version 3 (src/compositor/data_device.zig:127, 132, 278); wlroots threads the manager/device version through (types/data_device/wlr_data_device.c:236-244, 254-261).
+
+## Verdict
+
+Partial parity for the M3 clipboard subset; far from wlroots/smithay parity overall. The riskiest divergence is per-device selection storage: the clipboard never crosses clients, which is the protocol's core purpose. The unmanaged offer lifetime (dangling source pointers, offer accumulation) is a latent memory-safety bug. DnD, action negotiation, and serial/focus validation are entirely absent, so the module only supports a narrow single-client clipboard flow.
