@@ -18,6 +18,12 @@
 //! pointer focus surface. The seat also emits `key` signals so the
 //! compositor can bind keys (the server quits on Mod4+Escape).
 //!
+//! Event delivery follows wlroots: keyboard and pointer events (enter,
+//! leave, key, modifiers, motion, button, axis) reach only the focused
+//! client's resources, never the whole seat's resource list. libwayland
+//! itself rejects events carrying another client's surface, so a fan-out
+//! would kill the unfocused clients.
+//!
 //! Imports: utils/*, core/wire.zig, core/display.zig, buffers (via the
 //! surface), compositor/surface.zig + xkb.zig (sibling modules).
 
@@ -25,10 +31,12 @@ const std = @import("std");
 const log = @import("../utils/log.zig");
 const wire = @import("../core/wire.zig");
 const display_mod = @import("../core/display.zig");
+const compositor_mod = @import("compositor.zig");
 const surface_mod = @import("surface.zig");
 const xkb_mod = @import("xkb.zig");
 
 const server = @import("protocol").server;
+const client = @import("protocol").client;
 
 const Surface = surface_mod.Surface;
 const Fixed = wire.wl.Fixed;
@@ -180,10 +188,16 @@ pub const Seat = struct {
             return; // no focus, no motion target
         }
         const time = nowMs(self);
-        for (self.pointers.items) |ptr| {
-            if (self.pointer_focus == null) continue;
-            ptr.sendMotion(time, Fixed.fromInt(@intCast(self.focus_x)), Fixed.fromInt(@intCast(self.focus_y)));
-            if (ptr.getVersion() >= 5) ptr.sendFrame();
+        // Motion goes only to the focused client's pointer resources
+        // (wlroots: wlr_seat_pointer_send_motion iterates
+        // focused_client->pointers, wlr_seat_pointer.c:246-268).
+        if (self.pointer_focus) |focus| {
+            const focus_client = focus.resource.getClient();
+            for (self.pointers.items) |ptr| {
+                if (ptr.getClient() != focus_client) continue;
+                ptr.sendMotion(time, Fixed.fromInt(@intCast(self.focus_x)), Fixed.fromInt(@intCast(self.focus_y)));
+                if (ptr.getVersion() >= 5) ptr.sendFrame();
+            }
         }
         self.events.pointer_move.emit(self);
     }
@@ -197,42 +211,80 @@ pub const Seat = struct {
         const serial = self.display.nextSerial();
         const time = nowMs(self);
         const state: server.wl.Pointer.ButtonState = if (pressed) .pressed else .released;
-        for (self.pointers.items) |ptr| {
-            ptr.sendButton(serial, time, button, state);
-            if (ptr.getVersion() >= 5) ptr.sendFrame();
+        // Button goes only to the focused client's pointer resources
+        // (wlroots: wlr_seat_pointer_send_button iterates
+        // focused_client->pointers, wlr_seat_pointer.c:274-295).
+        if (self.pointer_focus) |focus| {
+            const focus_client = focus.resource.getClient();
+            for (self.pointers.items) |ptr| {
+                if (ptr.getClient() != focus_client) continue;
+                ptr.sendButton(serial, time, button, state);
+                if (ptr.getVersion() >= 5) ptr.sendFrame();
+            }
         }
         self.events.button.emit(self);
     }
 
     /// Vertical/horizontal wheel or scroll axis. `value` is in pixels
     /// (10 per notch is the wlroots convention), `discrete` the notches.
+    ///
+    /// Event shape follows wlr_seat_pointer_send_axis
+    /// (wlr_seat_pointer.c:321-392): value != 0 emits axis_source +
+    /// (axis_discrete) + axis, while value == 0 terminates the scroll
+    /// with axis_stop. Events go only to the focused client's pointer
+    /// resources.
     pub fn pointerAxis(self: *Seat, axis: server.wl.Pointer.Axis, value: f64, discrete: i32) void {
+        const focus = self.pointer_focus orelse return;
+        const focus_client = focus.resource.getClient();
         const time = nowMs(self);
         for (self.pointers.items) |ptr| {
+            if (ptr.getClient() != focus_client) continue;
             if (ptr.getVersion() >= 5) {
                 ptr.sendAxisSource(.wheel);
-                if (discrete != 0) ptr.sendAxisDiscrete(axis, discrete);
-                ptr.sendAxisStop(time, axis);
+                if (value != 0) {
+                    if (discrete != 0) ptr.sendAxisDiscrete(axis, discrete);
+                    ptr.sendAxis(time, axis, Fixed.fromDouble(value));
+                } else {
+                    ptr.sendAxisStop(time, axis);
+                }
+                ptr.sendFrame();
+            } else if (value != 0) {
+                // Pre-v5 clients: axis only (source/discrete/stop do not
+                // exist below version 5).
+                ptr.sendAxis(time, axis, Fixed.fromDouble(value));
             }
-            ptr.sendAxis(time, axis, Fixed.fromDouble(value));
-            if (ptr.getVersion() >= 5) ptr.sendFrame();
         }
     }
 
     /// Set keyboard focus. Sends leave to the old and enter (with the
-    /// currently pressed keys) to the new focus surface.
+    /// currently pressed keys) to the new focus surface. Both go only to
+    /// the respective surface's client's keyboards (wlroots:
+    /// wlr_seat_keyboard_enter, wlr_seat_keyboard.c:234-311); libwayland
+    /// rejects enter/leave carrying a foreign client's surface.
     pub fn setKeyboardFocus(self: *Seat, surface: ?*Surface) void {
         if (surface == self.keyboard_focus) return;
         const serial = self.display.nextSerial();
         if (self.keyboard_focus) |old| {
             const old_res = old.resource;
-            for (self.keyboards.items) |kbd| kbd.sendLeave(serial, old_res);
+            const old_client = old_res.getClient();
+            for (self.keyboards.items) |kbd| {
+                if (kbd.getClient() != old_client) continue;
+                kbd.sendLeave(serial, old_res);
+            }
         }
         self.keyboard_focus = surface;
         if (surface) |s| {
             const s_res = s.resource;
+            const s_client = s_res.getClient();
             var keys = wire.wl.Array.fromArrayList(u32, self.pressed);
-            for (self.keyboards.items) |kbd| kbd.sendEnter(serial, s_res, &keys);
+            for (self.keyboards.items) |kbd| {
+                if (kbd.getClient() != s_client) continue;
+                kbd.sendEnter(serial, s_res, &keys);
+            }
+            // wlroots sends the current modifiers to the newly focused
+            // client right after enter (wlr_seat_keyboard.c:291); the
+            // protocol mandates a modifiers event after enter.
+            self.sendKeyboardModifiers();
             log.debug("keyboard focus -> surface@{d}", self.io, self.log_cfg, "seat", .{s_res.getId()});
         }
         self.events.keyboard_focus.emit(self);
@@ -268,17 +320,24 @@ pub const Seat = struct {
             self.mods_depressed = mods.depressed;
             self.mods_latched = mods.latched;
             self.mods_locked = mods.locked;
-            const serial = self.display.nextSerial();
-            for (self.keyboards.items) |kbd| {
-                kbd.sendModifiers(serial, self.mods_depressed, self.mods_latched, self.mods_locked, 0);
-            }
+            // Modifier broadcasts go only to the focused client's
+            // keyboards (wlroots: wlr_seat_keyboard_send_modifiers
+            // iterates focused_client->keyboards).
+            self.sendKeyboardModifiers();
         }
 
         const state: server.wl.Keyboard.KeyState = if (pressed) .pressed else .released;
         const serial = self.display.nextSerial();
         const time = nowMs(self);
-        if (self.keyboard_focus) |_| {
-            for (self.keyboards.items) |kbd| kbd.sendKey(serial, time, keycode, state);
+        // Key events go only to the focused client's keyboards
+        // (wlroots: wlr_seat_keyboard_send_key iterates
+        // focused_client->keyboards, wlr_seat_keyboard.c:67-84).
+        if (self.keyboard_focus) |focus| {
+            const focus_client = focus.resource.getClient();
+            for (self.keyboards.items) |kbd| {
+                if (kbd.getClient() != focus_client) continue;
+                kbd.sendKey(serial, time, keycode, state);
+            }
         }
         self.events.key.emit(self);
     }
@@ -296,13 +355,35 @@ pub const Seat = struct {
         return self.mods_depressed & (1 << 6) != 0;
     }
 
+    /// Send the current modifier state (with a fresh serial) to the
+    /// focused client's keyboard resources only. Mirrors wlroots'
+    /// wlr_seat_keyboard_send_modifiers (wlr_seat_keyboard.c:205-232);
+    /// the protocol requires it right after keyboard.enter, and on any
+    /// modifier change.
+    fn sendKeyboardModifiers(self: *Seat) void {
+        const focus = self.keyboard_focus orelse return;
+        const focus_client = focus.resource.getClient();
+        const serial = self.display.nextSerial();
+        for (self.keyboards.items) |kbd| {
+            if (kbd.getClient() != focus_client) continue;
+            kbd.sendModifiers(serial, self.mods_depressed, self.mods_latched, self.mods_locked, 0);
+        }
+    }
+
     fn pointerEnter(self: *Seat, surface: *Surface, sx: i32, sy: i32) void {
         self.pointer_focus = surface;
         self.pointer_enter_serial = self.display.nextSerial();
         self.focus_x = sx;
         self.focus_y = sy;
         const res = surface.resource;
+        // Enter goes only to the surface's client's pointer resources
+        // (wlroots: wlr_seat_pointer_enter loops over client->pointers,
+        // wlr_seat_pointer.c:184-196). Sending a foreign surface to
+        // another client's wl_pointer is rejected by libwayland, which
+        // flags the client connection as errored.
+        const surface_client = res.getClient();
         for (self.pointers.items) |ptr| {
+            if (ptr.getClient() != surface_client) continue;
             ptr.sendEnter(
                 self.pointer_enter_serial,
                 res,
@@ -320,7 +401,12 @@ pub const Seat = struct {
         const serial = self.display.nextSerial();
         const old = self.pointer_focus.?;
         const res = old.resource;
+        // Leave goes only to the leaving surface's client's pointers
+        // (wlroots: seat_client_send_pointer_leave_raw,
+        // wlr_seat_pointer.c:148-158).
+        const old_client = res.getClient();
         for (self.pointers.items) |ptr| {
+            if (ptr.getClient() != old_client) continue;
             ptr.sendLeave(serial, res);
             if (ptr.getVersion() >= 5) ptr.sendFrame();
         }
@@ -337,9 +423,9 @@ pub const Seat = struct {
 // wl_seat request handling
 // ---------------------------------------------------------------------------
 
-fn bindSeat(client: *wire.Client, seat: *Seat, version: u32, id: u32) void {
-    const resource = server.wl.Seat.create(client, version, id) catch {
-        client.postNoMemory();
+fn bindSeat(wl_client: *wire.Client, seat: *Seat, version: u32, id: u32) void {
+    const resource = server.wl.Seat.create(wl_client, version, id) catch {
+        wl_client.postNoMemory();
         return;
     };
     resource.setHandler(*Seat, seatRequest, null, seat);
@@ -366,9 +452,17 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
                 _ = std.os.linux.close(fd);
             }
             if (kbd.getVersion() >= 4) kbd.sendRepeatInfo(0, 0); // no server-side repeat in M3
+            // Late enter only for the focused client (wlroots:
+            // focused_client == seat_client, wlr_seat_keyboard.c:449-460).
+            // A foreign-surface enter is rejected by libwayland.
             if (seat.keyboard_focus) |s| {
-                var keys = wire.wl.Array.fromArrayList(u32, seat.pressed);
-                kbd.sendEnter(seat.display.nextSerial(), s.resource, &keys);
+                if (kbd.getClient() == s.resource.getClient()) {
+                    var keys = wire.wl.Array.fromArrayList(u32, seat.pressed);
+                    kbd.sendEnter(seat.display.nextSerial(), s.resource, &keys);
+                    // wlroots sends enter then modifiers to the focused
+                    // client's keyboards on bind (wlr_seat_keyboard.c:459-460).
+                    seat.sendKeyboardModifiers();
+                }
             }
         },
         .get_pointer => |r| {
@@ -381,15 +475,19 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
                 resource.getClient().postNoMemory();
                 return;
             };
-            // A client binding late still sees the current focus.
+            // Late enter only for the focused client (wlroots:
+            // focused_client == seat_client, wlr_seat_pointer.c:560-566).
+            // A foreign-surface enter is rejected by libwayland.
             if (seat.pointer_focus) |s| {
-                ptr.sendEnter(
-                    seat.display.nextSerial(),
-                    s.resource,
-                    Fixed.fromInt(@intCast(seat.focus_x)),
-                    Fixed.fromInt(@intCast(seat.focus_y)),
-                );
-                if (ptr.getVersion() >= 5) ptr.sendFrame();
+                if (ptr.getClient() == s.resource.getClient()) {
+                    ptr.sendEnter(
+                        seat.display.nextSerial(),
+                        s.resource,
+                        Fixed.fromInt(@intCast(seat.focus_x)),
+                        Fixed.fromInt(@intCast(seat.focus_y)),
+                    );
+                    if (ptr.getVersion() >= 5) ptr.sendFrame();
+                }
             }
         },
         .get_touch => |r| {
@@ -435,4 +533,410 @@ fn pointerRequest(resource: *server.wl.Pointer, request: server.wl.Pointer.Reque
         },
         .release => resource.destroy(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: socketpair roundtrip harness (same pattern as presentation.zig).
+// ---------------------------------------------------------------------------
+
+const posix = std.posix;
+
+const RegistryCapture = struct {
+    compositor_name: ?u32 = null,
+    seat_name: ?u32 = null,
+
+    fn listener(registry: *client.wl.Registry, event: client.wl.Registry.Event, data: *RegistryCapture) void {
+        _ = registry;
+        switch (event) {
+            .global => |g| {
+                const name = std.mem.span(g.interface);
+                if (std.mem.eql(u8, name, "wl_compositor")) {
+                    data.compositor_name = g.name;
+                } else if (std.mem.eql(u8, name, "wl_seat")) {
+                    data.seat_name = g.name;
+                }
+            },
+            .global_remove => {},
+        }
+    }
+};
+
+/// Event log for one client-side wl_keyboard. `order` records the
+/// sequence of enter/modifiers/key/leave events so tests can assert that
+/// modifiers follow enter (the protocol mandates a modifiers event right
+/// after enter; wlroots sends it, wlr_seat_keyboard.c:291).
+const KeyboardEvents = struct {
+    const Order = enum { enter, modifiers, key, leave };
+
+    keymaps: usize = 0,
+    entered: bool = false,
+    enter_surface_id: u32 = 0,
+    modifiers: usize = 0,
+    mods_depressed: u32 = 0,
+    keys: usize = 0,
+    last_key: u32 = 0,
+    // SAFETY: filled during the test before any read.
+    order: [16]Order = undefined,
+    order_len: usize = 0,
+
+    fn log(data: *KeyboardEvents, e: Order) void {
+        std.debug.assert(data.order_len < data.order.len);
+        data.order[data.order_len] = e;
+        data.order_len += 1;
+    }
+
+    fn listener(keyboard: *client.wl.Keyboard, event: client.wl.Keyboard.Event, data: *KeyboardEvents) void {
+        _ = keyboard;
+        switch (event) {
+            .keymap => |e| {
+                data.keymaps += 1;
+                // The fd is owned by the receiving client: close it.
+                _ = std.os.linux.close(e.fd);
+            },
+            .enter => |e| {
+                data.entered = true;
+                if (e.surface) |s| data.enter_surface_id = s.getId();
+                data.log(.enter);
+            },
+            .leave => data.log(.leave),
+            .key => |e| {
+                data.keys += 1;
+                data.last_key = e.key;
+                data.log(.key);
+            },
+            .modifiers => |e| {
+                data.modifiers += 1;
+                data.mods_depressed = e.mods_depressed;
+                data.log(.modifiers);
+            },
+            .repeat_info => {},
+        }
+    }
+};
+
+/// Event counts for one client-side wl_pointer.
+const PointerEvents = struct {
+    entered: bool = false,
+    enter_surface_id: u32 = 0,
+    motion: usize = 0,
+    button: usize = 0,
+    axis: usize = 0,
+    axis_stop: usize = 0,
+    axis_discrete: usize = 0,
+    axis_source: usize = 0,
+
+    fn listener(pointer: *client.wl.Pointer, event: client.wl.Pointer.Event, data: *PointerEvents) void {
+        _ = pointer;
+        switch (event) {
+            .enter => |e| {
+                data.entered = true;
+                if (e.surface) |s| data.enter_surface_id = s.getId();
+            },
+            .leave => {},
+            .motion => data.motion += 1,
+            .button => data.button += 1,
+            .axis => data.axis += 1,
+            .axis_stop => data.axis_stop += 1,
+            .axis_discrete => data.axis_discrete += 1,
+            .axis_source => data.axis_source += 1,
+            .axis_value120 => {},
+            .axis_relative_direction => {},
+            .frame => {},
+            .warp => {},
+        }
+    }
+};
+
+/// One connected in-memory client: server-side wire client + client-side
+/// compositor/seat proxies, surface, keyboard and pointer.
+const TestClient = struct {
+    server: *wire.Client,
+    display: *client.wl.Display,
+    compositor: *client.wl.Compositor,
+    seat: *client.wl.Seat,
+    surface: *client.wl.Surface,
+    keyboard: *client.wl.Keyboard,
+    pointer: *client.wl.Pointer,
+    kbd_events: KeyboardEvents = .{},
+    ptr_events: PointerEvents = .{},
+};
+
+/// The seat's hit-test context: which surface the pick returns.
+const TestPickState = struct {
+    surface: ?*Surface = null,
+};
+
+fn testPick(ctx: *anyopaque, x: i32, y: i32) ?Seat.PickResult {
+    const st: *TestPickState = @ptrCast(@alignCast(ctx));
+    if (st.surface) |s| return .{ .surface = s, .sx = x, .sy = y };
+    return null;
+}
+
+/// A full compositor + seat + two in-memory clients, for wire
+/// roundtrips. `clients` tracks how many clients are connected so a
+/// failed init can tear down safely.
+const TestServer = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_cfg: log.Config,
+    display: ?*display_mod.CompositorDisplay = null,
+    compositor: ?*compositor_mod.Compositor = null,
+    seat: ?*Seat = null,
+    pick_state: TestPickState = .{},
+    // SAFETY: initialized by the harness before any use.
+    a: TestClient = undefined,
+    // SAFETY: initialized by the harness before any use.
+    b: TestClient = undefined,
+    clients: usize = 0,
+
+    /// Heap-allocated (the `io` pointer must outlive the stack frame; the
+    /// display, compositor and seat all store it).
+    fn init(allocator: std.mem.Allocator) !*TestServer {
+        const ts = try allocator.create(TestServer);
+        ts.* = .{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .log_cfg = .{ .min_level = .err },
+        };
+        // deinit() frees ts itself, so it is the only teardown errdefer.
+        errdefer ts.deinit();
+        ts.display = try display_mod.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
+        ts.compositor = try compositor_mod.Compositor.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        ts.seat = try Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        ts.seat.?.setPick(testPick, &ts.pick_state);
+        try connectClient(ts, &ts.a);
+        try connectClient(ts, &ts.b);
+        return ts;
+    }
+
+    fn deinit(ts: *TestServer) void {
+        // Clients tear down first (LIFO), then the modules.
+        if (ts.clients >= 2) {
+            ts.b.display.disconnect();
+            ts.b.server.destroy();
+        }
+        if (ts.clients >= 1) {
+            ts.a.display.disconnect();
+            ts.a.server.destroy();
+        }
+        if (ts.seat) |s| s.deinit();
+        if (ts.compositor) |c| c.deinit();
+        if (ts.display) |d| d.deinit();
+        const allocator = ts.allocator;
+        allocator.destroy(ts);
+    }
+
+    /// Client flush -> server event loop dispatch -> server flush ->
+    /// client dispatch for every connected client. Drives one roundtrip
+    /// without blocking.
+    fn pump(ts: *TestServer) !void {
+        if (ts.clients >= 1) {
+            if (ts.a.display.flush() != .SUCCESS) return error.ClientFlushFailed;
+        }
+        if (ts.clients >= 2) {
+            if (ts.b.display.flush() != .SUCCESS) return error.ClientFlushFailed;
+        }
+        try ts.display.?.getServer().getEventLoop().dispatch(0);
+        ts.display.?.flushClients();
+        if (ts.clients >= 1) try dispatchDisplay(ts.a.display);
+        if (ts.clients >= 2) try dispatchDisplay(ts.b.display);
+    }
+};
+
+/// Flush + roundtrip for one client display. Used while a client is
+/// still connecting, i.e. before it is registered in ts.a/ts.b.
+fn pumpOne(ts: *TestServer, c_display: *client.wl.Display) !void {
+    if (c_display.flush() != .SUCCESS) return error.ClientFlushFailed;
+    try ts.display.?.getServer().getEventLoop().dispatch(0);
+    ts.display.?.flushClients();
+    try dispatchDisplay(c_display);
+}
+
+fn dispatchDisplay(c_display: *client.wl.Display) !void {
+    var fds = [_]posix.pollfd{
+        .{ .fd = c_display.getFd(), .events = posix.POLL.IN, .revents = 0 },
+    };
+    if (try posix.poll(&fds, 0) > 0) {
+        if (c_display.dispatch() != .SUCCESS) return error.ClientDispatchFailed;
+    }
+}
+
+/// Connect one client: registry round, then bind wl_compositor + wl_seat
+/// (v7), create a surface and the seat's keyboard/pointer objects.
+fn connectClient(ts: *TestServer, tc: *TestClient) !void {
+    var fds: [2]posix.socket_t = undefined;
+    const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+    const server_client = wire.Client.create(ts.display.?.getServer(), fds[0]) orelse return error.ClientCreateFailed;
+    errdefer server_client.destroy();
+    const c_display = client.wl.Display.connectToFd(fds[1]) catch return error.ClientConnectFailed;
+    errdefer c_display.disconnect();
+
+    // Round 1: registry + global announcements.
+    const registry = try c_display.getRegistry();
+    var capture: RegistryCapture = .{};
+    registry.setListener(*RegistryCapture, RegistryCapture.listener, &capture);
+    try pumpOne(ts, c_display);
+
+    // Round 2: bind wl_compositor + wl_seat, create the surface and the
+    // keyboard/pointer objects; listeners attach before the pump.
+    const wl_compositor = try registry.bind(capture.compositor_name.?, client.wl.Compositor, 7);
+    const wl_seat = try registry.bind(capture.seat_name.?, client.wl.Seat, 7);
+    tc.* = .{
+        .server = server_client,
+        .display = c_display,
+        .compositor = wl_compositor,
+        .seat = wl_seat,
+        .surface = try wl_compositor.createSurface(),
+        .keyboard = try wl_seat.getKeyboard(),
+        .pointer = try wl_seat.getPointer(),
+    };
+    tc.keyboard.setListener(*KeyboardEvents, KeyboardEvents.listener, &tc.kbd_events);
+    tc.pointer.setListener(*PointerEvents, PointerEvents.listener, &tc.ptr_events);
+    try pumpOne(ts, c_display);
+    ts.clients += 1;
+}
+
+/// The server-side Surface created by `server_client` (each test client
+/// creates exactly one surface).
+fn surfaceForClient(ts: *TestServer, server_client: *wire.Client) *Surface {
+    for (ts.compositor.?.surfaces.items) |s| {
+        if (s.resource.getClient() == server_client) return s;
+    }
+    unreachable;
+}
+
+test "keyboard and pointer events reach only the focused client" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        // xkeyboard-config must be available in the test environment
+        // (same skip as xkb.zig's test).
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const surface_a = surfaceForClient(ts, a.server);
+    try std.testing.expectEqual(@as(usize, 2), ts.seat.?.keyboards.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ts.seat.?.pointers.items.len);
+
+    // Pointer focus on A's surface.
+    ts.pick_state.surface = surface_a;
+    ts.seat.?.pointerMotion(10, 10);
+    try ts.pump();
+
+    // Enter reaches only the focused client's pointer; the unfocused
+    // client gets nothing (a foreign-surface enter is rejected by
+    // libwayland and kills the connection).
+    try std.testing.expect(a.ptr_events.entered);
+    try std.testing.expect(!b.ptr_events.entered);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.motion);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.motion);
+
+    // Button press: click-to-focus moves keyboard focus to A's surface;
+    // the button event goes only to the focused client.
+    ts.seat.?.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.button);
+    try std.testing.expect(a.kbd_events.entered);
+    try std.testing.expect(!b.kbd_events.entered);
+
+    // Key events go only to the focused client's keyboard.
+    ts.seat.?.keyEvent(38, true); // 'a' (evdev A + 8)
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.kbd_events.keys);
+    try std.testing.expectEqual(@as(usize, 0), b.kbd_events.keys);
+    try std.testing.expectEqual(@as(u32, 38), a.kbd_events.last_key);
+
+    // Modifier change (left shift, keycode 50) also goes only to the
+    // focused client. The earlier click-to-focus already delivered one
+    // post-enter modifiers event to A.
+    ts.seat.?.keyEvent(50, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.kbd_events.modifiers);
+    try std.testing.expectEqual(@as(usize, 0), b.kbd_events.modifiers);
+    try std.testing.expectEqual(@as(u32, 1), a.kbd_events.mods_depressed);
+
+    // Wheel burst (discrete != 0): axis_source + axis_discrete + axis,
+    // no axis_stop; only the focused client.
+    ts.seat.?.pointerAxis(.vertical_scroll, 10.0, 1);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis_source);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis_discrete);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis);
+    try std.testing.expectEqual(@as(usize, 0), a.ptr_events.axis_stop);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.axis_source);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.axis_discrete);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.axis);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.axis_stop);
+
+    // Scroll end (value == 0): axis_stop only, no axis; only the focused
+    // client.
+    ts.seat.?.pointerAxis(.vertical_scroll, 0.0, 0);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis_stop);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis); // unchanged
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis_discrete); // unchanged
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.axis_stop);
+}
+
+test "keyboard enter is followed by a modifiers event" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const surface_a = surfaceForClient(ts, a.server);
+
+    // Initial bind: no focus yet, so no enter and no modifiers.
+    try std.testing.expect(!a.kbd_events.entered);
+    try std.testing.expectEqual(@as(usize, 0), a.kbd_events.modifiers);
+    try std.testing.expectEqual(@as(usize, 1), a.kbd_events.keymaps);
+
+    // setKeyboardFocus delivers enter then modifiers, in that order, to
+    // the focused client (wlroots: wlr_seat_keyboard.c:291).
+    ts.seat.?.setKeyboardFocus(surface_a);
+    try ts.pump();
+    try std.testing.expect(a.kbd_events.entered);
+    try std.testing.expectEqual(@as(u32, a.surface.getId()), a.kbd_events.enter_surface_id);
+    try std.testing.expectEqual(@as(usize, 1), a.kbd_events.modifiers);
+    try std.testing.expectEqual(@as(usize, 2), a.kbd_events.order_len);
+    try std.testing.expectEqual(KeyboardEvents.Order.enter, a.kbd_events.order[0]);
+    try std.testing.expectEqual(KeyboardEvents.Order.modifiers, a.kbd_events.order[1]);
+
+    // The unfocused client's keyboard gets no enter at all (enter
+    // targets the focused client; a foreign-surface enter is rejected by
+    // libwayland and kills the connection).
+    try std.testing.expect(!b.kbd_events.entered);
+    try std.testing.expectEqual(@as(usize, 0), b.kbd_events.modifiers);
+
+    // A keyboard bound after the focus exists also gets enter + modifiers
+    // (wlroots: seat_client_create_keyboard, wlr_seat_keyboard.c:459-460).
+    const second_kbd = try a.seat.getKeyboard();
+    var second_events: KeyboardEvents = .{};
+    second_kbd.setListener(*KeyboardEvents, KeyboardEvents.listener, &second_events);
+    try ts.pump();
+    try std.testing.expect(second_events.entered);
+    try std.testing.expectEqual(@as(usize, 1), second_events.modifiers);
+    try std.testing.expectEqual(@as(usize, 2), second_events.order_len);
+    try std.testing.expectEqual(KeyboardEvents.Order.enter, second_events.order[0]);
+    try std.testing.expectEqual(KeyboardEvents.Order.modifiers, second_events.order[1]);
+
+    // The unfocused client (B) binding late gets keymap/repeat_info only:
+    // no enter and no modifiers — the focus surface belongs to another
+    // client (wlroots gates on focused_client == seat_client).
+    const late_b_kbd = try b.seat.getKeyboard();
+    var late_b_events: KeyboardEvents = .{};
+    late_b_kbd.setListener(*KeyboardEvents, KeyboardEvents.listener, &late_b_events);
+    try ts.pump();
+    try std.testing.expect(!late_b_events.entered);
+    try std.testing.expectEqual(@as(usize, 0), late_b_events.modifiers);
+    try std.testing.expectEqual(@as(usize, 1), late_b_events.keymaps);
 }

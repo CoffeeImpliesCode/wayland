@@ -7,9 +7,11 @@
 //! Reference semantics (mirroring wlr_buffer.h:73):
 //! - `drop()`: the producer is done with the buffer.
 //! - `lock()`/`unlock()`: a consumer is reading it.
-//! - The `release` signal fires when the buffer has been dropped AND all
-//!   consumers are done (`dropped && n_locks == 0`). Listeners (e.g. the
-//!   shm module) use it to tell the client the buffer may be reused.
+//! - The `release` signal fires whenever the last consumer lock drops
+//!   (`n_locks == 0`), regardless of `dropped` — wlroots emits release on
+//!   the last unlock (types/buffer/buffer.c:50-61), and drop() of an
+//!   already-unlocked buffer also fires it. Listeners (e.g. the shm module)
+//!   use it to tell the client the buffer may be reused.
 //! - `destroy()`: emits the `destroy` signal, releases impl-private
 //!   resources via `impl.destroy`, then frees the Buffer itself.
 //!
@@ -88,11 +90,11 @@ pub const Buffer = struct {
         return buf;
     }
 
-    /// The surface stopped using the buffer (one attach cycle ended).
-    /// Drop is cycle-idempotent: a client may re-attach a released buffer
-    /// (double buffering), so the same Buffer is dropped once per replace
-    /// and can be dropped many times across its lifetime. The release
-    /// event fires when dropped and the last consumer lock is gone.
+    /// The producer is done with the buffer. Cycle-idempotent: a client
+    /// may re-attach a released buffer (double buffering), so the same
+    /// Buffer is dropped once per replace and can be dropped many times
+    /// across its lifetime. The release signal fires when no consumer lock
+    /// remains (n_locks == 0).
     pub fn drop(buf: *Buffer) void {
         buf.dropped = true;
         buf.maybeRelease();
@@ -104,7 +106,10 @@ pub const Buffer = struct {
     }
 
     /// A consumer is done reading. Unlocking an unlocked buffer is a
-    /// programmer error.
+    /// programmer error. Dropping the last lock fires the release signal
+    /// even if the buffer was never dropped (wlroots
+    /// types/buffer/buffer.c:50-61): the client learns it may reuse the
+    /// buffer as soon as the compositor is done reading it.
     pub fn unlock(buf: *Buffer) void {
         assert(buf.n_locks > 0);
         buf.n_locks -= 1;
@@ -112,7 +117,7 @@ pub const Buffer = struct {
     }
 
     fn maybeRelease(buf: *Buffer) void {
-        if (buf.dropped and buf.n_locks == 0) {
+        if (buf.n_locks == 0) {
             buf.events.release.emit(buf);
         }
     }
@@ -198,7 +203,7 @@ test "drop with no locks releases immediately" {
     try std.testing.expectEqual(@as(u32, 1), observer.release_count);
 }
 
-test "unlock without drop does not release" {
+test "unlock to zero releases without a drop" {
     const allocator = std.testing.allocator;
     var data: TestBufferData = .{};
     var observer: TestObserver = .{
@@ -210,9 +215,12 @@ test "unlock without drop does not release" {
     defer buf.destroy();
     buf.events.release.add(&observer.release_listener);
 
+    // A plain lock->unlock cycle fires release even though the producer
+    // never dropped the buffer (wlroots types/buffer/buffer.c:50-61): the
+    // client may reuse it as soon as the compositor is done reading.
     try buf.lock();
     buf.unlock();
-    try std.testing.expectEqual(@as(u32, 0), observer.release_count);
+    try std.testing.expectEqual(@as(u32, 1), observer.release_count);
 }
 
 test "destroy fires destroy signal before impl destroy" {

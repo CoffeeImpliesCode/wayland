@@ -22,6 +22,10 @@ pub const Backend = struct {
     events: struct {
         /// A new output became available.
         new_output: wire.Signal(*output_mod.Output),
+        /// A new input device became available (wlr_backend new_input).
+        /// No input backends emit this yet (raylib feeds the seat via its
+        /// poll hook); libinput will announce devices through it.
+        new_input: wire.Signal(*InputDevice),
         /// The backend is being destroyed.
         destroy: wire.Signal(*Backend),
     },
@@ -31,6 +35,14 @@ pub const Backend = struct {
         start: *const fn (backend: *Backend) error{BackendFailed}!void,
         /// Tear down backend-owned resources (not the Backend struct).
         destroy: *const fn (allocator: std.mem.Allocator, data: *anyopaque) void,
+    };
+
+    /// An input device announced by a backend (wlr_input_device pattern).
+    /// M3 has no real input backends; the raylib source feeds the seat
+    /// directly. The struct carries the device kind and a name for logs.
+    pub const InputDevice = struct {
+        kind: enum { keyboard, pointer, touch },
+        name: [:0]const u8,
     };
 
     pub fn init(
@@ -52,6 +64,7 @@ pub const Backend = struct {
             .events = undefined,
         };
         self.events.new_output.init();
+        self.events.new_input.init();
         self.events.destroy.init();
         return self;
     }
@@ -70,6 +83,11 @@ pub const Backend = struct {
     /// Announce an output to the compositor.
     pub fn emitNewOutput(backend: *Backend, out: *output_mod.Output) void {
         backend.events.new_output.emit(out);
+    }
+
+    /// Announce an input device to the compositor.
+    pub fn emitNewInput(backend: *Backend, device: *InputDevice) void {
+        backend.events.new_input.emit(device);
     }
 };
 

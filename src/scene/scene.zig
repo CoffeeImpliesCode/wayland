@@ -155,13 +155,24 @@ pub const SceneNode = struct {
 
     /// Append `child` as the last child (top of the draw order). If `child`
     /// already has a parent it is reparented. `node` must be a .tree node.
+    /// Rejects with error.CycleDetected when `child` is `node` or an
+    /// ancestor of `node` (the append would make `node` its own ancestor);
+    /// the tree is left unchanged.
     pub fn appendChild(
         node: *SceneNode,
         allocator: std.mem.Allocator,
         child: *SceneNode,
-    ) error{OutOfMemory}!void {
+    ) error{ OutOfMemory, CycleDetected }!void {
         std.debug.assert(node.kind == .tree);
-        std.debug.assert(node != child);
+        // A node cannot become its own ancestor: reject when `child` is
+        // `node` or already on `node`'s ancestor chain. Mirrors
+        // wlr_scene_node_reparent's ancestor walk (wlr_scene.c:1316-1319);
+        // unlike wlroots we surface it as an error, not an assert, so the
+        // check holds in release builds too.
+        var ancestor: ?*SceneNode = node;
+        while (ancestor) |a| : (ancestor = a.parent) {
+            if (a == child) return error.CycleDetected;
+        }
         if (child.parent) |p| p.removeChild(child);
         try node.children.append(allocator, child);
         child.parent = node;
@@ -527,6 +538,50 @@ test "scene tree construction, append, remove, enable" {
     try testing.expect(!c.enabled);
     c.enable(true);
     try testing.expect(c.enabled);
+}
+
+test "appendChild rejects self-subtree cycles and leaves the tree unchanged" {
+    const allocator = testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    const scene = try makeScene(allocator, &io, &log_cfg);
+    defer scene.deinit();
+
+    // root -> a -> b -> c
+    const a = try SceneNode.create(allocator, scene.root, .tree);
+    const b = try SceneNode.create(allocator, a, .tree);
+    const c = try SceneNode.create(allocator, b, .tree);
+
+    // Appending `a` under its own descendant `c` would make `a` its own
+    // ancestor (a -> b -> c -> a): rejected, tree unchanged.
+    try testing.expectError(error.CycleDetected, c.appendChild(allocator, a));
+    try testing.expect(a.parent == scene.root);
+    try testing.expect(b.parent == a);
+    try testing.expect(c.parent == b);
+    try testing.expectEqual(@as(usize, 1), scene.root.children.items.len);
+    try testing.expectEqual(@as(usize, 1), a.children.items.len);
+    try testing.expectEqual(@as(usize, 1), b.children.items.len);
+    try testing.expectEqual(@as(usize, 0), c.children.items.len);
+    try testing.expect(scene.root.children.items[0] == a);
+    try testing.expect(a.children.items[0] == b);
+    try testing.expect(b.children.items[0] == c);
+
+    // Direct self-append is a cycle too.
+    try testing.expectError(error.CycleDetected, a.appendChild(allocator, a));
+    try testing.expectEqual(@as(usize, 1), a.children.items.len);
+
+    // Appending a direct parent under its own child (b under c).
+    try testing.expectError(error.CycleDetected, c.appendChild(allocator, b));
+    try testing.expect(b.parent == a);
+    try testing.expectEqual(@as(usize, 1), b.children.items.len);
+
+    // Reparenting within the same subtree is still fine: no cycle.
+    try a.appendChild(allocator, c);
+    try testing.expect(c.parent == a);
+    try testing.expectEqual(@as(usize, 0), b.children.items.len);
+    try testing.expectEqual(@as(usize, 2), a.children.items.len);
 }
 
 test "absolutePosition sums nested offsets" {

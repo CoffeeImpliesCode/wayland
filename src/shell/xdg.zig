@@ -206,6 +206,11 @@ pub const XdgSurface = struct {
     configure_serial: u32 = 0,
     /// Serial of the last configure acked by the client, if any.
     acked_serial: ?u32 = null,
+    /// Every configure serial sent since the last (re)map, for
+    /// ack_configure validation (wlroots-style configure list; wlroots
+    /// types/xdg_shell/wlr_xdg_shell.c tracks sent serials and rejects
+    /// acks of serials that were never sent).
+    sent_serials: std.ArrayList(u32) = .empty,
     /// A configure has been sent at least once since the last (re)map.
     configure_sent: bool = false,
     /// Window geometry from set_window_geometry (double-buffered).
@@ -224,19 +229,32 @@ pub const XdgSurface = struct {
         xdg.resource.sendConfigure(serial);
         xdg.configure_serial = serial;
         xdg.configure_sent = true;
+        xdg.sent_serials.append(xdg.allocator, serial) catch {
+            xdg.resource.postNoMemory();
+        };
     }
 
     /// Handle xdg_surface.ack_configure. The serial must have been sent
-    /// (<= the latest) and must be newer than the last acked one — a
-    /// client may ack a configure that was superseded by a newer one
-    /// (wlroots-style serial list; re-configures race client acks).
+    /// (present in the sent list) and must be newer than the last acked
+    /// one — a client may ack a configure that was superseded by a newer
+    /// one, but never one that was not sent or already acked (wlroots
+    /// configure-list semantics; re-configures race client acks).
     fn ackConfigure(xdg: *XdgSurface, serial: u32) void {
-        if (serial > xdg.configure_serial or (xdg.acked_serial != null and serial <= xdg.acked_serial.?)) {
-            xdg.resource.postError(.invalid_serial, "ack_configure: invalid or already-acked serial");
+        if (std.mem.indexOfScalar(u32, xdg.sent_serials.items, serial) == null) {
+            xdg.resource.postError(.invalid_serial, "ack_configure: unknown serial");
+            return;
+        }
+        if (xdg.acked_serial != null and serial <= xdg.acked_serial.?) {
+            xdg.resource.postError(.invalid_serial, "ack_configure: already-acked serial");
             return;
         }
         xdg.configured = true;
         xdg.acked_serial = serial;
+        // Prune the sent list: serials up to and including the acked one
+        // can never be acked again.
+        while (xdg.sent_serials.items.len > 0 and xdg.sent_serials.items[0] <= serial) {
+            _ = xdg.sent_serials.orderedRemove(0);
+        }
         if (xdg.geometry_set) xdg.current_geometry = xdg.pending_geometry;
         log.info("surface configured serial={d} role={s}", xdg.io, xdg.log_cfg, log_tag, .{
             serial,
@@ -258,6 +276,7 @@ pub const XdgSurface = struct {
         // The next commit after a re-map must trigger a fresh configure.
         xdg.configure_sent = false;
         xdg.acked_serial = null;
+        xdg.sent_serials.clearRetainingCapacity();
         log.info("surface unmapped role={s}", xdg.io, xdg.log_cfg, log_tag, .{@tagName(xdg.role)});
     }
 };
@@ -411,6 +430,7 @@ fn xdgSurfaceDestroy(res: *server.xdg.Surface, xdg: *XdgSurface) void {
     }
     xdg.unmapSurface();
     xdg.events.destroy.emit(xdg);
+    xdg.sent_serials.deinit(shell.allocator);
     shell.allocator.destroy(xdg);
 }
 
