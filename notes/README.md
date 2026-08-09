@@ -197,5 +197,11 @@ Recommendation: build on **wlroots via zig-wayland + zig-wlroots**, not smithay.
   (v0.20.1), `codeberg-river-river` (v0.4.0), `github-WayfireWM-wayfire`
   (v0.11.0), `github-YaLTeR-niri` (v26.04), `github-swaywm-sway` (1.11-rc2),
   `github-labwc-labwc` (0.20.1), `github-wayvr-org-wayvr` (v26.7.1).
+  Linked-lib sources (pinned to the build versions, 2026-08-09):
+  `gitlab-freedesktop-mesa-drm` (libdrm-2.4.134), `gitlab-freedesktop-libinput-libinput`
+  (1.31.3), `github-xkbcommon-libxkbcommon` (xkbcommon-1.13.2), `github-raysan5-raylib`
+  (6.0), `github-systemd-systemd` (v261.1), `gitlab-freedesktop-pixman-pixman` (0.46.4).
+  Smithay's protocol crate: `github-Smithay-wayland-rs` (master; smithay v0.7.0 pins
+  wayland-server 0.31.13).
 - Architecture questions: deepwiki MCP (smithay and wlroots have wikis).
 - VCS: jj only, never git.

@@ -40,7 +40,7 @@ Private handlers cited in rows (not inventory): `wmBaseRequest` (:136), `wmBaseG
 ### xdg_wm_base.destroy
 - ours: destroys the resource unconditionally (xdg.zig:138-140).
 - wlroots: posts DEFUNCT_SURFACES error if the client still has child surfaces (wlr_xdg_shell.c:44-58).
-- smithay: no defunct check found in the xdg module [INFERENCE].
+- smithay: CORRECTED 2026-08-09 — a defunct guard DOES exist: `xdg_wm_base::Error::DefunctSurfaces` posted at `src/wayland/shell/xdg/handlers/wm_base.rs:96` (the earlier grep missed the handlers/ submodule).
 - verdict: divergent. Ours misses the protocol-required defunct guard.
 
 ### get_xdg_surface (XdgSurface creation)
@@ -136,7 +136,7 @@ Private handlers cited in rows (not inventory): `wmBaseRequest` (:136), `wmBaseG
 ### popup parenting / topmost enforcement
 - ours: parent stored as a raw XdgSurface pointer; no parent-role check, no parentless-commit rejection, no topmost rules (xdg.zig:262-271, 635-647).
 - wlroots: INVALID_POPUP_PARENT if the parent has no role (wlr_xdg_popup.c:382-386); commit of a parentless popup rejected NOT_CONSTRUCTED (wlr_xdg_popup.c:247-253); destroy and grab enforce NOT_THE_TOPMOST_POPUP (wlr_xdg_popup.c:345-355, 298-301).
-- smithay: `pre_commit_hook` rejects a popup without parent (mod.rs:1986-1992); no topmost enforcement found [INFERENCE].
+- smithay: `pre_commit_hook` rejects a popup without parent (mod.rs:1986-1992); VERIFIED 2026-08-09: no topmost enforcement anywhere in the xdg module (grep `topmost` over src/wayland/shell/xdg/ is empty — smithay leaves stacking to the compositor's space).
 - verdict: divergent. Ours lacks all three: parent-role check, parentless-commit rejection, topmost rules.
 
 ### positioner completeness at get_popup

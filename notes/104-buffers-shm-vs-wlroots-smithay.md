@@ -237,8 +237,11 @@ ShmBufferData; `Buffer.init`; attach resource_destroy + release listeners.
 2. Release timing: wlroots emits `release` on every unlock reaching `n_locks == 0`
    regardless of `dropped` (`buffer.c:56-57`); we require `dropped` too
    (`buffer.zig:113-116`). A consumer that unlocks an undropped buffer would not notify
-   the client in our model. [INFERENCE on downstream impact — no surface here calls
-   unlock without a prior drop.]
+   the client in our model. RESOLVED 2026-08-09: premise stale post-fix — `maybeRelease`
+   (buffer.zig:119-123) now emits on `n_locks == 0` regardless of `dropped` (guarded by
+   the new exactly-once `released` flag), and the surface's commit step 8 unlocks the
+   current buffer without a prior drop, so the client IS notified at every commit end;
+   downstream impact nil (verified against surface.zig commit + buffer.zig).
 3. Full protocol ownership: wlroots and smithay implement wl_shm create_pool/
    create_buffer/resize with their own validation (offset/stride/format overflow,
    pool-shrink forbid, format table). See `wlr_shm.c:158-333`, `handlers.rs:79-166`,
@@ -260,7 +263,10 @@ ShmBufferData; `Buffer.init`; attach resource_destroy + release listeners.
 6. SIGBUS fault reporting: smithay converts a SIGBUS fault into a protocol error + kills
    the client (`wayland/shm/mod.rs:250-257`); ours (via libwayland) silently zero-fills
    the faulting page and returns the data pointer, so a bad client is not errored.
-   [INFERENCE: our `getData` returns the mapping regardless; no error surfaced.]
+   [RESOLVED 2026-08-09: `getData` returns `?*anyopaque` (generated bindings, nullable)
+   and our impl null-checks it — `begin_data_ptr_access` returns `error.Unsupported`
+   when null (shm.zig:174-177) — so the missing-mapping case IS surfaced; the
+   zero-fill-vs-error divergence from smithay stands.]
 
 ## Verdict
 

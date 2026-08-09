@@ -47,7 +47,7 @@ wlroots ref = types/wlr_screencopy_v1.c, header = include/wlr/types/wlr_screenco
 2. copy_with_damage is a no-op (screencopy.zig:208-210): no damage accumulation or wait (wlr_screencopy_v1.c:302-308); clients get no per-box damage (wlr_screencopy_v1.c:156-181).
 3. No linux-dmabuf capture: no linux_dmabuf event (wlr_screencopy_v1.c:592-595) and no dma render-pass copy (wlr_screencopy_v1.c:234-281).
 4. Fixed ARGB8888 read format (screencopy.zig:198, 254-257) vs renderer preferred_read_format (wlr_screencopy_v1.c:543); no stride validation (wlr_screencopy_v1.c:418-421) — a padded client shm buffer is silently mis-copied because our rows assume tight stride.
-5. Region ignores output scale/transform (wlr_screencopy_v1.c:576-580); clamps instead of failing (wlr_screencopy_v1.c:313-319). [INFERENCE: correct only while our output pipeline is scale 1, normal transform — verify against output module.]
+5. Region ignores output scale/transform (wlr_screencopy_v1.c:576-580); clamps instead of failing (wlr_screencopy_v1.c:313-319). [VERIFIED 2026-08-09: our output pipeline is fixed at scale 1.0 / transform .normal (output.zig:66-67) with no mode-driven changes, so the clamp is correct today; it would break only if scale/transform became dynamic.]
 6. overlay_cursor flag has no effect (screencopy.zig:117-123; wlr_screencopy_v1.c:443-446).
 7. No output-enabled state: wlroots fails disabled outputs at capture and copy time (wlr_screencopy_v1.c:508-511, 364-367).
 8. Ready timestamp is copy time, not frame commit/present time (screencopy.zig:299-301 vs wlr_screencopy_v1.c:337).

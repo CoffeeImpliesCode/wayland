@@ -130,7 +130,7 @@ Private module fns (cited in rows, not inventory): `start` (headless.zig:68), `d
 - ours: no runtime predicate; Zig comptime types select impls (headless.zig:23-26 uses a typed `Backend.Impl` table).
 - wlroots: `wlr_backend_is_headless` compares `impl` pointer (backend/headless/backend.c:84-86).
 - smithay: N/A.
-- verdict: missing, but harmless — the typed `data: *anyopaque` + comptime dispatch replaces it [INFERENCE].
+- verdict: missing, but harmless — the typed `data: *anyopaque` + comptime dispatch replaces it [VERIFIED 2026-08-09: backend.zig's Impl fn-pointer table with typed data (backend.zig:29-34,49-57) — the typed `*anyopaque` per-impl data + comptime dispatch gives the same per-impl polymorphism as wlr_backend_impl's void data].
 
 ## Gaps
 

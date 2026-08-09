@@ -373,6 +373,16 @@ pub const Seat = struct {
         }
     }
 
+    /// A surface was destroyed: drop any focus pointing at it. The surface
+    /// is already gone, so no leave events are sent (the owner is the one
+    /// destroying it or disconnecting); wlroots clears focus the same way
+    /// (wlr_seat_pointer_clear_focus, wlr_seat_keyboard.c). Without this
+    /// the next motion/button/key dereferences a freed Surface.
+    pub fn surfaceDestroyed(self: *Seat, surface: *Surface) void {
+        if (self.pointer_focus == surface) self.pointer_focus = null;
+        if (self.keyboard_focus == surface) self.keyboard_focus = null;
+    }
+
     fn pointerEnter(self: *Seat, surface: *Surface, sx: i32, sy: i32) void {
         self.pointer_focus = surface;
         self.pointer_enter_serial = self.display.nextSerial();

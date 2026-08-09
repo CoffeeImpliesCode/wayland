@@ -331,7 +331,11 @@ keymap text via get_as_string into a memfd (write + lseek, no mmap).
     (`wlr_seat_keyboard.c:276-287`; `wlr_seat_pointer.c:210-225`). seat.zig has
     no destroy listener for either focus. If a focused surface is destroyed
     without a preceding focus change, `keyboard_focus`/`pointer_focus` dangle
-    [INFERENCE — no seat-side cleanup found in seat.zig or surface.zig].
+    [RESOLVED 2026-08-09 — confirmed real, then FIXED: no cleanup existed (only the
+    pointer-leave path nulls `pointer_focus`, seat.zig:416; `onSurfaceDestroy` in
+    main.zig:889 did nothing). Added `Seat.surfaceDestroyed(s)` (seat.zig, clears
+    both focuses when they point at the destroyed surface) and wired it into
+    `onSurfaceDestroy`. The dangling-focus UAF is closed.]
 12. **xkb is a minimal FFI subset.** Ours binds 7 extern fns (xkb.zig:24-40).
     wlroots uses the full xkbcommon API: keymap ref/swap
     (wlr_keyboard.c:204-283), keymap comparison `wlr_keyboard_keymaps_match`

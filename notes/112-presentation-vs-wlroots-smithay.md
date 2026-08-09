@@ -28,7 +28,7 @@ Rows: our item vs wlroots vs smithay.
    - Verdict: same.
 
 2. `Presentation.init` global + bind + clock_id (ours:82, bind sends CLOCK_MONOTONIC via `resource.sendClockId(clock_id_monotonic)`, line 239-241).
-   - wlroots: `wlr_presentation_create(display, backend, version)` creates global and hooks display destroy, types/wlr_presentation_time.c:177; bind sends `wp_presentation_send_clock_id(resource, CLOCK_MONOTONIC)`, line 152-163, line 162. Takes a backend argument (used only for the destroy-signal pattern, not stored — [INFERENCE] from the .c body: backend is unused in the function).
+   - wlroots: `wlr_presentation_create(display, backend, version)` creates global and hooks display destroy, types/wlr_presentation_time.c:177; bind sends `wp_presentation_send_clock_id(resource, CLOCK_MONOTONIC)`, line 152-163, line 162. Takes a backend argument (used only for the destroy-signal pattern, not stored — VERIFIED 2026-08-09: signature at wlr_presentation_time.c:177-179; the backend param is passed to wl_display_add_destroy_listener, not retained)CE] from the .c body: backend is unused in the function).
    - smithay: `PresentationState::new(display, clk_id)` creates global version 2 with caller-supplied clock id, mod.rs:99-110; bind sends `interface.clock_id(self.clk_id)`, mod.rs:129-139.
    - Verdict: close. Same wire behavior; clock is hardcoded CLOCK_MONOTONIC in ours and wlroots, configurable in smithay. Ours takes the compositor display directly, no backend parameter.
 
@@ -79,7 +79,7 @@ Numbered behaviors we lack vs wlroots/smithay, with evidence:
 6. Timestamp not the hardware present time. Ours takes the clock at present() call (src/presentation.zig:187). wlroots uses the output present event's `when` (types/wlr_presentation_time.c:244-248); smithay takes `time` from the compositor (mod.rs:237, 275). Our tv drifts from the true scanout time by scheduling latency.
 7. No ZERO_COPY flag handling (src/presentation.zig:14-15; flags always 0 at server/main.zig:620). wlroots sets/clears it from the scanout path (types/wlr_presentation_time.c:296-298); smithay lets the compositor pass Kind (mod.rs:240).
 8. No v1 adaptive-sync refresh zeroing (neither ours nor, notably, smithay's Dispatch2 path — smithay has it in presented, mod.rs:264-273; wlroots in feedback_handle_output_present, types/wlr_presentation_time.c:292-295). Ours sends the same refresh to all versions (src/presentation.zig:183, 190). Latent until VRR exists.
-9. Feedback objects are not merged per commit. wlroots groups all feedback requests of one commit into one object with several resources (types/wlr_presentation_time.c:115-126); smithay and ours are 1:1 per resource (mod.rs:157; src/presentation.zig:130-166). Wire-visible difference: none (each resource still gets its own events), so this is an internal-structure divergence, not a protocol gap [INFERENCE — same wire behavior either way].
+9. Feedback objects are not merged per commit. wlroots groups all feedback requests of one commit into one object with several resources (types/wlr_presentation_time.c:115-126); smithay and ours are 1:1 per resource (mod.rs:157; src/presentation.zig:130-166). Wire-visible difference: none (each resource still gets its own events), so this is an internal-structure divergence, not a protocol gap [VERIFIED 2026-08-09: wlroots' merge is one feedback object per surface-commit with a `wl_list resources` (wlr_presentation_time.c:115-126, `feedback->resources`); each resource receives its own events, so per-resource wire behavior is identical to ours].
 
 ## Verdict
 

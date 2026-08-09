@@ -47,7 +47,7 @@ Event loop: `calloop` 0.14. Threading model is DOCUMENTED (src/lib.rs):
 callbacks receive `&mut State`; "the callback invocation is *always*
 sequential", so a centralized mutable state needs no synchronization.
 That State is therefore not `Sync` follows from the documented model
-[INFERENCE — implied, not stated verbatim]. New in master:
+CORRECTED 2026-08-09: `SyncPoint`/`wait` are present in the v0.7.0 tag itself — src/backend/renderer/sync/{egl.rs,mod.rs} — not master-only. New in master:
 `Frame::finish()` returns a `SyncPoint`, `Renderer::wait(&SyncPoint)`
 waits on it (src/backend/renderer/sync/; anvil waits after
 `render_frame`, anvil/src/udev.rs:1662) — cross-thread rendering is
@@ -226,7 +226,11 @@ state, XWaylandKeyboardGrab; nothing scene-graph related.
 - `desktop::Space` is desktop-window oriented; large-canvas uses
   (pan/zoom, rotated content, tiling) need a custom Element layer.
 - Threading: documented sequential `&mut State` model (lib.rs); State
-  not `Sync` [INFERENCE — follows from the documented model];
+  not `Sync` [UNRESOLVED 2026-08-09: the sequential model does not imply
+  !Sync; `AnvilState` (anvil/src/state.rs:131-148) has no explicit
+  Send/Sync impls and no Rc/RefCell in its direct fields — Sync-ness is
+  auto-derived from deep field types (e.g. calloop::Loop), which would
+  need a compile-time assertion to settle];
   multi-thread rendering is the author's job (`SyncPoint`/`wait` are the
   handoff primitive, see Architecture).
 

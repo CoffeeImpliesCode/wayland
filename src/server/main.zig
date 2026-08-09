@@ -890,6 +890,7 @@ fn onSurfaceDestroy(listener: *wire.Listener(*Surface), s: *Surface) void {
     const entry: *SurfaceEntry = @fieldParentPtr("destroy_listener", listener);
     const self = entry.state;
     removeSurfaceNode(self, entry);
+    self.seat.surfaceDestroyed(s);
     self.presentation.discard(s);
     _ = self.surface_entries.remove(s);
     self.allocator.destroy(entry);

@@ -76,7 +76,9 @@ Numbered behaviors we lack vs wlroots/smithay, with evidence.
    outputs_update/frame_done on buffers (wlrH:172-177; emitted in
    `wlr_scene_node_destroy` wlr:99-112 and `update_node_update_outputs` wlr:426).
    Ours has no event surface at all; frame timing lives in the presentation
-   module instead [INFERENCE — src/server/main.zig:122].
+   module instead [VERIFIED 2026-08-09: scene.zig declares no Signal/events
+   (grep empty); ServerState.presentation drives frame timing (main.zig:122,
+   presentation.zig) — the divergence is structural, as stated].
 5. No direct scanout: `wlr_scene_output_build_state` tries scanout for
    single-entry frames (wlr:2448, `scene_entry_try_direct_scanout` wlr:2061);
    ours always renders through the pass.

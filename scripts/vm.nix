@@ -65,6 +65,9 @@
   # shared dir stays host-clean) and run the DRM + libinput E2E at boot
   # (compositor-demo-drm, the default); the headless regression
   # (compositor-demo) stays available as a manually-started unit.
+  # Console root login for manual gates (headless E2E).
+  users.users.root.initialPassword = "root";
+
   systemd.services.compositor-demo-drm = {
     wantedBy = [ "multi-user.target" ];
     after = [ "local-fs.target" ];
