@@ -776,6 +776,14 @@ fn onInputReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
             // Fatal device error: stop the loop (tests must not hang).
             if (err == error.BackendFailed) self.loop.?.stop();
         };
+        // The dispatch marshalled seat events (key/pointer/axis) into the
+        // clients' outbound buffers. Without a flush here they sit until
+        // the next display-poll wake — which only fires when a client is
+        // ACTIVE (sending requests). An idle client therefore never
+        // receives a key press (observed: weston-terminal/foot got no
+        // keystroke while idle). Flush immediately so the event reaches
+        // the client regardless of its own activity.
+        self.display.flushClients();
     }
 }
 
