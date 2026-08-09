@@ -702,7 +702,9 @@ fn pxAt(cap: *const CaptureState, x: usize, y: usize) [4]u8 {
 
 /// True when the captured pixel at (screen_x, screen_y) shows the
 /// gradient under `zoom`: R=255, G=0, A=255 and B at the world point
-/// cx + (screen_x - cx)/zoom.
+/// cx + (screen_x - cx)/zoom. B allows a small tolerance: the real pixman
+/// bilinear samples at the pixel CENTER, so the ramp can differ by 1-2
+/// from the exact floor formula (R/G/A are exact).
 fn gradientPixelMatches(
     cap: *const CaptureState,
     state: *const ClientState,
@@ -712,7 +714,9 @@ fn gradientPixelMatches(
 ) bool {
     const p = pxAt(cap, screen_x, screen_y);
     const b = gradientBAt(state, screen_x, zoom);
-    return p[2] == 255 and p[1] == 0 and p[0] == b and p[3] == 255;
+    const b_lo = if (b >= 2) b - 2 else 0;
+    const b_hi = if (b <= 253) b + 2 else 255;
+    return p[2] == 255 and p[1] == 0 and p[3] == 255 and p[0] >= b_lo and p[0] <= b_hi;
 }
 
 /// M4 Phase B: wait for the server's synth wheel zoom to land, then

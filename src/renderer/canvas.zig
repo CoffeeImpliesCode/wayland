@@ -29,13 +29,21 @@
 //!   convention, include/wlr/render/pass.h): out = src_premul +
 //!   dst * (1 - src_a) per channel, alpha included. Opaque pixels
 //!   (a = 255, opacity = 1) are exact copies.
+//! - Fast path: common-case items (normal buffer transform, world size
+//!   == texture size, opacity 1) composite through the real pixman
+//!   library (`pixman_image_composite32`, SIMD-optimized; the
+//!   weston/wlroots model), replacing the per-pixel f64 loop (~545ms
+//!   full-canvas in the VM). Everything else keeps the hand-rolled
+//!   bilinear rasterizer below.
 //!
-//! Imports: utils/geom, scene/camera, renderer/{pixman,texture}.
+//! Imports: utils/geom, scene/camera, renderer/{pixman,texture}, the
+//! pixman_c C binding (build.zig).
 
 const std = @import("std");
 const geom = @import("../utils/geom.zig");
 const camera_mod = @import("../scene/camera.zig");
 const pixman = @import("pixman.zig");
+const pixman_c = @import("pixman_c"); // real pixman library (SIMD composite)
 const texture_mod = @import("texture.zig");
 const log_mod = @import("../utils/log.zig"); // tests only
 
@@ -84,15 +92,36 @@ pub fn render(
     stride: u32,
 ) void {
     _ = allocator;
+    // Destination pixman image: wrap the framebuffer bytes ONCE per
+    // composite and reuse it across items (pixman_image_create_bits wraps
+    // existing memory — no copy). unref releases the wrapper, not the
+    // bytes. When wrapping fails, the hand-rolled path below still works
+    // (drawItem falls back).
+    const dst_img = pixman_c.pixman_image_create_bits(
+        pixman_c.PIXMAN_a8r8g8b8,
+        fb.width,
+        fb.height,
+        @ptrCast(@alignCast(fb.data.ptr)),
+        fb.stride,
+    );
+    defer {
+        if (dst_img) |img| _ = pixman_c.pixman_image_unref(img);
+    }
     for (items) |item| {
         // `!(opacity > 0)` also skips NaN opacity.
         if (!(item.opacity > 0) or item.world_w <= 0 or item.world_h <= 0) continue;
         if (item.texture.width <= 0 or item.texture.height <= 0) continue;
-        drawItem(fb, camera, item, stride);
+        drawItem(fb, camera, item, stride, dst_img);
     }
 }
 
-fn drawItem(fb: *pixman.Framebuffer, camera: *const Camera, item: CanvasItem, stride: u32) void {
+fn drawItem(
+    fb: *pixman.Framebuffer,
+    camera: *const Camera,
+    item: CanvasItem,
+    stride: u32,
+    dst_img: ?*pixman_c.pixman_image_t,
+) void {
     // Transformed quad and its screen-space AABB.
     const corners = [4]geom.FPoint{
         camera.worldToScreen(item.world_x, item.world_y),
@@ -123,6 +152,25 @@ fn drawItem(fb: *pixman.Framebuffer, camera: *const Camera, item: CanvasItem, st
     if (x0 >= x1 or y0 >= y1) return;
 
     const tex_data: *pixman.PixmanTextureData = @ptrCast(@alignCast(item.texture.data));
+
+    // Fast path: the common case — normal buffer transform, 1:1 scale
+    // (world rect == texture size), fully opaque — composites through the
+    // real pixman library instead of the per-pixel f64 loop. Pixman's
+    // SIMD bilinear + fixed-point precision differs slightly from the f64
+    // loop (pixel output changes; tests carry pixman's exact values).
+    // Non-normal transforms, scaled surfaces, and fractional opacity keep
+    // the hand-rolled loop below (the stride/fast-mode logic only exists
+    // there; pixman does not need it).
+    if (item.transform == .normal and
+        item.opacity == 1.0 and
+        item.world_w == @as(f64, @floatFromInt(item.texture.width)) and
+        item.world_h == @as(f64, @floatFromInt(item.texture.height)))
+    {
+        if (dst_img) |dst| {
+            compositePixman(dst, camera, item, tex_data, x0, y0, x1, y1);
+            return;
+        }
+    }
 
     // Precompute the surface-space affine for the item: u = u_c + u_dx*sx +
     // u_dy*sy (and v), folding the camera transform (screenToWorld) + the
@@ -214,6 +262,102 @@ fn drawItem(fb: *pixman.Framebuffer, camera: *const Camera, item: CanvasItem, st
             }
         }
     }
+}
+
+/// Composite a common-case item (normal transform, world size == texture
+/// size, opacity 1) into `dst` through the real pixman library
+/// (pixman_image_composite32, SIMD; the weston/wlroots model — cf.
+/// libweston/pixman-renderer.c composite_whole and
+/// render/pixman/pass.c render_pass_add_texture). The texture memory is
+/// wrapped in a pixman image (no copy); the composite region is the
+/// item's screen AABB (x0,y0)-(x1,y1) clipped to the framebuffer.
+///
+/// The source transform maps DESTINATION pixels to texture coordinates:
+/// pixman applies a source image's transform to the destination
+/// coordinate system (pixman-bits-image.c
+/// __bits_image_fetch_affine_no_alpha: sample = M · dest; weston sets
+/// output_to_buffer_matrix, wlroots builds the dst→src map). For the
+/// camera affine this is the exact inverse of worldToScreen restricted
+/// to the item (a = z·cos, b = −z·sin, c = z·sin, d = z·cos forward):
+///   sample_x = cos/z·dx − sin/z·dy + cx − world_x − cos·(W/2)/z + sin·(H/2)/z
+///   sample_y = sin/z·dx + cos/z·dy + cy − world_y − sin·(W/2)/z − cos·(H/2)/z
+/// which is the hand-rolled loop's u/v affine, byte for byte.
+///
+/// src_x/src_y are passed EQUAL to the dest origin: pixman's src iterator
+/// walks src_x + i and applies the transform to that coordinate, so src_x
+/// must be the dest origin for the transform to see dest pixel
+/// coordinates (weston composite_whole passes 0,0 with dest 0,0 for the
+/// same reason).
+///
+/// Repeat NONE: samples outside the texture are (0,0,0,0) — transparent,
+/// matching the hand-rolled loop's u/v rejection (weston composite_clipped
+/// hardcodes NONE for the same reason; PAD would smear edge texels into
+/// the rotated-quad AABB corners).
+fn compositePixman(
+    dst: *pixman_c.pixman_image_t,
+    camera: *const Camera,
+    item: CanvasItem,
+    tex_data: *pixman.PixmanTextureData,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+) void {
+    const cos_r = @cos(camera.rotation);
+    const sin_r = @sin(camera.rotation);
+    const inv_z = 1.0 / camera.zoom;
+    const sw2 = camera.screen_w / 2;
+    const sh2 = camera.screen_h / 2;
+
+    var transform: pixman_c.pixman_transform_t = undefined;
+    transform.matrix[0][0] = pixmanFixed(cos_r * inv_z);
+    transform.matrix[0][1] = pixmanFixed(-sin_r * inv_z);
+    transform.matrix[0][2] = pixmanFixed(
+        camera.center_x - item.world_x - cos_r * sw2 * inv_z + sin_r * sh2 * inv_z,
+    );
+    transform.matrix[1][0] = pixmanFixed(sin_r * inv_z);
+    transform.matrix[1][1] = pixmanFixed(cos_r * inv_z);
+    transform.matrix[1][2] = pixmanFixed(
+        camera.center_y - item.world_y - sin_r * sw2 * inv_z - cos_r * sh2 * inv_z,
+    );
+    transform.matrix[2][0] = 0;
+    transform.matrix[2][1] = 0;
+    transform.matrix[2][2] = pixmanFixed(1.0);
+
+    const src_img = pixman_c.pixman_image_create_bits(
+        pixman_c.PIXMAN_a8r8g8b8,
+        item.texture.width,
+        item.texture.height,
+        @ptrCast(@alignCast(tex_data.pixels.ptr)),
+        tex_data.stride,
+    ) orelse return;
+    defer _ = pixman_c.pixman_image_unref(src_img);
+
+    _ = pixman_c.pixman_image_set_transform(src_img, &transform);
+    _ = pixman_c.pixman_image_set_filter(src_img, pixman_c.PIXMAN_FILTER_BILINEAR, null, 0);
+    pixman_c.pixman_image_set_repeat(src_img, pixman_c.PIXMAN_REPEAT_NONE);
+
+    pixman_c.pixman_image_composite32(
+        pixman_c.PIXMAN_OP_OVER,
+        src_img,
+        null, // no mask: opacity is 1 on this path
+        dst,
+        x0,
+        y0, // src origin == dest origin (see doc)
+        0,
+        0, // mask origin (unused)
+        x0,
+        y0, // dest origin: the clipped AABB
+        x1 - x0,
+        y1 - y0,
+    );
+}
+
+/// pixman_double_to_fixed: 16.16 fixed point. The C macro casts with UB
+/// on overflow; saturating instead keeps pathological zooms from
+/// trapping (they draw garbage either way, exactly like weston).
+fn pixmanFixed(v: f64) pixman_c.pixman_fixed_t {
+    return @intFromFloat(std.math.clamp(v * 65536.0, -2147483648.0, 2147483647.0));
 }
 
 /// Map a surface point (normalized u, v in [0, 1)) to the normalized
@@ -412,18 +556,21 @@ test "canvas: zoomed camera samples the bilinear midpoint" {
     defer tex.destroy();
 
     // Zoom 2 centered on the texture center (1,1): the 2x2 texture exactly
-    // fills the 4x4 fb. Pixel (1,1) samples the world point (0.5,0.5) —
-    // the midpoint of the four texels — so the bilinear tap is their mean:
-    // (red + green + blue + white)/4 = (128,128,128,255) in B,G,R,A (±1).
+    // fills the 4x4 fb. This item is the pixman fast path (normal
+    // transform, scale 1, opaque), and pixman's bilinear samples the
+    // destination pixel center: pixel (1,1) samples its center (1.5,1.5),
+    // which maps to world (0.75,0.75) — not the texel midpoint the
+    // hand-rolled corner-sampling loop produced. The bilinear weights are
+    // 0.75 on the base texel, 0.25 on its neighbors: R = 255·0.75² +
+    // 255·0.25² = 159.375 → 159, G = B = 255·0.25 = 63.75 → 63, A = 255.
+    // These are pixman's exact fixed-point outputs, byte for byte.
     const camera: Camera = .{ .center_x = 1, .center_y = 1, .zoom = 2, .rotation = 0, .screen_w = 4, .screen_h = 4 };
     const items = [_]CanvasItem{
         .{ .texture = tex, .world_x = 0, .world_y = 0, .world_w = 2, .world_h = 2, .opacity = 1.0 },
     };
     render(allocator, fb, &camera, &items, 1);
 
-    const got = fb.pixelAt(1, 1);
-    for (got[0..3]) |b| try std.testing.expect(@abs(@as(i32, b) - 128) <= 1);
-    try std.testing.expectEqual(@as(u8, 255), got[3]);
+    try std.testing.expectEqual([4]u8{ 63, 63, 159, 255 }, fb.pixelAt(1, 1));
 }
 
 test "canvas: 90-degree transform samples the rotated buffer" {

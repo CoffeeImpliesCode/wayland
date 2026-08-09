@@ -11,6 +11,11 @@ rec {
     wayland
     wayland-protocols
     libxkbcommon # SDL/wayland video driver dep (raylib backend)
+    libinput
+    libdrm
+    udev
+    pixman
+    systemd
     (raylib.overrideAttrs {
       enableDebugging = true;
       dontStrip = true;

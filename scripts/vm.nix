@@ -61,6 +61,8 @@
     pkgs.libinput
     pkgs.libinput.dev
     pkgs.libevdev
+    # Canvas renderer: the real pixman library (SIMD compositor).
+    pkgs.pixman
     # Interactive demo client (foot terminal on the canvas).
     pkgs.foot
     # Reference terminal client (weston-terminal) — used by the interactive
@@ -68,7 +70,7 @@
     pkgs.weston
   ];
   environment.variables.PKG_CONFIG_PATH =
-    "${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
+    "${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig";
 
   # Boot-time E2Es: build the repo in the guest (isolated caches so the
   # shared dir stays host-clean) and run the DRM + libinput E2E at boot
@@ -91,7 +93,7 @@
       StandardError = "journal+console";
       # environment.variables does not reliably reach systemd services;
       # give the build the .pc search path explicitly.
-      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
+      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig";
     };
     # The minimal systemd service PATH does not include the system
     # packages: give the script the toolchain it needs.
@@ -127,7 +129,7 @@
       StandardError = "journal+console";
       # environment.variables does not reliably reach systemd services;
       # give the build the .pc search path explicitly.
-      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
+      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.pixman}/lib/pkgconfig";
     };
     # The minimal systemd service PATH does not include the system
     # packages: give the script the toolchain it needs.

@@ -63,6 +63,28 @@ pub fn build(b: *Build) void {
     // modifier/keysym state with it (libxkbcommon is in the devenv
     // packages; the .pc comes from its dev output).
     lib.linkSystemLibrary("xkbcommon", .{});
+    // Real pixman library (pixman-0.46.4): SIMD-optimized software
+    // compositor for the canvas pass (pixman_image_composite32), replacing
+    // the hand-rolled per-pixel bilinear (weston/wlroots use the same). The
+    // include path + link come from pkg-config at configure time (nix:
+    // nixpkgs#pixman.dev).
+    {
+        const pixman_c = b.addTranslateC(.{
+            .root_source_file = b.path("src/renderer/pixman_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const cflags = b.run(&.{ "pkg-config", "--cflags", "pixman-1" });
+        var it = std.mem.tokenizeAny(u8, cflags, " \t\n");
+        while (it.next()) |tok| {
+            if (std.mem.startsWith(u8, tok, "-I") and tok.len > 2) {
+                pixman_c.addSystemIncludePath(.{ .cwd_relative = b.dupe(tok[2..]) });
+            }
+        }
+        lib.addImport("pixman_c", pixman_c.createModule());
+        lib.linkSystemLibrary("pixman-1", .{ .use_pkg_config = .force });
+    }
     // DRM/KMS backend (src/backend/drm.zig): libdrm via a translate-c shim
     // (house pattern, cf. raylib_c). The include root + root/libdrm come
     // from pkg-config at configure time (nix: nixpkgs#libdrm.dev).
@@ -87,8 +109,11 @@ pub fn build(b: *Build) void {
     // devices; the runtime lib is in the devenv/nix closure.
     lib.linkSystemLibrary("libinput", .{});
     // libinput's udev context needs libudev (ships with systemd; the .pc
-    // comes from systemd's dev output, in PKG_CONFIG_PATH for the build).
-    lib.linkSystemLibrary("udev", .{ .use_pkg_config = .force });
+    // is libudev.pc from systemd's dev output — link the correct name, so
+    // pkg-config resolves the -L/-l flags and the udev_new/udev_unref
+    // symbols actually link (linking 'udev' looked for a non-existent
+    // udev.pc and left libudev out, giving undefined symbols).
+    lib.linkSystemLibrary("libudev", .{ .use_pkg_config = .force });
 
     const exe = b.addExecutable(.{
         .name = "wayland",
