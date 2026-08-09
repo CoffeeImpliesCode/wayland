@@ -58,8 +58,14 @@ pub const renderer = @import("renderer/renderer.zig");
 /// Framebuffer target plus PixmanRenderer.create/importMemory. Exported
 /// for consumers that render with pixman (test servers, examples).
 pub const pixman = @import("renderer/pixman.zig");
+/// M4 canvas pass rasterizer (renderer/canvas.zig): camera-transformed
+/// texture compositing into a pixman framebuffer.
+pub const canvas = @import("renderer/canvas.zig");
 pub const shell = @import("shell/xdg.zig");
 pub const scene = @import("scene/scene.zig");
+/// M4 camera (scene/camera.zig): the world→screen view transform for the
+/// canvas pass.
+pub const camera = @import("scene/camera.zig");
 pub const presentation = @import("presentation.zig");
 /// zwlr_screencopy_manager_v1 (screencopy.zig): shm-based output capture.
 pub const screencopy = @import("screencopy.zig");
@@ -85,6 +91,8 @@ comptime {
     _ = renderer;
     _ = shell;
     _ = scene;
+    _ = camera;
+    _ = canvas;
     _ = presentation;
     _ = screencopy;
 }

@@ -72,6 +72,13 @@ const ClientState = struct {
     /// constants if the mode event had not arrived at setup time).
     surface_width: i32 = 0,
     surface_height: i32 = 0,
+    /// M4: the server's camera, parsed from WAYLAND_CAMERA at startup —
+    /// the world→screen mapping used for the camera-aware gradient
+    /// expectations. Identity defaults (cx=cy=0, zoom=1): world x ==
+    /// screen x, today's behavior.
+    camera_cx: f64 = 0,
+    camera_cy: f64 = 0,
+    camera_zoom: f64 = 1,
     /// Screencopy capture state (filled when the frame advertises its
     /// buffer and completed on ready).
     capture: ?CaptureState = null,
@@ -127,6 +134,9 @@ pub fn main(init: std.process.Init) !void {
     const registry = try display.getRegistry();
     var state: ClientState = .{ .display = display, .registry = registry };
     registry.setListener(*ClientState, onRegistryEvent, &state);
+    // M4: the server camera (WAYLAND_CAMERA) drives the camera-aware
+    // gradient expectations in verifyCapturePixels.
+    parseCameraEnv(&state, init.environ_map);
 
     // Collect globals: another roundtrip processes the registry burst.
     if (wl.Display.roundtrip(display) != .SUCCESS) {
@@ -595,8 +605,13 @@ fn setupCapture(state: *ClientState) !*client.zwlr.ScreencopyFrameV1 {
 }
 
 /// Verify the captured framebuffer: the client's red gradient (R=255,
-/// B ramping with x) plus the compositor's fallback cursor (a light rect
-/// at the synth pointer position 50,50).
+/// B ramping with world x) plus the compositor's fallback cursor (a light
+/// rect at the synth pointer position 50,50). The gradient checks are
+/// camera-aware: the server stamps the surface into world space and
+/// renders it through WAYLAND_CAMERA, so screen (x, y) samples the client
+/// buffer at world x = cx + (x - cx)/zoom (the server's own inverse is
+/// center + (x - W/2)/zoom; the two coincide for the E2E camera, cx =
+/// W/2). The cursor stays screen-space at constant size (unchanged).
 fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !void {
     if (cap.width != @as(u32, @intCast(state.surface_width)) or
         cap.height != @as(u32, @intCast(state.surface_height)))
@@ -613,14 +628,21 @@ fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !voi
         }
     }.at;
 
-    // (5,5): the gradient at x=5 -> B=0, G=0, R=255, A=255.
+    // (5,5): gradient colors at the world point under (5,5) — B ramps
+    // with world x (identity: x=5 -> B=0; E2E cx=640,zoom=2: world x =
+    // 322.5 -> B=64), while R=255, G=0, A=255 hold across the gradient.
     const g = px(cap, 5, 5);
-    if (g[2] != 255 or g[1] != 0 or g[0] != 0 or g[3] != 255) {
-        verdict("CLIENT-ERROR", "pixel (5,5) = {d},{d},{d},{d}, expected gradient start", .{ g[0], g[1], g[2], g[3] });
+    const g_b = gradientB(state, 5);
+    if (g[2] != 255 or g[1] != 0 or g[0] != g_b or g[3] != 255) {
+        verdict("CLIENT-ERROR", "pixel (5,5) = {d},{d},{d},{d}, expected B={d}", .{
+            g[0], g[1], g[2], g[3], g_b,
+        });
         return error.PixelMismatch;
     }
-    // (1000,600): gradient B = 1000*255/surface_width (199 at 1280 wide).
-    const expected_b: u8 = @intCast((1000 * 255) / @as(usize, @intCast(state.surface_width)));
+    // (1000,600): gradient B at the world point under (1000,600) — at
+    // identity world x = 1000 -> B = 199; under cx=640,zoom=2 world x =
+    // 640 + (1000-640)/2 = 820 -> B = 163.
+    const expected_b = gradientB(state, 1000);
     const m = px(cap, 1000, 600);
     if (m[2] != 255 or m[1] != 0 or m[0] != expected_b or m[3] != 255) {
         verdict("CLIENT-ERROR", "pixel (1000,600) = {d},{d},{d},{d}, expected B={d}", .{
@@ -635,6 +657,43 @@ fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !voi
         return error.PixelMismatch;
     }
     verdict("CLIENT-CAPTURE", "pixels verified: gradient + cursor overlay", .{});
+}
+
+/// The client buffer's B value at the world point under screen x: the
+/// server stamps the buffer into world space 1:1, so the world point
+/// samples buffer pixel (world_x, ...), whose intensity is
+/// (world_x * 255) / surface_width (fillPattern). world_x follows the
+/// server camera: cx + (x - cx)/zoom with the parsed WAYLAND_CAMERA
+/// (identity defaults cx=0, zoom=1 -> world_x = x, the pre-M4 check).
+fn gradientB(state: *const ClientState, screen_x: usize) u8 {
+    const sx: f64 = @floatFromInt(screen_x);
+    const world_x = state.camera_cx + (sx - state.camera_cx) / state.camera_zoom;
+    const wx: usize = @intFromFloat(@floor(world_x));
+    return @intCast((wx * 255) / @as(usize, @intCast(state.surface_width)));
+}
+
+/// Parse WAYLAND_CAMERA ("cx=…,cy=…,zoom=…,rot=…") into the camera state
+/// the gradient expectations use. Mirrors the server's parseEnv
+/// (scene/camera.zig) but stays self-contained — the client imports no
+/// compositor library. Missing or malformed fields keep the identity
+/// defaults (cx=cy=0, zoom=1). Rotation is unused by the checks (the
+/// gradient varies only in x and the E2E camera has no rotation).
+fn parseCameraEnv(state: *ClientState, environ_map: *std.process.Environ.Map) void {
+    const value = environ_map.get("WAYLAND_CAMERA") orelse return;
+    var fields = std.mem.splitScalar(u8, value, ',');
+    while (fields.next()) |field| {
+        if (field.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        const key = field[0..eq];
+        const val = std.fmt.parseFloat(f64, field[eq + 1 ..]) catch continue;
+        if (std.mem.eql(u8, key, "cx")) {
+            state.camera_cx = val;
+        } else if (std.mem.eql(u8, key, "cy")) {
+            state.camera_cy = val;
+        } else if (std.mem.eql(u8, key, "zoom")) {
+            state.camera_zoom = val;
+        }
+    }
 }
 
 /// Poll the display fd (bounded by the deadline) and dispatch until

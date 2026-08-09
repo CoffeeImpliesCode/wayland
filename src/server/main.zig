@@ -76,6 +76,10 @@ const Surface = std.meta.Child(std.meta.Child(@TypeOf(@as(wayland.compositor.Com
 /// `?*Texture` as stored in SceneBufferNode.texture.
 // SAFETY: type-derivation only; the undefined value is never evaluated at runtime.
 const Texture = std.meta.Child(std.meta.Child(@TypeOf(@as(wayland.scene.SceneBufferNode, undefined).texture)));
+/// M4 camera + canvas pass (wayland.camera / wayland.canvas): the
+/// camera-transformed compositing path replacing the scene-output render.
+const Camera = wayland.camera.Camera;
+const CanvasItem = wayland.canvas.CanvasItem;
 
 const output_width: i32 = 1280;
 const output_height: i32 = 720;
@@ -109,6 +113,16 @@ const ServerState = struct {
     renderer: *wayland.renderer.Renderer,
     backend: *wayland.backend.Backend,
     framebuffer: *pixman.Framebuffer,
+    /// M4 camera: the world→screen mapping for the canvas pass. Parsed
+    /// from WAYLAND_CAMERA in onNewOutput once the real output size is
+    /// known (the DRM mode can differ from the 1280x720 defaults); the
+    /// default camera centers the world origin on the viewport center
+    /// (zoom 1, no rotation), so worldToScreen is the identity mapping —
+    /// today's no-camera composite.
+    camera: Camera,
+    /// Raw WAYLAND_CAMERA value, borrowed from the process environ
+    /// (parsed in onNewOutput with the output size).
+    camera_env: ?[]const u8,
     /// M2 scene graph: one scene and one output view (single-output server).
     scene: ?*wayland.scene.Scene = null,
     scene_output: ?*wayland.scene.SceneOutput = null,
@@ -137,6 +151,10 @@ const ServerState = struct {
     cursor_rect_node: ?*wayland.scene.SceneNode = null,
     cursor_buf_node: ?*wayland.scene.SceneNode = null,
     cursor_texture: ?*Texture = null,
+    /// M4: the fallback cursor's texture (a light-grey cursor_size²
+    /// square — the M3 fallback rect's color), created lazily on first
+    /// render and owned by the state.
+    cursor_fallback_texture: ?*Texture = null,
     presentation: *wayland.presentation.Presentation,
     /// Per-surface scene state, keyed by the compositor surface
     /// (initialized in the state literal with the server allocator).
@@ -332,6 +350,15 @@ pub fn main(init: std.process.Init) !void {
         .renderer = renderer,
         .backend = backend,
         .framebuffer = framebuffer,
+        .camera = Camera{
+            .center_x = @as(f64, @floatFromInt(output_width)) / 2.0,
+            .center_y = @as(f64, @floatFromInt(output_height)) / 2.0,
+            .zoom = 1,
+            .rotation = 0,
+            .screen_w = @floatFromInt(output_width),
+            .screen_h = @floatFromInt(output_height),
+        },
+        .camera_env = init.environ_map.get("WAYLAND_CAMERA"),
         .presentation = presentation,
         .surface_entries = std.AutoHashMap(*Surface, *SurfaceEntry).init(allocator),
         .toplevels = .empty,
@@ -528,6 +555,12 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
         });
     }
 
+    // M4 camera: parse WAYLAND_CAMERA with the REAL output size — the
+    // camera's viewport must match the framebuffer, so this runs after
+    // the resize above (unset/unparseable keeps the identity-behavior
+    // default, see parseCameraEnv).
+    self.camera = parseCameraEnv(self.camera_env, out.mode.width, out.mode.height);
+
     // M2: build the scene for this output (one scene, one output view).
     const scene = wayland.scene.Scene.init(self.allocator, self.io, self.log_cfg) catch |err| {
         log.err("scene init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
@@ -544,18 +577,8 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
         log.err("scene output init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
-    // Background rect covering the whole output (draws first, under the
-    // surface nodes).
-    const bg = wayland.scene.SceneNode.create(self.allocator, scene.root, .rect) catch |err| {
-        scene_output.destroy();
-        scene.deinit();
-        log.err("scene background init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
-    };
-    bg.kind.rect.width = out.mode.width;
-    bg.kind.rect.height = out.mode.height;
-    bg.kind.rect.color = background_color;
-
+    // M4: the background is drawn by the canvas pass (fb.fill) instead of
+    // a scene rect node — the scene graph is no longer rendered.
     self.scene = scene;
     self.scene_output = scene_output;
     out.events.frame.add(&self.frame_listener);
@@ -760,8 +783,11 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         for (new_cursor) |r| if (r) |rr| so.addDamage(rr);
     }
 
-    // Composite the scene into the framebuffer, then present it.
-    so.render(self.renderer, self.framebuffer);
+    // Composite the canvas into the framebuffer, then present it. M4:
+    // the canvas pass (background fill + camera-transformed surface
+    // textures + screen-space cursor) replaces the scene-output render;
+    // the damage-ring accounting below is unchanged.
+    compositeCanvas(self);
     _ = so.damage_ring.rotate();
     const perf_t_render = perfNs(self);
 
@@ -840,6 +866,145 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         log.info("reached WAYLAND_RUN_FRAMES={d}, stopping", self.io, self.log_cfg, "server", .{self.run_frames});
         self.loop.?.stop();
     }
+}
+
+/// Composite one frame into the framebuffer with the M4 canvas pass:
+/// 1. background fill (fb.fill — the scene's background rect is gone),
+/// 2. every mapped surface's texture stamped at its world rect (the
+///    node's absolute position + buffer size, 1:1) through the server
+///    camera — canvas.render composites in array order, so the last item
+///    draws on top (the entry iteration order, same as the presented
+///    list; the E2E has a single surface),
+/// 3. the cursor in SCREEN space through an identity camera (constant
+///    size, canvas-compositing.md §4). The cursor scene nodes remain as
+///    state (updateCursor/cursorFootprints still position them for the
+///    damage ring) but are no longer drawn by the scene.
+fn compositeCanvas(self: *ServerState) void {
+    // 1. Background. Premultiplied ARGB8888, memory bytes B,G,R,A; the
+    //    scene's background rect drew the same color via addRect
+    //    (round(color*a*255) per channel with straight alpha a=1), so
+    //    the bytes are identical.
+    const bg: [4]u8 = .{
+        @intFromFloat(@round(background_color[2] * 255.0)),
+        @intFromFloat(@round(background_color[1] * 255.0)),
+        @intFromFloat(@round(background_color[0] * 255.0)),
+        @intFromFloat(@round(background_color[3] * 255.0)),
+    };
+    self.framebuffer.fill(bg);
+
+    // 2. Surfaces: world rect = the node's absolute position + buffer
+    //    size (opacity 1.0; skip nodes without a texture).
+    var items: std.ArrayList(CanvasItem) = .empty;
+    defer items.deinit(self.allocator);
+    var entry_it = self.surface_entries.valueIterator();
+    while (entry_it.next()) |entry| {
+        const node = entry.*.node orelse continue;
+        const bn = node.kind.buffer;
+        const texture = bn.texture orelse continue;
+        const rect = node.absolutePosition();
+        items.append(self.allocator, .{
+            .texture = texture,
+            .world_x = @floatFromInt(rect.x),
+            .world_y = @floatFromInt(rect.y),
+            .world_w = @floatFromInt(rect.width),
+            .world_h = @floatFromInt(rect.height),
+            .opacity = 1.0,
+        }) catch |err| {
+            log.warn("canvas item append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        };
+    }
+    wayland.canvas.render(self.allocator, self.framebuffer, &self.camera, items.items);
+
+    // 3. Cursor: screen space at constant size. The identity camera
+    //    (center W/2,H/2, zoom 1, no rotation) makes worldToScreen the
+    //    identity mapping, so items placed at the pointer's screen coords
+    //    land on exactly those pixels. The fallback rect is a texture
+    //    now — the canvas pass draws textures, not scene rects — and the
+    //    client cursor surface texture wins when one is set.
+    const identity: Camera = .{
+        .center_x = @as(f64, @floatFromInt(self.framebuffer.width)) / 2.0,
+        .center_y = @as(f64, @floatFromInt(self.framebuffer.height)) / 2.0,
+        .zoom = 1,
+        .rotation = 0,
+        .screen_w = @floatFromInt(self.framebuffer.width),
+        .screen_h = @floatFromInt(self.framebuffer.height),
+    };
+    var cursor_items: [1]CanvasItem = undefined;
+    if (self.cursor_texture) |tex| {
+        const seat = self.seat;
+        cursor_items[0] = .{
+            .texture = tex,
+            .world_x = @floatFromInt(seat.pointer_x - seat.cursor_hotspot_x),
+            .world_y = @floatFromInt(seat.pointer_y - seat.cursor_hotspot_y),
+            .world_w = @floatFromInt(tex.width),
+            .world_h = @floatFromInt(tex.height),
+            .opacity = 1.0,
+        };
+    } else {
+        const tex = ensureCursorFallbackTexture(self) orelse return;
+        cursor_items[0] = .{
+            .texture = tex,
+            .world_x = @floatFromInt(self.seat.pointer_x),
+            .world_y = @floatFromInt(self.seat.pointer_y),
+            .world_w = @floatFromInt(cursor_size),
+            .world_h = @floatFromInt(cursor_size),
+            .opacity = 1.0,
+        };
+    }
+    wayland.canvas.render(self.allocator, self.framebuffer, &identity, &cursor_items);
+}
+
+/// The fallback cursor's texture: a solid light-grey cursor_size² square
+/// (the M3 fallback rect's color), created once and reused. The canvas
+/// pass draws textures only, so the rect becomes a texture; owned by the
+/// state and destroyed in cleanupSurfaceEntries.
+fn ensureCursorFallbackTexture(self: *ServerState) ?*Texture {
+    if (self.cursor_fallback_texture) |t| return t;
+    const n: usize = @as(usize, @intCast(cursor_size)) * @as(usize, @intCast(cursor_size));
+    var pixels: [n * 4]u8 = undefined;
+    const color: [4]u8 = .{
+        @intFromFloat(@round(cursor_color[2] * 255.0)),
+        @intFromFloat(@round(cursor_color[1] * 255.0)),
+        @intFromFloat(@round(cursor_color[0] * 255.0)),
+        @intFromFloat(@round(cursor_color[3] * 255.0)),
+    };
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        pixels[i * 4 ..][0..4].* = color;
+    }
+    const tex = pixman.PixmanRenderer.importMemory(
+        self.renderer,
+        cursor_size,
+        cursor_size,
+        cursor_size * 4,
+        &pixels,
+    ) catch |err| {
+        log.err("cursor fallback texture import failed: {s}", self.io, self.log_cfg, "server", .{
+            @errorName(err),
+        });
+        return null;
+    };
+    self.cursor_fallback_texture = tex;
+    return tex;
+}
+
+/// The M4 camera from WAYLAND_CAMERA ("cx=…,cy=…,zoom=…,rot=…") parsed
+/// with the output size; unset or unparseable values fall back to the
+/// default camera — center at the output center, zoom 1, no rotation —
+/// whose worldToScreen is the identity mapping (today's no-camera
+/// behavior; camera.isIdentity()'s center-(0,0) form is NOT the server
+/// default, which would shift every surface by half a viewport).
+fn parseCameraEnv(env_value: ?[]const u8, w: i32, h: i32) Camera {
+    const default: Camera = .{
+        .center_x = @as(f64, @floatFromInt(w)) / 2.0,
+        .center_y = @as(f64, @floatFromInt(h)) / 2.0,
+        .zoom = 1,
+        .rotation = 0,
+        .screen_w = @floatFromInt(w),
+        .screen_h = @floatFromInt(h),
+    };
+    const value = env_value orelse return default;
+    return wayland.camera.parseEnv(value, @intCast(w), @intCast(h)) orelse default;
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1203,8 @@ fn perfNs(self: *ServerState) u64 {
 fn cleanupSurfaceEntries(self: *ServerState) void {
     if (self.cursor_texture) |t| t.destroy();
     self.cursor_texture = null;
+    if (self.cursor_fallback_texture) |t| t.destroy();
+    self.cursor_fallback_texture = null;
     var it = self.surface_entries.valueIterator();
     while (it.next()) |entry_ptr| {
         const entry = entry_ptr.*;
@@ -1071,7 +1238,12 @@ fn wantRaylibBackend(environ_map: *std.process.Environ.Map) bool {
 fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
     const scene = self.scene orelse return null;
-    const node = scene.pick(x, y) orelse return null;
+    // M4: the pointer arrives in SCREEN coords, but the scene nodes live
+    // in world space — invert the camera first, then pick in world coords
+    // (surface-local coords are world coords too). With the default
+    // camera worldToScreen is the identity mapping, so this is a no-op.
+    const world = self.camera.screenToWorld(@floatFromInt(x), @floatFromInt(y));
+    const node = scene.pick(@intFromFloat(world.x), @intFromFloat(world.y)) orelse return null;
     var it = self.surface_entries.valueIterator();
     while (it.next()) |entry_ptr| {
         const entry = entry_ptr.*;
@@ -1079,8 +1251,8 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
             const rect = node.absolutePosition();
             return .{
                 .surface = entry.surface,
-                .sx = x - rect.x,
-                .sy = y - rect.y,
+                .sx = @as(i32, @intFromFloat(world.x)) - rect.x,
+                .sy = @as(i32, @intFromFloat(world.y)) - rect.y,
             };
         }
     }

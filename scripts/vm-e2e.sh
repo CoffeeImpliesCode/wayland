@@ -48,7 +48,7 @@ echo "=== vm-e2e: build ok, running headless E2E ==="
 
 mkdir -p /tmp/rt
 XDG_RUNTIME_DIR=/tmp/rt WAYLAND_BACKEND=headless WAYLAND_SYNTH_INPUT=1 \
-    WAYLAND_LOG=err WAYLAND_RUN_FRAMES=700 \
+    WAYLAND_CAMERA="cx=640,cy=360,zoom=2" WAYLAND_LOG=err WAYLAND_RUN_FRAMES=700 \
     /tmp/zo/bin/wayland-server > /tmp/srv.out 2>&1 &
 SRV=$!
 SOCK=""
@@ -63,7 +63,7 @@ if [ -z "$SOCK" ]; then
     exit 1
 fi
 
-XDG_RUNTIME_DIR=/tmp/rt WAYLAND_DISPLAY="$SOCK" /tmp/zo/bin/wayland-client 2>/tmp/cli.log
+XDG_RUNTIME_DIR=/tmp/rt WAYLAND_DISPLAY="$SOCK" WAYLAND_CAMERA="cx=640,cy=360,zoom=2" /tmp/zo/bin/wayland-client 2>/tmp/cli.log
 RC=$?
 kill "$SRV" 2>/dev/null
 echo "=== vm-e2e: client rc=$RC ==="

@@ -74,6 +74,7 @@ mkdir -p /tmp/rt
 # the log quiet but let the drm + libinput tags through.
 XDG_RUNTIME_DIR=/tmp/rt WAYLAND_BACKEND=drm WAYLAND_LIBINPUT=1 \
     WAYLAND_SYNTH_INPUT=1 \
+    WAYLAND_CAMERA="cx=640,cy=360,zoom=2" \
     WAYLAND_LOG=err,server=debug,surface=debug,xdg=debug,shm=debug,drm=info,libinput=info WAYLAND_RUN_FRAMES=900 \
     /tmp/zo/bin/wayland-server > /tmp/srv.out 2>&1 &
 SRV=$!
@@ -89,7 +90,7 @@ if [ -z "$SOCK" ]; then
     exit 1
 fi
 
-XDG_RUNTIME_DIR=/tmp/rt WAYLAND_DISPLAY="$SOCK" /tmp/zo/bin/wayland-client \
+XDG_RUNTIME_DIR=/tmp/rt WAYLAND_DISPLAY="$SOCK" WAYLAND_CAMERA="cx=640,cy=360,zoom=2" /tmp/zo/bin/wayland-client \
     > /tmp/cli.out 2>&1
 RC=$?
 # The server stops itself after WAYLAND_RUN_FRAMES; wait briefly, then kill.

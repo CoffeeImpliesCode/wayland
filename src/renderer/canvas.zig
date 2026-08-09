@@ -122,7 +122,7 @@ fn drawItem(fb: *pixman.Framebuffer, camera: *const Camera, item: CanvasItem) vo
 /// Texel coordinate is (u * width, v * height); taps outside the texture
 /// contribute 0 (the u,v rejection above keeps the base tap in range).
 /// Returns the color as 0..255 floats in memory byte order (B,G,R,A).
-fn sampleBilinear(data: *PixmanTextureData, tw: i32, th: i32, u: f64, v: f64) [4]f32 {
+fn sampleBilinear(data: *pixman.PixmanTextureData, tw: i32, th: i32, u: f64, v: f64) [4]f32 {
     const x_tex = u * @as(f64, @floatFromInt(tw));
     const y_tex = v * @as(f64, @floatFromInt(th));
     const ix0: i32 = @intFromFloat(@floor(x_tex));
@@ -141,7 +141,7 @@ fn sampleBilinear(data: *PixmanTextureData, tw: i32, th: i32, u: f64, v: f64) [4
 }
 
 /// One ARGB8888 texel as 0..255 floats in memory byte order (B,G,R,A).
-fn texelAt(data: *PixmanTextureData, x: i32, y: i32) [4]f32 {
+fn texelAt(data: *pixman.PixmanTextureData, x: i32, y: i32) [4]f32 {
     const off = @as(usize, @intCast(y)) * @as(usize, @intCast(data.stride)) + @as(usize, @intCast(x)) * 4;
     const px = data.pixels[off..][0..4];
     return .{ @floatFromInt(px[0]), @floatFromInt(px[1]), @floatFromInt(px[2]), @floatFromInt(px[3]) };
