@@ -1,9 +1,12 @@
 //! DRM/KMS backend with dumb-buffer scanout (pixman/software path).
 //!
 //! The compositor renders into its pixman Framebuffer (src/renderer/
-//! pixman.zig); this backend memcpys the framebuffer rows into a dumb
-//! buffer (DRM_IOCTL_MODE_CREATE_DUMB/MAP_DUMB/ADDFB2), then atomically
-//! page-flips it to the primary plane. Frame pacing is event-driven: each
+//! pixman.zig); this backend memcpys the framebuffer rows into one of
+//! two dumb buffers (DRM_IOCTL_MODE_CREATE_DUMB/MAP_DUMB/ADDFB2), then
+//! atomically page-flips it to the primary plane, alternating between
+//! the two buffers on every frame (A/B swapchain — every flip changes
+//! FB_ID, see the commit() docs for why that is required on virtio-gpu).
+//! Frame pacing is event-driven: each
 //! DRM_EVENT_FLIP_COMPLETE (read via `dispatch()`) sends the next
 //! output.frame signal — the same flip-completion pacing wlroots uses
 //! (backend/drm/drm.c handle_page_flip: wlr_output_send_frame in the
@@ -66,7 +69,12 @@ const default_device_path = "/dev/dri/card0";
 
 /// The plane properties we commit with, indexed by name — the plane_info
 /// table from wlroots backend/drm/properties.c (names must match exactly;
-/// "type" is read as a value, never committed).
+/// "type" is read as a value, never committed). "FB_DAMAGE_CLIPS" lives in
+/// the same wlroots table but is NOT listed here: it is optional (some
+/// drivers lack it), while scanPropIds is all-or-nothing — a plane without
+/// the property must still pass the scan. scanPlaneProps resolves it
+/// separately, leaving the id 0 when absent (wlroots' scan_properties does
+/// the same: missing optional ids stay 0).
 const plane_prop_names = [_][]const u8{
     "FB_ID",  "CRTC_ID", "SRC_X",  "SRC_Y",  "SRC_W", "SRC_H",
     "CRTC_X", "CRTC_Y",  "CRTC_W", "CRTC_H",
@@ -85,9 +93,30 @@ const PlanePropIds = struct {
     crtc_h: u32 = 0,
     /// Property id of the plane "type" property (read for classification).
     plane_type: u32 = 0,
+    /// Property id of the optional "FB_DAMAGE_CLIPS" blob property; 0 when
+    /// the driver lacks it (some do; virtio-gpu exposes it, see
+    /// virtgpu_plane.c drm_plane_enable_fb_damage_clips). Commits attach
+    /// damage only when nonzero (wlroots properties.c plane_info; atomic.c
+    /// guards on `crtc->primary->props.fb_damage_clips != 0`).
+    fb_damage_clips: u32 = 0,
 };
 
-/// Per-output DRM state: the scanout buffer and the KMS object ids bound
+/// One dumb scanout buffer: the CREATE_DUMB handle, its mmap, and the
+/// framebuffer id from ADDFB2. The backend keeps two of these (A/B) and
+/// page-flips between them, so the compositor never writes into the
+/// buffer currently being scanned out.
+const DumbBuffer = struct {
+    /// Dumb buffer (struct drm_mode_create_dumb output).
+    handle: u32 = 0,
+    pitch: u32 = 0,
+    size: usize = 0,
+    /// mmap of the dumb buffer; pitch may exceed width*4 (padding).
+    map: []align(std.heap.page_size_min) u8 = &.{},
+    /// Framebuffer id from DRM_IOCTL_MODE_ADDFB2.
+    fb_id: u32 = 0,
+};
+
+/// Per-output DRM state: the scanout buffers and the KMS object ids bound
 /// during start(). `out` is the compositor Output wrapper, created once
 /// the modeset succeeded.
 const DrmOutput = struct {
@@ -100,14 +129,26 @@ const DrmOutput = struct {
     crtc_mode_id: u32 = 0,
     crtc_active: u32 = 0,
     mode: output_mod.Mode,
-    /// Dumb buffer (struct drm_mode_create_dumb output).
-    dumb_handle: u32 = 0,
-    dumb_pitch: u32 = 0,
-    dumb_size: usize = 0,
-    /// mmap of the dumb buffer; pitch may exceed width*4 (padding).
-    map: []align(std.heap.page_size_min) u8 = &.{},
-    /// Framebuffer id from DRM_IOCTL_MODE_ADDFB2.
-    fb_id: u32 = 0,
+    /// Two dumb scanout buffers used as a flip-flop swapchain: every
+    /// per-frame commit copies into the buffer that is NOT currently
+    /// displayed and page-flips to ITS framebuffer id, so FB_ID changes
+    /// on every flip. This is mandatory on virtio-gpu: the plane update
+    /// is gated on drm_atomic_helper_damage_merged() (virtgpu_plane.c
+    /// virtio_gpu_plane_atomic_update), and re-committing the same FB
+    /// with only FB_DAMAGE_CLIPS damage empirically did not run the
+    /// scanout switch/upload (screen stayed at the boot console).
+    /// Alternating FB_ID makes `fb != old_state->fb` run the
+    /// scanout+upload+flush unconditionally, damage-independent — the
+    /// same buffer-swap trick wlroots uses for its swapchain
+    /// (wlr_drm_plane swapchain, backend/drm/atomic.c). It also closes
+    /// the single-buffer tearing gap (notes/116 gap 2): the previous
+    /// flip's buffer stays on screen while the next frame is written.
+    buffers: [2]DumbBuffer = .{ .{}, .{} },
+    /// Index into `buffers` of the buffer the modeset bound / last
+    /// flipped to. The next commit copies into buffers[1 - flip_index]
+    /// and flips to it, then flips the index — FB_ID alternates
+    /// A, B, A, B, ... (the modeset binds A = buffers[0]).
+    flip_index: u32 = 0,
     /// Mode blob id from drmModeCreatePropertyBlob (destroyed on teardown).
     mode_blob: u32 = 0,
     /// One flip in flight (guarded by the frame-event pacing).
@@ -293,57 +334,63 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
         drm_out.crtc_active = crtc_props[1];
     }
 
-    // --- dumb buffer: create, map, addfb2
+    // --- dumb scanout buffers: create, map, addfb2 — TWO of them, an
+    // A/B swapchain (see the DrmOutput.buffers doc: every flip must
+    // change FB_ID because virtio-gpu's plane update is damage-gated).
     // (smithay src/backend/drm/dumb.rs framebuffer_from_dumb_buffer:
-    // create dumb -> add_framebuffer; wlroots uses the same ioctls).
+    // create dumb -> add_framebuffer; wlroots uses the same ioctls.)
+    // A partial failure is fine: drmTeardown is idempotent and frees
+    // whatever the loop already created.
     {
         const width: u32 = found.mode.hdisplay;
         const height: u32 = found.mode.vdisplay;
 
-        var create_dumb: c.struct_drm_mode_create_dumb = .{
-            .height = height,
-            .width = width,
-            .bpp = 32,
-            .flags = 0,
-        };
-        if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb) != 0) {
-            log_mod.err("drm: DRM_IOCTL_MODE_CREATE_DUMB failed", self.io, self.log_cfg, "drm", .{});
-            return error.BackendFailed;
-        }
-        drm_out.dumb_handle = create_dumb.handle;
-        drm_out.dumb_pitch = create_dumb.pitch;
-        drm_out.dumb_size = @intCast(create_dumb.size);
+        for (&drm_out.buffers) |*buf| {
+            var create_dumb: c.struct_drm_mode_create_dumb = .{
+                .height = height,
+                .width = width,
+                .bpp = 32,
+                .flags = 0,
+            };
+            if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb) != 0) {
+                log_mod.err("drm: DRM_IOCTL_MODE_CREATE_DUMB failed", self.io, self.log_cfg, "drm", .{});
+                return error.BackendFailed;
+            }
+            buf.handle = create_dumb.handle;
+            buf.pitch = create_dumb.pitch;
+            buf.size = @intCast(create_dumb.size);
 
-        var map_dumb: c.struct_drm_mode_map_dumb = .{ .handle = create_dumb.handle };
-        if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0) {
-            log_mod.err("drm: DRM_IOCTL_MODE_MAP_DUMB failed", self.io, self.log_cfg, "drm", .{});
-            return error.BackendFailed;
-        }
-        drm_out.map = std.posix.mmap(
-            null,
-            drm_out.dumb_size,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED },
-            fd,
-            map_dumb.offset,
-        ) catch {
-            log_mod.err("drm: mmap dumb buffer failed", self.io, self.log_cfg, "drm", .{});
-            return error.BackendFailed;
-        };
+            var map_dumb: c.struct_drm_mode_map_dumb = .{ .handle = create_dumb.handle };
+            if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0) {
+                log_mod.err("drm: DRM_IOCTL_MODE_MAP_DUMB failed", self.io, self.log_cfg, "drm", .{});
+                return error.BackendFailed;
+            }
+            buf.map = std.posix.mmap(
+                null,
+                buf.size,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .SHARED },
+                fd,
+                map_dumb.offset,
+            ) catch {
+                log_mod.err("drm: mmap dumb buffer failed", self.io, self.log_cfg, "drm", .{});
+                return error.BackendFailed;
+            };
 
-        var fb2: c.struct_drm_mode_fb_cmd2 = .{
-            .width = width,
-            .height = height,
-            .pixel_format = drm_format_xrgb8888,
-            .handles = .{ create_dumb.handle, 0, 0, 0 },
-            .pitches = .{ create_dumb.pitch, 0, 0, 0 },
-            .offsets = .{ 0, 0, 0, 0 },
-        };
-        if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_ADDFB2, &fb2) != 0) {
-            log_mod.err("drm: DRM_IOCTL_MODE_ADDFB2 failed", self.io, self.log_cfg, "drm", .{});
-            return error.BackendFailed;
+            var fb2: c.struct_drm_mode_fb_cmd2 = .{
+                .width = width,
+                .height = height,
+                .pixel_format = drm_format_xrgb8888,
+                .handles = .{ create_dumb.handle, 0, 0, 0 },
+                .pitches = .{ create_dumb.pitch, 0, 0, 0 },
+                .offsets = .{ 0, 0, 0, 0 },
+            };
+            if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_ADDFB2, &fb2) != 0) {
+                log_mod.err("drm: DRM_IOCTL_MODE_ADDFB2 failed", self.io, self.log_cfg, "drm", .{});
+                return error.BackendFailed;
+            }
+            buf.fb_id = fb2.fb_id;
         }
-        drm_out.fb_id = fb2.fb_id;
     }
 
     // --- mode blob (wlroots atomic.c create_mode_blob).
@@ -357,11 +404,35 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
     }
 
     // --- atomic modeset: connector->crtc binding, crtc active+mode,
-    // plane fb + full source/dest rect. Blocking (no flip event; the
-    // first frame's page flip sends the event).
+    // plane fb + full source/dest rect + full-fb damage clip. Blocking
+    // (no flip event; the first frame's page flip sends the event).
     // (wlroots atomic.c atomic_connector_add + set_plane_props; smithay
     // surface/atomic.rs set_connector/set_crtc/set_plane).
     {
+        // FB_DAMAGE_CLIPS (full-fb rect) must ride every commit touching
+        // the plane: virtio-gpu's plane update is gated on merged damage
+        // clips — drivers/gpu/drm/virtio/virtgpu_plane.c
+        // virtio_gpu_plane_atomic_update early-returns before the scanout
+        // switch and the dumb upload/flush when
+        // drm_atomic_helper_damage_merged() finds nothing, and our
+        // commits otherwise change only FB_ID (wlroots atomic.c
+        // drm_atomic_connector_prepare -> create_fb_damage_clips_blob,
+        // set_plane_props adds the blob id). Skipped when the driver
+        // lacks the property (fb_damage_clips == 0).
+        var damage_blob: u32 = 0;
+        if (plane.fb_damage_clips != 0) {
+            if (!createDamageBlob(fd, found.mode.hdisplay, found.mode.vdisplay, &damage_blob)) {
+                log_mod.err("drm: create FB_DAMAGE_CLIPS blob failed", self.io, self.log_cfg, "drm", .{});
+                return error.BackendFailed;
+            }
+        }
+        // The kernel copies the clips into the plane state at commit
+        // time; the blob is destroyed right after (wlroots atomic.c
+        // drm_atomic_connector_commit_state: destroy_blob(state->fb_damage_clips)).
+        defer {
+            if (damage_blob != 0) _ = c.drmModeDestroyPropertyBlob(fd, damage_blob);
+        }
+
         const req = c.drmModeAtomicAlloc() orelse {
             log_mod.err("drm: drmModeAtomicAlloc failed", self.io, self.log_cfg, "drm", .{});
             return error.BackendFailed;
@@ -373,7 +444,7 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
             c.drmModeAtomicAddProperty(req, found.crtc_id, drm_out.crtc_mode_id, drm_out.mode_blob) < 0 or
             c.drmModeAtomicAddProperty(req, found.crtc_id, drm_out.crtc_active, 1) < 0 or
             c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_id, found.crtc_id) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.fb_id, drm_out.fb_id) < 0 or
+            c.drmModeAtomicAddProperty(req, plane_id, plane.fb_id, drm_out.buffers[0].fb_id) < 0 or
             c.drmModeAtomicAddProperty(req, plane_id, plane.src_x, 0) < 0 or
             c.drmModeAtomicAddProperty(req, plane_id, plane.src_y, 0) < 0 or
             c.drmModeAtomicAddProperty(req, plane_id, plane.src_w, src_w) < 0 or
@@ -381,18 +452,28 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
             c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_x, 0) < 0 or
             c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_y, 0) < 0 or
             c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_w, found.mode.hdisplay) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_h, found.mode.vdisplay) < 0)
+            c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_h, found.mode.vdisplay) < 0 or
+            (plane.fb_damage_clips != 0 and
+                c.drmModeAtomicAddProperty(req, plane_id, plane.fb_damage_clips, damage_blob) < 0))
         {
             log_mod.err("drm: atomic modeset property add failed", self.io, self.log_cfg, "drm", .{});
             return error.BackendFailed;
         }
+        log_mod.debug(
+            "drm: modeset commit plane={d} fbA={d} fbB={d} damage_prop={d} damage_blob={d}",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{ plane_id, drm_out.buffers[0].fb_id, drm_out.buffers[1].fb_id, plane.fb_damage_clips, damage_blob },
+        );
         const commit_rc = c.drmModeAtomicCommit(fd, req, c.DRM_MODE_ATOMIC_ALLOW_MODESET, null);
         if (commit_rc != 0) {
             log_mod.err(
                 "drm: atomic modeset commit failed (errno {s}); props: " ++
                     "conn{{id={d},crtc_prop={d},crtc={d}}} " ++
                     "crtc{{id={d},mode_prop={d},mode={d},active_prop={d}}} " ++
-                    "plane{{id={d},crtc_prop={d},crtc={d},fb_prop={d},fb={d},src={d},{d},{d},{d},dst={d},{d},{d},{d}}}",
+                    "plane{{id={d},crtc_prop={d},crtc={d},fb_prop={d},fb={d}," ++
+                    "src={d},{d},{d},{d},dst={d},{d},{d},{d},damage_prop={d},damage={d}}}",
                 self.io,
                 self.log_cfg,
                 "drm",
@@ -409,7 +490,7 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
                     plane.crtc_id,
                     found.crtc_id,
                     plane.fb_id,
-                    drm_out.fb_id,
+                    drm_out.buffers[0].fb_id,
                     plane.src_x,
                     plane.src_y,
                     plane.src_w,
@@ -418,6 +499,8 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
                     plane.crtc_y,
                     plane.crtc_w,
                     plane.crtc_h,
+                    plane.fb_damage_clips,
+                    damage_blob,
                 },
             );
             return error.BackendFailed;
@@ -496,19 +579,57 @@ fn commit(out: *output_mod.Output, state: *const output_mod.Output.State) error{
     }
 
     const fb: *pixman.Framebuffer = @ptrCast(@alignCast(state.buffer.?));
+    // A/B swapchain: draw into the OTHER buffer (the one not currently
+    // displayed — the modeset bound buffers[0], so the first commit
+    // copies into buffers[1]) and flip to ITS framebuffer id. Every flip
+    // therefore changes FB_ID, which is what makes the kernel's plane
+    // update run at all on virtio-gpu: virtio_gpu_plane_atomic_update
+    // (virtgpu_plane.c) early-returns before the scanout switch and the
+    // dumb upload/flush when drm_atomic_helper_damage_merged() finds no
+    // damage, and our FB_DAMAGE_CLIPS damage alone empirically did not
+    // trigger it (screen stuck at the boot console, zero "handle 0x"
+    // update lines). `fb != old_state->fb` skips the damage gate and
+    // runs the update unconditionally. Alternating the buffer also
+    // closes the single-buffer tearing gap (notes/116 gap 2): the
+    // compositor writes into a buffer no scanout is currently reading.
+    const buf = &self.buffers[1 - self.flip_index];
     // Row-by-row copy: the dumb pitch may exceed width*4, so a single
     // whole-buffer memcpy would skew every row past the first.
     // (smithay dumb.rs scans out the same pitch-padded ARGB buffer.)
-    copyRows(fb.data, @intCast(fb.stride), self.map, self.dumb_pitch, fb.width, fb.height);
+    copyRows(fb.data, @intCast(fb.stride), buf.map, buf.pitch, fb.width, fb.height);
 
-    // Page flip: only FB_ID changes on the plane (the modeset bound the
-    // rest); PAGE_FLIP_EVENT + NONBLOCK like wlroots atomic.c
-    // (non-modeset commits with a new buffer are non-blocking flips).
+    // Page flip: FB_ID changes on the plane (the modeset bound the rest)
+    // plus a full-fb FB_DAMAGE_CLIPS clip; PAGE_FLIP_EVENT + NONBLOCK
+    // like wlroots atomic.c (non-modeset commits with a new buffer are
+    // non-blocking flips). The damage clip is kept for wlroots parity
+    // even though the FB_ID alternation alone now drives the update:
+    // virtio-gpu's plane update is gated on merged damage clips
+    // (virtgpu_plane.c virtio_gpu_plane_atomic_update), so the clip must
+    // stay attached for drivers that still consult it, and wlroots
+    // attaches damage on every commit the same way (atomic.c
+    // create_fb_damage_clips_blob + atomic_plane_set).
     const fd = self.backend.fd.?;
+    var damage_blob: u32 = 0;
+    if (self.props.fb_damage_clips != 0) {
+        if (!createDamageBlob(fd, @intCast(fb.width), @intCast(fb.height), &damage_blob)) {
+            log_mod.err("drm: create FB_DAMAGE_CLIPS blob failed", self.backend.io, self.backend.log_cfg, "drm", .{});
+            return error.CommitFailed;
+        }
+    }
+    // The kernel copies the clips into the plane state at commit time;
+    // the blob is destroyed right after (wlroots atomic.c
+    // drm_atomic_connector_commit_state: destroy_blob(state->fb_damage_clips)).
+    defer {
+        if (damage_blob != 0) _ = c.drmModeDestroyPropertyBlob(fd, damage_blob);
+    }
+
     const req = c.drmModeAtomicAlloc() orelse return error.CommitFailed;
     defer c.drmModeAtomicFree(req);
-    if (c.drmModeAtomicAddProperty(req, self.plane_id, self.props.fb_id, self.fb_id) < 0) {
-        log_mod.err("drm: atomic add FB_ID failed", self.backend.io, self.backend.log_cfg, "drm", .{});
+    if (c.drmModeAtomicAddProperty(req, self.plane_id, self.props.fb_id, buf.fb_id) < 0 or
+        (self.props.fb_damage_clips != 0 and
+            c.drmModeAtomicAddProperty(req, self.plane_id, self.props.fb_damage_clips, damage_blob) < 0))
+    {
+        log_mod.err("drm: atomic add FB_ID/damage failed", self.backend.io, self.backend.log_cfg, "drm", .{});
         return error.CommitFailed;
     }
     if (c.drmModeAtomicCommit(
@@ -521,6 +642,11 @@ fn commit(out: *output_mod.Output, state: *const output_mod.Output.State) error{
         return error.CommitFailed;
     }
     self.flip_pending = true;
+    // The flip is queued; the buffer just flipped to is now the
+    // displayed one, so the next commit copies into the other. Frame
+    // pacing (one flip in flight, the completion event drives the next
+    // frame) keeps this index accurate at commit time.
+    self.flip_index = 1 - self.flip_index;
 }
 
 /// The backend owns all per-output resources; Output.destroy() frees only
@@ -659,6 +785,20 @@ fn findPrimaryPlane(self: *DrmBackendData, crtc_index: usize, out_props: *PlaneP
         }
 
         out_props.* = props;
+        if (props.fb_damage_clips == 0) {
+            // Optional property (wlroots atomic.c guards every damage
+            // add on `props.fb_damage_clips != 0`): commits skip damage
+            // and rely on the driver doing a full plane update on its
+            // own. virtio-gpu exposes the property, so this only fires
+            // on other drivers.
+            log_mod.debug(
+                "drm: plane {d} lacks FB_DAMAGE_CLIPS; damage updates skipped",
+                self.io,
+                self.log_cfg,
+                "drm",
+                .{plane_id},
+            );
+        }
         return plane_id;
     }
     return null;
@@ -690,14 +830,20 @@ fn scanPropIds(fd: c_int, obj_id: u32, obj_type: u32, names: []const []const u8,
 }
 
 /// Plane property scan: the ten commit properties plus the "type"
-/// property id (read to classify the plane).
+/// property id (read to classify the plane) and the optional
+/// "FB_DAMAGE_CLIPS" id (0 when the driver lacks it — some do). The
+/// damage property must stay optional: scanPropIds is all-or-nothing, so
+/// a plane without FB_DAMAGE_CLIPS must still pass (wlroots properties.c
+/// plane_info includes fb_damage_clips but leaves missing optional ids at
+/// 0).
 fn scanPlaneProps(fd: c_int, plane_id: u32, out_props: *PlanePropIds) bool {
-    var ids: [11]u32 = undefined;
-    if (!scanPropIds(fd, plane_id, c.DRM_MODE_OBJECT_PLANE, &plane_prop_names, ids[0..10])) return false;
+    var ids: [10]u32 = undefined;
+    if (!scanPropIds(fd, plane_id, c.DRM_MODE_OBJECT_PLANE, &plane_prop_names, &ids)) return false;
 
     const props = c.drmModeObjectGetProperties(fd, plane_id, c.DRM_MODE_OBJECT_PLANE) orelse return false;
     defer c.drmModeFreeObjectProperties(props);
-    ids[10] = 0;
+    var plane_type: u32 = 0;
+    var fb_damage_clips: u32 = 0;
     var i: u32 = 0;
     while (i < props.*.count_props) : (i += 1) {
         const prop = c.drmModeGetProperty(fd, props.*.props[i]) orelse continue;
@@ -705,9 +851,13 @@ fn scanPlaneProps(fd: c_int, plane_id: u32, out_props: *PlanePropIds) bool {
         // drmModePropertyRes.name is a NUL-terminated char[32] buffer.
         const name_ptr: [*:0]const u8 = @ptrCast(&prop.*.name);
         const prop_name = std.mem.sliceTo(name_ptr, 0);
-        if (std.mem.eql(u8, prop_name, "type")) ids[10] = prop.*.prop_id;
+        if (std.mem.eql(u8, prop_name, "type")) {
+            plane_type = prop.*.prop_id;
+        } else if (std.mem.eql(u8, prop_name, "FB_DAMAGE_CLIPS")) {
+            fb_damage_clips = prop.*.prop_id;
+        }
     }
-    if (ids[10] == 0) return false;
+    if (plane_type == 0) return false;
 
     out_props.* = .{
         .fb_id = ids[0],
@@ -720,7 +870,8 @@ fn scanPlaneProps(fd: c_int, plane_id: u32, out_props: *PlanePropIds) bool {
         .crtc_y = ids[7],
         .crtc_w = ids[8],
         .crtc_h = ids[9],
-        .plane_type = ids[10],
+        .plane_type = plane_type,
+        .fb_damage_clips = fb_damage_clips,
     };
     return true;
 }
@@ -741,6 +892,43 @@ fn getPropValue(fd: c_int, obj_id: u32, obj_type: u32, prop_id: u32) ?u64 {
 /// (wlroots atomic.c set_plane_props: src_box->width * (1 << 16)).
 fn fixed16(v: u16) u64 {
     return @as(u64, v) << 16;
+}
+
+/// Create an FB_DAMAGE_CLIPS property blob covering the whole framebuffer
+/// (the backend repaints the entire dumb buffer every frame, so a full
+/// rect is the honest damage). The blob is an array of `drm_mode_rect`
+/// in plain framebuffer pixels — NOT 16.16 like SRC_*: kernel drm_plane.c
+/// "DOC: damage tracking" ("blob property with the layout of blob data is
+/// simply an array of &drm_mode_rect. Unlike plane &drm_plane_state.src
+/// coordinates, damage clips are not in 16.16 fixed point") and the uapi
+/// parse in drm_atomic_uapi.c checks `sizeof(struct drm_mode_rect)` per
+/// element. wlroots sends the same layout (atomic.c
+/// create_fb_damage_clips_blob passes pixman_box32_t rects, int32 x1/y1/
+/// x2/y2) and smithay builds drm_mode_rect values (drm/surface/mod.rs
+/// PlaneDamageClips::from_damage). The legacy uapi `struct drm_clip_rect`
+/// (unsigned short fields) is a drawable-era type and is NOT the damage
+/// blob element. `out` receives the blob id; the caller must destroy it
+/// with drmModeDestroyPropertyBlob after the atomic commit (the kernel
+/// copies the clips into the plane state at commit time — wlroots atomic.c
+/// destroys state->fb_damage_clips in drm_atomic_connector_commit_state).
+/// Returns false when blob creation fails.
+fn createDamageBlob(fd: c_int, width: u32, height: u32, out: *u32) bool {
+    // FB_DAMAGE_CLIPS blobs carry WHOLE-PIXEL rects, not 16.16: the
+    // kernel's damage iterator returns clips raw ("damage clips are whole
+    // number", drm_damage_helper.c) and virtio-gpu feeds them unshifted
+    // into the transfer/flush commands (virtgpu_plane.c). 16.16 values
+    // here made the upload 0x05000000px wide — a silent no-op on qemu.
+    // struct_drm_mode_rect (4x s32) matches the kernel's drm_clip_rect
+    // (u32) blob layout; wlroots uses the same pixel rects (atomic.c
+    // create_fb_damage_clips_blob).
+    const rect: c.struct_drm_mode_rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        // x2/y2 are exclusive, so the full rect spans the whole fb.
+        .x2 = @intCast(width),
+        .y2 = @intCast(height),
+    };
+    return c.drmModeCreatePropertyBlob(fd, &rect, @sizeOf(c.struct_drm_mode_rect), out) == 0;
 }
 
 /// Convert a drmModeModeInfo to the output Mode; refresh from vrefresh
@@ -791,18 +979,22 @@ fn drmTeardown(self: *DrmBackendData) void {
             _ = c.drmModeDestroyPropertyBlob(fd, drm_out.mode_blob);
             drm_out.mode_blob = 0;
         }
-        if (drm_out.fb_id != 0) {
-            _ = c.drmModeRmFB(fd, drm_out.fb_id);
-            drm_out.fb_id = 0;
-        }
-        if (drm_out.map.len != 0) {
-            std.posix.munmap(drm_out.map);
-            drm_out.map = &.{};
-        }
-        if (drm_out.dumb_handle != 0) {
-            var destroy_dumb: c.struct_drm_mode_destroy_dumb = .{ .handle = drm_out.dumb_handle };
-            _ = c.drmIoctl(fd, c.DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
-            drm_out.dumb_handle = 0;
+        // Reverse acquisition order per buffer: RmFB, munmap, destroy
+        // dumb. Both swapchain buffers are released.
+        for (&drm_out.buffers) |*buf| {
+            if (buf.fb_id != 0) {
+                _ = c.drmModeRmFB(fd, buf.fb_id);
+                buf.fb_id = 0;
+            }
+            if (buf.map.len != 0) {
+                std.posix.munmap(buf.map);
+                buf.map = &.{};
+            }
+            if (buf.handle != 0) {
+                var destroy_dumb: c.struct_drm_mode_destroy_dumb = .{ .handle = buf.handle };
+                _ = c.drmIoctl(fd, c.DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
+                buf.handle = 0;
+            }
         }
     }
     if (self.is_master) {

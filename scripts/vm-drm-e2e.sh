@@ -12,10 +12,11 @@
 set -uo pipefail
 exec > /dev/console 2>&1
 
-# Interactive mode: when the HOST created /shared/repo/.no-auto-demo, skip
-# the auto E2E and start the interactive demo (DRM server + foot) instead.
-if [ -f /shared/repo/.no-auto-demo ]; then
-    echo "=== auto E2E skipped (.no-auto-demo present); starting interactive demo ==="
+# Interactive mode: launched with QEMU_KERNEL_PARAMS="demo.interactive"
+# (kernel cmdline — reliable, unlike 9p file checks, which cache=loose
+# serves stale). Skips the auto E2E and starts the interactive demo.
+if grep -q demo.interactive /proc/cmdline; then
+    echo "=== auto E2E skipped (demo.interactive on the cmdline); starting interactive demo ==="
     systemctl start compositor-demo-interactive
     poweroff -f
     exit 0

@@ -25,7 +25,11 @@
   # evdev devices (/dev/input/*). Serial console only; pixel verification
   # is guest-side.
   virtualisation.qemu.options = [
-    "-device virtio-gpu-pci,xres=1280,yres=720"
+    # virtio-vga (VGA-compat) is what makes qemu present the guest's DRM
+    # scanout: with virtio-gpu-pci alone the display stays at the boot
+    # console (verified via QMP screendumps — even the kernel fbcon never
+    # displayed). The compositor uses card0 = the virtio-vga's.
+    "-vga virtio"
     "-device virtio-keyboard-pci"
     "-device virtio-mouse-pci"
     "-no-reboot"
