@@ -45,6 +45,8 @@
 //!       height: i32,
 //!       dropped: bool,
 //!       n_locks: u32,
+//!       released: bool,
+//!       tracked: bool,
 //!       allocator: std.mem.Allocator,
 //!       events: struct {
 //!           release: wire.Signal(*Buffer),
@@ -67,8 +69,10 @@
 //!   pub fn fromResource(allocator: std.mem.Allocator, resource: *wire.Resource) !*Buffer
 //! fromResource does NOT lock; the surface locks on attach and drop()s the
 //! buffer when done presenting. The release signal fires whenever the last
-//! lock drops (n_locks == 0), regardless of dropped (buffers/buffer.zig);
-//! the owner then destroys the Buffer.
+//! lock drops (n_locks == 0) — at most once per buffer lifetime
+//! (buffers/buffer.zig); ShmState frees tracked wrappers at deinit, and
+//! the surface destroys untracked ones (Buffer.tracked == false) in its
+//! buffer-replace and destroy paths.
 //!
 //! Cross-module: src/compositor/compositor.zig (this cluster):
 //!   Compositor.removeSurface(*Surface) void — called by Surface.destroy.
@@ -96,23 +100,8 @@ const Allocator = std.mem.Allocator;
 /// Double-buffered surface state. Pending accumulates request state;
 /// commit atomically applies it to current (see swapState).
 pub const State = struct {
-    pub const committed_buffer: u32 = 1 << 0;
-    pub const committed_damage: u32 = 1 << 1;
-    pub const committed_opaque: u32 = 1 << 2;
-    pub const committed_input: u32 = 1 << 3;
-    pub const committed_transform: u32 = 1 << 4;
-    pub const committed_scale: u32 = 1 << 5;
-
-    /// Bitfield of the state fields set since the last commit
-    /// (committed_* constants). Read from current after a commit to learn
-    /// what changed.
-    committed: u32 = 0,
     /// Attached buffer (locked while referenced by this state).
     buffer: ?*Buffer = null,
-    /// Position of the pending buffer relative to the previous one, in
-    /// surface-local coordinates (wl_surface.attach x/y or offset).
-    dx: i32 = 0,
-    dy: i32 = 0,
     /// Accumulated damaged rects in surface coordinates.
     surface_damage: Damage,
     /// Accumulated damaged rects in buffer coordinates. wl_surface.damage_buffer
@@ -241,6 +230,18 @@ pub const Surface = struct {
     /// dying); also used by the compositor at deinit.
     pub fn destroy(s: *Surface) void {
         log.debug("wl_surface@{d} destroyed", s.io, s.log_cfg, "surface", .{s.resource.getId()});
+        // Inert the wire resource: clear its user data (this Surface) and
+        // drop the destroy callback so the later client teardown
+        // (display.deinit destroying clients) cannot dereference the freed
+        // Surface through the resource. The generated bindings expose no
+        // wl_resource_set_user_data wrapper, so null the user data via the
+        // existing setDispatcher API — same effect as wlroots' inerting
+        // (types/output/output.c:146-151: wl_resource_set_user_data(resource, NULL))
+        // and it also removes the destroy callback, which the generated
+        // destroy wrapper would otherwise call with the stale pointer.
+        const res: *server.wl.Resource = @ptrCast(s.resource);
+        res.setDispatcher(null, null, null, null);
+
         if (s.mapped) {
             s.mapped = false;
             if (s.role) |role| if (role.unmap) |f| f(s);
@@ -252,13 +253,24 @@ pub const Surface = struct {
         // Release the buffers we referenced. drop() then unlock(): the
         // release signal fires inside the last unlock, after which the
         // Buffer may be destroyed by the buffers module — do not touch it.
-        if (s.current.buffer) |b| {
+        // Untracked wrappers (shm fromResource with no ShmState) are owned
+        // by the surface: destroy them once the drop/unlock completes.
+        const current_buf = s.current.buffer;
+        if (current_buf) |b| {
             b.drop();
             if (b.n_locks > 0) b.unlock();
+            if (!b.tracked) b.destroy();
         }
-        if (s.pending.buffer) |b| {
-            b.drop();
-            if (b.n_locks > 0) b.unlock();
+        const pending_buf = s.pending.buffer;
+        if (pending_buf) |b| {
+            // A lockless re-attach of the current buffer may leave the same
+            // wrapper in both slots (no extra lock held); it was handled —
+            // and possibly destroyed — above.
+            if (b != current_buf) {
+                b.drop();
+                if (b.n_locks > 0) b.unlock();
+                if (!b.tracked) b.destroy();
+            }
         }
         s.current.buffer = null;
         s.pending.buffer = null;
@@ -287,7 +299,7 @@ pub const Surface = struct {
     /// the buffer is dropped when the surface stops using it (replacement
     /// or destroy). A null buffer removes the surface content at the next
     /// commit.
-    pub fn attachBuffer(s: *Surface, buffer: ?*Buffer, x: i32, y: i32) void {
+    pub fn attachBuffer(s: *Surface, buffer: ?*Buffer) void {
         if (buffer) |b| {
             // Re-attaching the CURRENT buffer: the current state already
             // holds the surface's reference. Taking another lock would
@@ -323,9 +335,6 @@ pub const Surface = struct {
             }
         }
         s.pending.buffer = buffer;
-        s.pending.dx = x;
-        s.pending.dy = y;
-        s.pending.committed |= State.committed_buffer;
     }
 
     /// Commit pipeline: see the module comment for the step order.
@@ -343,6 +352,13 @@ pub const Surface = struct {
         // pending list to current, wlr_compositor.c:341-348).
         s.current.frame_callbacks.appendSlice(s.allocator, s.pending.frame_callbacks.items) catch {
             s.resource.postNoMemory();
+            // The swap already made the pending buffer current; release
+            // its attach lock (mirror step 8) so it is not stranded —
+            // otherwise the client waits for the buffer until the next
+            // successful commit or the surface is destroyed. OOM-only.
+            if (s.current.buffer) |b| {
+                if (b.n_locks > 0) b.unlock();
+            }
             return;
         };
         s.pending.frame_callbacks.clearRetainingCapacity();
@@ -355,6 +371,11 @@ pub const Surface = struct {
             if (old != s.current.buffer) {
                 old.drop();
                 if (old.n_locks > 0) old.unlock();
+                // Untracked wrappers are caller-owned: this was the
+                // surface's last reference, so free the wrapper (detaches
+                // its resource listeners). Tracked wrappers belong to
+                // ShmState, which frees them at deinit.
+                if (!old.tracked) old.destroy();
             }
         }
         // Release callbacks ride along with the current buffer.
@@ -457,7 +478,7 @@ pub const Surface = struct {
             }
             break :blk wrapped;
         } else null;
-        s.attachBuffer(b, x, y);
+        s.attachBuffer(b);
     }
 
     fn handleDamage(s: *Surface, x: i32, y: i32, width: i32, height: i32) void {
@@ -465,7 +486,6 @@ pub const Surface = struct {
             s.resource.postNoMemory();
             return;
         };
-        s.pending.committed |= State.committed_damage;
     }
 
     fn handleDamageBuffer(s: *Surface, x: i32, y: i32, width: i32, height: i32) void {
@@ -476,7 +496,6 @@ pub const Surface = struct {
             s.resource.postNoMemory();
             return;
         };
-        s.pending.committed |= State.committed_damage;
     }
 
     fn handleFrame(s: *Surface, callback_id: u32) void {
@@ -525,7 +544,6 @@ pub const Surface = struct {
             s.resource.postNoMemory();
             return;
         };
-        s.pending.committed |= State.committed_opaque;
     }
 
     fn handleSetInputRegion(s: *Surface, region: ?*server.wl.Region) void {
@@ -541,7 +559,6 @@ pub const Surface = struct {
             s.resource.postNoMemory();
             return;
         };
-        s.pending.committed |= State.committed_input;
     }
 
     fn handleSetBufferTransform(s: *Surface, transform: server.wl.Output.Transform) void {
@@ -551,7 +568,6 @@ pub const Surface = struct {
             return;
         }
         s.pending.transform = @enumFromInt(@as(u32, @intCast(value)));
-        s.pending.committed |= State.committed_transform;
     }
 
     fn handleSetBufferScale(s: *Surface, scale: i32) void {
@@ -560,14 +576,12 @@ pub const Surface = struct {
             return;
         }
         s.pending.scale = scale;
-        s.pending.committed |= State.committed_scale;
     }
 
-    fn handleOffset(s: *Surface, x: i32, y: i32) void {
+    fn handleOffset(_: *Surface, _: i32, _: i32) void {
         // wl_surface.offset (v5): role-specific location of the pending
-        // buffer. M1: stored like the attach offsets, applied at commit.
-        s.pending.dx = x;
-        s.pending.dy = y;
+        // buffer. M1 stores no attach/offset position (the write-only
+        // State.dx/dy were removed); the role ignores it.
     }
 
     fn fireReleaseCallbacksCurrent(s: *Surface) void {
@@ -612,12 +626,8 @@ pub const Surface = struct {
 /// is stale — M2's damage ring accumulates properly). Frame callbacks do
 /// NOT transfer here: Surface.commit accumulates them across commits.
 pub fn swapState(current: *State, allocator: Allocator, pending: *State) void {
-    current.committed = pending.committed;
-    pending.committed = 0;
     current.buffer = pending.buffer;
     pending.buffer = null;
-    current.dx = pending.dx;
-    current.dy = pending.dy;
     // Region lists transfer ownership; the previous current lists are
     // discarded. Pending restarts without a region (null opaque = no
     // opaque area, null input = infinite).
@@ -872,10 +882,7 @@ test "state swap transfers damage and regions, resets pending" {
     try pending.surface_damage.add(.{ .x = 1, .y = 2, .width = 3, .height = 4 });
     try pending.buffer_damage.add(.{ .x = 5, .y = 6, .width = 7, .height = 8 });
     try pending.frame_callbacks.append(allocator, @as(*server.wl.Callback, @ptrFromInt(0x100)));
-    pending.committed = State.committed_buffer | State.committed_damage;
     pending.buffer = @as(?*Buffer, @ptrFromInt(0x200));
-    pending.dx = 5;
-    pending.dy = 6;
     {
         var list: std.ArrayList(Rect) = .empty;
         try list.append(allocator, .{ .x = 1, .y = 1, .width = 2, .height = 2 });
@@ -891,12 +898,8 @@ test "state swap transfers damage and regions, resets pending" {
 
     swapState(&current, allocator, &pending);
 
-    try testing.expectEqual(State.committed_buffer | State.committed_damage, current.committed);
-    try testing.expectEqual(@as(u32, 0), pending.committed);
     try testing.expectEqual(@as(?*Buffer, @ptrFromInt(0x200)), current.buffer);
     try testing.expect(pending.buffer == null);
-    try testing.expectEqual(@as(i32, 5), current.dx);
-    try testing.expectEqual(@as(i32, 6), current.dy);
     try testing.expectEqual(@as(usize, 1), current.@"opaque".?.items.len);
     try testing.expectEqual(Rect{ .x = 1, .y = 1, .width = 2, .height = 2 }, current.@"opaque".?.items[0]);
     try testing.expect(pending.@"opaque" == null);
@@ -933,7 +936,6 @@ test "damage requests accumulate in separate coordinate spaces" {
     // its own buffer-coordinate list (they are not folded together).
     try testing.expectEqual(@as(usize, 1), s.pending.surface_damage.rects.items.len);
     try testing.expectEqual(@as(usize, 1), s.pending.buffer_damage.rects.items.len);
-    try testing.expect(s.pending.committed & State.committed_damage != 0);
 }
 
 test "frame callbacks are deferred until sendFrameDone" {
@@ -1005,8 +1007,7 @@ test "attach, commit, map and unmap transitions" {
     // First buffer commit maps the surface.
     var buffer: Buffer = undefined;
     testBuffer(allocator, &buffer);
-    s.attachBuffer(&buffer, 0, 0);
-    try testing.expectEqual(@as(u32, State.committed_buffer), s.pending.committed & State.committed_buffer);
+    s.attachBuffer(&buffer);
     s.commit();
 
     try testing.expect(s.mapped);
@@ -1018,7 +1019,7 @@ test "attach, commit, map and unmap transitions" {
     try testing.expectEqual(@as(usize, 1), test_commit_count);
 
     // Null attach commits remove the content: unmap.
-    s.attachBuffer(null, 0, 0);
+    s.attachBuffer(null);
     s.commit();
 
     try testing.expect(!s.mapped);
@@ -1081,7 +1082,7 @@ test "commit unlocks the current buffer at commit end" {
     testBuffer(allocator, &b1);
     var b2: Buffer = undefined;
     testBuffer(allocator, &b2);
-    s.attachBuffer(&b1, 0, 0);
+    s.attachBuffer(&b1);
     s.commit();
     // The attach lock is released at the END of the commit (wlroots
     // wlr_compositor.c:570-574) so the client can reuse the buffer; the
@@ -1090,7 +1091,7 @@ test "commit unlocks the current buffer at commit end" {
     try testing.expect(!b1.dropped);
     try testing.expect(s.current.buffer == &b1);
 
-    s.attachBuffer(&b2, 0, 0);
+    s.attachBuffer(&b2);
     s.commit();
     // b1 was swapped out: dropped (producer done); it was already unlocked.
     try testing.expect(b1.dropped);
@@ -1113,14 +1114,14 @@ test "re-attach of the current buffer does not double-lock" {
 
     var b: Buffer = undefined;
     testBuffer(allocator, &b);
-    s.attachBuffer(&b, 0, 0);
+    s.attachBuffer(&b);
     s.commit();
     try testing.expectEqual(@as(u32, 0), b.n_locks);
 
     // Lockless re-attach of the current buffer (weston-simple-shm resize
     // pattern): no new lock is taken, and the commit-end unlock must not
     // underflow a zero-count buffer.
-    s.attachBuffer(&b, 0, 0);
+    s.attachBuffer(&b);
     try testing.expect(!s.pending_locked);
     s.commit();
     try testing.expectEqual(@as(u32, 0), b.n_locks);
@@ -1142,7 +1143,7 @@ test "get_release callbacks fire when the buffer is released at commit end" {
 
     var b1: Buffer = undefined;
     testBuffer(allocator, &b1);
-    s.attachBuffer(&b1, 0, 0);
+    s.attachBuffer(&b1);
     s.handleGetRelease(tw.newId());
     try testing.expectEqual(@as(usize, 1), s.release_callbacks_pending.items.len);
     s.commit();
@@ -1154,7 +1155,7 @@ test "get_release callbacks fire when the buffer is released at commit end" {
     // Replacing the buffer drops the old one; its callbacks already fired.
     var b2: Buffer = undefined;
     testBuffer(allocator, &b2);
-    s.attachBuffer(&b2, 0, 0);
+    s.attachBuffer(&b2);
     s.commit();
     try testing.expectEqual(@as(usize, 0), s.release_callbacks_current.items.len);
     try testing.expect(b1.dropped);
@@ -1191,7 +1192,7 @@ test "commit validation rejects a buffer not divisible by scale" {
     var buffer: Buffer = undefined;
     testBuffer(allocator, &buffer); // 10x10
     s.handleSetBufferScale(3); // 10 % 3 != 0 -> invalid_size at commit
-    s.attachBuffer(&buffer, 0, 0);
+    s.attachBuffer(&buffer);
     s.commit();
 
     // The commit was discarded: nothing swapped, surface unmapped.
@@ -1239,13 +1240,13 @@ test "role hooks fire at commit, map and unmap" {
 
     var buffer: Buffer = undefined;
     testBuffer(allocator, &buffer);
-    s.attachBuffer(&buffer, 0, 0);
+    s.attachBuffer(&buffer);
     s.commit();
     try testing.expectEqual(@as(usize, 1), test_role_commits);
     try testing.expectEqual(@as(usize, 1), test_role_maps);
     try testing.expectEqual(@as(usize, 0), test_role_unmaps);
 
-    s.attachBuffer(null, 0, 0);
+    s.attachBuffer(null);
     s.commit();
     try testing.expectEqual(@as(usize, 2), test_role_commits);
     try testing.expectEqual(@as(usize, 1), test_role_maps);
@@ -1294,7 +1295,7 @@ test "commit with a zero-sized buffer does not map" {
     testBuffer(allocator, &buffer); // 10x10, then zeroed
     buffer.width = 0;
     buffer.height = 0;
-    s.attachBuffer(&buffer, 0, 0);
+    s.attachBuffer(&buffer);
     s.commit();
 
     // A zero-sized buffer is rejected at validation (invalid_size) and the
@@ -1369,7 +1370,7 @@ test "opaque and input regions are snapshotted as rect lists" {
     // Commit transfers ownership to current; pending restarts empty.
     var buffer: Buffer = undefined;
     testBuffer(allocator, &buffer);
-    s.attachBuffer(&buffer, 0, 0);
+    s.attachBuffer(&buffer);
     s.commit();
     try testing.expectEqual(@as(usize, 2), s.current.@"opaque".?.items.len);
     try testing.expectEqual(@as(usize, 2), s.current.input.?.items.len);
@@ -1397,7 +1398,7 @@ test "commit translates surface damage into buffer coordinates" {
 
     var buffer: Buffer = undefined;
     testBuffer(allocator, &buffer); // 10x10, scale 1, normal transform
-    s.attachBuffer(&buffer, 0, 0);
+    s.attachBuffer(&buffer);
     s.handleDamage(1, 2, 3, 4);
     s.handleDamageBuffer(10, 20, 30, 40);
     s.commit();
@@ -1431,7 +1432,7 @@ test "surface damage translation applies scale and transform" {
     testBuffer(allocator, &buffer); // 10x10
     s.handleSetBufferScale(2);
     s.handleSetBufferTransform(server.wl.Output.Transform.@"90");
-    s.attachBuffer(&buffer, 0, 0);
+    s.attachBuffer(&buffer);
     s.handleDamage(1, 2, 3, 4);
     s.commit();
 

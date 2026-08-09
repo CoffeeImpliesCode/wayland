@@ -37,7 +37,8 @@
 //!   because the module also drops on resource destruction.
 //! - Tracked wrappers (stateful path) are owned by ShmState and freed in
 //!   deinit. Untracked wrappers (stateless fromResource) are owned by the
-//!   caller, which must call Buffer.destroy.
+//!   surface, which destroys them via Buffer.destroy in its buffer-replace
+//!   and destroy paths (Buffer.tracked == false).
 
 const std = @import("std");
 const wire = @import("../core/wire.zig");
@@ -123,9 +124,12 @@ pub const ShmState = struct {
 };
 
 /// Wrap a client wl_buffer resource as an untracked Buffer. Unlike the
-/// stateful variant this creates a fresh wrapper per call; the caller owns
-/// it and must call Buffer.destroy when done. Prefer ShmState.fromResource
-/// in the compositor so repeated attaches of one resource share a wrapper.
+/// stateful variant this creates a fresh wrapper per call; the surface
+/// (the only caller, via surface.zig handleAttach when no ShmState is
+/// wired) owns it and destroys it via Buffer.destroy when it stops using
+/// it (buffer-replace and surface-destroy paths). Prefer
+/// ShmState.fromResource in the compositor so repeated attaches of one
+/// resource share a wrapper.
 pub fn fromResource(
     allocator: std.mem.Allocator,
     resource: *wire.Resource,
@@ -205,19 +209,22 @@ fn resourceDestroy(listener: *wire.Listener(*wire.Resource), resource: *wire.Res
     _ = resource;
     const d: *ShmBufferData = @fieldParentPtr("resource_destroy", listener);
     if (d.state) |state| {
-        _ = state.buffers.remove(d.resource_key);
         // The wrapper still outlives the resource (surfaces may hold it
         // until teardown); move ownership to the graveyard so deinit
         // frees it instead of leaking (the map no longer tracks it).
-        state.dead_buffers.append(state.allocator, d.buf) catch {
-            // OOM: the wrapper leaks at exit (DebugAllocator reports it)
-            // rather than corrupting the teardown walk.
-            return;
-        };
+        _ = state.buffers.remove(d.resource_key);
     }
+    // Invalidate BEFORE the graveyard append: if the append OOMs the
+    // wrapper is unreachable (removed from the map, never appended), so it
+    // leaks at deinit — but it must not keep pointing at the freed client
+    // resource, or a later surface unlock/replace/destroy would
+    // use-after-free. The nulling also makes releaseNotify's guard work.
     d.resource = null;
     d.shm = null;
     if (!d.buf.dropped) d.buf.drop();
+    if (d.state) |state| {
+        state.dead_buffers.append(state.allocator, d.buf) catch return;
+    }
 }
 
 /// The compositor is done with the buffer (dropped && n_locks == 0): tell
@@ -261,6 +268,10 @@ fn shmFromResource(
     );
     errdefer allocator.destroy(buf);
     d.buf = buf;
+    // Tracked wrappers (state != null) are owned by ShmState and freed in
+    // deinit; untracked wrappers are caller-owned, and the surface destroys
+    // them in its buffer-replace and destroy paths (Buffer.tracked).
+    buf.tracked = state != null;
 
     d.resource_destroy = wire.Listener(*wire.Resource).init(resourceDestroy);
     resource.addDestroyListener(&d.resource_destroy);

@@ -3,10 +3,11 @@
 //! Pure protocol client (generated `client.*` bindings + libwayland-client,
 //! no compositor library import):
 //!   1. connect via WAYLAND_DISPLAY, roundtrip
-//!   2. bind wl_compositor (v7), wl_shm (v3), xdg_wm_base (v7), wl_seat,
-//!      wl_output, zwlr_screencopy_manager_v1
+//!   2. bind wl_compositor (v7), wl_shm (server v2, bound at the
+//!      advertised version), xdg_wm_base (v7), wl_seat, wl_output,
+//!      zwlr_screencopy_manager_v1
 //!   3. xdg toplevel "m1-test"; empty commit; wait for configure, ack it
-//!   4. shm buffer (memfd, 1280x720x4, red gradient), attach, damage, commit
+//!   4. shm buffer (memfd, output-sized x4, red gradient), attach, damage, commit
 //!   5. one frame callback; on done -> CLIENT-OK, exit 0
 //!   6. M3 (WAYLAND_SYNTH_INPUT=1 on the server): waits for the pointer
 //!      enter + keyboard focus + key press, then captures the output via
@@ -23,11 +24,12 @@ const client = protocol.client;
 const wl = client.wl;
 const xdg = client.xdg;
 
-const surface_width: i32 = 1280;
-const surface_height: i32 = 720;
 const bytes_per_pixel: usize = 4;
-const pool_size: usize = @as(usize, @intCast(surface_width)) *
-    @as(usize, @intCast(surface_height)) * bytes_per_pixel;
+/// Fallback surface size, used only if the wl_output mode event has not
+/// been dispatched before the shm buffer setup (defensive; the mode event
+/// normally arrives during the initial configure wait).
+const fallback_width: i32 = 1280;
+const fallback_height: i32 = 720;
 const timeout_ms: i64 = 5000;
 
 /// Set from main so the step/verdict log helpers can read the clock
@@ -66,9 +68,24 @@ const ClientState = struct {
     got_key_press: bool = false,
     got_key_release: bool = false,
     output_mode: ?struct { width: i32, height: i32 } = null,
+    /// Surface size resolved from the advertised output mode (fallback
+    /// constants if the mode event had not arrived at setup time).
+    surface_width: i32 = 0,
+    surface_height: i32 = 0,
     /// Screencopy capture state (filled when the frame advertises its
     /// buffer and completed on ready).
     capture: ?CaptureState = null,
+};
+
+/// Why the capture wait ended with failed=true (reported by the CLIENT-
+/// ERROR verdict so a local failure is not misreported as a timeout).
+const CaptureFailure = enum {
+    /// The server sent the failed event.
+    server,
+    /// Creating the advertised shm buffer failed.
+    buffer_create,
+    /// Flushing the copy request failed.
+    flush,
 };
 
 const CaptureState = struct {
@@ -83,6 +100,7 @@ const CaptureState = struct {
     sent_copy: bool = false,
     ready: bool = false,
     failed: bool = false,
+    failure: CaptureFailure = .server,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -166,9 +184,14 @@ pub fn main(init: std.process.Init) !void {
         return error.ClientTimeout;
     }
     step("received configure serial={d}", .{state.configure_serial.?});
-    xdg_surface.ackConfigure(state.configure_serial.?);
 
     // --- shm buffer -------------------------------------------------------
+    // The configure is acked from the event handler (every configure,
+    // including the second size configure at first map, is acked there).
+    // Size the surface from the advertised output mode.
+    resolveSurfaceSize(&state);
+    const pool_size: usize = @as(usize, @intCast(state.surface_width)) *
+        @as(usize, @intCast(state.surface_height)) * bytes_per_pixel;
     const fd = try std.posix.memfd_create("m1-test-buffer", std.os.linux.MFD.CLOEXEC);
     defer _ = std.os.linux.close(fd);
     {
@@ -187,23 +210,23 @@ pub fn main(init: std.process.Init) !void {
         0,
     );
     defer std.posix.munmap(pixels);
-    fillPattern(pixels, surface_width, surface_height);
+    fillPattern(pixels, state.surface_width, state.surface_height);
 
     state.shm_pool = try state.shm.?.createPool(fd, @intCast(pool_size));
     state.buffer = try state.shm_pool.?.createBuffer(
         0,
-        surface_width,
-        surface_height,
-        surface_width * 4,
+        state.surface_width,
+        state.surface_height,
+        state.surface_width * 4,
         .argb8888,
     );
-    step("created shm buffer {d}x{d}", .{ surface_width, surface_height });
+    step("created shm buffer {d}x{d}", .{ state.surface_width, state.surface_height });
 
     // --- map: attach + damage + frame + commit ----------------------------
     const frame_cb = try surface.frame();
     frame_cb.setListener(*ClientState, onFrameDone, &state);
     surface.attach(state.buffer, 0, 0);
-    surface.damage(0, 0, surface_width, surface_height);
+    surface.damage(0, 0, state.surface_width, state.surface_height);
     surface.commit();
     if (wl.Display.flush(display) != .SUCCESS) {
         verdict("CLIENT-ERROR", "flush after buffer commit failed", .{});
@@ -247,8 +270,10 @@ pub fn main(init: std.process.Init) !void {
         verdict("CLIENT-ERROR", "no wl_output mode received", .{});
         return error.OutputModeMissing;
     };
-    if (mode.width != surface_width or mode.height != surface_height) {
-        verdict("CLIENT-ERROR", "unexpected output mode {d}x{d}", .{ mode.width, mode.height });
+    if (mode.width != state.surface_width or mode.height != state.surface_height) {
+        verdict("CLIENT-ERROR", "unexpected output mode {d}x{d} (surface sized {d}x{d})", .{
+            mode.width, mode.height, state.surface_width, state.surface_height,
+        });
         return error.OutputModeBad;
     }
     step("input verified: pointer enter+motion, button, key 38, keymap, output {d}x{d}", .{
@@ -269,7 +294,13 @@ pub fn main(init: std.process.Init) !void {
     }
     const cap = &state.capture.?;
     if (cap.failed or !cap.ready) {
-        verdict("CLIENT-ERROR", "screencopy failed", .{});
+        // The failure flag makes the wait end with a specific CLIENT-ERROR
+        // instead of timing out (a failed copy sends no ready event).
+        switch (cap.failure) {
+            .server => verdict("CLIENT-ERROR", "screencopy failed", .{}),
+            .buffer_create => verdict("CLIENT-ERROR", "capture buffer creation failed", .{}),
+            .flush => verdict("CLIENT-ERROR", "flush after capture copy failed", .{}),
+        }
         return error.CaptureFailed;
     }
     try verifyCapturePixels(cap, &state);
@@ -415,10 +446,22 @@ fn onCaptureFrameEvent(
                 @intCast(b.height),
                 @intCast(b.stride),
                 .argb8888,
-            ) catch return;
+            ) catch |err| {
+                // Flag the failure: no copy is sent, so the server sends
+                // no ready/failed and the wait must not report a timeout.
+                cap.failed = true;
+                cap.failure = .buffer_create;
+                step("capture buffer creation failed: {s}", .{@errorName(err)});
+                return;
+            };
             cap.sent_copy = true;
             frame.copy(cap.buffer);
-            _ = wl.Display.flush(state.display);
+            if (wl.Display.flush(state.display) != .SUCCESS) {
+                cap.failed = true;
+                cap.failure = .flush;
+                step("flush after capture copy failed", .{});
+                return;
+            }
             step("capture buffer {d}x{d} stride={d}, copy sent", .{ b.width, b.height, b.stride });
         },
         .linux_dmabuf => |d| step("capture linux_dmabuf {d}x{d}", .{ d.width, d.height }),
@@ -443,6 +486,10 @@ fn onXdgSurfaceEvent(surface: *xdg.Surface, event: xdg.Surface.Event, state: *Cl
         .configure => |c| {
             state.configure_serial = c.serial;
             state.got_configure = true;
+            // Ack every configure immediately: the server sends a second
+            // size configure at first map that a single pre-commit ack
+            // would never cover (the client commits only once).
+            state.xdg_surface.?.ackConfigure(c.serial);
         },
     }
 }
@@ -493,9 +540,30 @@ fn hasCaptureDone(state: *const ClientState) bool {
     return cap.ready or cap.failed;
 }
 
+/// Resolve the surface size from the advertised output mode. Called once
+/// before the shm buffer setup; by then the mode event has been dispatched
+/// (the global binds are flushed together with the empty commit, so the
+/// server's bind-time output state arrives during the configure wait).
+/// Falls back to the legacy constants with a warning if the mode event is
+/// still missing.
+fn resolveSurfaceSize(state: *ClientState) void {
+    if (state.output_mode) |m| {
+        state.surface_width = m.width;
+        state.surface_height = m.height;
+    } else {
+        state.surface_width = fallback_width;
+        state.surface_height = fallback_height;
+        step("WARNING: no wl_output mode yet; using fallback size {d}x{d}", .{
+            fallback_width, fallback_height,
+        });
+    }
+}
+
 /// Allocate the capture buffer (second memfd + shm pool) and the frame
 /// state; the frame object is created by captureOutput afterwards.
 fn setupCapture(state: *ClientState) !*client.zwlr.ScreencopyFrameV1 {
+    const pool_size: usize = @as(usize, @intCast(state.surface_width)) *
+        @as(usize, @intCast(state.surface_height)) * bytes_per_pixel;
     const fd = try std.posix.memfd_create("m3-capture", std.os.linux.MFD.CLOEXEC);
     errdefer _ = std.os.linux.close(fd);
     {
@@ -530,10 +598,11 @@ fn setupCapture(state: *ClientState) !*client.zwlr.ScreencopyFrameV1 {
 /// B ramping with x) plus the compositor's fallback cursor (a light rect
 /// at the synth pointer position 50,50).
 fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !void {
-    _ = state;
-    if (cap.width != surface_width or cap.height != surface_height) {
+    if (cap.width != @as(u32, @intCast(state.surface_width)) or
+        cap.height != @as(u32, @intCast(state.surface_height)))
+    {
         verdict("CLIENT-ERROR", "capture size {d}x{d} != {d}x{d}", .{
-            cap.width, cap.height, surface_width, surface_height,
+            cap.width, cap.height, state.surface_width, state.surface_height,
         });
         return error.CaptureSizeBad;
     }
@@ -550,10 +619,13 @@ fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !voi
         verdict("CLIENT-ERROR", "pixel (5,5) = {d},{d},{d},{d}, expected gradient start", .{ g[0], g[1], g[2], g[3] });
         return error.PixelMismatch;
     }
-    // (1000,600): gradient B = 1000*255/1280 = 199.
+    // (1000,600): gradient B = 1000*255/surface_width (199 at 1280 wide).
+    const expected_b: u8 = @intCast((1000 * 255) / @as(usize, @intCast(state.surface_width)));
     const m = px(cap, 1000, 600);
-    if (m[2] != 255 or m[1] != 0 or m[0] != 199 or m[3] != 255) {
-        verdict("CLIENT-ERROR", "pixel (1000,600) = {d},{d},{d},{d}, expected B=199", .{ m[0], m[1], m[2], m[3] });
+    if (m[2] != 255 or m[1] != 0 or m[0] != expected_b or m[3] != 255) {
+        verdict("CLIENT-ERROR", "pixel (1000,600) = {d},{d},{d},{d}, expected B={d}", .{
+            m[0], m[1], m[2], m[3], expected_b,
+        });
         return error.PixelMismatch;
     }
     // (53,53): inside the 8x8 fallback cursor at (50,50) -> light grey.
@@ -585,6 +657,10 @@ fn waitForEvent(
         var pfd = [_]std.posix.pollfd{
             .{ .fd = wl.Display.getFd(display), .events = std.posix.POLL.IN, .revents = 0 },
         };
+        // EINTR is retried inside std.posix.poll itself (std/posix.zig:
+        // errno(.INTR) => continue), so a signal never aborts the wait
+        // here; the remaining PollError members (NetworkDown /
+        // SystemResources / Unexpected) are fatal and propagate.
         _ = std.posix.poll(&pfd, @intCast(remaining)) catch |err| {
             verdict("CLIENT-ERROR", "poll failed: {s}", .{@errorName(err)});
             return err;

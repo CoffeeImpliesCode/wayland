@@ -97,7 +97,7 @@
       StandardError = "journal+console";
       # environment.variables does not reliably reach systemd services;
       # give the build the .pc search path explicitly.
-      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig";
+      Environment = "PKG_CONFIG_PATH=${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
     };
     # The minimal systemd service PATH does not include the system
     # packages: give the script the toolchain it needs.

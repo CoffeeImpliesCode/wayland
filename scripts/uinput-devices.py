@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Virtual input devices for the libinput backend (VM test path).
+"""Virtual input devices for the libinput backend (HOST-side tooling).
 
 Creates a virtual keyboard and an absolute mouse through /dev/uinput
-(python-evdev's uinput API). udev announces the devices to the compositor,
-whose libinput backend (WAYLAND_LIBINPUT=1) picks them up like real
-hardware. Run as root (or with uinput group access) inside the VM.
+(python-evdev's uinput API) on the HOST. udev announces the devices to
+the compositor, whose libinput backend (WAYLAND_LIBINPUT=1) picks them
+up like real hardware. Run as root (or with uinput group access) on the
+host.
+
+This script is NOT part of the E2E gate: the guest image ships no
+python3/evdev, and the VM E2Es use the virtio keyboard/mouse instead.
+It exists for interactive host-side debugging of the libinput backend.
 
 Usage (multiple commands per invocation; devices live for the process):
 

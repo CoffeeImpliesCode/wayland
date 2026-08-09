@@ -62,9 +62,14 @@
 //!   - axis: only the legacy LIBINPUT_EVENT_POINTER_AXIS is consumed. Since
 //!     libinput 1.19 the new SCROLL_WHEEL/FINGER/CONTINUOUS events are sent
 //!     *in addition* to it; consuming both would double every wheel click.
-//!     The wheel value is in degrees (15.0 per notch); `axisValueToPixels`
-//!     converts to the seat's 10 px per notch convention and
-//!     `axisDiscreteToNotches` rounds the physical click count.
+//!     The axis value's units depend on the source (libinput.h:1598-1617):
+//!     WHEEL is degrees (15.0 per notch) and `axisValueToPixels` converts to
+//!     the seat's 10 px per notch convention; FINGER and CONTINUOUS are
+//!     cursor-equivalent units (1.0 = 1 px) passed through as-is, matching
+//!     wlroots (backend/libinput/pointer.c:146). `axisDiscreteToNotches`
+//!     rounds the physical click count (WHEEL only; FINGER/CONTINUOUS
+//!     discrete is always 0, libinput.h:1653-1657). The source rides along
+//!     to the seat as wl_pointer.axis_source.
 //!
 //! Test path: no real devices exist on the dev host, so the pure logic
 //! (offset, scaling, axis conversion, event-type mapping, capability
@@ -80,6 +85,7 @@ const std = @import("std");
 const log_mod = @import("../utils/log.zig");
 const backend = @import("backend.zig");
 const seat_mod = @import("../compositor/seat.zig");
+const server = @import("protocol").server;
 
 // ---------------------------------------------------------------------------
 // Constants — numeric values verified against the real headers:
@@ -88,7 +94,6 @@ const seat_mod = @import("../compositor/seat.zig");
 // ---------------------------------------------------------------------------
 
 /// enum libinput_event_type (libinput.h:775-1040).
-pub const event_none: c_int = 0;
 pub const event_device_added: c_int = 1;
 pub const event_device_removed: c_int = 2;
 pub const event_keyboard_key: c_int = 300;
@@ -101,18 +106,25 @@ pub const event_pointer_scroll_finger: c_int = 405;
 pub const event_pointer_scroll_continuous: c_int = 406;
 
 /// enum libinput_key_state (libinput.h:222-225).
-pub const key_state_released: c_int = 0;
 pub const key_state_pressed: c_int = 1;
 /// enum libinput_button_state (libinput.h:246-249).
-pub const button_state_released: c_int = 0;
 pub const button_state_pressed: c_int = 1;
 
 /// enum libinput_pointer_axis (libinput.h:263-266).
 pub const pointer_axis_scroll_vertical: c_int = 0;
 pub const pointer_axis_scroll_horizontal: c_int = 1;
-/// enum libinput_pointer_axis_source (libinput.h:280+); only wheel is
-/// relevant to the VM test devices.
+/// enum libinput_pointer_axis_source (libinput.h:278-302). WHEEL_TILT
+/// is deprecated (never sent by any device since libinput 1.16); the
+/// others map onto wl_pointer.axis_source via axisSourceFromLibinput.
 pub const pointer_axis_source_wheel: c_int = 1;
+pub const pointer_axis_source_finger: c_int = 2;
+pub const pointer_axis_source_continuous: c_int = 3;
+pub const pointer_axis_source_wheel_tilt: c_int = 4;
+
+/// enum libinput_log_priority (libinput.h:195-197).
+pub const log_priority_debug: c_int = 10;
+pub const log_priority_info: c_int = 20;
+pub const log_priority_error: c_int = 30;
 
 /// enum libinput_device_capability (libinput.h:206-214).
 pub const device_cap_keyboard: c_int = 0;
@@ -140,7 +152,6 @@ const c = struct {
     pub const libinput_event_keyboard = opaque {};
     pub const libinput_event_pointer = opaque {};
     pub const libinput_device = opaque {};
-    pub const libinput_seat = opaque {};
     pub const udev = opaque {};
 
     /// struct libinput_interface (libinput.h:3604-3621): device fd
@@ -157,8 +168,6 @@ const c = struct {
         udev: ?*udev,
     ) ?*libinput;
     extern fn libinput_udev_assign_seat(li: ?*libinput, seat_id: [*:0]const u8) c_int;
-    extern fn libinput_path_create_context(interface: *const libinput_interface, user_data: ?*anyopaque) ?*libinput;
-    extern fn libinput_path_add_device(li: ?*libinput, path: [*:0]const u8) ?*libinput_device;
     extern fn libinput_get_fd(li: ?*libinput) c_int;
     extern fn libinput_dispatch(li: ?*libinput) c_int;
     /// Retrieve the next queued event (NULL when the queue is empty).
@@ -167,6 +176,20 @@ const c = struct {
     extern fn libinput_get_event(li: ?*libinput) ?*libinput_event;
     extern fn libinput_event_destroy(event: ?*libinput_event) void;
     extern fn libinput_unref(li: ?*libinput) ?*libinput;
+
+    // Log handler (libinput.h:4000-4071): the callback receives
+    // (context, priority, printf format, va_list) — no user_data — and is
+    // installed with libinput_log_set_handler after context creation.
+    pub const libinput_log_handler = *const fn (
+        li: ?*libinput,
+        priority: c_int,
+        format: [*:0]const u8,
+        args: *std.builtin.VaList,
+    ) callconv(.c) void;
+    extern fn libinput_log_set_handler(li: ?*libinput, handler: libinput_log_handler) void;
+    extern fn libinput_log_set_priority(li: ?*libinput, priority: c_int) void;
+    /// libc vsnprintf — the only way to consume the handler's va_list.
+    extern fn vsnprintf(buffer: [*]u8, size: usize, format: [*:0]const u8, args: *std.builtin.VaList) c_int;
 
     // Event accessors (libinput.h "event" group).
     extern fn libinput_event_get_type(event: ?*libinput_event) c_int;
@@ -190,9 +213,8 @@ const c = struct {
     extern fn libinput_event_pointer_get_axis_value_discrete(event: ?*libinput_event_pointer, axis: c_int) f64;
     extern fn libinput_event_pointer_get_axis_source(event: ?*libinput_event_pointer) c_int;
 
-    // Device accessors (libinput.h:4338, 4418).
+    // Device accessors (libinput.h:4338, 4490).
     extern fn libinput_device_get_name(device: ?*libinput_device) [*:0]const u8;
-    extern fn libinput_device_get_seat(device: ?*libinput_device) ?*libinput_seat;
     extern fn libinput_device_has_capability(device: ?*libinput_device, capability: c_int) c_int;
 
     // libudev: a plain context for device enumeration (libinput needs an
@@ -234,15 +256,52 @@ pub fn axisDiscreteToNotches(value: f64) i32 {
     return @intFromFloat(@round(value));
 }
 
+/// libinput axis source -> wl_pointer.axis_source. Mirrors wlroots'
+/// axis_source_from_libinput (backend/libinput/pointer.c:69-86).
+pub fn axisSourceFromLibinput(source: c_int) ?server.wl.Pointer.AxisSource {
+    return switch (source) {
+        pointer_axis_source_wheel => .wheel,
+        pointer_axis_source_finger => .finger,
+        pointer_axis_source_continuous => .continuous,
+        pointer_axis_source_wheel_tilt => .wheel_tilt,
+        else => null,
+    };
+}
+
+/// Scale a libinput axis value to seat pixels for the given source.
+/// WHEEL is degrees (15.0 per notch) -> the seat's 10 px per notch via
+/// axisValueToPixels; FINGER/CONTINUOUS are cursor-equivalent units
+/// (1.0 = 1 px, libinput.h:1598-1599, 1614-1617) that pass through
+/// unscaled, the same pass-through wlroots does
+/// (backend/libinput/pointer.c:146).
+pub fn axisValueToPixelsSource(source: server.wl.Pointer.AxisSource, value: f64) f64 {
+    return switch (source) {
+        .wheel, .wheel_tilt => axisValueToPixels(value),
+        .finger, .continuous => value,
+        _ => unreachable,
+    };
+}
+
+/// Discrete (notches) for the source: WHEEL counts physical wheel clicks;
+/// FINGER/CONTINUOUS discrete is always 0 (libinput.h:1653-1657).
+pub fn axisDiscreteForSource(source: server.wl.Pointer.AxisSource, raw: f64) i32 {
+    return switch (source) {
+        .wheel, .wheel_tilt => axisDiscreteToNotches(raw),
+        .finger, .continuous => 0,
+        _ => unreachable,
+    };
+}
+
 /// Map a libinput device to the backend's InputDevice kind. libinput's
 /// has_capability takes ONE capability and returns a bool; devices are
-/// classified by priority (keyboard > pointer > touch). Devices with only
-/// tablet/pad/switch/gesture capabilities map to null and are not
-/// announced.
+/// classified by priority (keyboard > pointer). Devices with only
+/// touch/tablet/pad/switch/gesture capabilities map to null and are not
+/// announced. Touch is deliberately unannounced: the seat implements no
+/// touch events, so a touchscreen would appear in the registry yet be
+/// inert (wlroots implements touch in events.c:184-194).
 pub fn kindForDevice(dev: ?*c.libinput_device) ?InputKind {
     if (c.libinput_device_has_capability(dev, device_cap_keyboard) != 0) return .keyboard;
     if (c.libinput_device_has_capability(dev, device_cap_pointer) != 0) return .pointer;
-    if (c.libinput_device_has_capability(dev, device_cap_touch) != 0) return .touch;
     return null;
 }
 
@@ -305,10 +364,12 @@ const Libinput = struct {
 
     /// libinput_dispatch + drain every queued event into the seat.
     /// Called when pollFd() is readable (and once in start() to pick up
-    /// the initial DEVICE_ADDED burst).
-    pub fn dispatch(self: *Libinput) error{DispatchFailed}!void {
+    /// the initial DEVICE_ADDED burst). A negative libinput_dispatch rc
+    /// is fatal for the context (libinput.h:3869-3870), so it surfaces
+    /// as BackendFailed and the caller tears the backend down.
+    pub fn dispatch(self: *Libinput) error{BackendFailed}!void {
         std.debug.assert(self.ctx != null);
-        if (c.libinput_dispatch(self.ctx) != 0) return error.DispatchFailed;
+        if (c.libinput_dispatch(self.ctx) < 0) return error.BackendFailed;
         while (c.libinput_get_event(self.ctx)) |event| {
             self.handleEvent(event);
             c.libinput_event_destroy(event);
@@ -351,7 +412,12 @@ const Libinput = struct {
         };
         errdefer self.allocator.free(owned);
 
-        self.devices.append(self.allocator, .{ .handle = dev, .kind = kind, .name = owned }) catch return;
+        self.devices.append(self.allocator, .{ .handle = dev, .kind = kind, .name = owned }) catch {
+            // Free the owned name here: `catch` returns without error, so
+            // the errdefer above is skipped.
+            self.allocator.free(owned);
+            return;
+        };
         // The announcement borrows the registry's name copy, which outlives
         // the event (libinput's own name pointer does not).
         // SAFETY: the string copy below (dupe) always succeeds before use.
@@ -414,17 +480,40 @@ const Libinput = struct {
 
     fn onPointerAxis(self: *Libinput, event: *c.libinput_event) void {
         const pevent = c.libinput_event_get_pointer_event(event) orelse return;
-        // wlroots iterates both scroll axes (handle_pointer_axis).
+        // The axis value's units depend on the source
+        // (libinput.h:1598-1617); the source is required to interpret it.
+        const source = axisSourceFromLibinput(c.libinput_event_pointer_get_axis_source(pevent)) orelse return;
+        // wlroots iterates both scroll axes (handle_pointer_axis,
+        // backend/libinput/pointer.c:114-148).
         if (c.libinput_event_pointer_has_axis(pevent, pointer_axis_scroll_vertical) != 0) {
-            const value = c.libinput_event_pointer_get_axis_value(pevent, pointer_axis_scroll_vertical);
-            const discrete = c.libinput_event_pointer_get_axis_value_discrete(pevent, pointer_axis_scroll_vertical);
-            self.seat.pointerAxis(.vertical_scroll, axisValueToPixels(value), axisDiscreteToNotches(discrete));
+            self.sendAxis(pevent, source, .vertical_scroll);
         }
         if (c.libinput_event_pointer_has_axis(pevent, pointer_axis_scroll_horizontal) != 0) {
-            const value = c.libinput_event_pointer_get_axis_value(pevent, pointer_axis_scroll_horizontal);
-            const discrete = c.libinput_event_pointer_get_axis_value_discrete(pevent, pointer_axis_scroll_horizontal);
-            self.seat.pointerAxis(.horizontal_scroll, axisValueToPixels(value), axisDiscreteToNotches(discrete));
+            self.sendAxis(pevent, source, .horizontal_scroll);
         }
+    }
+
+    /// Forward one scroll axis to the seat, scaled per source (see
+    /// axisValueToPixelsSource/axisDiscreteForSource for the semantics).
+    fn sendAxis(
+        self: *Libinput,
+        pevent: *c.libinput_event_pointer,
+        source: server.wl.Pointer.AxisSource,
+        axis: server.wl.Pointer.Axis,
+    ) void {
+        const libinput_axis: c_int = switch (axis) {
+            .vertical_scroll => pointer_axis_scroll_vertical,
+            .horizontal_scroll => pointer_axis_scroll_horizontal,
+            else => return, // unknown wire axis: nothing to forward
+        };
+        const value = c.libinput_event_pointer_get_axis_value(pevent, libinput_axis);
+        const raw_discrete = c.libinput_event_pointer_get_axis_value_discrete(pevent, libinput_axis);
+        self.seat.pointerAxis(
+            axis,
+            source,
+            axisValueToPixelsSource(source, value),
+            axisDiscreteForSource(source, raw_discrete),
+        );
     }
 };
 
@@ -432,6 +521,40 @@ const backend_impl: backend.Backend.Impl = .{
     .start = start,
     .destroy = destroy,
 };
+
+/// The libinput log handler callback carries no user_data
+/// (libinput.h:4049-4053), so the logging context is stashed module-wide
+/// while the backend runs. The server is single-threaded; start() sets
+/// both before the context is created, destroy() clears them.
+var handler_io: ?*std.Io = null;
+var handler_cfg: ?*const log_mod.Config = null;
+
+/// libinput log handler (libinput.h:4049-4053): forwards libinput's
+/// printf-style messages to log_mod under the "libinput" tag, mapped by
+/// priority (libinput.h:195-197). Installed at ERROR priority in start()
+/// (the same choice as wlroots backend.c:104-105).
+fn libinputLogHandler(
+    li: ?*c.libinput,
+    priority: c_int,
+    format: [*:0]const u8,
+    args: *std.builtin.VaList,
+) callconv(.c) void {
+    _ = li;
+    const io = handler_io orelse return;
+    const cfg = handler_cfg orelse return;
+    const level: log_mod.Level = switch (priority) {
+        log_priority_debug => .debug,
+        log_priority_info => .info,
+        log_priority_error => .err,
+        else => return,
+    };
+    // The only way to consume a C va_list: vsnprintf into a stack buffer.
+    var buf: [1024]u8 = undefined;
+    const n = c.vsnprintf(&buf, buf.len, format, args);
+    if (n < 0) return;
+    const len: usize = @min(@as(usize, @intCast(n)), buf.len);
+    log_mod.log("{s}", io, cfg, level, "libinput", .{buf[0..len]});
+}
 
 /// open_restricted: plain open of the evdev node (no logind session in the
 /// VM). libinput passes open(2) flags; evdev always opens
@@ -479,12 +602,18 @@ fn start(base: *backend.Backend) error{BackendFailed}!void {
 
     // Context lifecycle follows wlroots backend_start (backend.c): create
     // the udev context, assign the seat, then drain the initial events.
+    // The log handler goes in right after creation so libinput-side
+    // diagnostics land in the compositor log (wlroots backend.c:104-105).
+    handler_io = self.io;
+    handler_cfg = self.log_cfg;
     self.ctx = c.libinput_udev_create_context(&libinput_interface_impl, self, self.udev) orelse
         return error.BackendFailed;
     errdefer {
         _ = c.libinput_unref(self.ctx);
         self.ctx = null;
     }
+    c.libinput_log_set_handler(self.ctx, libinputLogHandler);
+    c.libinput_log_set_priority(self.ctx, log_priority_error);
 
     if (c.libinput_udev_assign_seat(self.ctx, self.seat_name.ptr) != 0) {
         log_mod.err("libinput seat assign failed (seat {s})", self.io, self.log_cfg, "libinput", .{self.seat_name});
@@ -509,6 +638,8 @@ fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
     self.devices.deinit(allocator);
     if (self.ctx) |ctx| _ = c.libinput_unref(ctx);
     if (self.udev) |udev| _ = c.udev_unref(udev);
+    handler_io = null;
+    handler_cfg = null;
     allocator.destroy(self);
 }
 
@@ -585,6 +716,39 @@ test "axis conversion" {
     try testing.expectEqual(@as(i32, 1), axisDiscreteToNotches(1.0));
     try testing.expectEqual(@as(i32, 0), axisDiscreteToNotches(0.4));
     try testing.expectEqual(@as(i32, -2), axisDiscreteToNotches(-1.6));
+}
+
+test "axis source mapping and per-source scaling" {
+    // libinput source -> wl_pointer.axis_source (wlroots
+    // backend/libinput/pointer.c:69-86).
+    try testing.expectEqual(
+        @as(?server.wl.Pointer.AxisSource, .wheel),
+        axisSourceFromLibinput(pointer_axis_source_wheel),
+    );
+    try testing.expectEqual(
+        @as(?server.wl.Pointer.AxisSource, .finger),
+        axisSourceFromLibinput(pointer_axis_source_finger),
+    );
+    try testing.expectEqual(
+        @as(?server.wl.Pointer.AxisSource, .continuous),
+        axisSourceFromLibinput(pointer_axis_source_continuous),
+    );
+    try testing.expectEqual(
+        @as(?server.wl.Pointer.AxisSource, .wheel_tilt),
+        axisSourceFromLibinput(pointer_axis_source_wheel_tilt),
+    );
+    try testing.expectEqual(@as(?server.wl.Pointer.AxisSource, null), axisSourceFromLibinput(0));
+
+    // WHEEL: degrees, 15.0 per click -> 10 px per notch.
+    try testing.expectApproxEqAbs(@as(f64, 10.0), axisValueToPixelsSource(.wheel, 15.0), 0.0001);
+    // FINGER/CONTINUOUS: cursor-equivalent units, 1.0 = 1 px (pass-through).
+    try testing.expectApproxEqAbs(@as(f64, 3.5), axisValueToPixelsSource(.finger, 3.5), 0.0001);
+    try testing.expectApproxEqAbs(@as(f64, -2.0), axisValueToPixelsSource(.continuous, -2.0), 0.0001);
+    // Discrete: wheel clicks rounded; finger/continuous always 0
+    // (libinput.h:1653-1657).
+    try testing.expectEqual(@as(i32, -2), axisDiscreteForSource(.wheel, -1.6));
+    try testing.expectEqual(@as(i32, 0), axisDiscreteForSource(.finger, 1.6));
+    try testing.expectEqual(@as(i32, 0), axisDiscreteForSource(.continuous, 1.6));
 }
 
 test "capability to kind mapping" {

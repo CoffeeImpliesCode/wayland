@@ -16,7 +16,10 @@ const output = @import("../output/output.zig");
 const Headless = struct {
     loop: *wire.EventLoop,
     timer: ?*wire.EventSource,
-    out: *output.Output,
+    /// Null until create() succeeds: the impl destroy runs from an
+    /// errdefer on a failed create() too, and must not deref a wrapper
+    /// that was never created.
+    out: ?*output.Output,
     mode: output.Mode,
 };
 
@@ -47,16 +50,22 @@ pub const HeadlessBackend = struct {
         std.debug.assert(mode.refresh_msec > 0);
 
         const headless = try allocator.create(Headless);
-        errdefer allocator.destroy(headless);
         headless.* = .{
             .loop = loop,
             .timer = null,
-            // SAFETY: assigned via `headless.out = out` right after output creation.
-            .out = undefined,
+            // SAFETY: assigned via `headless.out = out` right after output
+            // creation; null until then (the impl destroy guards it).
+            .out = null,
             .mode = mode,
         };
 
-        const base = try backend.Backend.init(allocator, io, log_cfg, &backend_impl, headless);
+        // Backend.init does not take ownership of headless on failure, so
+        // free it here; every failure path then frees headless exactly
+        // once. After init succeeds, the backend impl destroy owns it.
+        const base = backend.Backend.init(allocator, io, log_cfg, &backend_impl, headless) catch |err| {
+            allocator.destroy(headless);
+            return err;
+        };
         errdefer base.destroy();
 
         const out = try output.Output.create(allocator, io, log_cfg, base, &output_impl, headless, mode);
@@ -77,19 +86,21 @@ fn start(base: *backend.Backend) error{BackendFailed}!void {
     log_mod.info("started {d}x{d} @ {d}ms", base.io, base.log_cfg, "headless", .{
         headless.mode.width, headless.mode.height, headless.mode.refresh_msec,
     });
-    base.emitNewOutput(headless.out);
+    base.emitNewOutput(headless.out.?);
 }
 
 fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
     const headless: *Headless = @ptrCast(@alignCast(data));
     // Stop the timer first so no callback can run against a torn-down output.
     if (headless.timer) |timer| timer.remove();
-    headless.out.destroy();
+    // The output wrapper may never have been created when destroy runs
+    // from a failed create() errdefer (headless.out is null then).
+    if (headless.out) |out| out.destroy();
     allocator.destroy(headless);
 }
 
 fn frameCb(headless: *Headless) c_int {
-    headless.out.sendFrame();
+    headless.out.?.sendFrame();
     // libwayland does not re-arm timer sources after they fire; re-arm for
     // the next period. On failure, drop the source (return 0).
     headless.timer.?.timerUpdate(headless.mode.refresh_msec) catch return 0;

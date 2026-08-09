@@ -5,14 +5,28 @@
 # (virtio-gpu) with the libinput source on /dev/input/* (virtio keyboard +
 # mouse) plus the test client. Verdicts go to the console; CLIENT-OK plus
 # drm:/libinput: lines in the server log are the pass signals. Powers off.
+#
+# Host wrapper contract: the runner invokes this script under `timeout
+# 480`; exit 124 with the OK/FAIL line in the log is the expected
+# termination. The guest powers off on every path.
 set -uo pipefail
 exec > /dev/console 2>&1
 
 cd /shared/repo || { echo "VM-DRM-E2E-FAILED: repo share not mounted"; poweroff -f; exit 1; }
 # 9p defaults to cache=loose: host-side edits can be invisible to the
 # guest. Drop the cache so every boot builds the CURRENT source.
-mount -o remount,cache=none /shared/repo 2>/dev/null || true
-echo "=== share sanity: $(grep -c wantDrmBackend src/server/main.zig 2>/dev/null || echo 0) drm-wiring refs ==="
+# The guest image ships no mount(8): when it is absent, the forced
+# cache clean below plus the wiring grep are the staleness defenses.
+if command -v mount >/dev/null 2>&1; then
+    if ! mount -o remount,cache=none /shared/repo; then
+        echo "VM-DRM-E2E-FAILED: 9p remount failed"
+        poweroff -f
+        exit 1
+    fi
+else
+    echo "=== vm-drm-e2e: 9p remount skipped: no mount(8) in guest (cache=none mitigation unavailable); cache clean + wiring grep are the staleness defenses ==="
+fi
+echo "=== share sanity: $(grep -c wantDrmBackend src/server/main.zig 2>/dev/null || echo 0) marker refs ==="
 echo "=== vm-drm-e2e: building with the guest toolchain ==="
 # Same flags as the headless E2E: the drm + libinput backends compile
 # unconditionally, so no extra -D options are needed (guest has no raylib).
@@ -33,9 +47,12 @@ if [ ! -x /tmp/zo/bin/wayland-server ] || [ ! -x /tmp/zo/bin/wayland-client ]; t
     exit 1
 fi
 # Fail fast if the binary lacks the DRM wiring (stale-source smoke).
+# WAYLAND_BACKEND would match both wantDrmBackend and wantRaylibBackend;
+# WAYLAND_DRM_DEVICE appears only in wantDrmBackend (main.zig:1018-1024),
+# so it proves the DRM path is actually compiled in.
 # Note: the guest has no `strings` binary; grep -a reads the binary text.
-WIRED=$(grep -a -c "WAYLAND_BACKEND" /tmp/zo/bin/wayland-server || true)
-echo "=== binary wiring check: $WIRED refs ==="
+WIRED=$(grep -a -c "WAYLAND_DRM_DEVICE" /tmp/zo/bin/wayland-server || true)
+echo "=== drm wiring present: $WIRED refs ==="
 if [ "$WIRED" -eq 0 ]; then
     echo "=== diagnostics: ==="
     echo "zig: $(zig version)"
@@ -43,16 +60,12 @@ if [ "$WIRED" -eq 0 ]; then
     echo "binary md5: $(md5sum /tmp/zo/bin/wayland-server | cut -d' ' -f1)"
     echo "=== build.log tail: ==="
     tail -15 /tmp/build.log
-    echo "VM-DRM-E2E-FAILED: binary has no WAYLAND_BACKEND strings (stale build)"
+    echo "VM-DRM-E2E-FAILED: binary has no WAYLAND_DRM_DEVICE (drm wiring missing; stale build)"
     poweroff -f
     exit 1
 fi
-# DRM init failed (or the client failed): dump the kernel's view of the
-# modeset attempt (virtio-gpu logs atomic rejections to dmesg).
-if ! grep -q "VM-DRM-E2E-OK" /tmp/srv.out 2>/dev/null; then
-    echo "=== kernel log (virtio-gpu/kms): ==="
-    journalctl -k --no-pager 2>/dev/null | grep -iE "virtio|drm|atomic|kms" | tail -40
-fi
+# DRM init failures are diagnosed in the failure branch below (kernel
+# log, server log, client log).
 echo "=== vm-drm-e2e: build ok, running DRM E2E ==="
 
 mkdir -p /tmp/rt
@@ -61,7 +74,7 @@ mkdir -p /tmp/rt
 # the log quiet but let the drm + libinput tags through.
 XDG_RUNTIME_DIR=/tmp/rt WAYLAND_BACKEND=drm WAYLAND_LIBINPUT=1 \
     WAYLAND_SYNTH_INPUT=1 \
-    WAYLAND_LOG=err,server=debug,surface=debug,xdg=debug,shm=debug,drm=info,libinput=info WAYLAND_RUN_FRAMES=600 \
+    WAYLAND_LOG=err,server=debug,surface=debug,xdg=debug,shm=debug,drm=info,libinput=info WAYLAND_RUN_FRAMES=900 \
     /tmp/zo/bin/wayland-server > /tmp/srv.out 2>&1 &
 SRV=$!
 SOCK=""
@@ -87,7 +100,7 @@ done
 kill "$SRV" 2>/dev/null
 wait "$SRV" 2>/dev/null
 
-DRM_LINES=$(grep -c "drm:" /tmp/srv.out 2>/dev/null || true)
+DRM_LINES=$(grep -c "drm: modeset ok" /tmp/srv.out 2>/dev/null || true)
 # The startup logs (drm:/libinput:) live at the HEAD of the log; the tail
 # is dominated by teardown noise. Show both when the E2E failed.
 if [ "$RC" -ne 0 ] || [ "$DRM_LINES" -eq 0 ]; then
@@ -96,7 +109,7 @@ if [ "$RC" -ne 0 ] || [ "$DRM_LINES" -eq 0 ]; then
     echo "=== virtio modules: ==="
     grep -E "virtio|drm" /proc/modules 2>/dev/null | head -8
     echo "=== binary evidence (drm branch wired?): ==="
-    strings /tmp/zo/bin/wayland-server | grep -c "WAYLAND_BACKEND" | xargs echo "wantDrmBackend strings:"
+    grep -a -c "WAYLAND_DRM_DEVICE" /tmp/zo/bin/wayland-server | xargs echo "WAYLAND_DRM_DEVICE refs:"
     echo "=== pci virtio devices: ==="
     for d in /sys/bus/pci/devices/*/; do
         v=$(cat "$d/vendor" 2>/dev/null); [ "$v" = "0x1af4" ] && echo "$d: $(cat $d/device 2>/dev/null) $(cat $d/uevent 2>/dev/null | head -2 | tr '\n' ' ')"
@@ -105,13 +118,15 @@ if [ "$RC" -ne 0 ] || [ "$DRM_LINES" -eq 0 ]; then
     cat /tmp/srv.out
 fi
 LIBINPUT_LINES=$(grep -c "libinput:" /tmp/srv.out 2>/dev/null || true)
+LEAKS=$(grep -c "leaked" /tmp/srv.out 2>/dev/null || true)
 echo "=== vm-drm-e2e: client rc=$RC drm_lines=$DRM_LINES libinput_lines=$LIBINPUT_LINES ==="
+echo "=== leak check: $LEAKS (expect 0; DebugAllocator at server exit) ==="
 if [ "$RC" -eq 0 ] && grep -q "CLIENT-OK" /tmp/cli.out &&
-   [ "$DRM_LINES" -gt 0 ] && [ "$LIBINPUT_LINES" -gt 0 ]; then
-    LEAKS=$(grep -c "leaked" /tmp/srv.out 2>/dev/null || true)
-    echo "=== leak check: $LEAKS (expect 0; DebugAllocator at server exit) ==="
+   [ "$DRM_LINES" -gt 0 ] && [ "$LIBINPUT_LINES" -gt 0 ] && [ "$LEAKS" -eq 0 ]; then
     echo "VM-DRM-E2E-OK"
 else
+    echo "=== kernel log (virtio-gpu/kms): ==="
+    journalctl -k --no-pager 2>/dev/null | grep -iE "virtio|drm|atomic|kms" | tail -40
     echo "=== server log tail: ==="
     tail -40 /tmp/srv.out
     echo "=== client log tail: ==="

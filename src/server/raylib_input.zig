@@ -147,6 +147,9 @@ pub fn poll(ctx: *anyopaque) void {
 
     const wheel = raylib.GetMouseWheelMove();
     if (wheel != 0) {
-        seat.pointerAxis(.vertical_scroll, wheel * 10.0, @intFromFloat(wheel));
+        // raylib wheel is f32 (fractional on high-res wheels); clamp to a
+        // sane notch range before the lossy cast (zbc: no unbounded casts).
+        const notches: i32 = @intFromFloat(@min(@max(wheel, -100.0), 100.0));
+        seat.pointerAxis(.vertical_scroll, .wheel, wheel * 10.0, notches);
     }
 }

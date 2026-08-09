@@ -225,10 +225,13 @@ fn addRect(pass: *pass_mod.Pass, rect: geom.Rect, color: [4]f32) void {
     const y1 = @min(rect.y + rect.height, fb.height);
     if (x0 >= x1 or y0 >= y1) return;
 
+    // The framebuffer is ARGB8888 (little-endian memory bytes B,G,R,A),
+    // so the RGBA color is stored with B first: B,G,R,A. Alpha stays at
+    // index 3, so blendPixel's channel math is unchanged.
     const src: [4]u8 = .{
-        @intFromFloat(@round(std.math.clamp(color[0], 0.0, 1.0) * 255.0)),
-        @intFromFloat(@round(std.math.clamp(color[1], 0.0, 1.0) * 255.0)),
         @intFromFloat(@round(std.math.clamp(color[2], 0.0, 1.0) * 255.0)),
+        @intFromFloat(@round(std.math.clamp(color[1], 0.0, 1.0) * 255.0)),
+        @intFromFloat(@round(std.math.clamp(color[0], 0.0, 1.0) * 255.0)),
         @intFromFloat(@round(std.math.clamp(color[3], 0.0, 1.0) * 255.0)),
     };
 
@@ -243,7 +246,8 @@ fn addRect(pass: *pass_mod.Pass, rect: geom.Rect, color: [4]f32) void {
     }
 }
 
-/// Straight-alpha blend: dst = src*a + dst*(1-a) per channel.
+/// Straight-alpha blend: dst = src*a + dst*(1-a) per channel. The
+/// channels are in memory byte order (B,G,R,A), alpha at index 3.
 fn blendPixel(dst: *[4]u8, src: [4]u8) void {
     const a: u32 = src[3];
     if (a == 255) {
@@ -368,7 +372,7 @@ test "rect fill and alpha blend" {
     const renderer = try PixmanRenderer.create(allocator, &io, &log_cfg);
     defer renderer.destroy();
 
-    // Opaque fill.
+    // Opaque fill. Memory bytes are B,G,R,A, so red is [0,0,255,255].
     const fb = try Framebuffer.create(allocator, 4, 4);
     defer fb.deinit();
     const pass = renderer.beginPass(fb).?;
@@ -376,8 +380,8 @@ test "rect fill and alpha blend" {
     pass.submit();
 
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, fb.pixelAt(0, 0));
-    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, fb.pixelAt(1, 1));
-    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, fb.pixelAt(2, 2));
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(1, 1));
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(2, 2));
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, fb.pixelAt(3, 3));
 
     // Straight-alpha blend: half blue over white.
@@ -388,8 +392,8 @@ test "rect fill and alpha blend" {
     pass2.addRect(.{ .x = 0, .y = 0, .width = 4, .height = 4 }, .{ 0.0, 0.0, 1.0, 0.5 });
     pass2.submit();
 
-    // dst = src*a + dst*(1-a), a = 128:
-    // R,G: (0*128 + 255*127 + 127)/255 = 127;  B: (255*128 + 255*127 + 127)/255 = 255
+    // dst = src*a + dst*(1-a), a = 128; bytes in memory order B,G,R,A:
+    // B: (255*128 + 255*127 + 127)/255 = 255;  G,R: (0*128 + 255*127 + 127)/255 = 127
     // A: (128*128 + 255*127 + 127)/255 = 191
-    try std.testing.expectEqual([4]u8{ 127, 127, 255, 191 }, fb2.pixelAt(1, 1));
+    try std.testing.expectEqual([4]u8{ 255, 127, 127, 191 }, fb2.pixelAt(1, 1));
 }

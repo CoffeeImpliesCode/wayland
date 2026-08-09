@@ -211,10 +211,13 @@ pub fn main(init: std.process.Init) !void {
     const socket_name = try display.addSocketAuto();
     log.info("created socket {s}", io, &log_cfg, "server", .{socket_name});
 
-    const compositor = try wayland.compositor.Compositor.init(allocator, io, &log_cfg, display);
-    defer compositor.deinit();
+    // Teardown order (LIFO on the defers): wl_shm outlives the compositor,
+    // so shm_state.deinit is registered FIRST and runs LAST. Both inits
+    // only need the display; setShm wires them together after both exist.
     const shm_state = try wayland.shm.ShmState.init(allocator, io, &log_cfg, display);
     defer shm_state.deinit();
+    const compositor = try wayland.compositor.Compositor.init(allocator, io, &log_cfg, display);
+    defer compositor.deinit();
     compositor.setShm(shm_state);
     const shell = try wayland.shell.XdgShell.init(allocator, io, &log_cfg, display, compositor);
     defer shell.deinit();
@@ -270,6 +273,16 @@ pub fn main(init: std.process.Init) !void {
             backend_is_raylib = true;
             break :blk b;
         }
+        // Unknown WAYLAND_BACKEND value: headless fallback with a warning.
+        // An unset variable is the normal default (no warning); the raylib
+        // window-open failure logs its own warning above.
+        if (init.environ_map.get("WAYLAND_BACKEND")) |v| {
+            const known = std.mem.eql(u8, v, "drm") or
+                (build_options.enable_raylib and std.mem.eql(u8, v, "raylib"));
+            if (!known) {
+                log.warn("WAYLAND_BACKEND '{s}' unknown; using headless backend", io, &log_cfg, "server", .{v});
+            }
+        }
         break :blk try wayland.headless.HeadlessBackend.create(
             allocator,
             io,
@@ -287,18 +300,20 @@ pub fn main(init: std.process.Init) !void {
     // A second Backend whose only role is announcing devices + the poll fd
     // the zio loop watches; events flow into the seat via its dispatch.
     var input_backend: ?*wayland.backend.Backend = null;
-    if (init.environ_map.get("WAYLAND_LIBINPUT") != null and
-        std.mem.eql(u8, init.environ_map.get("WAYLAND_LIBINPUT").?, "1"))
-    {
-        input_backend = try libinput_mod.LibinputBackend.create(
-            allocator,
-            io,
-            &log_cfg,
-            seat,
-            "seat0",
-            output_width,
-            output_height,
-        );
+    if (init.environ_map.get("WAYLAND_LIBINPUT")) |v| {
+        if (std.mem.eql(u8, v, "1")) {
+            input_backend = try libinput_mod.LibinputBackend.create(
+                allocator,
+                io,
+                &log_cfg,
+                seat,
+                "seat0",
+                output_width,
+                output_height,
+            );
+        } else {
+            log.warn("WAYLAND_LIBINPUT '{s}' ignored (expected \"1\")", io, &log_cfg, "server", .{v});
+        }
     }
     // Function-scope: the backend is used until the event loop exits.
     defer if (input_backend) |ib| ib.destroy();
@@ -366,7 +381,16 @@ pub fn main(init: std.process.Init) !void {
     defer if (state.screencopy) |sc| sc.deinit();
 
     if (init.environ_map.get("WAYLAND_RUN_FRAMES")) |frames| {
-        state.run_frames = std.fmt.parseInt(u32, frames, 10) catch 0;
+        state.run_frames = std.fmt.parseInt(u32, frames, 10) catch |err| blk: {
+            log.warn(
+                "WAYLAND_RUN_FRAMES '{s}' not parseable ({s}); running until watchdog",
+                io,
+                &log_cfg,
+                "server",
+                .{ frames, @errorName(err) },
+            );
+            break :blk 0;
+        };
         if (state.run_frames > 0) {
             log.info("WAYLAND_RUN_FRAMES: stopping after {d} frames", io, &log_cfg, "server", .{state.run_frames});
         }
@@ -405,15 +429,27 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    try backend.start(); // fires new_output; the headless timer paces frames
-    if (input_backend) |ib| try ib.start();
-
     // --- zio event loop ---------------------------------------------------
     // SAFETY: initialized by loop.init() immediately below, before any use.
     var loop: zio.ev.Loop = undefined;
     try loop.init(.{});
     defer loop.deinit();
     state.loop = &loop;
+
+    // Watchdog: registered BEFORE backend.start() so the first DRM frame's
+    // re-arm (renderFrame) targets a timer already in the loop — a frame
+    // can render as soon as the loop starts dispatching, and re-arming an
+    // un-added timer would be a no-op. It fires only when nothing re-arms
+    // it for the full window; a wedged loop stops with an error instead
+    // of hanging tests.
+    var watchdog = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(watchdog_timeout_ms) });
+    watchdog.c.userdata = &state;
+    watchdog.c.callback = onWatchdog;
+    state.watchdog = &watchdog;
+    loop.add(&watchdog.c);
+
+    try backend.start(); // fires new_output; the headless timer paces frames
+    if (input_backend) |ib| try ib.start();
 
     // Watch the display fd: readable when a client sent requests or a wire
     // timer (headless frame pacing) is due. Rearm keeps the registration.
@@ -442,15 +478,6 @@ pub fn main(init: std.process.Init) !void {
         drm_poll.c.flags.rearm = true;
         loop.add(&drm_poll.c);
     }
-
-    // Watchdog: fires when no frame was rendered for the full window. The
-    // render path re-arms it, so a healthy server runs forever; a wedged
-    // one stops with an error instead of hanging tests.
-    var watchdog = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(watchdog_timeout_ms) });
-    watchdog.c.userdata = &state;
-    watchdog.c.callback = onWatchdog;
-    state.watchdog = &watchdog;
-    loop.add(&watchdog.c);
 
     log.info("entering event loop (display fd {d})", io, &log_cfg, "server", .{display.loopFd()});
     while (!loop.stopped()) {
@@ -595,6 +622,8 @@ fn onInputReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     if (self.input_backend) |ib| {
         libinput_mod.LibinputBackend.fromBackend(ib).dispatch() catch |err| {
             log.err("libinput dispatch failed: {s}", self.io, self.log_cfg, "libinput", .{@errorName(err)});
+            // Fatal device error: stop the loop (tests must not hang).
+            if (err == error.BackendFailed) self.loop.?.stop();
         };
     }
 }
@@ -603,7 +632,11 @@ fn onDrmReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     _ = loop;
     const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
     if (self.drm_poll_fd >= 0) {
-        drm_mod.dispatch(drm_mod.DrmBackend.fromBackend(self.drm_backend.?));
+        drm_mod.dispatch(drm_mod.DrmBackend.fromBackend(self.drm_backend.?)) catch |err| {
+            log.err("drm dispatch failed: {s}", self.io, self.log_cfg, "drm", .{@errorName(err)});
+            // Fatal device error: stop the loop (tests must not hang).
+            if (err == error.BackendFailed) self.loop.?.stop();
+        };
     }
 }
 
@@ -695,9 +728,9 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // output — the window texture starts blank, so a partial first upload
     // would leave the background uninitialized.
     if (self.frames_rendered == 0) {
-        so.addDamage(.{ .x = 0, .y = 0, .width = output_width, .height = output_height });
+        so.addDamage(.{ .x = 0, .y = 0, .width = out.mode.width, .height = out.mode.height });
     }
-    const out_rect: geom.Rect = .{ .x = 0, .y = 0, .width = output_width, .height = output_height };
+    const out_rect: geom.Rect = .{ .x = 0, .y = 0, .width = out.mode.width, .height = out.mode.height };
     // The surfaces about to be drawn this frame (presentation feedback
     // targets): every tracked surface with an active scene node.
     // Rebuilt each frame; the compositor drives this loop.
@@ -924,7 +957,10 @@ fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
                 if (t.xdg_surface.surface == s and
                     t.configured_size.w == 0 and t.configured_size.h == 0)
                 {
-                    t.configure(output_width, output_height) catch |err| {
+                    // The output is announced (onNewOutput) before any
+                    // surface can map, so its mode is the real size.
+                    const out = self.output.?;
+                    t.configure(out.mode.width, out.mode.height) catch |err| {
                         log.warn("toplevel reconfigure failed: {s}", self.io, self.log_cfg, "server", .{
                             @errorName(err),
                         });

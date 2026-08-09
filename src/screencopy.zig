@@ -274,6 +274,7 @@ fn copyFrame(
         frame.postError(.invalid_buffer, "buffer lock failed");
         return;
     };
+    defer buf.unlock();
 
     // Row-wise copy of the region (both sides are ARGB8888).
     const dst = dst_ptr.?;
@@ -291,7 +292,6 @@ fn copyFrame(
 
     // Hand the buffer back to the client (it may reuse it).
     buf.drop();
-    buf.unlock();
 
     // Damage + flags + ready. The timestamp is the capture time.
     frame.sendDamage(@intCast(state.x), @intCast(state.y), @intCast(state.width), @intCast(state.height));

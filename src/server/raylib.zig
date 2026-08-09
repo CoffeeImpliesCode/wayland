@@ -32,7 +32,10 @@ const pixman = wayland.pixman;
 const Raylib = struct {
     loop: *wire.EventLoop,
     timer: ?*wire.EventSource,
-    out: *output.Output,
+    /// Null until create() succeeds: the impl destroy runs from an
+    /// errdefer on a failed create() too, and must not deref a wrapper
+    /// that was never created.
+    out: ?*output.Output,
     mode: output.Mode,
     /// Input poll hook: called right after PollInputEvents in every
     /// commit (server-side raylib_input.zig feeds the seat from it).
@@ -124,17 +127,13 @@ pub const RaylibBackend = struct {
         defer raylib.UnloadImage(image);
         const texture = raylib.LoadTextureFromImage(image);
         if (texture.id == 0) return error.TextureLoadFailed;
+        // Unload the GPU texture on any failure below; on success it is
+        // owned by out_data (destroyOutput unloads it).
+        errdefer raylib.UnloadTexture(texture);
 
-        const rl = try allocator.create(Raylib);
-        errdefer allocator.destroy(rl);
-        rl.* = .{
-            .loop = loop,
-            .timer = null,
-            // SAFETY: assigned below via `rl.out = out`.
-            .out = undefined,
-            .mode = mode,
-        };
-
+        // Per-output state and its scratch first: their allocation-failure
+        // cleanup (errdefers below) is independent of the backend, so a
+        // failure cannot leak `rl`.
         const out_data = try allocator.create(RaylibOutputData);
         errdefer allocator.destroy(out_data);
         const scratch = try allocator.alloc(
@@ -155,7 +154,23 @@ pub const RaylibBackend = struct {
             ),
         };
 
-        const base = try backend.Backend.init(allocator, io, log_cfg, &backend_impl, rl);
+        const rl = try allocator.create(Raylib);
+        rl.* = .{
+            .loop = loop,
+            .timer = null,
+            // SAFETY: assigned below via `rl.out = out` once the output
+            // exists; null until then (the impl destroy guards it).
+            .out = null,
+            .mode = mode,
+        };
+
+        // Backend.init does not take ownership of rl on failure, so free
+        // it here; every failure path then frees rl exactly once. After
+        // init succeeds, the backend impl destroy owns rl.
+        const base = backend.Backend.init(allocator, io, log_cfg, &backend_impl, rl) catch |err| {
+            allocator.destroy(rl);
+            return err;
+        };
         errdefer base.destroy();
         const out = try output.Output.create(allocator, io, log_cfg, base, &output_impl, out_data, mode);
         rl.out = out;
@@ -178,21 +193,23 @@ fn start(base: *backend.Backend) error{BackendFailed}!void {
     log_mod.info("started {d}x{d} @ {d}ms (raylib window)", base.io, base.log_cfg, "raylib", .{
         rl.mode.width, rl.mode.height, rl.mode.refresh_msec,
     });
-    base.emitNewOutput(rl.out);
+    base.emitNewOutput(rl.out.?);
 }
 
 fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
     const rl: *Raylib = @ptrCast(@alignCast(data));
     // Stop the timer first so no callback can run against a torn-down output.
     if (rl.timer) |timer| timer.remove();
-    rl.out.destroy();
+    // The output wrapper may never have been created when destroy runs
+    // from a failed create() errdefer (rl.out is null then).
+    if (rl.out) |out| out.destroy();
     raylib.CloseWindow();
     allocator.destroy(rl);
 }
 
 fn frameCb(rl: *Raylib) c_int {
     const t0 = frameMs();
-    rl.out.sendFrame();
+    rl.out.?.sendFrame();
     // libwayland does not re-arm timer sources after they fire; re-arm so
     // the NEXT fire lands refresh_msec after THIS callback started (the
     // fixed-period re-arm drifts by the frame work: period = work + 16ms).
@@ -239,7 +256,7 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
                 region.h,
             );
         } else {
-            bgraToRgba(scratch, fb_px);
+            bgraToRgba(out.io, out.log_cfg, scratch, fb_px);
         }
         const perf_t_poll = perfNs(out.io);
         raylib.PollInputEvents();
@@ -309,7 +326,19 @@ fn uploadRegion(damage: *const wayland.utils.damage.Damage, fb_w: i32, fb_h: i32
 /// the R8G8B8A8 raylib texture. The present hot path (921k pixels/frame):
 /// runtime safety is disabled so the shuffle compiles to plain stores —
 /// the slices are sized by the fixed 1280x720 framebuffer and scratch.
-fn bgraToRgba(dst: []align(1) u32, src: []align(1) const u32) void {
+/// SAFETY NET: a framebuffer larger than the create-time scratch would
+/// overflow dst below (safety is off in the loop); guard it first.
+fn bgraToRgba(io: *std.Io, log_cfg: *const log_mod.Config, dst: []align(1) u32, src: []align(1) const u32) void {
+    if (src.len > dst.len) {
+        log_mod.err(
+            "raylib: framebuffer {d} px exceeds scratch capacity {d} px; skipping upload",
+            io,
+            log_cfg,
+            "raylib",
+            .{ src.len, dst.len },
+        );
+        return;
+    }
     @setRuntimeSafety(false);
     for (src, 0..) |px, i| {
         dst[i] = (px & 0xFF00FF00) | ((px & 0x000000FF) << 16) | ((px >> 16) & 0x000000FF);

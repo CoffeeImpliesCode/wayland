@@ -23,8 +23,9 @@ pub const Backend = struct {
         /// A new output became available.
         new_output: wire.Signal(*output_mod.Output),
         /// A new input device became available (wlr_backend new_input).
-        /// No input backends emit this yet (raylib feeds the seat via its
-        /// poll hook); libinput will announce devices through it.
+        /// The libinput backend emits this for each evdev device found
+        /// during udev enumeration (libinput.zig); the server subscribes
+        /// in main.zig.
         new_input: wire.Signal(*InputDevice),
         /// The backend is being destroyed.
         destroy: wire.Signal(*Backend),

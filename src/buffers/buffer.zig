@@ -12,6 +12,13 @@
 //!   the last unlock (types/buffer/buffer.c:50-61), and drop() of an
 //!   already-unlocked buffer also fires it. Listeners (e.g. the shm module)
 //!   use it to tell the client the buffer may be reused.
+//! - The release signal fires AT MOST ONCE per buffer lifetime: a
+//!   `released` guard (see maybeRelease) suppresses the duplicate
+//!   wl_buffer.release that re-dropping a replaced buffer at the next
+//!   commit would otherwise send. A client may re-attach the same
+//!   wl_buffer resource across cycles (double buffering), but the protocol
+//!   release event is per buffer, not per cycle — wlroots sends it exactly
+//!   once per committed buffer.
 //! - `destroy()`: emits the `destroy` signal, releases impl-private
 //!   resources via `impl.destroy`, then frees the Buffer itself.
 //!
@@ -54,6 +61,14 @@ pub const Buffer = struct {
     dropped: bool = false,
     /// Number of consumers currently reading the buffer.
     n_locks: u32 = 0, // public: the surface guards unlocks after early releases
+    /// The release signal has fired; it is emitted at most once per buffer
+    /// lifetime (see maybeRelease).
+    released: bool = false,
+    /// Whether a producer registry (e.g. ShmState) owns this wrapper and
+    /// frees it at deinit. False for untracked wrappers (the stateless
+    /// shm fromResource): the consumer that holds the last reference
+    /// destroys them via Buffer.destroy when done.
+    tracked: bool = true,
     events: struct {
         /// Fires once when `dropped && n_locks == 0`.
         release: wire.Signal(*Buffer),
@@ -94,7 +109,8 @@ pub const Buffer = struct {
     /// may re-attach a released buffer (double buffering), so the same
     /// Buffer is dropped once per replace and can be dropped many times
     /// across its lifetime. The release signal fires when no consumer lock
-    /// remains (n_locks == 0).
+    /// remains (n_locks == 0) — at most once per buffer lifetime (the
+    /// `released` guard).
     pub fn drop(buf: *Buffer) void {
         buf.dropped = true;
         buf.maybeRelease();
@@ -107,9 +123,9 @@ pub const Buffer = struct {
 
     /// A consumer is done reading. Unlocking an unlocked buffer is a
     /// programmer error. Dropping the last lock fires the release signal
-    /// even if the buffer was never dropped (wlroots
-    /// types/buffer/buffer.c:50-61): the client learns it may reuse the
-    /// buffer as soon as the compositor is done reading it.
+    /// (once per buffer lifetime) even if the buffer was never dropped
+    /// (wlroots types/buffer/buffer.c:50-61): the client learns it may
+    /// reuse the buffer as soon as the compositor is done reading it.
     pub fn unlock(buf: *Buffer) void {
         assert(buf.n_locks > 0);
         buf.n_locks -= 1;
@@ -117,7 +133,11 @@ pub const Buffer = struct {
     }
 
     fn maybeRelease(buf: *Buffer) void {
-        if (buf.n_locks == 0) {
+        // Exactly-once: a replaced buffer is re-dropped at the next commit
+        // (surface.zig commit step 3) and re-attached buffers cycle through
+        // drop/unlock again; only the first n_locks == 0 transition emits.
+        if (!buf.released and buf.n_locks == 0) {
+            buf.released = true;
             buf.events.release.emit(buf);
         }
     }
@@ -160,7 +180,7 @@ test "lock drop unlock release ordering" {
     try std.testing.expectEqual(@as(u32, 1), observer.release_count);
 }
 
-test "buffer reuse across attach cycles releases each cycle" {
+test "release fires exactly once across re-attach cycles" {
     const allocator = std.testing.allocator;
     var data: TestBufferData = .{};
     var observer: TestObserver = .{
@@ -179,12 +199,19 @@ test "buffer reuse across attach cycles releases each cycle" {
     try std.testing.expectEqual(@as(u32, 1), observer.release_count);
 
     // Cycle 2: the client re-attaches the SAME buffer (double buffering).
-    // A second drop of the same Buffer must not fail and must fire the
-    // release event again.
+    // drop/unlock repeat, but wl_buffer.release must fire exactly once per
+    // buffer lifetime — a second drop with n_locks == 0 no longer emits
+    // (the replace commit re-drops the old current buffer, surface.zig
+    // commit step 3; without the released guard that would duplicate the
+    // release sent at the buffer's own commit).
     try buf.lock();
     buf.drop();
     buf.unlock();
-    try std.testing.expectEqual(@as(u32, 2), observer.release_count);
+    try std.testing.expectEqual(@as(u32, 1), observer.release_count);
+
+    // A bare re-drop of the released (unlocked) buffer is silent too.
+    buf.drop();
+    try std.testing.expectEqual(@as(u32, 1), observer.release_count);
 }
 
 test "drop with no locks releases immediately" {

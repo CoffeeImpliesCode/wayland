@@ -79,6 +79,10 @@ pub const DataDeviceManager = struct {
     }
 
     pub fn deinit(self: *DataDeviceManager) void {
+        // Detach from the seat's focus signal before freeing the struct:
+        // the seat outlives the manager (main's defer order) and a later
+        // keyboard_focus emit would call into the freed manager.
+        self.focus_listener.link.remove();
         if (self.global) |g| g.remove();
         const allocator = self.allocator;
         self.devices.deinit(allocator);

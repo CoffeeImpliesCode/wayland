@@ -72,7 +72,6 @@ pub const Seat = struct {
     mods_locked: u32 = 0,
     /// Keysym of the most recent key event (compositor bindings).
     last_keysym: u32 = 0,
-    last_keycode: u32 = 0,
 
     // Pointer -------------------------------------------------------------
     /// Per-client wl_pointer resources (created on get_pointer).
@@ -91,8 +90,6 @@ pub const Seat = struct {
     cursor_surface_resource: ?*server.wl.Surface = null,
     cursor_hotspot_x: i32 = 0,
     cursor_hotspot_y: i32 = 0,
-    cursor_serial: u32 = 0,
-    cursor_visible: bool = true,
 
     /// Hit-test callback: map output coords to the surface under the
     /// pointer (surface-local coords). Null when nothing is hit.
@@ -225,7 +222,9 @@ pub const Seat = struct {
         self.events.button.emit(self);
     }
 
-    /// Vertical/horizontal wheel or scroll axis. `value` is in pixels
+    /// Vertical/horizontal wheel or scroll axis. `source` is the input
+    /// source (wheel/finger/continuous, set by the backend from
+    /// libinput_event_pointer_get_axis_source), `value` is in pixels
     /// (10 per notch is the wlroots convention), `discrete` the notches.
     ///
     /// Event shape follows wlr_seat_pointer_send_axis
@@ -233,14 +232,20 @@ pub const Seat = struct {
     /// (axis_discrete) + axis, while value == 0 terminates the scroll
     /// with axis_stop. Events go only to the focused client's pointer
     /// resources.
-    pub fn pointerAxis(self: *Seat, axis: server.wl.Pointer.Axis, value: f64, discrete: i32) void {
+    pub fn pointerAxis(
+        self: *Seat,
+        axis: server.wl.Pointer.Axis,
+        source: server.wl.Pointer.AxisSource,
+        value: f64,
+        discrete: i32,
+    ) void {
         const focus = self.pointer_focus orelse return;
         const focus_client = focus.resource.getClient();
         const time = nowMs(self);
         for (self.pointers.items) |ptr| {
             if (ptr.getClient() != focus_client) continue;
             if (ptr.getVersion() >= 5) {
-                ptr.sendAxisSource(.wheel);
+                ptr.sendAxisSource(source);
                 if (value != 0) {
                     if (discrete != 0) ptr.sendAxisDiscrete(axis, discrete);
                     ptr.sendAxis(time, axis, Fixed.fromDouble(value));
@@ -295,7 +300,6 @@ pub const Seat = struct {
     /// to the focused client and emits the key signal.
     pub fn keyEvent(self: *Seat, keycode: u32, pressed: bool) void {
         self.last_keysym = self.xkb.updateKey(keycode, pressed);
-        self.last_keycode = keycode;
 
         if (pressed) {
             if (!std.mem.containsAtLeast(u32, self.pressed.items, 1, &.{keycode})) {
@@ -345,7 +349,6 @@ pub const Seat = struct {
     /// Current cursor surface resource (client-set via
     /// wl_pointer.set_cursor); null cursor surface means hidden.
     pub fn cursorSurface(self: *Seat) ?*server.wl.Surface {
-        if (!self.cursor_visible) return null;
         return self.cursor_surface_resource;
     }
 
@@ -523,7 +526,6 @@ fn pointerRequest(resource: *server.wl.Pointer, request: server.wl.Pointer.Reque
         // most recent pointer.enter serial (or the pointer is not
         // focused, in which case the next enter uses it).
         .set_cursor => |r| {
-            seat.cursor_serial = r.serial;
             if (r.serial == seat.pointer_enter_serial or seat.pointer_focus == null) {
                 seat.cursor_surface_resource = r.surface;
                 seat.cursor_hotspot_x = r.hotspot_x;
@@ -782,14 +784,19 @@ fn connectClient(ts: *TestServer, tc: *TestClient) !void {
     // keyboard/pointer objects; listeners attach before the pump.
     const wl_compositor = try registry.bind(capture.compositor_name.?, client.wl.Compositor, 7);
     const wl_seat = try registry.bind(capture.seat_name.?, client.wl.Seat, 7);
+    // Bind the fallible calls to locals first: a struct literal with two
+    // `try`s leaks the first allocation if the second fails (zbc).
+    const surface = try wl_compositor.createSurface();
+    const keyboard = try wl_seat.getKeyboard();
+    const pointer = try wl_seat.getPointer();
     tc.* = .{
         .server = server_client,
         .display = c_display,
         .compositor = wl_compositor,
         .seat = wl_seat,
-        .surface = try wl_compositor.createSurface(),
-        .keyboard = try wl_seat.getKeyboard(),
-        .pointer = try wl_seat.getPointer(),
+        .surface = surface,
+        .keyboard = keyboard,
+        .pointer = pointer,
     };
     tc.keyboard.setListener(*KeyboardEvents, KeyboardEvents.listener, &tc.kbd_events);
     tc.pointer.setListener(*PointerEvents, PointerEvents.listener, &tc.ptr_events);
@@ -862,7 +869,7 @@ test "keyboard and pointer events reach only the focused client" {
 
     // Wheel burst (discrete != 0): axis_source + axis_discrete + axis,
     // no axis_stop; only the focused client.
-    ts.seat.?.pointerAxis(.vertical_scroll, 10.0, 1);
+    ts.seat.?.pointerAxis(.vertical_scroll, .wheel, 10.0, 1);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis_source);
     try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis_discrete);
@@ -875,7 +882,7 @@ test "keyboard and pointer events reach only the focused client" {
 
     // Scroll end (value == 0): axis_stop only, no axis; only the focused
     // client.
-    ts.seat.?.pointerAxis(.vertical_scroll, 0.0, 0);
+    ts.seat.?.pointerAxis(.vertical_scroll, .wheel, 0.0, 0);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis_stop);
     try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis); // unchanged

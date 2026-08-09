@@ -42,7 +42,7 @@
 //! (CREATE_DUMB/MAP_DUMB/DESTROY_DUMB/ADDFB2/SET_MASTER/DROP_MASTER),
 //! DRM_CLIENT_CAP_ATOMIC, DRM_MODE_OBJECT_*, DRM_MODE_CONNECTED,
 //! DRM_MODE_TYPE_PREFERRED, DRM_PLANE_TYPE_PRIMARY, DRM_MODE_PAGE_FLIP_EVENT,
-//! DRM_MODE_ATOMIC_*, DRM_FORMAT_ARGB8888.
+//! DRM_MODE_ATOMIC_*, DRM_FORMAT_XRGB8888.
 //!
 //! Imports: utils/*, backend/backend.zig, output/output.zig,
 //! renderer/pixman.zig, and the translated "drm_c" namespace.
@@ -54,10 +54,12 @@ const output_mod = @import("../output/output.zig");
 const pixman = @import("../renderer/pixman.zig");
 const c = @import("drm_c");
 
-/// DRM_FORMAT_ARGB8888 ('AR24' fourcc, 0x34325241): the pixman
-/// Framebuffer is an ARGB8888 u32 in little-endian memory — bytes
-/// B,G,R,A — which is exactly the layout DRM_FORMAT_ARGB8888 specifies
-/// ([31:0] A:R:G:B 8:8:8:8 little endian), so rows copy verbatim.
+/// DRM_FORMAT_XRGB8888 ('XR24' fourcc, 0x34325258): memory bytes
+/// B,G,R,X (little-endian u32; the alpha byte is ignored on scanout).
+/// The pixman Framebuffer is ARGB8888 in little-endian memory — bytes
+/// B,G,R,A — the same layout with a live alpha byte (the renderer
+/// stores B,G,R,A for rect fills, see addRect in renderer/pixman.zig),
+/// so rows copy verbatim.
 pub const drm_format_xrgb8888: u32 = 0x34325258;
 
 const default_device_path = "/dev/dri/card0";
@@ -169,8 +171,11 @@ pub fn pollFd(self: *DrmBackendData) std.posix.fd_t {
 
 /// Drain pending DRM events (drmHandleEvent); each flip completion emits
 /// output.frame. Called by the server's event loop when `pollFd` is
-/// readable (wlroots handle_drm_event).
-pub fn dispatch(self: *DrmBackendData) void {
+/// readable (wlroots handle_drm_event). A failed event read is fatal:
+/// the fd is wedged and frame pacing would stop, so the caller must
+/// tear the server down (wlroots destroys the backend in
+/// handle_drm_event, drm.c:2094-2100).
+pub fn dispatch(self: *DrmBackendData) error{BackendFailed}!void {
     const fd = self.fd orelse return;
     var evctx: c.drmEventContext = .{
         .version = 3,
@@ -180,6 +185,7 @@ pub fn dispatch(self: *DrmBackendData) void {
     };
     if (c.drmHandleEvent(fd, &evctx) != 0) {
         log_mod.err("drm: drmHandleEvent failed", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
     }
 }
 
@@ -455,6 +461,11 @@ fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
 
 fn testState(out: *output_mod.Output, state: *const output_mod.Output.State) error{InvalidState}!void {
     const self: *DrmOutput = @ptrCast(@alignCast(out.data));
+    // Transform and scale are not applied by this backend: the modeset
+    // pinned the plane's source/dest rect at init and commits only
+    // change FB_ID, so any such state would be silently ignored.
+    if (state.committed & output_mod.Output.State.committed_transform != 0) return error.InvalidState;
+    if (state.committed & output_mod.Output.State.committed_scale != 0) return error.InvalidState;
     // Mode changes are rejected: the dumb buffer and modeset are fixed
     // at init (single-mode backend for now). The refresh value is
     // advisory (pacing comes from the flip event, not the refresh
@@ -605,8 +616,9 @@ fn findConnectorMode(self: *DrmBackendData) ?FoundConnector {
 
 /// Find the primary plane for the CRTC and resolve the property ids used
 /// in commits (wlroots drm.c init_plane: the plane must have the CRTC in
-/// possible_crtcs and type == DRM_PLANE_TYPE_PRIMARY; properties.c
-/// plane_info table names the ids).
+/// possible_crtcs, type == DRM_PLANE_TYPE_PRIMARY, and support the
+/// scanout format XRGB8888; properties.c plane_info table names the
+/// ids).
 fn findPrimaryPlane(self: *DrmBackendData, crtc_index: usize, out_props: *PlanePropIds) ?u32 {
     const fd = self.fd.?;
     const res = c.drmModeGetPlaneResources(fd) orelse {
@@ -627,6 +639,24 @@ fn findPrimaryPlane(self: *DrmBackendData, crtc_index: usize, out_props: *PlaneP
         if (!scanPlaneProps(fd, plane_id, &props)) continue;
         const type_value = getPropValue(fd, plane_id, c.DRM_MODE_OBJECT_PLANE, props.plane_type) orelse continue;
         if (type_value != c.DRM_PLANE_TYPE_PRIMARY) continue;
+
+        // The plane must scan out our XRGB8888 dumb buffer; skip planes
+        // without the format (wlroots drm.c init_plane collects
+        // drm_plane->formats into the plane's format set, drm.c:169-186,
+        // and drm_fb_import refuses buffers whose format is absent from
+        // it, fb.c:144-169).
+        var has_xrgb8888 = false;
+        var fi: u32 = 0;
+        while (fi < plane.*.count_formats) : (fi += 1) {
+            if (plane.*.formats[fi] == drm_format_xrgb8888) {
+                has_xrgb8888 = true;
+                break;
+            }
+        }
+        if (!has_xrgb8888) {
+            log_mod.debug("drm: plane {d} lacks XRGB8888; skipping", self.io, self.log_cfg, "drm", .{plane_id});
+            continue;
+        }
 
         out_props.* = props;
         return plane_id;
@@ -811,8 +841,10 @@ fn pageFlipHandler(
 const testing = std.testing;
 
 test "fourcc constant matches drm_fourcc.h" {
-    // ARGB8888 fourcc 'A' 'R' '2' '4' = 0x34325241; the pixman framebuffer
-    // byte order (B,G,R,A in memory) equals DRM_FORMAT_ARGB8888's.
+    // XRGB8888 fourcc 'X' 'R' '2' '4' = 0x34325258 is the scanned-out
+    // format; the pixman framebuffer bytes (B,G,R,A in memory) match its
+    // layout with a live alpha byte. ARGB8888 ('A' 'R' '2' '4' =
+    // 0x34325241) is the same layout with alpha at the fourth byte.
     try testing.expectEqual(drm_format_xrgb8888, c.DRM_FORMAT_XRGB8888);
     try testing.expectEqual(@as(u32, 0x34325241), c.DRM_FORMAT_ARGB8888);
 }
