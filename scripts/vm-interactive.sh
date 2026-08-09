@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interactive canvas demo: DRM backend + foot terminal on the virtio-gpu
+# Interactive canvas demo: DRM backend + weston-terminal on the virtio-gpu
 # output, no auto-poweroff. Launched by the compositor-demo-drm boot gate
 # when /shared/repo/.no-auto-demo exists on the host share (touch the file
 # on the HOST, then boot the VM WITHOUT -nographic so qemu opens a window).
@@ -40,19 +40,25 @@ if [ ! -S /tmp/rt/wayland-1 ]; then
     exit 1
 fi
 
-WAYLAND_DISPLAY=wayland-1 "${FOOT:-foot}" --font="monospace:size=14" \
-    > /tmp/foot.log 2>&1 &
-FOOT_PID=$!
+# Reference terminal client (weston-terminal) — a standard xdg_shell
+# client that renders the demo (drag/zoom/cursor) and is simpler than
+# foot. Note: neither weston-terminal nor foot renders keyboard input
+# end-to-end in this compositor — both receive the wl_keyboard.key event
+# but do not commit their terminal update (an open issue; see the git log
+# on the mouse-move perf work). Override with TERM=foot to test foot.
+WAYLAND_DISPLAY=wayland-1 "${TERM:-weston-terminal}" \
+    > /tmp/term.log 2>&1 &
+TERM_PID=$!
 
 sleep 1
-if ! kill -0 "$FOOT_PID" 2>/dev/null; then
-    echo "VM-INTERACTIVE-FAILED: foot died after 1s"
-    tail -20 /tmp/foot.log
+if ! kill -0 "$TERM_PID" 2>/dev/null; then
+    echo "VM-INTERACTIVE-FAILED: terminal died after 1s"
+    tail -20 /tmp/term.log
     poweroff -f
     exit 1
 fi
 
-echo "VM-INTERACTIVE-OK: server pid $SRV, foot pid $FOOT_PID (drag to pan, wheel to zoom)"
+echo "VM-INTERACTIVE-OK: server pid $SRV, terminal pid $TERM_PID (drag to pan, wheel to zoom)"
 # Keep the oneshot unit alive; the demo ends when the VM powers off.
 while kill -0 "$SRV" 2>/dev/null; do
     sleep 1

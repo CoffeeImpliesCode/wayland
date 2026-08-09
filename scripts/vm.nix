@@ -63,6 +63,9 @@
     pkgs.libevdev
     # Interactive demo client (foot terminal on the canvas).
     pkgs.foot
+    # Reference terminal client (weston-terminal) — used by the interactive
+    # demo instead of foot (a simpler standard xdg_shell client).
+    pkgs.weston
   ];
   environment.variables.PKG_CONFIG_PATH =
     "${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
@@ -107,7 +110,7 @@
       ExecStart = "${pkgs.bash}/bin/bash /shared/repo/scripts/vm-interactive.sh";
       StandardOutput = "journal+console";
       StandardError = "journal+console";
-      Environment = "FOOT=${pkgs.foot}/bin/foot";
+      Environment = "TERM=${pkgs.weston}/bin/weston-terminal";
     };
   };
 
