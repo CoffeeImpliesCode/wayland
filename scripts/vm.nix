@@ -67,8 +67,10 @@
   # shared dir stays host-clean) and run the DRM + libinput E2E at boot
   # (compositor-demo-drm, the default); the headless regression
   # (compositor-demo) stays available as a manually-started unit.
-  # Console root login for manual gates (headless E2E).
-  users.users.root.initialPassword = "root";
+  # Console root login for manual gates (headless E2E): auto-login on the
+  # serial console (the VM image locks root's password regardless of
+  # hashedPassword — auto-login sidesteps it for this disposable test VM).
+  services.getty.autologinUser = "root";
 
   systemd.services.compositor-demo-drm = {
     wantedBy = [ "multi-user.target" ];
