@@ -97,7 +97,7 @@ const watchdog_timeout_ms: u64 = 5000;
 /// Background color (straight alpha RGBA).
 const background_color = [4]f32{ 0.1, 0.1, 0.12, 1.0 };
 /// Fallback cursor: a small light rect when no client cursor surface.
-const cursor_size: i32 = 8;
+const cursor_size: i32 = 16;
 const cursor_color = [4]f32{ 0.95, 0.95, 0.95, 1.0 };
 
 /// Per-surface scene state: the SceneBufferNode that draws the surface's
@@ -1004,7 +1004,14 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         // the compositeCanvas path.
         self.cursor_repaint = false;
         if (self.base_framebuffer) |base| {
-            if (old_cursor[0]) |r| copyRegion(base, self.framebuffer, r);
+            // Restore BOTH old footprints (the fallback-rect node AND the
+            // client-cursor node — weston-terminal sets a cursor surface,
+            // so the visible cursor is the buf node, not the rect node).
+            // Restoring only the rect node left the old client cursor in
+            // place, smearing a trail behind the moving pointer.
+            for (old_cursor) |r| {
+                if (r) |rr| copyRegion(base, self.framebuffer, rr);
+            }
         }
         drawCursor(self);
     } else if (self.frame_kick) {
@@ -1258,23 +1265,48 @@ fn copyWhole(src: *pixman.Framebuffer, dst: *pixman.Framebuffer) void {
     @memcpy(dst.data, src.data);
 }
 
-/// The fallback cursor's texture: a solid light-grey cursor_size² square
-/// (the M3 fallback rect's color), created once and reused. The canvas
-/// pass draws textures only, so the rect becomes a texture; owned by the
-/// state and destroyed in cleanupSurfaceEntries.
+/// The fallback cursor's texture: a 16x16 pointer arrow (white body, black
+/// outline) so the cursor is visible over the canvas and the terminal —
+/// the old solid cursor_size² grey square was nearly invisible (the
+/// reported "no mouse movement"). Drawn with a premultiplied white fill +
+/// black outline; the shape is the classic X left_ptr. The rest is
+/// transparent (alpha 0), so the over-blend leaves the background.
+/// Owned by the state and destroyed in cleanupSurfaceEntries.
 fn ensureCursorFallbackTexture(self: *ServerState) ?*Texture {
     if (self.cursor_fallback_texture) |t| return t;
-    const n: usize = @as(usize, @intCast(cursor_size)) * @as(usize, @intCast(cursor_size));
+    const n: usize = @intCast(cursor_size * cursor_size);
     var pixels: [n * 4]u8 = undefined;
-    const color: [4]u8 = .{
-        @intFromFloat(@round(cursor_color[2] * 255.0)),
-        @intFromFloat(@round(cursor_color[1] * 255.0)),
-        @intFromFloat(@round(cursor_color[0] * 255.0)),
-        @intFromFloat(@round(cursor_color[3] * 255.0)),
+    // The classic left_ptr arrow, 16x16: '1' = body (white), '2' = outline
+    // (black), '.' = transparent. Hotspot is the top-left tip.
+    const shape = [_][]const u8{
+        "2...............",
+        "22..............",
+        "212.............",
+        "2112............",
+        "21112...........",
+        "211112..........",
+        "2111112.........",
+        "21111112........",
+        "211111112.......",
+        "2111111112......",
+        "21111111112.....",
+        "211111111112....",
+        "2111111111112...",
+        "21..21111112....",
+        "2...21111112....",
+        "....211112......",
     };
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        pixels[i * 4 ..][0..4].* = color;
+    var y: usize = 0;
+    while (y < shape.len and y < @as(usize, @intCast(cursor_size))) : (y += 1) {
+        var x: usize = 0;
+        while (x < shape[y].len and x < @as(usize, @intCast(cursor_size))) : (x += 1) {
+            const off = (y * @as(usize, @intCast(cursor_size)) + x) * 4;
+            switch (shape[y][x]) {
+                '2' => pixels[off..][0..4].* = .{ 0, 0, 0, 255 },
+                '1' => pixels[off..][0..4].* = .{ 255, 255, 255, 255 },
+                else => pixels[off..][0..4].* = .{ 0, 0, 0, 0 },
+            }
+        }
     }
     const tex = pixman.PixmanRenderer.importMemory(
         self.renderer,
@@ -1521,27 +1553,13 @@ fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
         // creation happens exactly once per map.
         if (self.output) |out| s.setEntered(out);
 
-        // First map: give the toplevel its real size. The initial
-        // configure was 0x0 ("client decides"); after the client acked it
-        // and mapped, a configure with the output size makes well-behaved
-        // clients (foot, simple-shm) fill the output.
-        if (s.role != null) {
-            for (self.toplevels.items) |t| {
-                if (t.xdg_surface.surface == s and
-                    t.configured_size.w == 0 and t.configured_size.h == 0)
-                {
-                    // The output is announced (onNewOutput) before any
-                    // surface can map, so its mode is the real size.
-                    const out = self.output.?;
-                    t.configure(out.mode.width, out.mode.height) catch |err| {
-                        log.warn("toplevel reconfigure failed: {s}", self.io, self.log_cfg, "server", .{
-                            @errorName(err),
-                        });
-                    };
-                    break;
-                }
-            }
-        }
+        // First map. The initial configure was 0x0 ("client decides"); the
+        // client maps at its OWN preferred size (weston-terminal ~640x480,
+        // foot its default) and the surface size comes from its committed
+        // buffer, so no configure is needed for the initial render. The
+        // client keeps a natural size on the canvas instead of being blown
+        // up to fill the output (the previous configure-to-output-size made
+        // a terminal enormous).
     }
 }
 

@@ -659,10 +659,15 @@ fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !voi
         });
         return error.PixelMismatch;
     }
-    // (53,53): inside the 8x8 fallback cursor at (50,50) -> light grey.
-    const c = pxAt(cap, 53, 53);
+    // (51,53): inside the 16x16 pointer-arrow cursor's white body (tip at
+    // (50,50), row 3 col 1 is the '1' fill) -> white.
+    const c = pxAt(cap, 51, 53);
     if (c[0] < 200 or c[1] < 200 or c[2] < 200) {
-        verdict("CLIENT-ERROR", "cursor pixel (53,53) = {d},{d},{d},{d}, expected light", .{ c[0], c[1], c[2], c[3] });
+        verdict(
+            "CLIENT-ERROR",
+            "cursor pixel (51,53) = {d},{d},{d},{d}, expected white (arrow body)",
+            .{ c[0], c[1], c[2], c[3] },
+        );
         return error.PixelMismatch;
     }
     verdict("CLIENT-CAPTURE", "pixels verified: gradient + cursor overlay", .{});
