@@ -8,7 +8,7 @@ Research-and-prototype repo for a future Wayland compositor on a large 2D/3D can
 - Compositor layer: wlroots/smithay-style.
 - Usage layer: dynamicland-inspired.
 - Usage layer: dynamicland-inspired.
-- **Always consult your inspirations** (wlroots/smithay for compositor design, dynamicland for canvas/usage design) before answering design or implementation questions — foreign clones and deepwiki are the reference material.
+- **Always consult your inspirations** (wlroots/smithay/KWin for compositor design, dynamicland for canvas/usage design) before answering design or implementation questions — foreign clones and deepwiki are the reference material.
 - Stack: Zig 0.16.0 (stable).
 - Status: research. No compositor code yet.
 - VCS: jj. Never use git commands.
@@ -158,7 +158,10 @@ Training data predates these changes. Check `zig env` and local std sources befo
     (1.49), `freedesktop-wayland-weston` (16.0.0), `codeberg-ifreund-zig-wlroots`
     (v0.20.1), `codeberg-river-river` (v0.4.0), `github-WayfireWM-wayfire`
     (v0.11.0), `github-YaLTeR-niri` (v26.04), `github-swaywm-sway` (1.11-rc2),
-    `github-labwc-labwc` (0.20.1), `github-wayvr-org-wayvr` (v26.7.1).
+    `github-labwc-labwc` (0.20.1), `github-wayvr-org-wayvr` (v26.7.1),
+    `invent-kde-org-plasma-kwin` (master; KWin, the KDE Plasma Wayland
+    compositor — the most feature-complete reference: `src/scene/` scene
+    graph, `src/wayland/` compositing, `src/core/` — cloned 2026-08-10).
   - To use a zig dependency override, match its fingerprint and pass `zig build --fork`.
 
 ## Development
