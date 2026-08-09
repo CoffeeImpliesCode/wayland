@@ -206,6 +206,23 @@ const ServerState = struct {
     /// once the first surface is mapped (headless input E2E).
     synth_input: bool = false,
     synth_fired: bool = false,
+    /// M4 Phase B: the synth wheel-zoom step (one wheel-up notch once
+    /// the client's FIRST screencopy capture has been served, plus a
+    /// 2-frame grace) has been sent. Separate from synth_fired: the
+    /// input step is event-driven (map time varies), the zoom step is
+    /// capture-count-driven so it lands after the client's zoom-2
+    /// checks.
+    synth_scrolled: bool = false,
+    /// M4 Phase B: rendered frames since the first screencopy capture
+    /// was served. The synth wheel fires once this reaches 2, so the
+    /// zoom lands after the phase-1 capture buffer is fully delivered
+    /// (ready message flushed) without depending on frame timing.
+    synth_scroll_grace: u32 = 0,
+    /// M4 Phase B camera drag: the last pointer position while the left
+    /// button is held (the pan anchor); null when not dragging. A click
+    /// without motion never produces a delta, so the seat's
+    /// click-to-focus is unchanged.
+    camera_drag: ?DragPoint = null,
     /// WAYLAND_PERF=1: log per-frame pipeline timings (import -> render
     /// -> present) in microseconds.
     perf: bool = false,
@@ -215,7 +232,16 @@ const ServerState = struct {
     new_toplevel_listener: wire.Listener(*wayland.shell.XdgToplevel),
     new_popup_listener: wire.Listener(*wayland.shell.XdgPopup),
     seat_key_listener: wire.Listener(*wayland.seat.Seat),
+    /// M4 Phase B camera controls: seat listeners for the drag-pan
+    /// (button + pointer_move signals) and the wheel-zoom (axis signal).
+    seat_button_listener: wire.Listener(*wayland.seat.Seat),
+    seat_pointer_move_listener: wire.Listener(*wayland.seat.Seat),
+    seat_axis_listener: wire.Listener(*wayland.seat.Seat),
 };
+
+/// M4 Phase B: the drag-pan gesture anchor — the pointer position while
+/// the left button is held.
+const DragPoint = struct { x: i32, y: i32 };
 
 pub fn main(init: std.process.Init) !void {
     var debug_alloc = std.heap.DebugAllocator(.{}).init;
@@ -398,6 +424,9 @@ pub fn main(init: std.process.Init) !void {
         .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
         .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
         .seat_key_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKey),
+        .seat_button_listener = wire.Listener(*wayland.seat.Seat).init(onSeatButton),
+        .seat_pointer_move_listener = wire.Listener(*wayland.seat.Seat).init(onSeatPointerMove),
+        .seat_axis_listener = wire.Listener(*wayland.seat.Seat).init(onSeatAxis),
     };
     if (backend_is_drm) state.drm_backend = backend;
     defer state.toplevels.deinit(allocator);
@@ -417,6 +446,14 @@ pub fn main(init: std.process.Init) !void {
     shell.events.new_toplevel.add(&state.new_toplevel_listener);
     shell.events.new_popup.add(&state.new_popup_listener);
     seat.events.key.add(&state.seat_key_listener);
+    // M4 Phase B camera controls: wheel zoom + drag pan hook the seat's
+    // existing event surface (button, pointer_move, axis). The raylib
+    // and libinput backends feed these signals through the seat API
+    // (pointerButton/pointerMotion/pointerAxis), so no backend change is
+    // needed; headless E2E synthesizes the same calls.
+    seat.events.button.add(&state.seat_button_listener);
+    seat.events.pointer_move.add(&state.seat_pointer_move_listener);
+    seat.events.axis.add(&state.seat_axis_listener);
     // The compositor hit-tests over the scene graph: surfaces map to
     // scene nodes through the surface entries.
     seat.setPick(pickSurface, &state);
@@ -757,6 +794,31 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
             seat.keyEvent(38, true); // 'a' (evdev A + 8)
             seat.keyEvent(38, false);
             log.info("synth input: pointer click + key 'a' at 50,50", self.io, self.log_cfg, "server", .{});
+        }
+    }
+
+    // M4 Phase B synth scroll: one wheel-up notch once the client's
+    // FIRST screencopy capture has been served (capture count >= 1),
+    // plus a 2-frame grace (and once only). Capture-count-driven rather
+    // than frame-count-driven: the canvas bilinear composite is slow in
+    // the E2E, so a fixed frame number cannot be timed against the
+    // client's retry window (frame 100 landed ~0.5s after the window
+    // closed). The client's phase-1 checks read the already-copied
+    // capture buffer, so a zoom landing after the capture cannot affect
+    // them; its retry loop then captures fresh frames until it sees the
+    // zoomed pixels. The notch goes through the seat (pointerAxis:
+    // value=10.0 px per the seat's wheel convention, discrete=1), so
+    // the axis signal zooms the camera 2 -> 2.5.
+    if (self.synth_input and !self.synth_scrolled) {
+        if (self.screencopy) |sc| {
+            if (sc.captures_served >= 1) {
+                self.synth_scroll_grace += 1;
+                if (self.synth_scroll_grace >= 2) {
+                    self.synth_scrolled = true;
+                    self.seat.pointerAxis(.vertical_scroll, .wheel, 10.0, 1);
+                    log.info("synth input: wheel up notch (camera zoom x1.25)", self.io, self.log_cfg, "server", .{});
+                }
+            }
         }
     }
 
@@ -1454,8 +1516,14 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     // (surface-local coords are world coords too). With the default
     // camera worldToScreen is the identity mapping, so this is a no-op.
     const world = self.camera.screenToWorld(@floatFromInt(x), @floatFromInt(y));
-    const pick_x: i32 = @intFromFloat(@min(@max(world.x, @as(f64, std.math.minInt(i32))), @as(f64, std.math.maxInt(i32))));
-    const pick_y: i32 = @intFromFloat(@min(@max(world.y, @as(f64, std.math.minInt(i32))), @as(f64, std.math.maxInt(i32))));
+    const pick_x: i32 = @intFromFloat(@min(
+        @max(world.x, @as(f64, std.math.minInt(i32))),
+        @as(f64, std.math.maxInt(i32)),
+    ));
+    const pick_y: i32 = @intFromFloat(@min(
+        @max(world.y, @as(f64, std.math.minInt(i32))),
+        @as(f64, std.math.maxInt(i32)),
+    ));
     const node = scene.pick(pick_x, pick_y) orelse return null;
     var it = self.surface_entries.valueIterator();
     while (it.next()) |entry_ptr| {
@@ -1503,6 +1571,53 @@ fn onSeatKey(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.S
         log.info("Mod4+Escape pressed: stopping", self.io, self.log_cfg, "server", .{});
         if (self.loop) |loop| loop.stop();
     }
+}
+
+/// M4 camera drag: the left button press anchors a pan gesture; motion
+/// while held pans the camera. A click without motion never moves the
+/// pointer between press and release, so it keeps the seat's
+/// click-to-focus (already handled inside the seat).
+fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
+    const self: *ServerState = @fieldParentPtr("seat_button_listener", listener);
+    if (seat.last_button != wayland.seat.btn_left) return;
+    self.camera_drag = if (seat.last_button_pressed)
+        DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y }
+    else
+        null;
+}
+
+/// M4 camera pan: while the left button is held, pointer motion moves
+/// the camera center by (-delta_x / zoom, -delta_y / zoom) world units
+/// per screen pixel — the world point under the pointer stays under it.
+fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
+    const self: *ServerState = @fieldParentPtr("seat_pointer_move_listener", listener);
+    const drag = self.camera_drag orelse return;
+    const dx = seat.pointer_x - drag.x;
+    const dy = seat.pointer_y - drag.y;
+    if (dx == 0 and dy == 0) return;
+    self.camera.center_x -= @as(f64, @floatFromInt(dx)) / self.camera.zoom;
+    self.camera.center_y -= @as(f64, @floatFromInt(dy)) / self.camera.zoom;
+    self.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
+    log.debug("camera center -> {d},{d}", self.io, self.log_cfg, "camera", .{
+        self.camera.center_x, self.camera.center_y,
+    });
+}
+
+/// M4 camera zoom: a vertical wheel notch (+1 discrete) multiplies the
+/// camera zoom by 1.25, -1 divides; clamped to [0.1, 16.0]. The zoom is
+/// a viewport property, so it applies regardless of pointer focus (the
+/// seat emits the axis signal for every axis event).
+fn onSeatAxis(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
+    const self: *ServerState = @fieldParentPtr("seat_axis_listener", listener);
+    if (seat.last_axis != .vertical_scroll or seat.last_axis_discrete == 0) return;
+    const factor: f64 = if (seat.last_axis_discrete > 0) 1.25 else 1.0 / 1.25;
+    var steps: i32 = seat.last_axis_discrete;
+    if (steps < 0) steps = -steps;
+    var zoom = self.camera.zoom;
+    var i: i32 = 0;
+    while (i < steps) : (i += 1) zoom *= factor;
+    self.camera.zoom = std.math.clamp(zoom, 0.1, 16.0);
+    log.debug("camera zoom -> {d}", self.io, self.log_cfg, "camera", .{self.camera.zoom});
 }
 
 /// Sync the cursor nodes with the seat state: position at the pointer

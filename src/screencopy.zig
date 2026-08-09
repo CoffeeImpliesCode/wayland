@@ -43,6 +43,11 @@ pub const Screencopy = struct {
     /// Monotonic capture timestamp source (tv_sec_hi, tv_sec_lo, tv_nsec).
     clock: *const fn (ctx: *anyopaque, out: *[3]u32) void,
     clock_ctx: *anyopaque,
+    /// Completed captures: incremented once per served `copy` request
+    /// (pixels fully copied into the client's buffer, before the frame
+    /// is marked ready). The server reads this to time synth input
+    /// against real client captures instead of frame counts.
+    captures_served: u32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -292,6 +297,12 @@ fn copyFrame(
 
     // Hand the buffer back to the client (it may reuse it).
     buf.drop();
+
+    // The capture is fully served: pixels are in the client's buffer.
+    // The server times its synth input off this counter (the client's
+    // first capture is count 1) rather than frame counts, which cannot
+    // be predicted reliably against the client's retry window.
+    state.screencopy.captures_served += 1;
 
     // Damage + flags + ready. The timestamp is the capture time.
     frame.sendDamage(@intCast(state.x), @intCast(state.y), @intCast(state.width), @intCast(state.height));

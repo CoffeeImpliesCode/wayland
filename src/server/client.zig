@@ -79,6 +79,9 @@ const ClientState = struct {
     camera_cx: f64 = 0,
     camera_cy: f64 = 0,
     camera_zoom: f64 = 1,
+    /// True when WAYLAND_CAMERA was present (even if partially parsed):
+    /// mirrors the server, where a present-but-missing cx/cy means 0.
+    camera_env_set: bool = false,
     /// Screencopy capture state (filled when the frame advertises its
     /// buffer and completed on ready).
     capture: ?CaptureState = null,
@@ -314,6 +317,12 @@ pub fn main(init: std.process.Init) !void {
         return error.CaptureFailed;
     }
     try verifyCapturePixels(cap, &state);
+    destroyCapture(&state);
+
+    // M4 Phase B: the server's synth wheel zoom (2 -> 2.5 under the E2E
+    // camera) lands at frame 100; wait for it with a bounded
+    // capture-retry loop.
+    try verifyZoomLanding(&state);
 
     // Drain remaining events so the server sees a clean client teardown.
     if (wl.Display.roundtrip(display) != .SUCCESS) {
@@ -567,6 +576,14 @@ fn resolveSurfaceSize(state: *ClientState) void {
             fallback_width, fallback_height,
         });
     }
+    // Mirror the server's default camera: no WAYLAND_CAMERA env -> the
+    // server centers the world origin on the viewport center (zoom 1).
+    // The client's identity defaults must match or the zoom verification
+    // expects the wrong world point (cx=0 vs cx=W/2).
+    if (!state.camera_env_set) {
+        state.camera_cx = @as(f64, @floatFromInt(state.surface_width)) / 2.0;
+        state.camera_cy = @as(f64, @floatFromInt(state.surface_height)) / 2.0;
+    }
 }
 
 /// Allocate the capture buffer (second memfd + shm pool) and the frame
@@ -621,21 +638,13 @@ fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !voi
         });
         return error.CaptureSizeBad;
     }
-    const px = struct {
-        fn at(c: *const CaptureState, x: usize, y: usize) [4]u8 {
-            const off = y * c.stride + x * 4;
-            return .{ c.pixels[off], c.pixels[off + 1], c.pixels[off + 2], c.pixels[off + 3] };
-        }
-    }.at;
-
     // (5,5): gradient colors at the world point under (5,5) — B ramps
     // with world x (identity: x=5 -> B=0; E2E cx=640,zoom=2: world x =
     // 322.5 -> B=64), while R=255, G=0, A=255 hold across the gradient.
-    const g = px(cap, 5, 5);
-    const g_b = gradientB(state, 5);
-    if (g[2] != 255 or g[1] != 0 or g[0] != g_b or g[3] != 255) {
+    if (!gradientPixelMatches(cap, state, 5, 5, state.camera_zoom)) {
+        const g = pxAt(cap, 5, 5);
         verdict("CLIENT-ERROR", "pixel (5,5) = {d},{d},{d},{d}, expected B={d}", .{
-            g[0], g[1], g[2], g[3], g_b,
+            g[0], g[1], g[2], g[3], gradientB(state, 5),
         });
         return error.PixelMismatch;
     }
@@ -643,15 +652,15 @@ fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !voi
     // identity world x = 1000 -> B = 199; under cx=640,zoom=2 world x =
     // 640 + (1000-640)/2 = 820 -> B = 163.
     const expected_b = gradientB(state, 1000);
-    const m = px(cap, 1000, 600);
-    if (m[2] != 255 or m[1] != 0 or m[0] != expected_b or m[3] != 255) {
+    if (!gradientPixelMatches(cap, state, 1000, 600, state.camera_zoom)) {
+        const m = pxAt(cap, 1000, 600);
         verdict("CLIENT-ERROR", "pixel (1000,600) = {d},{d},{d},{d}, expected B={d}", .{
             m[0], m[1], m[2], m[3], expected_b,
         });
         return error.PixelMismatch;
     }
     // (53,53): inside the 8x8 fallback cursor at (50,50) -> light grey.
-    const c = px(cap, 53, 53);
+    const c = pxAt(cap, 53, 53);
     if (c[0] < 200 or c[1] < 200 or c[2] < 200) {
         verdict("CLIENT-ERROR", "cursor pixel (53,53) = {d},{d},{d},{d}, expected light", .{ c[0], c[1], c[2], c[3] });
         return error.PixelMismatch;
@@ -666,10 +675,111 @@ fn verifyCapturePixels(cap: *const CaptureState, state: *const ClientState) !voi
 /// server camera: cx + (x - cx)/zoom with the parsed WAYLAND_CAMERA
 /// (identity defaults cx=0, zoom=1 -> world_x = x, the pre-M4 check).
 fn gradientB(state: *const ClientState, screen_x: usize) u8 {
+    return gradientBAt(state, screen_x, state.camera_zoom);
+}
+
+/// gradientB under an explicit camera zoom: the zoom-landing phase
+/// checks the 1.25x post-scroll zoom, which the client derives from its
+/// env camera + the zoom rule (the server state is not directly
+/// observable).
+fn gradientBAt(state: *const ClientState, screen_x: usize, zoom: f64) u8 {
     const sx: f64 = @floatFromInt(screen_x);
-    const world_x = state.camera_cx + (sx - state.camera_cx) / state.camera_zoom;
+    const world_x = state.camera_cx + (sx - state.camera_cx) / zoom;
     const wx: usize = @intFromFloat(@floor(world_x));
     return @intCast((wx * 255) / @as(usize, @intCast(state.surface_width)));
+}
+
+/// The captured pixel's BGRA bytes at (x, y) in the framebuffer.
+fn pxAt(cap: *const CaptureState, x: usize, y: usize) [4]u8 {
+    const off = y * cap.stride + x * 4;
+    return .{ cap.pixels[off], cap.pixels[off + 1], cap.pixels[off + 2], cap.pixels[off + 3] };
+}
+
+/// True when the captured pixel at (screen_x, screen_y) shows the
+/// gradient under `zoom`: R=255, G=0, A=255 and B at the world point
+/// cx + (screen_x - cx)/zoom.
+fn gradientPixelMatches(
+    cap: *const CaptureState,
+    state: *const ClientState,
+    screen_x: usize,
+    screen_y: usize,
+    zoom: f64,
+) bool {
+    const p = pxAt(cap, screen_x, screen_y);
+    const b = gradientBAt(state, screen_x, zoom);
+    return p[2] == 255 and p[1] == 0 and p[0] == b and p[3] == 255;
+}
+
+/// M4 Phase B: wait for the server's synth wheel zoom to land, then
+/// verify the camera-moved gradient. The scroll fires once 100 frames
+/// have rendered (2 -> 2.5 under the E2E camera); the compositor
+/// re-renders fully and sends frame_done every frame, so a fresh
+/// screencopy capture shows the new zoom within a frame of the scroll.
+/// Timing-tolerant: capture -> check -> 250ms sleep -> retry, up to 30
+/// attempts (7.5s total); CLIENT-ERROR if the zoom never lands.
+fn verifyZoomLanding(state: *ClientState) !void {
+    const zoom_after = state.camera_zoom * 1.25;
+    const expected_b = gradientBAt(state, 1000, zoom_after);
+    var attempt: u32 = 0;
+    while (attempt < 30) : (attempt += 1) {
+        const frame = try setupCapture(state);
+        frame.setListener(*ClientState, onCaptureFrameEvent, state);
+        if (wl.Display.flush(state.display) != .SUCCESS) {
+            verdict("CLIENT-ERROR", "flush after zoom capture failed", .{});
+            return error.FlushFailed;
+        }
+        if (!try waitForEvent(hasCaptureDone, state, timeout_ms)) {
+            verdict("CLIENT-TIMEOUT", "no zoom capture ready/failed within {d}ms", .{timeout_ms});
+            return error.ClientTimeout;
+        }
+        const cap = &state.capture.?;
+        if (cap.failed or !cap.ready) {
+            // The failure flag makes the wait end with a specific
+            // CLIENT-ERROR instead of timing out (no ready event).
+            switch (cap.failure) {
+                .server => verdict("CLIENT-ERROR", "zoom screencopy failed", .{}),
+                .buffer_create => verdict("CLIENT-ERROR", "zoom capture buffer creation failed", .{}),
+                .flush => verdict("CLIENT-ERROR", "flush after zoom capture copy failed", .{}),
+            }
+            return error.CaptureFailed;
+        }
+        const b = pxAt(cap, 1000, 600)[0];
+        if (gradientPixelMatches(cap, state, 1000, 600, zoom_after)) {
+            verdict("CLIENT-ZOOM", "zoom landed: {d} -> {d} (B={d} at (1000,600))", .{
+                state.camera_zoom, zoom_after, b,
+            });
+            destroyCapture(state);
+            return;
+        }
+        step("zoom not landed yet (attempt {d}): B={d} at (1000,600), expected {d}", .{
+            attempt + 1, b, expected_b,
+        });
+        destroyCapture(state);
+        std.Io.sleep(client_io, .fromMilliseconds(250), .awake) catch |err| {
+            verdict("CLIENT-ERROR", "zoom retry sleep failed: {s}", .{@errorName(err)});
+            return err;
+        };
+    }
+    verdict("CLIENT-ERROR", "zoom never landed after 30 captures (expected B={d} at (1000,600))", .{
+        expected_b,
+    });
+    return error.ZoomNotLanded;
+}
+
+/// Free a finished capture's client-side resources (frame object, shm
+/// pool + buffer, memfd, mapping). Called between retries so the bounded
+/// loop does not leak a memfd + mapping per attempt; the server has sent
+/// ready (or the capture failed before any buffer), so destroying the
+/// frame object is safe (wlr-screencopy: "can be sent at any time").
+fn destroyCapture(state: *ClientState) void {
+    const cap = &state.capture.?;
+    cap.frame.destroy();
+    // buffer is only valid once the buffer event arrived and the copy
+    // was sent (setupCapture leaves it undefined).
+    if (cap.sent_copy) cap.buffer.destroy();
+    cap.pool.destroy();
+    _ = std.os.linux.close(cap.fd);
+    std.posix.munmap(cap.pixels);
 }
 
 /// Parse WAYLAND_CAMERA ("cx=…,cy=…,zoom=…,rot=…") into the camera state
@@ -680,6 +790,7 @@ fn gradientB(state: *const ClientState, screen_x: usize) u8 {
 /// gradient varies only in x and the E2E camera has no rotation).
 fn parseCameraEnv(state: *ClientState, environ_map: *std.process.Environ.Map) void {
     const value = environ_map.get("WAYLAND_CAMERA") orelse return;
+    state.camera_env_set = true;
     var fields = std.mem.splitScalar(u8, value, ',');
     while (fields.next()) |field| {
         if (field.len == 0) continue;

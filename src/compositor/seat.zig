@@ -72,6 +72,16 @@ pub const Seat = struct {
     mods_locked: u32 = 0,
     /// Keysym of the most recent key event (compositor bindings).
     last_keysym: u32 = 0,
+    /// Button code of the most recent pointer button event + its state
+    /// (compositor bindings; mirrors last_keysym — the button signal is
+    /// the notification, these fields carry the payload).
+    last_button: u32 = 0,
+    last_button_pressed: bool = false,
+    /// The most recent scroll axis event: the axis + discrete notch
+    /// count (compositor bindings; mirrors last_keysym — the axis signal
+    /// is the notification, these fields carry the payload).
+    last_axis: server.wl.Pointer.Axis = .vertical_scroll,
+    last_axis_discrete: i32 = 0,
     /// The most recent serial this seat handed out. Input events carry it
     /// to the focused client, which echoes it back in serial-bearing
     /// requests (wl_pointer.set_cursor, wl_data_device.set_selection,
@@ -108,12 +118,21 @@ pub const Seat = struct {
         /// A key was pressed/released. The seat state (last_keysym,
         /// mods) is already updated; read it in the handler.
         key: wire.Signal(*Seat),
-        /// A pointer button was pressed/released.
+        /// A pointer button was pressed/released. The seat state
+        /// (last_button, last_button_pressed) is already updated; read
+        /// it in the handler.
         button: wire.Signal(*Seat),
-        /// The pointer moved.
+        /// The pointer moved. The seat state (pointer_x, pointer_y) is
+        /// already updated; read it in the handler.
         pointer_move: wire.Signal(*Seat),
         /// Keyboard focus changed.
         keyboard_focus: wire.Signal(*Seat),
+        /// A scroll axis event was fed to the seat (pointerAxis). The
+        /// seat state (last_axis, last_axis_discrete) is already
+        /// updated; read it in the handler. Emitted even without a
+        /// focused surface: the compositor's camera zoom is a viewport
+        /// operation, not a client delivery.
+        axis: wire.Signal(*Seat),
     },
 
     /// Result of a hit test: the surface and the pointer position in
@@ -151,6 +170,7 @@ pub const Seat = struct {
         self.events.button.init();
         self.events.pointer_move.init();
         self.events.keyboard_focus.init();
+        self.events.axis.init();
         self.global = try display.addGlobal(server.wl.Seat, *Seat, bindSeat, seat_version, self);
         log.debug("seat created (keyboard + pointer)", io, log_cfg, "seat", .{});
         return self;
@@ -218,6 +238,11 @@ pub const Seat = struct {
     /// Pointer button press/release (linux input button code). A press
     /// moves keyboard focus to the surface under the pointer.
     pub fn pointerButton(self: *Seat, button: u32, pressed: bool) void {
+        // Record the event for compositor listeners (mirrors keyEvent's
+        // last_keysym): the camera drag hook reads these from the button
+        // signal.
+        self.last_button = button;
+        self.last_button_pressed = pressed;
         if (pressed) {
             if (self.pointer_focus) |focus| self.setKeyboardFocus(focus);
         }
@@ -255,6 +280,15 @@ pub const Seat = struct {
         value: f64,
         discrete: i32,
     ) void {
+        // Record the event for compositor listeners (mirrors keyEvent's
+        // last_keysym): the camera zoom hook reads these from the axis
+        // signal. Recorded and emitted BEFORE the focus check — the
+        // viewport zoom is a compositor operation, not a client delivery,
+        // so it works without a focused surface.
+        self.last_axis = axis;
+        self.last_axis_discrete = discrete;
+        self.events.axis.emit(self);
+
         const focus = self.pointer_focus orelse return;
         const focus_client = focus.resource.getClient();
         const time = nowMs(self);
