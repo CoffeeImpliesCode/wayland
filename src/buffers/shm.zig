@@ -60,6 +60,11 @@ pub const ShmState = struct {
     display: *display_mod.CompositorDisplay,
     /// Tracked wrappers: client wl_buffer resource -> Buffer (dedupe).
     buffers: std.AutoHashMap(*wire.Resource, *Buffer),
+    /// Wrappers whose client resource was destroyed: dropped from the map
+    /// (a recycled resource pointer must get a fresh wrapper) but still
+    /// referenced by surfaces until teardown, so ownership moves here and
+    /// deinit frees them.
+    dead_buffers: std.ArrayList(*Buffer) = .empty,
 
     /// Enable the wl_shm protocol (internal libwayland global + formats)
     /// and allocate the shm state. Safe to call once per display.
@@ -84,8 +89,12 @@ pub const ShmState = struct {
 
     /// Reclaim all tracked wrappers (their client resources may already be
     /// gone; the wrappers themselves outlive them). Destroying a wrapper
-    /// removes it from the map, so re-iterate until empty.
+    /// removes it from the map, so re-iterate until empty. Dead wrappers
+    /// (resource destroyed, still surface-referenced) live in the
+    /// graveyard list and are freed here too.
     pub fn deinit(state: *ShmState) void {
+        for (state.dead_buffers.items) |buf| Buffer.destroy(buf);
+        state.dead_buffers.deinit(state.allocator);
         while (state.buffers.count() > 0) {
             var it = state.buffers.keyIterator();
             const key = (it.next() orelse unreachable).*;
@@ -195,7 +204,17 @@ fn shmDestroy(allocator: std.mem.Allocator, data: *anyopaque) void {
 fn resourceDestroy(listener: *wire.Listener(*wire.Resource), resource: *wire.Resource) void {
     _ = resource;
     const d: *ShmBufferData = @fieldParentPtr("resource_destroy", listener);
-    if (d.state) |state| _ = state.buffers.remove(d.resource_key);
+    if (d.state) |state| {
+        _ = state.buffers.remove(d.resource_key);
+        // The wrapper still outlives the resource (surfaces may hold it
+        // until teardown); move ownership to the graveyard so deinit
+        // frees it instead of leaking (the map no longer tracks it).
+        state.dead_buffers.append(state.allocator, d.buf) catch {
+            // OOM: the wrapper leaks at exit (DebugAllocator reports it)
+            // rather than corrupting the teardown walk.
+            return;
+        };
+    }
     d.resource = null;
     d.shm = null;
     if (!d.buf.dropped) d.buf.drop();

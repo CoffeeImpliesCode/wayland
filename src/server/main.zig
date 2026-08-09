@@ -300,6 +300,8 @@ pub fn main(init: std.process.Init) !void {
             output_height,
         );
     }
+    // Function-scope: the backend is used until the event loop exits.
+    defer if (input_backend) |ib| ib.destroy();
 
     var state: ServerState = .{
         .allocator = allocator,

@@ -108,6 +108,8 @@ LIBINPUT_LINES=$(grep -c "libinput:" /tmp/srv.out 2>/dev/null || true)
 echo "=== vm-drm-e2e: client rc=$RC drm_lines=$DRM_LINES libinput_lines=$LIBINPUT_LINES ==="
 if [ "$RC" -eq 0 ] && grep -q "CLIENT-OK" /tmp/cli.out &&
    [ "$DRM_LINES" -gt 0 ] && [ "$LIBINPUT_LINES" -gt 0 ]; then
+    LEAKS=$(grep -c "leaked" /tmp/srv.out 2>/dev/null || true)
+    echo "=== leak check: $LEAKS (expect 0; DebugAllocator at server exit) ==="
     echo "VM-DRM-E2E-OK"
 else
     echo "=== server log tail: ==="
