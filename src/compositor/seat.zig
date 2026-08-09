@@ -72,6 +72,14 @@ pub const Seat = struct {
     mods_locked: u32 = 0,
     /// Keysym of the most recent key event (compositor bindings).
     last_keysym: u32 = 0,
+    /// The most recent serial this seat handed out. Input events carry it
+    /// to the focused client, which echoes it back in serial-bearing
+    /// requests (wl_pointer.set_cursor, wl_data_device.set_selection,
+    /// wl_data_device.start_drag). Consumers reject stale serials
+    /// (data_device.zig validates against this; wlroots' equivalents are
+    /// the per-client serial ring, wlr_seat.c:500, and the pointer grab
+    /// serial, wlr_seat_pointer.c:603-617).
+    last_serial: u32 = 0,
 
     // Pointer -------------------------------------------------------------
     /// Per-client wl_pointer resources (created on get_pointer).
@@ -169,6 +177,14 @@ pub const Seat = struct {
         self.pick_ctx = ctx;
     }
 
+    /// Next seat serial: wraps the display counter and records the value,
+    /// so serial-bearing client requests (set_cursor, set_selection,
+    /// start_drag) can be validated against the seat's last serial.
+    fn nextSerial(self: *Seat) u32 {
+        self.last_serial = self.display.nextSerial();
+        return self.last_serial;
+    }
+
     /// Move the pointer to output coords (x, y): hit-test, deliver
     /// enter/leave/motion to the focused client, move the cursor.
     pub fn pointerMotion(self: *Seat, x: i32, y: i32) void {
@@ -205,7 +221,7 @@ pub const Seat = struct {
         if (pressed) {
             if (self.pointer_focus) |focus| self.setKeyboardFocus(focus);
         }
-        const serial = self.display.nextSerial();
+        const serial = self.nextSerial();
         const time = nowMs(self);
         const state: server.wl.Pointer.ButtonState = if (pressed) .pressed else .released;
         // Button goes only to the focused client's pointer resources
@@ -268,7 +284,7 @@ pub const Seat = struct {
     /// rejects enter/leave carrying a foreign client's surface.
     pub fn setKeyboardFocus(self: *Seat, surface: ?*Surface) void {
         if (surface == self.keyboard_focus) return;
-        const serial = self.display.nextSerial();
+        const serial = self.nextSerial();
         if (self.keyboard_focus) |old| {
             const old_res = old.resource;
             const old_client = old_res.getClient();
@@ -331,7 +347,7 @@ pub const Seat = struct {
         }
 
         const state: server.wl.Keyboard.KeyState = if (pressed) .pressed else .released;
-        const serial = self.display.nextSerial();
+        const serial = self.nextSerial();
         const time = nowMs(self);
         // Key events go only to the focused client's keyboards
         // (wlroots: wlr_seat_keyboard_send_key iterates
@@ -366,7 +382,7 @@ pub const Seat = struct {
     fn sendKeyboardModifiers(self: *Seat) void {
         const focus = self.keyboard_focus orelse return;
         const focus_client = focus.resource.getClient();
-        const serial = self.display.nextSerial();
+        const serial = self.nextSerial();
         for (self.keyboards.items) |kbd| {
             if (kbd.getClient() != focus_client) continue;
             kbd.sendModifiers(serial, self.mods_depressed, self.mods_latched, self.mods_locked, 0);
@@ -385,7 +401,7 @@ pub const Seat = struct {
 
     fn pointerEnter(self: *Seat, surface: *Surface, sx: i32, sy: i32) void {
         self.pointer_focus = surface;
-        self.pointer_enter_serial = self.display.nextSerial();
+        self.pointer_enter_serial = self.nextSerial();
         self.focus_x = sx;
         self.focus_y = sy;
         const res = surface.resource;
@@ -411,7 +427,7 @@ pub const Seat = struct {
     }
 
     fn pointerLeave(self: *Seat) void {
-        const serial = self.display.nextSerial();
+        const serial = self.nextSerial();
         const old = self.pointer_focus.?;
         const res = old.resource;
         // Leave goes only to the leaving surface's client's pointers
@@ -471,7 +487,7 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
             if (seat.keyboard_focus) |s| {
                 if (kbd.getClient() == s.resource.getClient()) {
                     var keys = wire.wl.Array.fromArrayList(u32, seat.pressed);
-                    kbd.sendEnter(seat.display.nextSerial(), s.resource, &keys);
+                    kbd.sendEnter(seat.nextSerial(), s.resource, &keys);
                     // wlroots sends enter then modifiers to the focused
                     // client's keyboards on bind (wlr_seat_keyboard.c:459-460).
                     seat.sendKeyboardModifiers();
@@ -494,7 +510,7 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
             if (seat.pointer_focus) |s| {
                 if (ptr.getClient() == s.resource.getClient()) {
                     ptr.sendEnter(
-                        seat.display.nextSerial(),
+                        seat.nextSerial(),
                         s.resource,
                         Fixed.fromInt(@intCast(seat.focus_x)),
                         Fixed.fromInt(@intCast(seat.focus_y)),

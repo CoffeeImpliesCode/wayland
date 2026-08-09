@@ -1,26 +1,42 @@
 //! wl_surface state machine: double-buffered pending/current state,
 //! commit pipeline, frame callbacks, map/unmap tracking, role hooks.
 //!
-//! Commit pipeline order:
+//! Commit pipeline order (client commit):
 //!   1. validate pending state (posts wl_surface protocol errors and
 //!      discards the commit on failure)
-//!   2. swap pending -> current (scalar copy; damage lists transfer so
+//!   2. emit the client_commit signal BEFORE the apply decision, mirroring
+//!      wlroots surface_handle_commit (wlr_compositor.c:577-598): the
+//!      subcompositor's sync handler locks the pending state here
+//!      (wlr_subcompositor.c:224-235)
+//!   3. if cached_state_locks is set, the commit is DEFERRED: the pending
+//!      state keeps accumulating (sync-subsurface caching) and nothing is
+//!      applied or signaled until the lock clears (parent commit, desync,
+//!      or teardown — see wlroots surface_cache_pending,
+//!      wlr_compositor.c:484-501)
+//!   4. applyCommit (wlroots surface_commit_state, wlr_compositor.c:511-575):
+//!      swap pending -> current (scalar copy; damage lists transfer so
 //!      the pending state restarts empty; frame callbacks accumulate on
 //!      current across commits — each waits for the next present)
-//!   3. drop the buffer the surface stopped using (its lock was already
+//!   5. drop the buffer the surface stopped using (its lock was already
 //!      released at the end of the previous commit)
-//!   4. translate the committed surface damage into buffer coordinates
+//!   6. translate the committed surface damage into buffer coordinates
 //!      (scale + inverse transform) and union into current.buffer_damage
-//!   5. role.client_commit hook
-//!   6. role.commit hook
-//!   7. emit client_commit + commit signals
-//!   8. map/unmap transition: mapped = (current.buffer != null and
+//!   7. role.client_commit hook
+//!   8. role.commit hook
+//!   9. emit the commit signal
+//!  10. map/unmap transition: mapped = (current.buffer != null and
 //!      width/height > 0); on change, run the role.map/role.unmap hook
 //!      and the map/unmap signal
-//!   9. unlock the current buffer (wlroots wlr_compositor.c:570-574) so
+//!  11. unlock the current buffer (wlroots wlr_compositor.c:570-574) so
 //!      the client may reuse it (double buffering); the release signal
 //!      fires here (buffers/buffer.zig) and completes get_release
 //!      callbacks
+//!
+//! applyCommit also runs directly — without the client_commit phase — when
+//! the subcompositor flushes a deferred (cached) commit on the parent's
+//! commit, on desync, or at wl_subsurface teardown (wlroots
+//! wlr_surface_unlock_cached -> surface_commit_state,
+//! wlr_compositor.c:947-986): a flushed commit is not a client commit.
 //!
 //! Frame callbacks are NOT completed at commit: they accumulate in
 //! current.frame_callbacks and are sent with wl_callback.done by
@@ -85,6 +101,7 @@ const wire = @import("../core/wire.zig");
 const role_mod = @import("role.zig");
 const compositor_mod = @import("compositor.zig");
 const region_mod = @import("region.zig");
+const output_mod = @import("../output/output.zig");
 const buffer_mod = @import("../buffers/buffer.zig");
 const shm_mod = @import("../buffers/shm.zig");
 
@@ -116,8 +133,17 @@ pub const State = struct {
     /// input (infinite). Owned rect list (same snapshot semantics).
     input: ?std.ArrayList(Rect) = null,
     /// Transform the client already applied to the buffer contents.
+    /// CANONICAL READ: consumers (rendering, input picking, damage
+    /// translation) must read `current.transform` — the committed state
+    /// after the pending->current swap (swapState). `pending.transform`
+    /// is only the client's in-flight request. Mirror of wlroots'
+    /// wlr_surface_state.transform (wlr_compositor.h:60-66).
     transform: geom.Transform = .normal,
     /// Scale the client rendered the buffer at.
+    /// CANONICAL READ: same rule as transform — read `current.scale`
+    /// (the committed value); the surface-local size is the buffer size
+    /// transformed and divided by it (wlr_surface_state_has_buffer,
+    /// wlr_compositor.h:356).
     scale: i32 = 1,
     /// wl_callback resources created by wl_surface.frame. Completed with
     /// done(ms) at present time by Surface.sendFrameDone (wlroots
@@ -159,12 +185,31 @@ pub const Surface = struct {
     /// Whether the surface currently presents content (buffer with a
     /// positive size; see the map transition in commit).
     mapped: bool = false,
+    /// Deferred-commit lock (mirrors wlroots' pending.cached_state_locks,
+    /// wlr_compositor.c:942-945): while set, commit() keeps the pending
+    /// state accumulating instead of applying it (wlr_compositor.c:594-598).
+    /// Set by the subcompositor's sync handler on the client_commit
+    /// signal (wlr_subcompositor.c:224-235); a bool suffices because a
+    /// surface holds at most one role, so at most one lock can exist
+    /// (wlroots counts multiple synced-object locks).
+    cached_state_locks: bool = false,
+    /// The output this surface is currently composited on; null = on no
+    /// output. Single-output world: wlroots' current_outputs list
+    /// (wlr_compositor.h:134-153) collapsed to one slot. Driven by the
+    /// compositor through setEntered/setLeft, which emit the enter/leave
+    /// signals on change (wlroots wlr_surface_send_enter/send_leave,
+    /// wlr_compositor.c:1071-1128 — the wire events are the listener's
+    /// job, not the surface's).
+    outputs: ?*output_mod.Output = null,
     role: ?*const SurfaceRole = null,
     /// The wire resource that granted the role (e.g. the xdg_surface
     /// resource); the role object is reachable through its user data.
     role_resource: ?*wire.Resource = null,
     events: struct {
-        /// The client's wl_surface.commit request was applied.
+        /// The client's wl_surface.commit request arrived (fired by
+        /// commit() BEFORE the apply decision, wlroots wlr_compositor.c:
+        /// 577-598): the subcompositor sync handler decides deferral
+        /// here. Not fired for cache flushes (applyCommit).
         client_commit: wire.Signal(*Surface),
         /// The commit fully processed (role hooks included).
         commit: wire.Signal(*Surface),
@@ -172,6 +217,16 @@ pub const Surface = struct {
         map: wire.Signal(*Surface),
         /// The surface stopped being mapped.
         unmap: wire.Signal(*Surface),
+        /// The surface entered an output's composition (payload: the
+        /// output; fired by setEntered). The wire wl_surface.enter event
+        /// is the listener's job (wlroots wlr_surface_send_enter,
+        /// wlr_compositor.c:1071-1103).
+        enter: wire.Signal(*output_mod.Output),
+        /// The surface left its output's composition (payload: the output
+        /// lost; fired by setLeft). Not fired at surface destroy: the
+        /// output relationship dies with the surface (wlroots destroys
+        /// surface_output entries silently, wlr_compositor.c:1055-1063).
+        leave: wire.Signal(*output_mod.Output),
         /// The surface is being destroyed (last event).
         destroy: wire.Signal(*Surface),
     },
@@ -214,6 +269,10 @@ pub const Surface = struct {
                 // SAFETY: initialized via .init() immediately after construction, before any emit.
                 .unmap = undefined,
                 // SAFETY: initialized via .init() immediately after construction, before any emit.
+                .enter = undefined,
+                // SAFETY: initialized via .init() immediately after construction, before any emit.
+                .leave = undefined,
+                // SAFETY: initialized via .init() immediately after construction, before any emit.
                 .destroy = undefined,
             },
         };
@@ -221,6 +280,8 @@ pub const Surface = struct {
         s.events.commit.init();
         s.events.map.init();
         s.events.unmap.init();
+        s.events.enter.init();
+        s.events.leave.init();
         s.events.destroy.init();
         resource.setHandler(*Surface, handleRequest, handleDestroy, s);
         return s;
@@ -342,7 +403,33 @@ pub const Surface = struct {
         // 1. Validate; posts protocol errors and discards the commit.
         if (!s.validatePending()) return;
 
-        // 2. Swap pending -> current.
+        // 2. The client_commit signal fires BEFORE the apply decision,
+        // mirroring wlroots surface_handle_commit (wlr_compositor.c:577-598):
+        // the subcompositor's sync handler decides here whether this commit
+        // is deferred (wlr_subcompositor.c:224-235).
+        s.events.client_commit.emit(s);
+
+        // 3. Deferred (sync-subsurface caching): the pending state keeps
+        // accumulating; nothing is applied and no signals fire until the
+        // lock clears (parent commit, desync, or teardown — wlroots
+        // surface_cache_pending, wlr_compositor.c:594-598). The cached
+        // commits merge into the single pending slot, so the eventual
+        // flush applies the latest state in one commit (wlroots keeps a
+        // cached-state list and applies each; observationally equivalent
+        // for buffer/damage/frame-callback behavior).
+        if (s.cached_state_locks) return;
+
+        s.applyCommit();
+    }
+
+    /// Apply the pending state (wlroots surface_commit_state,
+    /// wlr_compositor.c:511-575). Runs on client commits (from commit)
+    /// and directly when the subcompositor flushes a deferred commit
+    /// (wlroots wlr_surface_unlock_cached, wlr_compositor.c:947-986): the
+    /// flush is not a client commit, so the client_commit phase is
+    /// skipped. See the module comment for the step order.
+    pub fn applyCommit(s: *Surface) void {
+        // 4. Swap pending -> current.
         const old_buffer = s.current.buffer;
         swapState(&s.current, s.allocator, &s.pending);
 
@@ -353,7 +440,7 @@ pub const Surface = struct {
         s.current.frame_callbacks.appendSlice(s.allocator, s.pending.frame_callbacks.items) catch {
             s.resource.postNoMemory();
             // The swap already made the pending buffer current; release
-            // its attach lock (mirror step 8) so it is not stranded —
+            // its attach lock (mirror step 10) so it is not stranded —
             // otherwise the client waits for the buffer until the next
             // successful commit or the surface is destroyed. OOM-only.
             if (s.current.buffer) |b| {
@@ -363,7 +450,7 @@ pub const Surface = struct {
         };
         s.pending.frame_callbacks.clearRetainingCapacity();
 
-        // 3. The surface stopped using the previous buffer. Its lock was
+        // 5. The surface stopped using the previous buffer. Its lock was
         // already released at the end of the previous commit, so this only
         // marks the producer done; the guard keeps a zero-count buffer
         // (lockless re-attach) from being unlocked.
@@ -383,21 +470,23 @@ pub const Surface = struct {
         s.release_callbacks_pending.clearRetainingCapacity();
         s.buffer = s.current.buffer;
 
-        // 4. Translate the committed surface damage into buffer
+        // 6. Translate the committed surface damage into buffer
         // coordinates (wlroots surface_update_damage, wlr_compositor.c:248-296).
         s.updateBufferDamage();
 
-        // 5. Role-specific processing of the committed state.
+        // 7. Role-specific processing of the committed state.
         if (s.role) |role| if (role.client_commit) |f| f(s);
 
-        // 6. Role commit hook, then the commit signals. Frame callbacks
+        // 8. Role commit hook, then the commit signal. Frame callbacks
         // are not completed here: sendFrameDone fires them at present
-        // time (wlroots wlr_surface_send_frame_done).
+        // time (wlroots wlr_surface_send_frame_done). The client_commit
+        // signal was already emitted by commit() before the apply
+        // decision (step 2); a flush via applyCommit is not a client
+        // commit, so it must not re-emit it.
         if (s.role) |role| if (role.commit) |f| f(s);
-        s.events.client_commit.emit(s);
         s.events.commit.emit(s);
 
-        // 7. Map/unmap transition. wlroots maps only when the buffer has a
+        // 9. Map/unmap transition. wlroots maps only when the buffer has a
         // positive size (wlr_surface_state_has_buffer, wlr_compositor.h:356);
         // the unmap transition stays buffer == null.
         const now_mapped = blk: {
@@ -414,7 +503,7 @@ pub const Surface = struct {
             s.events.unmap.emit(s);
         }
 
-        // 8. Unlock the current buffer (wlroots wlr_compositor.c:570-574)
+        // 10. Unlock the current buffer (wlroots wlr_compositor.c:570-574)
         // so the client can reuse it immediately (double buffering). The
         // lockless re-attach special case leaves n_locks at 0, so guard the
         // unlock; the release signal fires here (buffers/buffer.zig) and
@@ -437,7 +526,30 @@ pub const Surface = struct {
         s.current.frame_callbacks.clearRetainingCapacity();
     }
 
-    fn validatePending(s: *Surface) bool {
+    /// The surface entered `out`: it is now composited on that output.
+    /// Idempotent (no-op when already on it); emits events.enter on the
+    /// change. The wire wl_surface.enter event is the listener's job
+    /// (wlroots wlr_surface_send_enter, wlr_compositor.c:1071-1103).
+    pub fn setEntered(s: *Surface, out: *output_mod.Output) void {
+        if (s.outputs == out) return;
+        s.outputs = out;
+        s.events.enter.emit(out);
+    }
+
+    /// The surface left its output. Idempotent; emits events.leave on the
+    /// change (wlroots wlr_surface_send_leave, wlr_compositor.c:1105-1128).
+    pub fn setLeft(s: *Surface) void {
+        const prev = s.outputs orelse return;
+        s.outputs = null;
+        s.events.leave.emit(prev);
+    }
+
+    /// Validate the pending state (posts a wl_surface protocol error and
+    /// returns false on failure; the pending state is kept so the client
+    /// may fix and re-commit). Public because the subcompositor re-checks
+    /// a merged pending at cache flush: deferred commits are validated at
+    /// their own commit, but requests made after the last commit are not.
+    pub fn validatePending(s: *Surface) bool {
         const buf = s.pending.buffer orelse return true;
         if (buf.width <= 0 or buf.height <= 0) {
             s.resource.postError(.invalid_size, "attached buffer has a non-positive size");
@@ -871,6 +983,64 @@ var test_buffer_impl: buffer_mod.Impl = .{
 };
 
 // --- Tests --------------------------------------------------------------
+
+test "enter/leave signals fire once per output transition" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    test_enter_count = 0;
+    test_leave_count = 0;
+    test_enter_listener = wire.Listener(*output_mod.Output).init(testEnterNotify);
+    test_leave_listener = wire.Listener(*output_mod.Output).init(testLeaveNotify);
+    s.events.enter.add(&test_enter_listener);
+    s.events.leave.add(&test_leave_listener);
+
+    // SAFETY: test fixture; the payload pointer is only passed through
+    // the signal, never dereferenced.
+    const fake_out: *output_mod.Output = @ptrFromInt(0x100);
+    try testing.expect(s.outputs == null);
+
+    s.setEntered(fake_out);
+    try testing.expect(s.outputs == fake_out);
+    try testing.expectEqual(@as(usize, 1), test_enter_count);
+
+    // Idempotent: re-entering the same output fires nothing.
+    s.setEntered(fake_out);
+    try testing.expectEqual(@as(usize, 1), test_enter_count);
+
+    s.setLeft();
+    try testing.expect(s.outputs == null);
+    try testing.expectEqual(@as(usize, 1), test_leave_count);
+
+    // Idempotent: leaving without an output fires nothing.
+    s.setLeft();
+    try testing.expectEqual(@as(usize, 1), test_leave_count);
+}
+
+var test_enter_count: usize = 0;
+var test_leave_count: usize = 0;
+// SAFETY: test fixture; initialized via .init(handler) inside the tests before use.
+var test_enter_listener: wire.Listener(*output_mod.Output) = undefined;
+// SAFETY: test fixture; initialized via .init(handler) inside the tests before use.
+var test_leave_listener: wire.Listener(*output_mod.Output) = undefined;
+
+fn testEnterNotify(listener: *wire.Listener(*output_mod.Output), _: *output_mod.Output) void {
+    _ = listener;
+    test_enter_count += 1;
+}
+
+fn testLeaveNotify(listener: *wire.Listener(*output_mod.Output), _: *output_mod.Output) void {
+    _ = listener;
+    test_leave_count += 1;
+}
 
 test "state swap transfers damage and regions, resets pending" {
     const allocator = testing.allocator;

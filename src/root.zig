@@ -17,12 +17,14 @@ pub const wire = @import("core/wire.zig");
 const geom_mod = @import("utils/geom.zig");
 const damage_mod = @import("utils/damage.zig");
 const log_mod = @import("utils/log.zig");
+const matrix_mod = @import("utils/matrix.zig");
 const display_mod = @import("core/display.zig");
 
 pub const utils = struct {
     pub const geom = geom_mod;
     pub const damage = damage_mod;
     pub const log = log_mod;
+    pub const matrix = matrix_mod;
 };
 
 pub const core = struct {

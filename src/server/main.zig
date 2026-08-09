@@ -66,6 +66,10 @@ const log = wayland.utils.log;
 const geom = wayland.utils.geom;
 const wire = wayland.wire;
 const pixman = wayland.pixman;
+/// wl_output_transform box/point helpers (utils/matrix.zig): the surface
+/// size of a buffer under the surface's scale+transform (buffer -> surface
+/// per wlroots util/box.c:105-145, ported 1:1).
+const matrix = wayland.utils.matrix;
 
 // Library types not re-exported from root.zig. Zig 0.16 module ownership
 // forbids importing a library file into the server module, so the types
@@ -76,6 +80,11 @@ const Surface = std.meta.Child(std.meta.Child(@TypeOf(@as(wayland.compositor.Com
 /// `?*Texture` as stored in SceneBufferNode.texture.
 // SAFETY: type-derivation only; the undefined value is never evaluated at runtime.
 const Texture = std.meta.Child(std.meta.Child(@TypeOf(@as(wayland.scene.SceneBufferNode, undefined).texture)));
+/// `*Subsurface` as stored in Subcompositor.subsurfaces.
+// SAFETY: type-derivation only; the undefined value is never evaluated at runtime.
+const Subsurface = std.meta.Child(std.meta.Child(
+    @TypeOf(@as(wayland.subsurface.Subcompositor, undefined).subsurfaces.items),
+));
 /// M4 camera + canvas pass (wayland.camera / wayland.canvas): the
 /// camera-transformed compositing path replacing the scene-output render.
 const Camera = wayland.camera.Camera;
@@ -94,12 +103,33 @@ const cursor_color = [4]f32{ 0.95, 0.95, 0.95, 1.0 };
 /// Per-surface scene state: the SceneBufferNode that draws the surface's
 /// current buffer, plus the listeners that keep it in sync (commit
 /// updates the texture, destroy removes it and frees the entry).
+///
+/// Each surface also owns a .tree container node (`tree`, under
+/// scene.root for toplevels, under the PARENT surface's tree for
+/// subsurfaces). The buffer node is the tree's first child; a surface's
+/// subsurfaces are its siblings' trees appended after it — draw order =
+/// children order, so a subsurface draws above its parent but below any
+/// later sibling, and never above unrelated toplevels (notes/107 gap 9:
+/// the old flat re-append drew every subsurface above EVERYTHING).
 const SurfaceEntry = struct {
     state: *ServerState,
     surface: *Surface,
+    /// The .tree container holding `node` (and, for non-subsurfaces, the
+    /// subtrees of this surface's subsurfaces). Null while unmapped.
+    tree: ?*wayland.scene.SceneNode = null,
+    /// The surface's buffer node (the tree's first child; what the seat
+    /// picks and the canvas draws).
     node: ?*wayland.scene.SceneNode = null,
     commit_listener: wire.Listener(*Surface),
     destroy_listener: wire.Listener(*Surface),
+    /// wl_surface.enter/leave signal listeners (the surface module emits
+    /// the signals on output enter/leave; these send the wire events).
+    enter_listener: wire.Listener(*wayland.output.Output),
+    leave_listener: wire.Listener(*wayland.output.Output),
+    /// Enter/leave: whether wl_surface.enter was sent for this surface
+    /// (single-output server). Guards the wire events so map/unmap/destroy
+    /// firing patterns can never double-send.
+    entered: bool = false,
 };
 
 const ServerState = struct {
@@ -871,10 +901,12 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
 /// Composite one frame into the framebuffer with the M4 canvas pass:
 /// 1. background fill (fb.fill — the scene's background rect is gone),
 /// 2. every mapped surface's texture stamped at its world rect (the
-///    node's absolute position + buffer size, 1:1) through the server
-///    camera — canvas.render composites in array order, so the last item
-///    draws on top (the entry iteration order, same as the presented
-///    list; the E2E has a single surface),
+///    node's absolute position + the SURFACE size — buffer size under
+///    the committed transform, divided by the scale — sampled through the
+///    surface's buffer transform) through the server camera; canvas.render
+///    composites in array order, so the last item draws on top (the entry
+///    iteration order, same as the presented list; the E2E has a single
+///    surface),
 /// 3. the cursor in SCREEN space through an identity camera (constant
 ///    size, canvas-compositing.md §4). The cursor scene nodes remain as
 ///    state (updateCursor/cursorFootprints still position them for the
@@ -892,8 +924,13 @@ fn compositeCanvas(self: *ServerState) void {
     };
     self.framebuffer.fill(bg);
 
-    // 2. Surfaces: world rect = the node's absolute position + buffer
-    //    size (opacity 1.0; skip nodes without a texture).
+    // 2. Surfaces: world rect = the node's absolute position + the
+    //    SURFACE size (the node dst is the surface size — the buffer size
+    //    under the committed transform divided by the scale, see
+    //    updateSurfaceNode). The item carries the surface's buffer
+    //    transform so the canvas pass samples the texture through it
+    //    (notes/124 gap 1; scale=1 + normal = today's 1:1 blit, byte
+    //    identical).
     var items: std.ArrayList(CanvasItem) = .empty;
     defer items.deinit(self.allocator);
     var entry_it = self.surface_entries.valueIterator();
@@ -909,6 +946,7 @@ fn compositeCanvas(self: *ServerState) void {
             .world_w = @floatFromInt(rect.width),
             .world_h = @floatFromInt(rect.height),
             .opacity = 1.0,
+            .transform = entry.*.surface.current.transform,
         }) catch |err| {
             log.warn("canvas item append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         };
@@ -1025,9 +1063,12 @@ fn syncSurfaces(self: *ServerState) void {
         entry.* = .{
             .state = self,
             .surface = s,
+            .tree = null,
             .node = null,
             .commit_listener = wire.Listener(*Surface).init(onSurfaceCommit),
             .destroy_listener = wire.Listener(*Surface).init(onSurfaceDestroy),
+            .enter_listener = wire.Listener(*wayland.output.Output).init(onSurfaceEnter),
+            .leave_listener = wire.Listener(*wayland.output.Output).init(onSurfaceLeave),
         };
         self.surface_entries.put(s, entry) catch |err| {
             self.allocator.destroy(entry);
@@ -1036,6 +1077,13 @@ fn syncSurfaces(self: *ServerState) void {
         };
         s.events.commit.add(&entry.commit_listener);
         s.events.destroy.add(&entry.destroy_listener);
+        s.events.enter.add(&entry.enter_listener);
+        s.events.leave.add(&entry.leave_listener);
+        // updateSurfaceNode drives the enter/leave signals (setEntered at
+        // node creation, setLeft at removal), so a surface that mapped
+        // before this subscription still fires enter here — no separate
+        // catch-up needed (the surface module's signals are the single
+        // path; the wire event listeners are below).
         updateSurfaceNode(self, entry);
     }
 }
@@ -1054,11 +1102,55 @@ fn onSurfaceCommit(listener: *wire.Listener(*Surface), _: *Surface) void {
 fn onSurfaceDestroy(listener: *wire.Listener(*Surface), s: *Surface) void {
     const entry: *SurfaceEntry = @fieldParentPtr("destroy_listener", listener);
     const self = entry.state;
+    // removeSurfaceNode drives setLeft, whose leave signal sends the wire
+    // wl_surface.leave — so a destroyed (still entered) surface gets its
+    // leave here too, flag-guarded against double-sends. (wlroots drops
+    // the output tracking silently at surface death, wlr_compositor.c:
+    // 1055-1063; sending the event is harmless on a client-destroyed
+    // resource and keeps the client's enter/leave accounting balanced.)
     removeSurfaceNode(self, entry);
     self.seat.surfaceDestroyed(s);
     self.presentation.discard(s);
     _ = self.surface_entries.remove(s);
     self.allocator.destroy(entry);
+}
+
+/// wl_surface.enter signal (surface gained the output; fired by the
+/// surface module at map): send wl_surface.enter to the surface's client.
+fn onSurfaceEnter(listener: *wire.Listener(*wayland.output.Output), _: *wayland.output.Output) void {
+    const entry: *SurfaceEntry = @fieldParentPtr("enter_listener", listener);
+    if (entry.entered) return;
+    entry.entered = true;
+    sendSurfaceEnter(entry.state, entry.surface, true);
+}
+
+/// wl_surface.leave signal (surface lost the output; fired at unmap):
+/// send wl_surface.leave to the surface's client.
+fn onSurfaceLeave(listener: *wire.Listener(*wayland.output.Output), _: *wayland.output.Output) void {
+    const entry: *SurfaceEntry = @fieldParentPtr("leave_listener", listener);
+    if (!entry.entered) return;
+    entry.entered = false;
+    sendSurfaceEnter(entry.state, entry.surface, false);
+}
+
+/// Send wl_surface.enter/leave for the surface's client: the wl_output
+/// resource that client bound. A surface's events go only to its owner,
+/// and a client that never bound wl_output gets none (wlroots
+/// wlr_surface_send_enter/leave, wlr_compositor.c:1071-1128, iterate the
+/// output's resources and match on the client). Single-output server: the
+/// one WlOutput is the only output that can enter/leave.
+fn sendSurfaceEnter(self: *ServerState, s: *Surface, enter: bool) void {
+    const wl_output = self.wl_output orelse return;
+    const client = s.resource.getClient();
+    for (wl_output.resources.items) |res| {
+        if (res.getClient() != client) continue;
+        if (enter) {
+            s.resource.sendEnter(res);
+        } else {
+            s.resource.sendLeave(res);
+        }
+        break;
+    }
 }
 
 /// Ensure the surface's scene node exists and shows its current buffer;
@@ -1074,9 +1166,33 @@ fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
         log.debug("surfnode: no pixels", self.io, self.log_cfg, "server", .{});
         return;
     };
+    // Orphan recovery: a surface whose wl_subsurface died (the client
+    // destroyed the role object, or the parent surface died —
+    // subsurface.zig tears the entry down and clears the role) renders as
+    // a plain surface again. Its tree leaves the (possibly dead) parent
+    // tree for the root and shows on its next commit (wlroots recursively
+    // unmaps children with the parent, wlr_compositor.c:854-872, and the
+    // surface re-renders once its role object is gone).
+    if (entry.tree) |tree| {
+        if (subsurfaceFor(self, s) == null and tree.parent != self.scene.?.root) {
+            self.scene.?.root.appendChild(self.allocator, tree) catch |err| {
+                // OOM: the subsurface tree is skipped this frame.
+                log.warn("subsurface orphan re-root OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            };
+            tree.enable(true);
+        }
+    }
+    // The SURFACE size: the buffer size under the committed transform,
+    // divided by the committed scale (notes/124 gap 1). The node's dst
+    // rect is the surface rect, so pick, damage and the canvas world rect
+    // are all surface-sized; the canvas pass samples the texture through
+    // the transform. Commit validation guarantees integrality.
+    const size = surfaceSize(s, buf);
     if (entry.node) |node| {
         // Same-size commit: update the texture in place (no alloc, no
-        // texture churn — the per-frame hot path).
+        // texture churn — the per-frame hot path). The dst rect is still
+        // refreshed: scale/transform can change on a commit that reuses
+        // the same buffer.
         const bn = node.kind.buffer;
         if (bn.texture) |tex| {
             const byte_len = @as(usize, @intCast(pixels.stride)) * @as(usize, @intCast(buf.height));
@@ -1087,6 +1203,8 @@ fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
                 pixels.stride,
                 pixels.ptr[0..byte_len],
             )) {
+                bn.dst_width = size.w;
+                bn.dst_height = size.h;
                 node.enable(true);
                 return;
             }
@@ -1096,23 +1214,38 @@ fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
     }
     const texture = importSurfacePixels(self, buf, pixels) orelse return;
     if (entry.node) |node| {
-        // Update in place: swap in the new texture (1:1, dst = buffer size).
+        // Update in place: swap in the new texture (dst = surface size).
         const bn = node.kind.buffer;
         if (bn.texture) |old| old.destroy();
         bn.texture = texture;
-        bn.dst_width = buf.width;
-        bn.dst_height = buf.height;
+        bn.dst_width = size.w;
+        bn.dst_height = size.h;
         node.enable(true);
     } else {
-        const node = wayland.scene.SceneNode.create(self.allocator, self.scene.?.root, .buffer) catch |err| {
+        // First map: create the tree container (under the parent surface's
+        // tree for a subsurface, scene.root otherwise), then the buffer
+        // node as its first child.
+        ensureSurfaceTree(self, entry);
+        const tree = entry.tree orelse {
+            texture.destroy();
+            log.warn("scene tree create failed", self.io, self.log_cfg, "server", .{});
+            return;
+        };
+        const node = wayland.scene.SceneNode.create(self.allocator, tree, .buffer) catch |err| {
             texture.destroy();
             log.warn("scene node create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
             return;
         };
         node.kind.buffer.texture = texture;
-        node.kind.buffer.dst_width = buf.width;
-        node.kind.buffer.dst_height = buf.height;
+        node.kind.buffer.dst_width = size.w;
+        node.kind.buffer.dst_height = size.h;
         entry.node = node;
+
+        // The surface maps on the single output: drive the surface's
+        // enter tracking (setEntered emits events.enter on the change;
+        // the enter listener sends the wire event). Idempotent — node
+        // creation happens exactly once per map.
+        if (self.output) |out| s.setEntered(out);
 
         // First map: give the toplevel its real size. The initial
         // configure was 0x0 ("client decides"); after the client acked it
@@ -1138,13 +1271,89 @@ fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
     }
 }
 
-/// Remove (and free) the surface's scene node; the entry keeps tracking
+/// The surface size of `buf` under the surface's committed transform and
+/// scale: boxTransform of the buffer rect (buffer -> surface per
+/// wl_output_transform, wlroots util/box.c:105-145) divided by the scale.
+/// The commit validation (surface.zig validatePending) guarantees the
+/// transformed buffer size is divisible by the scale, so the division is
+/// exact.
+fn surfaceSize(s: *Surface, buf: *wayland.buffers.Buffer) geom.Size {
+    const rect = matrix.boxTransform(
+        .{ .x = 0, .y = 0, .width = buf.width, .height = buf.height },
+        s.current.transform,
+        buf.width,
+        buf.height,
+    );
+    return .{ .w = @divExact(rect.width, s.current.scale), .h = @divExact(rect.height, s.current.scale) };
+}
+
+/// The wl_subsurface role object for `s`, or null when `s` is not a
+/// subsurface (the surface-side link to its parent; subsurface.zig
+/// records surface/parent/x/y/sync plus the restack fields).
+fn subsurfaceFor(self: *ServerState, s: *Surface) ?*Subsurface {
+    for (self.subcompositor.subsurfaces.items) |ss| {
+        if (ss.surface == s) return ss;
+    }
+    return null;
+}
+
+/// Create the surface's tree container if it does not exist yet. A
+/// non-subsurface (potential parent) gets its tree under scene.root; a
+/// subsurface gets its tree under the PARENT surface's tree, or a
+/// disabled root placeholder when the parent is not mapped yet
+/// (syncSubsurfaceNodes reparents it into place once the parent maps).
+fn ensureSurfaceTree(self: *ServerState, entry: *SurfaceEntry) void {
+    if (entry.tree != null) return;
+    const root = self.scene.?.root;
+    var parent_tree: ?*wayland.scene.SceneNode = null;
+    if (subsurfaceFor(self, entry.surface)) |ss| {
+        if (self.surface_entries.get(ss.parent)) |parent_entry| {
+            parent_tree = parent_entry.tree;
+        }
+    }
+    const tree = wayland.scene.SceneNode.create(self.allocator, parent_tree orelse root, .tree) catch |err| {
+        log.warn("scene tree create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    // A placeholder subsurface tree (parent unmapped) stays hidden until
+    // syncSubsurfaceNodes moves it under the parent and enables it.
+    if (parent_tree == null and subsurfaceFor(self, entry.surface) != null) {
+        tree.enable(false);
+    }
+    entry.tree = tree;
+}
+
+/// Remove (and free) the surface's scene nodes; the entry keeps tracking
 /// the surface for a future remap.
 fn removeSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
+    // Detach this surface's subsurface trees first: node.destroy cascades
+    // into the whole subtree, which would free the children's nodes out
+    // from under their entries. Reparent them to the root, disabled; they
+    // re-enter the parent's tree when the parent maps again. (On append
+    // OOM the cascade still frees them — a catastrophic-memory path.)
+    for (self.subcompositor.subsurfaces.items) |ss| {
+        if (ss.parent != entry.surface) continue;
+        const child_entry = self.surface_entries.get(ss.surface) orelse continue;
+        const child_tree = child_entry.tree orelse continue;
+        if (child_tree.parent != self.scene.?.root) {
+            self.scene.?.root.appendChild(self.allocator, child_tree) catch |err| {
+                log.warn("subsurface detach failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            };
+            child_tree.enable(false);
+        }
+    }
+    // The surface left the output: drive the surface's leave tracking
+    // (setLeft emits events.leave on the change; idempotent when the
+    // surface was never entered).
+    if (entry.surface.outputs != null) entry.surface.setLeft();
     if (entry.node) |node| {
         if (node.kind.buffer.texture) |texture| texture.destroy();
         node.destroy(self.allocator);
         entry.node = null;
+    }
+    if (entry.tree) |tree| {
+        tree.destroy(self.allocator);
+        entry.tree = null;
     }
 }
 
@@ -1210,6 +1419,8 @@ fn cleanupSurfaceEntries(self: *ServerState) void {
         const entry = entry_ptr.*;
         entry.commit_listener.link.remove();
         entry.destroy_listener.link.remove();
+        entry.enter_listener.link.remove();
+        entry.leave_listener.link.remove();
         removeSurfaceNode(self, entry);
         self.allocator.destroy(entry);
     }
@@ -1243,7 +1454,9 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     // (surface-local coords are world coords too). With the default
     // camera worldToScreen is the identity mapping, so this is a no-op.
     const world = self.camera.screenToWorld(@floatFromInt(x), @floatFromInt(y));
-    const node = scene.pick(@intFromFloat(world.x), @intFromFloat(world.y)) orelse return null;
+    const pick_x: i32 = @intFromFloat(@min(@max(world.x, @as(f64, std.math.minInt(i32))), @as(f64, std.math.maxInt(i32))));
+    const pick_y: i32 = @intFromFloat(@min(@max(world.y, @as(f64, std.math.minInt(i32))), @as(f64, std.math.maxInt(i32))));
+    const node = scene.pick(pick_x, pick_y) orelse return null;
     var it = self.surface_entries.valueIterator();
     while (it.next()) |entry_ptr| {
         const entry = entry_ptr.*;
@@ -1251,8 +1464,8 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
             const rect = node.absolutePosition();
             return .{
                 .surface = entry.surface,
-                .sx = @as(i32, @intFromFloat(world.x)) - rect.x,
-                .sy = @as(i32, @intFromFloat(world.y)) - rect.y,
+                .sx = pick_x - rect.x,
+                .sy = pick_y - rect.y,
             };
         }
     }
@@ -1370,28 +1583,102 @@ fn addSat(a: i32, b: i32) i32 {
     };
 }
 
-/// Position every subsurface node over its mapped parent: the child node
-/// follows the parent's absolute position plus the subsurface offset, and
-/// always draws above the parent (re-appended at the end of the tree).
+/// Position every subsurface over its mapped parent and keep its tree
+/// inside the PARENT surface's tree (notes/107 gap 9: the old flat
+/// re-append to the scene root made each subsurface draw above every
+/// other surface in the scene). The parent tree's children order is the
+/// stacking order — the parent's own buffer node first, then each
+/// subsurface's tree in place_above/place_below order — so a subsurface
+/// draws above its parent and earlier siblings, below later siblings, and
+/// never above unrelated toplevels. wlroots keeps the same structure
+/// (types/scene/subsurface_tree.c:238-304: children inside the parent's
+/// tree node). Pending restacks are applied here (request-time recording
+/// lives in the subsurface role state) and cleared.
 fn syncSubsurfaceNodes(self: *ServerState) void {
     const scene = self.scene orelse return;
     for (self.subcompositor.subsurfaces.items) |ss| {
         const child_entry = self.surface_entries.get(ss.surface) orelse continue;
-        const child_node = child_entry.node orelse continue;
+        const child_tree = child_entry.tree orelse continue;
         const parent_entry = self.surface_entries.get(ss.parent) orelse continue;
-        if (parent_entry.node) |parent_node| {
-            const pr = parent_node.absolutePosition();
-            child_node.x = pr.x + ss.x;
-            child_node.y = pr.y + ss.y;
-            child_node.enable(true);
-            // Draw the child above its parent (and everything else).
-            scene.root.appendChild(self.allocator, child_node) catch |err| {
-                log.warn("subsurface z-order failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-            };
+        if (parent_entry.tree) |parent_tree| {
+            // Move the child tree under the parent's tree (appendChild
+            // reparents; a root placeholder lands here on the parent's
+            // first map).
+            if (child_tree.parent != parent_tree) {
+                parent_tree.appendChild(scene.allocator, child_tree) catch |err| {
+                    log.warn("subsurface parenting failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+                    child_tree.enable(false);
+                    continue;
+                };
+            }
+            if (ss.restack_sibling_id != 0) {
+                applyRestack(self, ss, child_tree, parent_tree);
+                ss.restack_sibling_id = 0;
+            }
+            // Offset relative to the parent tree (which sits at the
+            // parent surface's origin; the old code summed the parent's
+            // absolute position, equal here because the trees are all at
+            // the root's (0,0) chain).
+            child_tree.x = ss.x;
+            child_tree.y = ss.y;
+            child_tree.enable(true);
         } else {
-            child_node.enable(false);
+            child_tree.enable(false);
         }
     }
+}
+
+/// Apply a recorded wl_subsurface.place_above/place_below: reorder
+/// `child` within `parent_tree`'s children to just after (above) or just
+/// before (below) the reference surface's node. The reference is recorded
+/// at request time as the wl_surface RESOURCE id of the parent or a
+/// sibling subsurface (never a raw *Surface, so a dead reference cannot
+/// dangle): resolve it to the parent's own buffer node or the sibling's
+/// tree. A reference whose surface or node is gone drops the restack.
+fn applyRestack(
+    self: *ServerState,
+    ss: *Subsurface,
+    child: *wayland.scene.SceneNode,
+    parent_tree: *wayland.scene.SceneNode,
+) void {
+    const ref_node: ?*wayland.scene.SceneNode = blk: {
+        if (ss.restack_sibling_id == ss.parent.resource.getId()) {
+            const parent_entry = self.surface_entries.get(ss.parent) orelse break :blk null;
+            break :blk parent_entry.node;
+        }
+        // The reference is a wl_surface resource id in the child's client
+        // namespace, so match the client too (compositor.surfaces spans
+        // clients; two clients could hold the same id).
+        const child_client = ss.surface.resource.getClient();
+        for (self.subcompositor.subsurfaces.items) |other| {
+            if (other.parent != ss.parent) continue;
+            if (other.surface.resource.getClient() != child_client) continue;
+            if (other.surface.resource.getId() != ss.restack_sibling_id) continue;
+            const other_entry = self.surface_entries.get(other.surface) orelse break :blk null;
+            break :blk other_entry.tree;
+        }
+        break :blk null;
+    };
+    const ref = ref_node orelse return;
+    if (ref == child) return; // degenerate: the reference is itself
+    parent_tree.removeChild(child);
+    const ref_idx = std.mem.indexOfScalar(*wayland.scene.SceneNode, parent_tree.children.items, ref) orelse {
+        parent_tree.appendChild(self.allocator, child) catch |err| {
+            // OOM: the child stays detached this frame.
+            log.warn("subsurface append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        };
+        return;
+    };
+    const insert_at = ref_idx + (if (ss.restack_above) @as(usize, 1) else 0);
+    parent_tree.children.insert(self.allocator, insert_at, child) catch {
+        // OOM: fall back to the top of the stack (appendChild re-links).
+        parent_tree.appendChild(self.allocator, child) catch |err| {
+            // OOM: the child stays detached this frame.
+            log.warn("subsurface append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        };
+        return;
+    };
+    child.parent = parent_tree;
 }
 
 // ---------------------------------------------------------------------------
