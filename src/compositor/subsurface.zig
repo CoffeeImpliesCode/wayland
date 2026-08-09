@@ -193,6 +193,20 @@ fn subcompositorRequest(
     }
 }
 
+/// True when `parent` is `child` itself or a descendant of `child` (the
+/// parent chain from `parent` reaches `child`): a wl_subsurface must not
+/// be a parent of one of its own ancestors. Walk the chain of surfaces'
+/// subsurface parents (nesting allowed, so the chain length is bounded by
+/// the tree depth — each surface has at most one wl_subsurface parent).
+fn parentIsDescendant(_: *Subcompositor, child: *Surface, parent: *Surface) bool {
+    var cursor = parent;
+    while (true) {
+        if (cursor == child) return true;
+        const ss = subsurfaceFromSurface(cursor) orelse return false;
+        cursor = ss.parent;
+    }
+}
+
 fn getSubsurface(
     sc: *Subcompositor,
     resource: *server.wl.Subcompositor,
@@ -214,10 +228,15 @@ fn getSubsurface(
         resource.postError(.bad_parent, "parent must be a different surface");
         return;
     }
-    if (parent.role == &subsurface_role) {
-        // A subsurface cannot be a parent (nesting goes through the
-        // regular surface it is attached to).
-        resource.postError(.bad_parent, "parent is a subsurface");
+    // The spec (wayland.xml wl_subcompositor.get_subsurface): the parent
+    // must not be one of the child surface's descendants (and must differ
+    // from the child). A subsurface IS a legal parent — nesting is
+    // allowed (wlroots types/wlr_subcompositor.c rejects only when the
+    // parent's root is the child, `wlr_surface_get_root_surface(parent)
+    // == surface`). Rejecting `parent.role == subsurface` here killed
+    // real clients (foot nests surfaces) with a spurious protocol error.
+    if (parentIsDescendant(sc, surface, parent)) {
+        resource.postError(.bad_parent, "parent is a descendant of the child surface");
         return;
     }
 
