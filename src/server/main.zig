@@ -195,10 +195,32 @@ const ServerState = struct {
     loop: ?*zio.ev.Loop = null,
     /// One-shot watchdog timer, re-armed on every render.
     watchdog: ?*zio.ev.Timer = null,
+    /// Whether the watchdog is active (WAYLAND_WATCHDOG_DISABLE unset).
+    /// Guards BOTH the initial loop.add and the renderFrame re-arm: zio's
+    /// setTimer arms an un-armed timer, so a re-arm on a disabled watchdog
+    /// would re-add it and it would still fire on an idle demo.
+    watchdog_enabled: bool = true,
     output: ?*wayland.output.Output = null,
     /// Toplevels created by clients (tracked for observability).
     toplevels: std.ArrayList(*wayland.shell.XdgToplevel) = .empty,
     frames_rendered: u32 = 0,
+    /// Idle-frame skip: a frame only renders when something changed this
+    /// cycle (a surface commit, a camera move, a cursor move). Cleared
+    /// after a successful render+flip; when set, requestRender() wakes
+    /// the renderer via output.sendFrame(). Without this the DRM flip
+    /// chain renders + flips a full composite every vsync (~60fps) even
+    /// with nothing on screen — the observed ~95% idle CPU.
+    repaint_pending: bool = true,
+    /// True while renderFrame is on the stack. requestRender() must not
+    /// synchronously emit output.sendFrame() while a render is already in
+    /// progress: a render can re-trigger requestRender (the synth input's
+    /// seat.pointerMotion, camera/seat events) and an emit from inside
+    /// the frame event handler re-enters renderFrame, recursing until the
+    /// frame-event emit GP-faults. When set, requestRender only marks
+    /// repaint_pending — the in-flight render has already read the
+    /// changed state (the synth runs before the composite) and consumes
+    /// it at the end.
+    in_render: bool = false,
     /// Stop after this many frames; 0 = run until watchdog/error.
     run_frames: u32 = 0,
     watchdog_fired: bool = false,
@@ -368,7 +390,11 @@ pub fn main(init: std.process.Init) !void {
     defer backend.destroy();
 
     const framebuffer = try pixman.Framebuffer.create(allocator, output_width, output_height);
-    defer framebuffer.deinit();
+    // NOTE: no defer framebuffer.deinit() here — the ServerState owns the
+    // framebuffer (state.framebuffer), and onNewOutput resizes it by
+    // freeing the old + assigning a new one. A defer on this local would
+    // point at the (possibly freed) original and double-free at shutdown
+    // (DebugAllocator segfault); main frees state.framebuffer instead.
 
     // libinput input source (evdev devices; VM: virtio keyboard/mouse).
     // A second Backend whose only role is announcing devices + the poll fd
@@ -540,7 +566,13 @@ pub fn main(init: std.process.Init) !void {
     watchdog.c.userdata = &state;
     watchdog.c.callback = onWatchdog;
     state.watchdog = &watchdog;
-    loop.add(&watchdog.c);
+    // The idle-frame skip means a healthy server renders nothing between
+    // changes, so the watchdog (re-armed only per render) would stop an
+    // idle interactive demo after the window. WAYLAND_WATCHDOG_DISABLE
+    // opts out (set by the interactive VM demo; the E2E keeps it).
+    const watchdog_disabled = init.environ_map.get("WAYLAND_WATCHDOG_DISABLE") != null;
+    state.watchdog_enabled = !watchdog_disabled;
+    if (!watchdog_disabled) loop.add(&watchdog.c);
 
     try backend.start(); // fires new_output; the headless timer paces frames
     if (input_backend) |ib| try ib.start();
@@ -585,6 +617,10 @@ pub fn main(init: std.process.Init) !void {
         state.watchdog_fired,
     });
     state.loop = null;
+    // The ServerState owns the render framebuffer (onNewOutput may have
+    // replaced the original via resize); free the CURRENT one here — the
+    // backend must already be torn down so nothing references it.
+    state.framebuffer.deinit();
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +779,20 @@ fn onDisplayReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
         return;
     };
     log.debug("display ready: dispatch done", self.io, self.log_cfg, "server", .{});
+    // Track any surfaces created this dispatch. syncSurfaces also runs at
+    // the top of renderFrame, but with the idle-frame skip renderFrame
+    // does not run between changes — without this, a surface created
+    // after the first frame never gets its commit listener subscribed, so
+    // its commits cannot wake the idle renderer (the compositor only saw
+    // the surface once, at the pre-change render).
+    syncSurfaces(self);
+    // Synth input (headless/DRM E2E) fires on every dispatch, not in
+    // renderFrame: the idle-frame skip means renders only happen on
+    // changes, and the M4 scroll is gated on the client's screencopy
+    // captures (which do not themselves trigger a render). Running here
+    // (per loop dispatch, independent of rendering) keeps both the M3
+    // click/key and the M4 wheel-scroll timing correct under the skip.
+    maybeSynthInput(self);
     self.display.flushClients();
 }
 
@@ -753,30 +803,16 @@ fn onWatchdog(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     loop.stop();
 }
 
-fn onOutputFrame(listener: *wire.Listener(*wayland.output.Output), out: *wayland.output.Output) void {
-    const self: *ServerState = @fieldParentPtr("frame_listener", listener);
-    renderFrame(self, out);
-}
-
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
-
-fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
-    const zone = tracy.Zone.begin(.{ .src = @src() });
-    defer zone.end();
-    const perf_t0 = perfNs(self);
-
-    // M2: surfaces created since the last frame get scene nodes.
-    syncSurfaces(self);
-    const perf_t_sync = perfNs(self);
-    // Subsurfaces: position child nodes over their mapped parent.
-    syncSubsurfaceNodes(self);
-
-    // M3 synth input: one pointer click + key press once the first
-    // surface is mapped (headless E2E). Event-driven: the map time varies
-    // with client startup, so a fixed frame number would race.
-    if (self.synth_input and !self.synth_fired) {
+/// M3 + M4 synth input for the headless/DRM E2Es. Runs per dispatch (not
+/// per render — see onDisplayReady).
+/// - M3: one pointer click + key press once the first surface is mapped.
+/// - M4 Phase B: one wheel-up notch once the client's FIRST screencopy
+///   capture has been served (captures_served >= 1) plus a 2-call grace.
+/// The notch goes through the seat (pointerAxis), so the axis signal
+/// zooms the camera (2 -> 2.5 under the E2E).
+fn maybeSynthInput(self: *ServerState) void {
+    if (!self.synth_input) return;
+    if (!self.synth_fired) {
         var any_mapped = false;
         var entry_it = self.surface_entries.valueIterator();
         while (entry_it.next()) |ep| {
@@ -796,20 +832,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
             log.info("synth input: pointer click + key 'a' at 50,50", self.io, self.log_cfg, "server", .{});
         }
     }
-
-    // M4 Phase B synth scroll: one wheel-up notch once the client's
-    // FIRST screencopy capture has been served (capture count >= 1),
-    // plus a 2-frame grace (and once only). Capture-count-driven rather
-    // than frame-count-driven: the canvas bilinear composite is slow in
-    // the E2E, so a fixed frame number cannot be timed against the
-    // client's retry window (frame 100 landed ~0.5s after the window
-    // closed). The client's phase-1 checks read the already-copied
-    // capture buffer, so a zoom landing after the capture cannot affect
-    // them; its retry loop then captures fresh frames until it sees the
-    // zoomed pixels. The notch goes through the seat (pointerAxis:
-    // value=10.0 px per the seat's wheel convention, discrete=1), so
-    // the axis signal zooms the camera 2 -> 2.5.
-    if (self.synth_input and !self.synth_scrolled) {
+    if (!self.synth_scrolled) {
         if (self.screencopy) |sc| {
             if (sc.captures_served >= 1) {
                 self.synth_scroll_grace += 1;
@@ -821,6 +844,51 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
             }
         }
     }
+}
+
+fn onOutputFrame(listener: *wire.Listener(*wayland.output.Output), out: *wayland.output.Output) void {
+    const self: *ServerState = @fieldParentPtr("frame_listener", listener);
+    renderFrame(self, out);
+}
+
+/// Mark that the next frame must render (something changed) and wake the
+/// renderer via output.sendFrame(). The DRM frame chain is driven by the
+/// flip event (sendFrame -> renderFrame -> commit -> flip -> event), so a
+/// change while idle needs this kick to start a frame; subsequent frames
+/// then pace off the flips until the change is consumed.
+fn requestRender(self: *ServerState) void {
+    self.repaint_pending = true;
+    if (!self.in_render) {
+        if (self.output) |out| out.sendFrame();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
+    const zone = tracy.Zone.begin(.{ .src = @src() });
+    defer zone.end();
+    // See the in_render field: guard against re-entrant emits from
+    // requestRender while this render is on the stack.
+    self.in_render = true;
+    defer self.in_render = false;
+    // Idle-frame skip: nothing changed since the last render, so skip the
+    // full composite + flip. Without this the flip chain runs a full
+    // 1280x800 bilinear composite + fb copy at every vsync (~60fps) even
+    // with a static canvas — the observed ~95% idle CPU. Changes set
+    // repaint_pending (requestRender); it is cleared after a successful
+    // render, and a flip-pending collision leaves it set so the next
+    // flip event re-renders.
+    if (!self.repaint_pending) {
+        return;
+    }
+    const perf_t0 = perfNs(self);
+
+    const perf_t_sync = perfNs(self);
+    // Subsurfaces: position child nodes over their mapped parent.
+    syncSubsurfaceNodes(self);
 
     const so = self.scene_output orelse {
         log.err("render: no scene output", self.io, self.log_cfg, "server", .{});
@@ -907,7 +975,10 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         }
     }
     out.commitState(&state) catch |err| {
-        log.err("output commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        // Usually the flip-pending pacing collision (a commit while a
+        // flip is in flight); the DRM logs real failures itself. The
+        // repaint flag stays set so the flip event re-renders it.
+        log.debug("output commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
     const perf_t_present = perfNs(self);
@@ -935,6 +1006,9 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     self.presentation.present(self.presented.items, @intCast(output_refresh_msec), 0);
 
     self.frames_rendered += 1;
+    // The frame was rendered + committed (the flip is in flight): clear
+    // the pending flag so the next flip event skips until a change.
+    self.repaint_pending = false;
     tracy.frameMark(null);
     log.debug("render frame={d} surfaces={d}", self.io, self.log_cfg, "server", .{
         self.frames_rendered,
@@ -950,9 +1024,13 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     self.display.flushClients();
 
     // Progress: keep the watchdog from firing. A wedged loop stops instead
-    // of hanging tests.
-    if (self.watchdog) |t| {
-        self.loop.?.setTimer(t, .{ .duration = zio.Duration.fromMilliseconds(watchdog_timeout_ms) });
+    // of hanging tests. Guarded by watchdog_enabled: zio's setTimer arms
+    // an un-armed timer, so without this a disabled watchdog (interactive
+    // demo) would be re-armed by the first render and fire anyway.
+    if (self.watchdog_enabled) {
+        if (self.watchdog) |t| {
+            self.loop.?.setTimer(t, .{ .duration = zio.Duration.fromMilliseconds(watchdog_timeout_ms) });
+        }
     }
     if (self.run_frames != 0 and self.frames_rendered >= self.run_frames) {
         log.info("reached WAYLAND_RUN_FRAMES={d}, stopping", self.io, self.log_cfg, "server", .{self.run_frames});
@@ -1116,6 +1194,7 @@ fn parseCameraEnv(env_value: ?[]const u8, w: i32, h: i32) Camera {
 /// surface may have committed before we subscribed). Called from the
 /// frame handler, so surfaces created in the same dispatch are caught.
 fn syncSurfaces(self: *ServerState) void {
+    var subscribed_new = false;
     for (self.compositor.surfaces.items) |s| {
         if (self.surface_entries.contains(s)) continue;
         const entry = self.allocator.create(SurfaceEntry) catch |err| {
@@ -1147,7 +1226,13 @@ fn syncSurfaces(self: *ServerState) void {
         // catch-up needed (the surface module's signals are the single
         // path; the wire event listeners are below).
         updateSurfaceNode(self, entry);
+        subscribed_new = true;
     }
+    // A newly-tracked surface may already have committed its buffer (the
+    // commit fired before we subscribed); wake the idle renderer so its
+    // content actually appears. Without this, a surface that maps once
+    // between renders is never drawn.
+    if (subscribed_new) requestRender(self);
 }
 
 /// wl_surface.commit applied: refresh the surface's scene node from its
@@ -1156,6 +1241,7 @@ fn syncSurfaces(self: *ServerState) void {
 fn onSurfaceCommit(listener: *wire.Listener(*Surface), _: *Surface) void {
     const entry: *SurfaceEntry = @fieldParentPtr("commit_listener", listener);
     updateSurfaceNode(entry.state, entry);
+    requestRender(entry.state);
 }
 
 /// wl_surface destroyed: drop the scene node, deliver discarded feedback,
@@ -1591,6 +1677,8 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
 /// per screen pixel — the world point under the pointer stays under it.
 fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_pointer_move_listener", listener);
+    // The cursor follows the pointer regardless of drag state.
+    requestRender(self);
     const drag = self.camera_drag orelse return;
     const dx = seat.pointer_x - drag.x;
     const dy = seat.pointer_y - drag.y;
@@ -1618,6 +1706,7 @@ fn onSeatAxis(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.
     while (i < steps) : (i += 1) zoom *= factor;
     self.camera.zoom = std.math.clamp(zoom, 0.1, 16.0);
     log.debug("camera zoom -> {d}", self.io, self.log_cfg, "camera", .{self.camera.zoom});
+    requestRender(self);
 }
 
 /// Sync the cursor nodes with the seat state: position at the pointer

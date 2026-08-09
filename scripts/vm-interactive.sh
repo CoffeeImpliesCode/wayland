@@ -24,6 +24,7 @@ export WAYLAND_SYNTH_INPUT=0
 # the VM stops), the frame watchdog self-re-arms.
 export WAYLAND_CAMERA="cx=640,cy=360,zoom=1.5"
 export WAYLAND_LOG=err,drm=info,libinput=info
+export WAYLAND_WATCHDOG_DISABLE=1
 
 /tmp/zo/bin/wayland-server > /tmp/srv-interactive.log 2>&1 &
 SRV=$!

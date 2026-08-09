@@ -574,7 +574,10 @@ fn commit(out: *output_mod.Output, state: *const output_mod.Output.State) error{
     // the previous flip drives the next frame); a second flip before the
     // event would EBUSY. wlroots atomic.c guards the same way.
     if (self.flip_pending) {
-        log_mod.err("drm: page flip already pending", self.backend.io, self.backend.log_cfg, "drm", .{});
+        // Normal pacing under the requestRender-driven model: a commit
+        // can land while the previous flip is still in flight; the flip
+        // completion event re-renders it. Not an error.
+        log_mod.debug("drm: page flip already pending", self.backend.io, self.backend.log_cfg, "drm", .{});
         return error.CommitFailed;
     }
 
