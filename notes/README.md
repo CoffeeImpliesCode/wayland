@@ -136,16 +136,18 @@ Recommendation: build on **wlroots via zig-wayland + zig-wlroots**, not smithay.
    backend, wl_registry globals, xdg-shell configure/ack, shm buffers, own
    zig test client (no weston needed); pixman renderer; verified end-to-end
    (client roundtrip → surface mapped → rendered, leak-free).
-4. **Output rendering with wlr_scene** — Outputs on the nested wayland
-   backend (then DRM), wlr_scene tree, frame_done pacing, presentation
-   timing. Deliverable: windows composite on a real output.
-5. **Canvas rendering spike** — Custom render pass: camera matrix
-   (world `f64` → screen), pan/zoom, world-space culling, reuse cached
-   textures. Deliverable: arbitrary scale/rotation proven on a surface.
-6. **Input remapping** — Pointer screen coords → invert camera → world →
-   per-surface inverse transform → surface-local; focus rules in world
-   space; tick `frame_done` during pan so clients repaint. Deliverable:
-   click, scroll, and drag correct through the camera.
+4. **Output rendering with wlr_scene** — done (2026-08-07, own scene graph +
+   output module): scene tree, frame_done pacing, presentation timing,
+   damage ring; verified on the headless + DRM backends (VM-DRM-E2E-OK,
+   2026-08-09).
+5. **Canvas rendering spike** — IN PROGRESS (2026-08-09): custom render pass
+   (`src/renderer/canvas.zig`) + camera (`src/scene/camera.zig`, world
+   `f64` → screen, pan/zoom/rotation, world-space culling, cached-texture
+   reuse). Deliverable: arbitrary scale/rotation proven on a surface.
+6. **Input remapping** — IN PROGRESS (2026-08-09, with 5): pointer screen
+   coords → inverse camera → world → surface-local; focus rules in world
+   space; camera-aware `frame_done` during pan. Deliverable: click, scroll,
+   and drag correct through the camera.
 7. **Client-side scaling** — Implement viewporter and fractional-scale-v1;
    advertise `scale = max(1, zoom)`. Deliverable: sharp zoom for
    conforming clients.

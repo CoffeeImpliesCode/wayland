@@ -210,7 +210,32 @@ pub fn build(b: *Build) void {
 
     const lib_tests = b.addTest(.{ .root_module = lib });
     const run_lib_tests = b.addRunArtifact(lib_tests);
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+
+    // exe_tests: the server executable's root module (src/server/main.zig)
+    // declares its own `pub fn main(init: std.process.Init)`, which a test
+    // binary built from that root would keep as its entry and then panic
+    // on the runner's `--listen=-` protocol args. Give the test step its
+    // own root module (src/server/main_test.zig, no main) so the test
+    // runner becomes the entry; the comptime import + refAllDecls in that
+    // root still force full analysis of main.zig's decls (AGENTS.md
+    // gate-5: unused decls still type-check). The module mirrors the
+    // server root's imports (zio, tracy, build_options, tracy_impl,
+    // raylib_c) and system links.
+    const exe_test_module = b.createModule(.{
+        .root_source_file = b.path("src/server/main_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const import_names = server_exe.root_module.import_table.keys();
+    const import_mods = server_exe.root_module.import_table.values();
+    for (import_names, import_mods) |import_name, import_mod| {
+        exe_test_module.addImport(import_name, import_mod);
+    }
+    exe_test_module.linkSystemLibrary("xkbcommon", .{});
+    if (enable_raylib) {
+        exe_test_module.linkSystemLibrary("raylib", .{ .use_pkg_config = .force });
+    }
+    const exe_tests = b.addTest(.{ .root_module = exe_test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");

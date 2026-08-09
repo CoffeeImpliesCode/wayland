@@ -2,8 +2,11 @@
 //!
 //! Canonical renderer for headless backends and tests; reference
 //! implementation of the Pass contract. M1 scope: 1:1 texture blits and
-//! straight-alpha rect fills. Scaling, cropping and texture alpha arrive
-//! with M2.
+//! rect fills, all composited with PREMULTIPLIED alpha: source RGB is
+//! premultiplied by source A before the over blend, matching
+//! wlr_render_color (include/wlr/render/pass.h:135-137) and smithay
+//! Color32F (src/backend/renderer/color.rs:3). Scaling, cropping and
+//! texture alpha arrive with M2.
 //!
 //! Imports: utils/*, renderer/{renderer,pass,texture}.zig.
 
@@ -69,7 +72,14 @@ pub const Framebuffer = struct {
     }
 };
 
-const PixmanTextureData = struct {
+/// Texture payload. PUBLISHED so other modules cast `Texture.data` to
+/// this exact type — never to a locally re-declared mirror. (Zig 0.16
+/// lays default structs out by alignment, not declaration order, so two
+/// look-alike declarations are NOT guaranteed identical; one shared
+/// declaration removes the hazard. `extern struct` is not usable here:
+/// `[]u8` is not a C-ABI type and this struct never crosses the FFI
+/// boundary.)
+pub const PixmanTextureData = struct {
     pixels: []u8,
     stride: i32,
     allocator: std.mem.Allocator,
@@ -117,6 +127,13 @@ pub const PixmanRenderer = struct {
 
     /// Import an ARGB8888 pixel buffer as a texture. The pixels are copied
     /// into renderer-owned memory.
+    ///
+    /// Pixels are stored as delivered: premultiplied ARGB8888. The Wayland
+    /// protocol requires alpha premultiplied into the color values
+    /// (wl_buffer, protocols/wayland/wayland.xml:533-536), and wlroots'
+    /// pixman renderer wraps client bytes with no conversion
+    /// (render/pixman/renderer.c pixman_texture_from_buffer), so no
+    /// premultiplication happens here either.
     pub fn importMemory(
         renderer: *renderer_mod.Renderer,
         w: i32,
@@ -188,6 +205,18 @@ fn addTexture(pass: *pass_mod.Pass, texture: *texture_mod.Texture, src: ?geom.FR
     const tex_data: *PixmanTextureData = @ptrCast(@alignCast(texture.data));
     _ = alpha; // M1: straight blit; alpha compositing arrives with M2.
 
+    // The blit stays a raw copy: texture bytes are already premultiplied
+    // ARGB8888. wl_shm buffers carry premultiplied alpha (wl_buffer,
+    // protocols/wayland/wayland.xml:533-536), and wlroots' pixman renderer
+    // wraps client bytes in a pixman image with pixman_image_create_bits_no_clear
+    // — no premultiplication at upload (render/pixman/renderer.c
+    // pixman_texture_from_buffer) — then composites with PIXMAN_OP_OVER on the
+    // premultiplied a8r8g8b8 image (render/pixman/pass.c render_pass_add_texture,
+    // render/pixman/pixel_format.c:12). M1 only does full-rect, alpha=1 blits,
+    // so replacing the destination with the source bytes is the exact
+    // premultiplied-over result (PIXMAN_OP_SRC). Scanout and screencopy
+    // consumers copy bytes unchanged.
+
     const tw: f64 = @floatFromInt(texture.width);
     const th: f64 = @floatFromInt(texture.height);
     const src_whole = if (src) |s| s.x == 0 and s.y == 0 and s.width == tw and s.height == th else true;
@@ -225,14 +254,17 @@ fn addRect(pass: *pass_mod.Pass, rect: geom.Rect, color: [4]f32) void {
     const y1 = @min(rect.y + rect.height, fb.height);
     if (x0 >= x1 or y0 >= y1) return;
 
-    // The framebuffer is ARGB8888 (little-endian memory bytes B,G,R,A),
-    // so the RGBA color is stored with B first: B,G,R,A. Alpha stays at
-    // index 3, so blendPixel's channel math is unchanged.
+    // The Pass API takes a straight-alpha color (pass.zig), while the
+    // framebuffer and blendPixel are premultiplied (wlr_render_color
+    // convention, include/wlr/render/pass.h:135-137): premultiply RGB by
+    // alpha here. The framebuffer is ARGB8888 little-endian memory bytes
+    // B,G,R,A, so the RGBA color is stored with B first, alpha at index 3.
+    const a = std.math.clamp(color[3], 0.0, 1.0);
     const src: [4]u8 = .{
-        @intFromFloat(@round(std.math.clamp(color[2], 0.0, 1.0) * 255.0)),
-        @intFromFloat(@round(std.math.clamp(color[1], 0.0, 1.0) * 255.0)),
-        @intFromFloat(@round(std.math.clamp(color[0], 0.0, 1.0) * 255.0)),
-        @intFromFloat(@round(std.math.clamp(color[3], 0.0, 1.0) * 255.0)),
+        @intFromFloat(@round(std.math.clamp(color[2] * a, 0.0, 1.0) * 255.0)),
+        @intFromFloat(@round(std.math.clamp(color[1] * a, 0.0, 1.0) * 255.0)),
+        @intFromFloat(@round(std.math.clamp(color[0] * a, 0.0, 1.0) * 255.0)),
+        @intFromFloat(@round(a * 255.0)),
     };
 
     const fb_stride: usize = @intCast(fb.stride);
@@ -246,8 +278,12 @@ fn addRect(pass: *pass_mod.Pass, rect: geom.Rect, color: [4]f32) void {
     }
 }
 
-/// Straight-alpha blend: dst = src*a + dst*(1-a) per channel. The
-/// channels are in memory byte order (B,G,R,A), alpha at index 3.
+/// Premultiplied-alpha over composite: out = src + dst*(1-src.a) per
+/// channel, src's RGB already multiplied by src.a (so src[i] <= src[3]).
+/// Channels are in memory byte order (B,G,R,A), alpha at index 3; the
+/// alpha channel formula reduces to src.a + dst.a*(1-src.a). The result
+/// stays <= 255 for valid premultiplied input. Opaque sources replace,
+/// fully transparent sources are skipped.
 fn blendPixel(dst: *[4]u8, src: [4]u8) void {
     const a: u32 = src[3];
     if (a == 255) {
@@ -259,7 +295,7 @@ fn blendPixel(dst: *[4]u8, src: [4]u8) void {
     while (i < 4) : (i += 1) {
         const s: u32 = src[i];
         const d: u32 = dst[i];
-        dst[i] = @intCast((s * a + d * (255 - a) + 127) / 255);
+        dst[i] = @intCast((s * 255 + d * (255 - a) + 127) / 255);
     }
 }
 
@@ -384,7 +420,7 @@ test "rect fill and alpha blend" {
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(2, 2));
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, fb.pixelAt(3, 3));
 
-    // Straight-alpha blend: half blue over white.
+    // Premultiplied-over blend: half blue over white.
     const fb2 = try Framebuffer.create(allocator, 4, 4);
     defer fb2.deinit();
     fb2.fill(.{ 255, 255, 255, 255 });
@@ -392,8 +428,10 @@ test "rect fill and alpha blend" {
     pass2.addRect(.{ .x = 0, .y = 0, .width = 4, .height = 4 }, .{ 0.0, 0.0, 1.0, 0.5 });
     pass2.submit();
 
-    // dst = src*a + dst*(1-a), a = 128; bytes in memory order B,G,R,A:
-    // B: (255*128 + 255*127 + 127)/255 = 255;  G,R: (0*128 + 255*127 + 127)/255 = 127
-    // A: (128*128 + 255*127 + 127)/255 = 191
-    try std.testing.expectEqual([4]u8{ 255, 127, 127, 191 }, fb2.pixelAt(1, 1));
+    // addRect premultiplies the straight color: a = round(0.5*255) = 128,
+    // B = round(1.0*0.5*255) = 128 -> src bytes B,G,R,A = {128, 0, 0, 128}.
+    // Over white with out = src + dst*(1-a); bytes in memory order B,G,R,A:
+    // B: (128*255 + 255*127 + 127)/255 = 255;  G,R: (0*255 + 255*127 + 127)/255 = 127
+    // A: (128*255 + 255*127 + 127)/255 = 255
+    try std.testing.expectEqual([4]u8{ 255, 127, 127, 255 }, fb2.pixelAt(1, 1));
 }
