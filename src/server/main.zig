@@ -221,6 +221,24 @@ const ServerState = struct {
     /// changed state (the synth runs before the composite) and consumes
     /// it at the end.
     in_render: bool = false,
+    /// The canvas WITHOUT the cursor (background + camera-transformed
+    /// surfaces), persisted so a hover cursor move restores a region from
+    /// it instead of recompositing the whole canvas (~450ms full-canvas
+    /// bilinear in the VM). Recomposited only when the canvas changes; the
+    /// display framebuffer = base + cursor overlay.
+    base_framebuffer: ?*pixman.Framebuffer = null,
+    /// Hover cursor move in progress: renderFrame skips the full composite
+    /// and instead restores the old cursor region from base_framebuffer +
+    /// redraws the cursor at the new pointer (set by onSeatPointerMove).
+    cursor_repaint: bool = false,
+    /// A client has a pending wl_surface.frame callback (it is ready for
+    /// the next frame) but the canvas is otherwise unchanged. The
+    /// idle-frame skip would starve it: the client waits for the
+    /// wl_callback.done to render its next update (foot's render loop),
+    /// which only fires on a present. renderFrame presents the unchanged
+    /// framebuffer (no recomposite) so the callback fires and the client
+    /// can commit its pending content.
+    frame_kick: bool = false,
     /// Stop after this many frames; 0 = run until watchdog/error.
     run_frames: u32 = 0,
     watchdog_fired: bool = false,
@@ -619,7 +637,10 @@ pub fn main(init: std.process.Init) !void {
     state.loop = null;
     // The ServerState owns the render framebuffer (onNewOutput may have
     // replaced the original via resize); free the CURRENT one here — the
-    // backend must already be torn down so nothing references it.
+    // backend must already be torn down so nothing references it. The base
+    // (canvas-without-cursor) too.
+    if (state.base_framebuffer) |base| base.deinit();
+    state.base_framebuffer = null;
     state.framebuffer.deinit();
 }
 
@@ -653,6 +674,10 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
         };
         self.framebuffer.deinit();
         self.framebuffer = fb;
+        // The base (canvas-without-cursor) is lazily recreated at the new
+        // size on the next composite; a stale-sized base would copy wrong.
+        if (self.base_framebuffer) |base| base.deinit();
+        self.base_framebuffer = null;
         log.info("framebuffer resized to {d}x{d}", self.io, self.log_cfg, "server", .{
             out.mode.width, out.mode.height,
         });
@@ -786,6 +811,22 @@ fn onDisplayReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     // its commits cannot wake the idle renderer (the compositor only saw
     // the surface once, at the pre-change render).
     syncSurfaces(self);
+    // A surface with a pending wl_surface.frame is ready for the next
+    // frame. The idle-frame skip would starve it (foot's render loop waits
+    // for the wl_callback.done before drawing + committing its next
+    // update), so present the unchanged canvas to fire the callback. Only
+    // when the renderer is otherwise idle — a real change already queues
+    // a render that presents everything.
+    if (!self.repaint_pending and !self.in_render) {
+        var it = self.surface_entries.valueIterator();
+        while (it.next()) |ep| {
+            if (ep.*.surface.current.frame_callbacks.items.len > 0) {
+                self.frame_kick = true;
+                requestRender(self);
+                break;
+            }
+        }
+    }
     // Synth input (headless/DRM E2E) fires on every dispatch, not in
     // renderFrame: the idle-frame skip means renders only happen on
     // changes, and the M4 scroll is gated on the client's screencopy
@@ -947,7 +988,26 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // the canvas pass (background fill + camera-transformed surface
     // textures + screen-space cursor) replaces the scene-output render;
     // the damage-ring accounting below is unchanged.
-    compositeCanvas(self);
+    if (self.cursor_repaint) {
+        // Hover cursor move: the canvas is static, so restore the old
+        // cursor region from the persisted base + redraw the cursor at the
+        // new pointer — no full-canvas recomposite (the ~450ms bilinear).
+        // The base is only invalidated by a real canvas change, which takes
+        // the compositeCanvas path.
+        self.cursor_repaint = false;
+        if (self.base_framebuffer) |base| {
+            if (old_cursor[0]) |r| copyRegion(base, self.framebuffer, r);
+        }
+        drawCursor(self);
+    } else if (self.frame_kick) {
+        // A client is ready for the next frame (pending wl_callback) but
+        // the canvas is unchanged. Present the current framebuffer so the
+        // callback fires and the client can render + commit its pending
+        // update — no recomposite.
+        self.frame_kick = false;
+    } else {
+        compositeCanvas(self);
+    }
     _ = so.damage_ring.rotate();
     const perf_t_render = perfNs(self);
 
@@ -1051,7 +1111,24 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
 ///    size, canvas-compositing.md §4). The cursor scene nodes remain as
 ///    state (updateCursor/cursorFootprints still position them for the
 ///    damage ring) but are no longer drawn by the scene.
+/// Composite the full canvas (background + camera-transformed surfaces +
+/// screen-space cursor) into the display framebuffer. The background +
+/// surfaces (the "base") are rendered into the persisted base_framebuffer
+/// first and copied out, so renderFrame's cursor_repaint path can restore
+/// a cursor region from the base without recompositing the whole canvas
+/// (the ~450ms full-canvas bilinear in the VM).
 fn compositeCanvas(self: *ServerState) void {
+    ensureBaseFramebuffer(self);
+    compositeBase(self);
+    copyWhole(self.base_framebuffer.?, self.framebuffer);
+    drawCursor(self);
+}
+
+/// Render the background + all mapped surfaces through the camera into the
+/// base framebuffer (the canvas WITHOUT the cursor). The expensive
+/// full-canvas bilinear; done only when the canvas actually changes.
+fn compositeBase(self: *ServerState) void {
+    const base = self.base_framebuffer orelse return;
     // 1. Background. Premultiplied ARGB8888, memory bytes B,G,R,A; the
     //    scene's background rect drew the same color via addRect
     //    (round(color*a*255) per channel with straight alpha a=1), so
@@ -1062,7 +1139,7 @@ fn compositeCanvas(self: *ServerState) void {
         @intFromFloat(@round(background_color[0] * 255.0)),
         @intFromFloat(@round(background_color[3] * 255.0)),
     };
-    self.framebuffer.fill(bg);
+    base.fill(bg);
 
     // 2. Surfaces: world rect = the node's absolute position + the
     //    SURFACE size (the node dst is the surface size — the buffer size
@@ -1091,14 +1168,15 @@ fn compositeCanvas(self: *ServerState) void {
             log.warn("canvas item append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         };
     }
-    wayland.canvas.render(self.allocator, self.framebuffer, &self.camera, items.items);
+    wayland.canvas.render(self.allocator, base, &self.camera, items.items);
+}
 
-    // 3. Cursor: screen space at constant size. The identity camera
-    //    (center W/2,H/2, zoom 1, no rotation) makes worldToScreen the
-    //    identity mapping, so items placed at the pointer's screen coords
-    //    land on exactly those pixels. The fallback rect is a texture
-    //    now — the canvas pass draws textures, not scene rects — and the
-    //    client cursor surface texture wins when one is set.
+/// Draw the screen-space cursor into the display framebuffer at the
+/// pointer's current position (identity camera, constant size). The
+/// fallback rect is a texture now — the canvas pass draws textures, not
+/// scene rects — and the client cursor surface texture wins when one is
+/// set.
+fn drawCursor(self: *ServerState) void {
     const identity: Camera = .{
         .center_x = @as(f64, @floatFromInt(self.framebuffer.width)) / 2.0,
         .center_y = @as(f64, @floatFromInt(self.framebuffer.height)) / 2.0,
@@ -1130,6 +1208,46 @@ fn compositeCanvas(self: *ServerState) void {
         };
     }
     wayland.canvas.render(self.allocator, self.framebuffer, &identity, &cursor_items);
+}
+
+/// Create the base framebuffer (matching the display framebuffer's size)
+/// on first use; freed in main's teardown.
+fn ensureBaseFramebuffer(self: *ServerState) void {
+    if (self.base_framebuffer != null) return;
+    const fb = pixman.Framebuffer.create(
+        self.allocator,
+        self.framebuffer.width,
+        self.framebuffer.height,
+    ) catch |err| {
+        log.err("base framebuffer create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    self.base_framebuffer = fb;
+}
+
+/// Copy a rect from src to dst (both output-sized, stride = width*4).
+fn copyRegion(src: *pixman.Framebuffer, dst: *pixman.Framebuffer, rect: geom.Rect) void {
+    const x_start: i32 = @max(rect.x, 0);
+    const y_start: i32 = @max(rect.y, 0);
+    const x_end_raw = std.math.add(i32, rect.x, rect.width) catch std.math.maxInt(i32);
+    const y_end_raw = std.math.add(i32, rect.y, rect.height) catch std.math.maxInt(i32);
+    const x_end: i32 = @min(x_end_raw, dst.width);
+    const y_end: i32 = @min(y_end_raw, dst.height);
+    if (x_start >= x_end or y_start >= y_end) return;
+    const row_bytes: usize = @intCast(@as(i32, x_end - x_start) * 4);
+    const src_stride: usize = @intCast(src.stride);
+    const dst_stride: usize = @intCast(dst.stride);
+    var yy: i32 = y_start;
+    while (yy < y_end) : (yy += 1) {
+        const so: usize = @as(usize, @intCast(yy)) * src_stride + @as(usize, @intCast(x_start)) * 4;
+        const do_: usize = @as(usize, @intCast(yy)) * dst_stride + @as(usize, @intCast(x_start)) * 4;
+        @memcpy(dst.data[do_..][0..row_bytes], src.data[so..][0..row_bytes]);
+    }
+}
+
+/// Copy the whole base into dst (same size + stride).
+fn copyWhole(src: *pixman.Framebuffer, dst: *pixman.Framebuffer) void {
+    @memcpy(dst.data, src.data);
 }
 
 /// The fallback cursor's texture: a solid light-grey cursor_size² square
@@ -1677,9 +1795,16 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
 /// per screen pixel — the world point under the pointer stays under it.
 fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_pointer_move_listener", listener);
-    // The cursor follows the pointer regardless of drag state.
-    requestRender(self);
-    const drag = self.camera_drag orelse return;
+    // Hover (no drag): the canvas is static, so just move the cursor —
+    // repaint only the cursor region (renderFrame's cursor_repaint path),
+    // not the ~450ms full-canvas composite.
+    if (self.camera_drag == null) {
+        self.cursor_repaint = true;
+        requestRender(self);
+        return;
+    }
+    // Dragging: the camera pans, so the whole canvas re-composites.
+    const drag = self.camera_drag.?;
     const dx = seat.pointer_x - drag.x;
     const dy = seat.pointer_y - drag.y;
     if (dx == 0 and dy == 0) return;
@@ -1689,6 +1814,7 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
     log.debug("camera center -> {d},{d}", self.io, self.log_cfg, "camera", .{
         self.camera.center_x, self.camera.center_y,
     });
+    requestRender(self);
 }
 
 /// M4 camera zoom: a vertical wheel notch (+1 discrete) multiplies the

@@ -117,15 +117,35 @@ fn drawItem(fb: *pixman.Framebuffer, camera: *const Camera, item: CanvasItem) vo
 
     const tex_data: *pixman.PixmanTextureData = @ptrCast(@alignCast(item.texture.data));
 
+    // Hoist the camera transform's invariants out of the pixel loop.
+    // screenToWorld recomputes @cos/@sin per call — 2 trig ops per pixel,
+    // the dominant cost of a full-canvas composite (~500ms in the VM for
+    // a zoomed foot). Everything below is the SAME arithmetic screenToWorld
+    // performs, with only the per-item constants pulled out; the per-pixel
+    // divisions by camera.zoom and world_w/h are kept (not inverted) so the
+    // result is bit-identical to the direct form.
+    const cos_r = @cos(camera.rotation);
+    const sin_r = @sin(camera.rotation);
+    const sw2 = camera.screen_w / 2;
+    const sh2 = camera.screen_h / 2;
+    const ccx = camera.center_x;
+    const ccy = camera.center_y;
+    const wz = camera.zoom;
+    const wx = item.world_x;
+    const wy = item.world_y;
+    const ww = item.world_w;
+    const wh = item.world_h;
+
     var y = y0;
     while (y < y1) : (y += 1) {
         const sy: f64 = @floatFromInt(y);
         var x = x0;
         while (x < x1) : (x += 1) {
             const sx: f64 = @floatFromInt(x);
-            const p = camera.screenToWorld(sx, sy);
-            const u = (p.x - item.world_x) / item.world_w;
-            const v = (p.y - item.world_y) / item.world_h;
+            const dx = (sx - sw2) / wz;
+            const dy = (sy - sh2) / wz;
+            const u = (ccx + dx * cos_r - dy * sin_r - wx) / ww;
+            const v = (ccy + dx * sin_r + dy * cos_r - wy) / wh;
             if (u < 0 or u >= 1 or v < 0 or v >= 1) continue;
             // Surface-space (u, v) -> texture-space (tu, tv): the inverse
             // of the buffer transform (transform maps buffer -> surface
@@ -228,8 +248,22 @@ fn addWeighted(acc: *[4]f32, color: [4]f32, weight: f64) void {
 /// memory byte order (B,G,R,A) as 0..255 floats; it is premultiplied by
 /// (a * opacity) here, so opaque texels at opacity 1 are exact copies.
 fn blendPremultiplied(fb: *pixman.Framebuffer, x: i32, y: i32, sample: [4]f32, opacity: f32) void {
-    const dst = fb.pixelAt(x, y);
+    const off = @as(usize, @intCast(y)) * @as(usize, @intCast(fb.stride)) + @as(usize, @intCast(x)) * 4;
     const sa = (sample[3] / 255.0) * opacity; // src alpha after opacity, 0..1
+    if (sa >= 1.0) {
+        // Opaque: the over blend with sa=1 is a pure copy — the source
+        // replaces the destination (per-channel `sample*1 + dst*0`).
+        // Skips the per-pixel f32 blend for opaque surfaces (foot); the
+        // result is byte-identical to the general blend.
+        fb.data[off + 0] = @intFromFloat(std.math.round(std.math.clamp(sample[0], 0.0, 255.0)));
+        fb.data[off + 1] = @intFromFloat(std.math.round(std.math.clamp(sample[1], 0.0, 255.0)));
+        fb.data[off + 2] = @intFromFloat(std.math.round(std.math.clamp(sample[2], 0.0, 255.0)));
+        fb.data[off + 3] = @intFromFloat(std.math.round(std.math.clamp(sample[3], 0.0, 255.0)));
+        return;
+    }
+    if (sa <= 0.0) return; // fully transparent: the source contributes nothing
+
+    const dst = fb.pixelAt(x, y);
     const inv = 1.0 - sa;
     var out: [4]u8 = undefined;
     var i: usize = 0;
@@ -241,7 +275,6 @@ fn blendPremultiplied(fb: *pixman.Framebuffer, x: i32, y: i32, sample: [4]f32, o
     const a = sample[3] * opacity + @as(f32, @floatFromInt(dst[3])) * inv;
     out[3] = @intFromFloat(std.math.round(std.math.clamp(a, 0.0, 255.0)));
 
-    const off = @as(usize, @intCast(y)) * @as(usize, @intCast(fb.stride)) + @as(usize, @intCast(x)) * 4;
     fb.data[off..][0..4].* = out;
 }
 
