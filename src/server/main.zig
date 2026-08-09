@@ -263,6 +263,12 @@ const ServerState = struct {
     /// without motion never produces a delta, so the seat's
     /// click-to-focus is unchanged.
     camera_drag: ?DragPoint = null,
+    /// Progressive-quality fast render: set while a camera drag/pan is
+    /// active so compositeBase renders the canvas at a reduced stride
+    /// (blocky but ~stride² cheaper per frame — keeps panning responsive
+    /// on a slow CPU). Cleared when the drag ends; the next full-quality
+    /// render replaces the blocky frame.
+    fast_render: bool = false,
     /// WAYLAND_PERF=1: log per-frame pipeline timings (import -> render
     /// -> present) in microseconds.
     perf: bool = false,
@@ -1183,7 +1189,7 @@ fn compositeBase(self: *ServerState) void {
             log.warn("canvas item append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         };
     }
-    wayland.canvas.render(self.allocator, base, &self.camera, items.items);
+    wayland.canvas.render(self.allocator, base, &self.camera, items.items, if (self.fast_render) 3 else 1);
 }
 
 /// Draw the screen-space cursor into the display framebuffer at the
@@ -1222,7 +1228,7 @@ fn drawCursor(self: *ServerState) void {
             .opacity = 1.0,
         };
     }
-    wayland.canvas.render(self.allocator, self.framebuffer, &identity, &cursor_items);
+    wayland.canvas.render(self.allocator, self.framebuffer, &identity, &cursor_items, 1);
 }
 
 /// Create the base framebuffer (matching the display framebuffer's size)
@@ -1810,10 +1816,13 @@ fn onSeatKey(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.S
 fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_button_listener", listener);
     if (seat.last_button != wayland.seat.btn_left) return;
-    self.camera_drag = if (seat.last_button_pressed)
-        DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y }
-    else
-        null;
+    if (seat.last_button_pressed) {
+        self.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
+        self.fast_render = true;
+    } else {
+        self.camera_drag = null;
+        self.fast_render = false;
+    }
 }
 
 /// M4 camera pan: while the left button is held, pointer motion moves

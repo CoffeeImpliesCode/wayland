@@ -70,22 +70,29 @@ pub const CanvasItem = struct {
 /// Composite `items` into `fb` through `camera` (module doc: draw order,
 /// sampling and blend conventions). `allocator` is reserved — the
 /// rasterizer is allocation-free today.
+/// `stride`: pixel sampling stride (1 = full quality; >1 = progressive
+/// "fast" mode used while dragging/panning — every stride-th pixel is
+/// bilinear-sampled and the stride x stride block is filled with that
+/// sample, cutting the per-pixel bilinear cost ~stride² fold so a camera
+/// pan stays responsive on a slow CPU. The result is blocky until the
+/// interaction ends and a full-quality render replaces it.)
 pub fn render(
     allocator: std.mem.Allocator,
     fb: *pixman.Framebuffer,
     camera: *const Camera,
     items: []const CanvasItem,
+    stride: u32,
 ) void {
     _ = allocator;
     for (items) |item| {
         // `!(opacity > 0)` also skips NaN opacity.
         if (!(item.opacity > 0) or item.world_w <= 0 or item.world_h <= 0) continue;
         if (item.texture.width <= 0 or item.texture.height <= 0) continue;
-        drawItem(fb, camera, item);
+        drawItem(fb, camera, item, stride);
     }
 }
 
-fn drawItem(fb: *pixman.Framebuffer, camera: *const Camera, item: CanvasItem) void {
+fn drawItem(fb: *pixman.Framebuffer, camera: *const Camera, item: CanvasItem, stride: u32) void {
     // Transformed quad and its screen-space AABB.
     const corners = [4]geom.FPoint{
         camera.worldToScreen(item.world_x, item.world_y),
@@ -117,51 +124,94 @@ fn drawItem(fb: *pixman.Framebuffer, camera: *const Camera, item: CanvasItem) vo
 
     const tex_data: *pixman.PixmanTextureData = @ptrCast(@alignCast(item.texture.data));
 
-    // Hoist the camera transform's invariants out of the pixel loop.
-    // screenToWorld recomputes @cos/@sin per call — 2 trig ops per pixel,
-    // the dominant cost of a full-canvas composite (~500ms in the VM for
-    // a zoomed foot). Everything below is the SAME arithmetic screenToWorld
-    // performs, with only the per-item constants pulled out; the per-pixel
-    // divisions by camera.zoom and world_w/h are kept (not inverted) so the
-    // result is bit-identical to the direct form.
+    // Precompute the surface-space affine for the item: u = u_c + u_dx*sx +
+    // u_dy*sy (and v), folding the camera transform (screenToWorld) + the
+    // world-rect normalization into per-item constants. This eliminates the
+    // per-pixel divisions by zoom and world_w/h — ~6 divisions per pixel
+    // were the dominant cost of the full-canvas composite (~450ms in the
+    // VM), far more than the trig (already hoisted) or the bilinear.
     const cos_r = @cos(camera.rotation);
     const sin_r = @sin(camera.rotation);
+    const inv_zoom = 1.0 / camera.zoom;
     const sw2 = camera.screen_w / 2;
     const sh2 = camera.screen_h / 2;
     const ccx = camera.center_x;
     const ccy = camera.center_y;
-    const wz = camera.zoom;
     const wx = item.world_x;
     const wy = item.world_y;
     const ww = item.world_w;
     const wh = item.world_h;
+    const inv_ww = 1.0 / ww;
+    const inv_wh = 1.0 / wh;
+    const u_c = (ccx - sw2 * inv_zoom * cos_r + sh2 * inv_zoom * sin_r - wx) * inv_ww;
+    const u_dx = inv_zoom * cos_r * inv_ww;
+    const u_dy = -inv_zoom * sin_r * inv_ww;
+    const v_c = (ccy - sw2 * inv_zoom * sin_r - sh2 * inv_zoom * cos_r - wy) * inv_wh;
+    const v_dx = inv_zoom * sin_r * inv_wh;
+    const v_dy = inv_zoom * cos_r * inv_wh;
+    const tex_w: f64 = @floatFromInt(item.texture.width);
+    const tex_h: f64 = @floatFromInt(item.texture.height);
+    // Fold the surface->texture map (surfaceToTexture, normal transform) —
+    // the common case (a terminal at scale 1): tu = u * world_w / tex_w.
+    const scale_w = ww / tex_w;
+    const scale_h = wh / tex_h;
 
+    const st: i32 = @intCast(@max(stride, 1));
     var y = y0;
-    while (y < y1) : (y += 1) {
+    while (y < y1) : (y += st) {
         const sy: f64 = @floatFromInt(y);
         var x = x0;
-        while (x < x1) : (x += 1) {
+        while (x < x1) : (x += st) {
             const sx: f64 = @floatFromInt(x);
-            const dx = (sx - sw2) / wz;
-            const dy = (sy - sh2) / wz;
-            const u = (ccx + dx * cos_r - dy * sin_r - wx) / ww;
-            const v = (ccy + dx * sin_r + dy * cos_r - wy) / wh;
+            const u = u_c + u_dx * sx + u_dy * sy;
+            const v = v_c + v_dx * sx + v_dy * sy;
             if (u < 0 or u >= 1 or v < 0 or v >= 1) continue;
             // Surface-space (u, v) -> texture-space (tu, tv): the inverse
-            // of the buffer transform (transform maps buffer -> surface
-            // per wl_output_transform). Identity (normal) is (u, v)
-            // unchanged — the pre-transform sampling, byte for byte.
-            const t = surfaceToTexture(
-                item.transform,
-                u,
-                v,
-                item.world_w,
-                item.world_h,
-                item.texture.width,
-                item.texture.height,
-            );
-            const sample = sampleBilinear(tex_data, item.texture.width, item.texture.height, t.u, t.v);
-            blendPremultiplied(fb, x, y, sample, item.opacity);
+            // of the buffer transform. Identity (normal) is (u, v) scaled
+            // by world_w/tex_w (folded above); other transforms use
+            // surfaceToTexture (rare: rotated/flipped surfaces).
+            var tu = u * scale_w;
+            var tv = v * scale_h;
+            if (item.transform != .normal) {
+                // Rotated/flipped surface: the full surfaceToTexture map.
+                const t = surfaceToTexture(item.transform, u, v, ww, wh, item.texture.width, item.texture.height);
+                tu = t.u;
+                tv = t.v;
+            }
+            const sample = sampleBilinear(tex_data, item.texture.width, item.texture.height, tu, tv);
+            // Full quality: write the pixel. Fast mode: fill the
+            // stride x stride block with this sample (blocky until the
+            // interaction ends).
+            if (st == 1) {
+                blendPremultiplied(fb, x, y, sample, item.opacity);
+            } else if ((sample[3] / 255.0) * item.opacity >= 1.0) {
+                // Opaque fill: the over blend is a copy. Compute the 4
+                // output bytes ONCE + memcpy the block — the per-pixel
+                // round was the fast-mode floor (~4M rounds/frame).
+                const out: [4]u8 = .{
+                    @intFromFloat(std.math.round(std.math.clamp(sample[0], 0.0, 255.0))),
+                    @intFromFloat(std.math.round(std.math.clamp(sample[1], 0.0, 255.0))),
+                    @intFromFloat(std.math.round(std.math.clamp(sample[2], 0.0, 255.0))),
+                    @intFromFloat(std.math.round(std.math.clamp(sample[3], 0.0, 255.0))),
+                };
+                const fb_stride: usize = @intCast(fb.stride);
+                var by: i32 = 0;
+                while (by < st and y + by < y1) : (by += 1) {
+                    var bx: i32 = 0;
+                    while (bx < st and x + bx < x1) : (bx += 1) {
+                        const off = @as(usize, @intCast(y + by)) * fb_stride + @as(usize, @intCast(x + bx)) * 4;
+                        fb.data[off..][0..4].* = out;
+                    }
+                }
+            } else {
+                var by: i32 = 0;
+                while (by < st and y + by < y1) : (by += 1) {
+                    var bx: i32 = 0;
+                    while (bx < st and x + bx < x1) : (bx += 1) {
+                        blendPremultiplied(fb, x + bx, y + by, sample, item.opacity);
+                    }
+                }
+            }
         }
     }
 }
@@ -304,7 +354,7 @@ test "canvas: identity camera blits a 2x2 texture exactly" {
     const items = [_]CanvasItem{
         .{ .texture = tex, .world_x = 0, .world_y = 0, .world_w = 2, .world_h = 2, .opacity = 1.0 },
     };
-    render(allocator, fb, &camera, &items);
+    render(allocator, fb, &camera, &items, 1);
 
     // 1:1 blit: each texture texel lands exactly on its screen pixel.
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(0, 0));
@@ -320,7 +370,7 @@ test "canvas: identity camera blits a 2x2 texture exactly" {
     const offscreen = [_]CanvasItem{
         .{ .texture = tex, .world_x = 10, .world_y = 10, .world_w = 2, .world_h = 2, .opacity = 1.0 },
     };
-    render(allocator, fb, &camera, &offscreen);
+    render(allocator, fb, &camera, &offscreen, 1);
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, fb.pixelAt(3, 3));
 
     // Premultiplied-over blend: half-opacity red over white →
@@ -328,7 +378,7 @@ test "canvas: identity camera blits a 2x2 texture exactly" {
     fb.fill(.{ 255, 255, 255, 255 });
     var faded = items;
     faded[0].opacity = 0.5;
-    render(allocator, fb, &camera, &faded);
+    render(allocator, fb, &camera, &faded, 1);
     const blended = fb.pixelAt(0, 0);
     try std.testing.expect(@abs(@as(i32, blended[0]) - 128) <= 1);
     try std.testing.expect(@abs(@as(i32, blended[1]) - 128) <= 1);
@@ -339,7 +389,7 @@ test "canvas: identity camera blits a 2x2 texture exactly" {
     const before = fb.pixelAt(1, 0);
     var hidden = items;
     hidden[0].opacity = 0.0;
-    render(allocator, fb, &camera, &hidden);
+    render(allocator, fb, &camera, &hidden, 1);
     try std.testing.expectEqual(before, fb.pixelAt(1, 0));
 }
 
@@ -369,7 +419,7 @@ test "canvas: zoomed camera samples the bilinear midpoint" {
     const items = [_]CanvasItem{
         .{ .texture = tex, .world_x = 0, .world_y = 0, .world_w = 2, .world_h = 2, .opacity = 1.0 },
     };
-    render(allocator, fb, &camera, &items);
+    render(allocator, fb, &camera, &items, 1);
 
     const got = fb.pixelAt(1, 1);
     for (got[0..3]) |b| try std.testing.expect(@abs(@as(i32, b) - 128) <= 1);
@@ -411,7 +461,7 @@ test "canvas: 90-degree transform samples the rotated buffer" {
             .transform = .@"90",
         },
     };
-    render(allocator, fb, &camera, &items);
+    render(allocator, fb, &camera, &items, 1);
 
     // The 1x2 surface rect fills fb pixels (0,0)..(1,2).
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(0, 0)); // top: red
@@ -421,7 +471,7 @@ test "canvas: 90-degree transform samples the rotated buffer" {
     fb.fill(.{ 0, 0, 0, 0 });
     var rotated = items;
     rotated[0].transform = .@"270";
-    render(allocator, fb, &camera, &rotated);
+    render(allocator, fb, &camera, &rotated, 1);
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, fb.pixelAt(0, 0)); // top: green
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(0, 1)); // bottom: red
 }
@@ -457,7 +507,7 @@ test "canvas: 180 and flipped transforms mirror the buffer" {
             .transform = .@"180",
         },
     };
-    render(allocator, fb, &camera, &items);
+    render(allocator, fb, &camera, &items, 1);
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, fb.pixelAt(0, 0)); // left: green
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(1, 0)); // right: red
 
@@ -466,14 +516,14 @@ test "canvas: 180 and flipped transforms mirror the buffer" {
     // (vertical mirror): unchanged — red left, green right.
     fb.fill(.{ 0, 0, 0, 0 });
     items[0].transform = .flipped_180;
-    render(allocator, fb, &camera, &items);
+    render(allocator, fb, &camera, &items, 1);
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(0, 0)); // left: red
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, fb.pixelAt(1, 0)); // right: green
 
     // .flipped on a 2x1 surface mirrors horizontally: red right, green left.
     fb.fill(.{ 0, 0, 0, 0 });
     items[0].transform = .flipped;
-    render(allocator, fb, &camera, &items);
+    render(allocator, fb, &camera, &items, 1);
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, fb.pixelAt(0, 0)); // left: green
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(1, 0)); // right: red
 
@@ -488,7 +538,7 @@ test "canvas: 180 and flipped transforms mirror the buffer" {
     f90[0].transform = .flipped_90;
     f90[0].world_w = 1;
     f90[0].world_h = 2;
-    render(allocator, fb, &cam90, &f90);
+    render(allocator, fb, &cam90, &f90, 1);
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(0, 0)); // top: red
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, fb.pixelAt(0, 1)); // bottom: green
 }
