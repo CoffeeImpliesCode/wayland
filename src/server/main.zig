@@ -1171,8 +1171,18 @@ fn compositeBase(self: *ServerState) void {
     //    identical).
     var items: std.ArrayList(CanvasItem) = .empty;
     defer items.deinit(self.allocator);
+    // The cursor's WlSurface is drawn ONLY as the cursor (drawCursor),
+    // never as a normal surface — matching wlroots (the cursor is a
+    // separate plane, never a scene node) and niri (the cursor surface is
+    // excluded from normal surface rendering via an early return on its
+    // commit). Rendering it here too produced a SECOND cursor at the
+    // surface's node position.
+    const cursor_res = self.seat.cursorSurface();
     var entry_it = self.surface_entries.valueIterator();
     while (entry_it.next()) |entry| {
+        if (cursor_res) |cr| {
+            if (entry.*.surface.resource == cr) continue;
+        }
         const node = entry.*.node orelse continue;
         const bn = node.kind.buffer;
         const texture = bn.texture orelse continue;
