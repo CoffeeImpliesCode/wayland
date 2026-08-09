@@ -3,3 +3,4 @@ zig-out/
 codedb.snapshot
 .devenv/
 .direnv/
+.no-auto-demo

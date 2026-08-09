@@ -57,6 +57,8 @@
     pkgs.libinput
     pkgs.libinput.dev
     pkgs.libevdev
+    # Interactive demo client (foot terminal on the canvas).
+    pkgs.foot
   ];
   environment.variables.PKG_CONFIG_PATH =
     "${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig";
@@ -85,6 +87,22 @@
     # The minimal systemd service PATH does not include the system
     # packages: give the script the toolchain it needs.
     path = [ pkgs.zig pkgs.pkg-config ];
+  };
+
+  # Interactive canvas demo: DRM server + foot terminal on the virtio-gpu
+  # output. Started by the compositor-demo-drm gate when the host created
+  # /shared/repo/.no-auto-demo; run the VM WITHOUT -nographic so qemu
+  # opens a window (virtio input reaches the seat through libinput: drag
+  # pans, wheel zooms).
+  systemd.services.compositor-demo-interactive = {
+    after = [ "local-fs.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${pkgs.bash}/bin/bash /shared/repo/scripts/vm-interactive.sh";
+      StandardOutput = "journal+console";
+      StandardError = "journal+console";
+      Environment = "FOOT=${pkgs.foot}/bin/foot";
+    };
   };
 
   # Headless regression E2E: not wanted at boot; run with

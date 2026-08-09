@@ -12,6 +12,15 @@
 set -uo pipefail
 exec > /dev/console 2>&1
 
+# Interactive mode: when the HOST created /shared/repo/.no-auto-demo, skip
+# the auto E2E and start the interactive demo (DRM server + foot) instead.
+if [ -f /shared/repo/.no-auto-demo ]; then
+    echo "=== auto E2E skipped (.no-auto-demo present); starting interactive demo ==="
+    systemctl start compositor-demo-interactive
+    poweroff -f
+    exit 0
+fi
+
 cd /shared/repo || { echo "VM-DRM-E2E-FAILED: repo share not mounted"; poweroff -f; exit 1; }
 # 9p defaults to cache=loose: host-side edits can be invisible to the
 # guest. Drop the cache so every boot builds the CURRENT source.
