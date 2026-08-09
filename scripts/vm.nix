@@ -31,7 +31,7 @@
     "-no-reboot"
   ];
   virtualisation.memorySize = 2048;
-  virtualisation.diskSize = 4096;
+  virtualisation.diskSize = 8192;
   virtualisation.sharedDirectories = {
     repo = {
       source = "~/projects/wayland";

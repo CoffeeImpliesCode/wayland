@@ -39,7 +39,7 @@ if [ ! -S /tmp/rt/wayland-1 ]; then
     exit 1
 fi
 
-WAYLAND_DISPLAY=wayland-1 "${FOOT:-foot}" --font-size=14 \
+WAYLAND_DISPLAY=wayland-1 "${FOOT:-foot}" --font="monospace:size=14" \
     > /tmp/foot.log 2>&1 &
 FOOT_PID=$!
 
