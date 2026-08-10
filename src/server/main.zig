@@ -98,6 +98,11 @@ const watchdog_timeout_ms: u64 = 5000;
 const background_color = [4]f32{ 0.1, 0.1, 0.12, 1.0 };
 /// Fallback cursor: a small light rect when no client cursor surface.
 const cursor_size: i32 = 16;
+/// The pointer-move threshold (px, squared) before a left-button press
+/// becomes a camera drag. A click with sub-threshold micro-movement keeps
+/// the seat's click-to-focus (the terminal gets the keyboard) instead of
+/// panning the camera.
+const drag_threshold_sq: i32 = 16; // 4 px
 const cursor_color = [4]f32{ 0.95, 0.95, 0.95, 1.0 };
 
 /// Per-surface scene state: the SceneBufferNode that draws the surface's
@@ -263,6 +268,12 @@ const ServerState = struct {
     /// without motion never produces a delta, so the seat's
     /// click-to-focus is unchanged.
     camera_drag: ?DragPoint = null,
+    /// Whether the drag has crossed the movement threshold (a real pan has
+    /// started). A press alone only arms camera_drag; the pan (and the
+    /// fast-render blockiness) begins once the pointer moves > drag_threshold
+    /// px — so a click with a tiny micro-move doesn't pan the camera or
+    /// steal focus from the terminal (the reported 'click hangs the cursor').
+    drag_active: bool = false,
     /// Progressive-quality fast render: set while a camera drag/pan is
     /// active so compositeBase renders the canvas at a reduced stride
     /// (blocky but ~stride² cheaper per frame — keeps panning responsive
@@ -1827,38 +1838,52 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
     const self: *ServerState = @fieldParentPtr("seat_button_listener", listener);
     if (seat.last_button != wayland.seat.btn_left) return;
     if (seat.last_button_pressed) {
+        // Arm the pan anchor but DON'T start it (drag_active stays false):
+        // a click without enough movement must keep click-to-focus.
         self.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
-        self.fast_render = true;
+        self.drag_active = false;
+        self.fast_render = false;
     } else {
         self.camera_drag = null;
+        self.drag_active = false;
         self.fast_render = false;
     }
 }
 
-/// M4 camera pan: while the left button is held, pointer motion moves
-/// the camera center by (-delta_x / zoom, -delta_y / zoom) world units
-/// per screen pixel — the world point under the pointer stays under it.
+/// M4 camera pan: while the left button is held + the pointer has moved
+/// past drag_threshold, motion pans the camera center by (-delta / zoom)
+/// world units per screen pixel — the world point under the pointer stays
+/// under it. Sub-threshold movement (a click) is a hover (cursor follows,
+/// no pan), so click-to-focus on the terminal works and the camera does
+/// not jump.
 fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_pointer_move_listener", listener);
-    // Hover (no drag): the canvas is static, so just move the cursor —
-    // repaint only the cursor region (renderFrame's cursor_repaint path),
-    // not the ~450ms full-canvas composite.
-    if (self.camera_drag == null) {
-        self.cursor_repaint = true;
+    // A drag is armed (button held). If it hasn't crossed the threshold
+    // yet, a sub-threshold move is a hover (cursor follows, no pan); once
+    // it crosses, start the pan.
+    if (self.camera_drag) |anchor| {
+        const dx = seat.pointer_x - anchor.x;
+        const dy = seat.pointer_y - anchor.y;
+        if (!self.drag_active and dx * dx + dy * dy < drag_threshold_sq) {
+            self.cursor_repaint = true;
+            requestRender(self);
+            return;
+        }
+        // Above the threshold (or already dragging): pan the camera.
+        self.drag_active = true;
+        self.fast_render = true;
+        self.camera.center_x -= @as(f64, @floatFromInt(dx)) / self.camera.zoom;
+        self.camera.center_y -= @as(f64, @floatFromInt(dy)) / self.camera.zoom;
+        self.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
+        log.debug("camera center -> {d},{d}", self.io, self.log_cfg, "camera", .{
+            self.camera.center_x, self.camera.center_y,
+        });
         requestRender(self);
         return;
     }
-    // Dragging: the camera pans, so the whole canvas re-composites.
-    const drag = self.camera_drag.?;
-    const dx = seat.pointer_x - drag.x;
-    const dy = seat.pointer_y - drag.y;
-    if (dx == 0 and dy == 0) return;
-    self.camera.center_x -= @as(f64, @floatFromInt(dx)) / self.camera.zoom;
-    self.camera.center_y -= @as(f64, @floatFromInt(dy)) / self.camera.zoom;
-    self.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
-    log.debug("camera center -> {d},{d}", self.io, self.log_cfg, "camera", .{
-        self.camera.center_x, self.camera.center_y,
-    });
+    // No drag armed: hover — the canvas is static, so just move the
+    // cursor (repaint only the cursor region, not the full composite).
+    self.cursor_repaint = true;
     requestRender(self);
 }
 
