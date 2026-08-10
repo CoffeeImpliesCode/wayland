@@ -1733,6 +1733,12 @@ fn cleanupSurfaceEntries(self: *ServerState) void {
     self.cursor_texture = null;
     if (self.cursor_fallback_texture) |t| t.destroy();
     self.cursor_fallback_texture = null;
+    if (build_options.enable_raylib) {
+        if (self.raylib_input) |input| {
+            self.allocator.destroy(input);
+            self.raylib_input = null;
+        }
+    }
     var it = self.surface_entries.valueIterator();
     while (it.next()) |entry_ptr| {
         const entry = entry_ptr.*;

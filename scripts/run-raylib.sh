@@ -4,18 +4,17 @@
 # The raylib backend needs a live X11/Wayland session (GLFW opens the
 # window); it feeds the seat from the window's own keyboard + mouse.
 #
-# Default client is the wayland-client test client (runs its E2E:
-# connect -> map a gradient -> screencopy verify -> synth zoom -> CLIENT-OK,
-# then exits). Set CLIENT to a command (e.g. a terminal) to run that instead.
+# Default client is a terminal (weston-terminal, else foot) so the raylib
+# window's real input drives the demo. The synth-driven test client is NOT
+# the default — it needs WAYLAND_SYNTH_INPUT=1 and conflicts with the
+# window input. Set CLIENT to override.
 #
-#   scripts/run-raylib.sh                        # test client, exits after E2E
-#   CLIENT=foot scripts/run-raylib.sh            # launch a terminal instead
-#   CLIENT='weston-terminal' scripts/run-raylib.sh
+#   scripts/run-raylib.sh                        # terminal in the raylib window
+#   CLIENT='weston-terminal --font-size=14' scripts/run-raylib.sh
 #   WAYLAND_CAMERA="cx=640,cy=360,zoom=1.5" scripts/run-raylib.sh
 #   WAYLAND_LOG=err,server=debug scripts/run-raylib.sh
 #
-# The server runs until the client exits (test client) or you Ctrl-C
-# (CLIENT=terminal); both paths kill the server.
+# The server runs until the client exits or you Ctrl-C; both kill it.
 set -u
 
 # The raylib window needs a live display; fail fast otherwise (GLFW's
@@ -25,11 +24,15 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     exit 1
 fi
 
-# Fresh runtime dir so the socket name is predictable.
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/rt}"
-rm -rf "$XDG_RUNTIME_DIR"
-mkdir -p "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
+# A DEDICATED runtime dir for the demo. We NEVER reuse the caller's real
+# XDG_RUNTIME_DIR (e.g. /run/user/$UID): that dir holds the live Wayland,
+# D-Bus, pulse and dconf sockets of the user's session, and rm -rf on it
+# would destroy them. WAYLAND_RT_DIR overrides the location.
+RT="${WAYLAND_RT_DIR:-/tmp/rt-raylib}"
+rm -rf "$RT"
+mkdir -p "$RT"
+chmod 700 "$RT"
+export XDG_RUNTIME_DIR="$RT"
 
 # Build the server if the binary is missing.
 if [ ! -x ./zig-out/bin/wayland-server ]; then
@@ -38,8 +41,9 @@ if [ ! -x ./zig-out/bin/wayland-server ]; then
 fi
 
 # Backend + camera + logging, all overridable from the environment. The
-# demo stays up (no RUN_FRAMES, watchdog disabled); WAYLAND_SYNTH_INPUT is
-# unset so the raylib window's own input drives the seat.
+# demo stays up (no RUN_FRAMES, watchdog disabled). The raylib window's own
+# keyboard/mouse feeds the seat (no WAYLAND_SYNTH_INPUT — the synth is for
+# the headless/DRM E2E and conflicts with the window's real input).
 export WAYLAND_BACKEND="${WAYLAND_BACKEND:-raylib}"
 export WAYLAND_CAMERA="${WAYLAND_CAMERA:-cx=640,cy=360,zoom=1.5}"
 export WAYLAND_LOG="${WAYLAND_LOG:-err,server=info}"
@@ -74,13 +78,22 @@ if [ -z "$SOCK" ] || [ ! -S "$XDG_RUNTIME_DIR/$SOCK" ]; then
 fi
 echo "run-raylib: server ready (socket $SOCK, pid $SRV)"
 
-# Client: the test client by default, or CLIENT=<command>.
+# Client: a terminal by default (the raylib window's real input drives it —
+# the test client is synth-driven and incompatible). CLIENT overrides.
 if [ -n "${CLIENT:-}" ]; then
     echo "run-raylib: running client: $CLIENT"
     WAYLAND_DISPLAY="$SOCK" bash -c "$CLIENT"
     RC=$?
+elif command -v weston-terminal >/dev/null 2>&1; then
+    echo "run-raylib: running weston-terminal"
+    WAYLAND_DISPLAY="$SOCK" weston-terminal
+    RC=$?
+elif command -v foot >/dev/null 2>&1; then
+    echo "run-raylib: running foot"
+    WAYLAND_DISPLAY="$SOCK" foot
+    RC=$?
 else
-    echo "run-raylib: running test client (set CLIENT=... to override)"
+    echo "run-raylib: no terminal (weston-terminal/foot) — running the test client; it expects WAYLAND_SYNTH_INPUT=1 and may time out" >&2
     WAYLAND_DISPLAY="$SOCK" ./zig-out/bin/wayland-client
     RC=$?
 fi

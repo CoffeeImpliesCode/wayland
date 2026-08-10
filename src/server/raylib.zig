@@ -116,8 +116,11 @@ pub const RaylibBackend = struct {
         }
 
         raylib.InitWindow(mode.width, mode.height, title.ptr);
-        errdefer raylib.CloseWindow();
         if (!raylib.IsWindowReady()) return error.WindowInitFailed;
+        // errdefer registered only after IsWindowReady: CloseWindow on a
+        // never-opened window (InitWindow failed — e.g. the DISPLAY is set
+        // but no server) segfaults in raylib (a NULL core handle).
+        errdefer raylib.CloseWindow();
         raylib.SetTargetFPS(60);
 
         // Blank RGBA8888 texture (GenImageColor produces
