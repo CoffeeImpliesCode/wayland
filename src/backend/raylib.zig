@@ -53,9 +53,6 @@ const RaylibOutputData = struct {
     texture: raylib.Texture2D,
     /// WAYLAND_PERF=1: log present-stage timings.
     perf: bool = false,
-    /// BGRA-in-memory (ARGB8888 u32) -> RGBA byte swap scratch for the
-    /// R8G8B8A8 raylib texture; width*height*4 bytes.
-    scratch: []u8,
 };
 
 const backend_impl: backend.Backend.Impl = .{
@@ -173,22 +170,16 @@ pub const RaylibBackend = struct {
         // owned by out_data (destroyOutput unloads it).
         errdefer raylib.UnloadTexture(texture);
 
-        // Per-output state and its scratch first: their allocation-failure
-        // cleanup (errdefers below) is independent of the backend, so a
-        // failure cannot leak `rl`.
+        // Per-output state first: its allocation-failure cleanup
+        // (errdefers below) is independent of the backend, so a failure
+        // cannot leak `rl`.
         const out_data = try allocator.create(RaylibOutputData);
         errdefer allocator.destroy(out_data);
-        const scratch = try allocator.alloc(
-            u8,
-            @as(usize, @intCast(mode.width)) * @as(usize, @intCast(mode.height)) * 4,
-        );
-        errdefer allocator.free(scratch);
         out_data.* = .{
             .allocator = allocator,
             .io = io,
             .log_cfg = log_cfg,
             .texture = texture,
-            .scratch = scratch,
             .perf = std.mem.eql(
                 u8,
                 std.mem.span(std.c.getenv("WAYLAND_PERF") orelse ""),
@@ -278,47 +269,56 @@ fn testState(_: *output.Output, state: *const output.Output.State) error{Invalid
 }
 
 /// Upload the committed framebuffer into the window texture and draw it.
-/// No-op (beyond logging) when the state carries no buffer. When the
-/// state's damage rects union into a box smaller than the framebuffer,
-/// only that box is byte-swapped and uploaded (UpdateTextureRec); whole,
-/// empty, or full-screen damage keeps the full UpdateTexture path.
+/// No-op (beyond logging) when the state carries no buffer. The upload is
+/// a direct GL_BGRA texSubImage2D of the framebuffer bytes — no CPU
+/// byte-swap (bgraToRgba was ~20-40% of the compositor CPU in the perf
+/// profiles); the GL driver does the BGRA→RGBA swizzle on upload. When
+/// the state's damage rects union into a box smaller than the
+/// framebuffer, only that box is uploaded (GL_UNPACK_ROW_LENGTH handles
+/// the framebuffer's row stride); whole/full-screen damage keeps the full
+/// upload.
 fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFailed}!void {
     const od: *RaylibOutputData = @ptrCast(@alignCast(out.data));
     if (state.buffer) |buf| {
         const fb: *pixman.Framebuffer = @ptrCast(@alignCast(buf));
         const perf_t0 = perfNs(out.io);
-        // ARGB8888 u32 (BGRA bytes in little-endian memory) -> RGBA bytes
-        // for the R8G8B8A8 raylib texture.
-        const scratch = std.mem.bytesAsSlice(u32, od.scratch);
-        const fb_px = std.mem.bytesAsSlice(u32, fb.data);
-        const full_w: usize = @intCast(fb.width);
         const upload = uploadRegion(&state.damage, fb.width, fb.height);
-        if (upload) |region| {
-            // Byte-swap only the damaged box's rows into the scratch
-            // (offset into fb.data; tight w*h rows), then upload the box.
-            bgraToRgbaRegion(
-                scratch[0 .. region.w * region.h],
-                fb_px,
-                full_w,
-                region.x,
-                region.y,
-                region.w,
-                region.h,
-            );
-        } else {
-            bgraToRgba(out.io, out.log_cfg, scratch, fb_px);
-        }
+        // The GL upload state (texture binding + unpack row length) is
+        // global; save + restore so raylib's own drawing is unaffected.
+        var bound: c_int = 0;
+        raylib.glad_glGetIntegerv.?(raylib.RL_GL_TEXTURE_BINDING_2D, &bound);
+        raylib.glad_glBindTexture.?(raylib.RL_GL_TEXTURE_2D, od.texture.id);
+        raylib.glad_glPixelStorei.?(raylib.RL_GL_UNPACK_ROW_LENGTH, fb.width);
         const perf_t_swap = perfNs(out.io);
         if (upload) |region| {
-            raylib.UpdateTextureRec(od.texture, .{
-                .x = @floatFromInt(region.x),
-                .y = @floatFromInt(region.y),
-                .width = @floatFromInt(region.w),
-                .height = @floatFromInt(region.h),
-            }, scratch.ptr);
+            const row_stride: usize = @intCast(fb.stride);
+            const byte_off = @as(usize, @intCast(region.y)) * row_stride + @as(usize, @intCast(region.x)) * 4;
+            raylib.glad_glTexSubImage2D.?(
+                raylib.RL_GL_TEXTURE_2D,
+                0,
+                @intCast(region.x),
+                @intCast(region.y),
+                @intCast(region.w),
+                @intCast(region.h),
+                raylib.RL_GL_BGRA,
+                raylib.RL_GL_UNSIGNED_BYTE,
+                fb.data[byte_off..].ptr,
+            );
         } else {
-            raylib.UpdateTexture(od.texture, od.scratch.ptr);
+            raylib.glad_glTexSubImage2D.?(
+                raylib.RL_GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                @intCast(fb.width),
+                @intCast(fb.height),
+                raylib.RL_GL_BGRA,
+                raylib.RL_GL_UNSIGNED_BYTE,
+                fb.data.ptr,
+            );
         }
+        raylib.glad_glPixelStorei.?(raylib.RL_GL_UNPACK_ROW_LENGTH, 0);
+        raylib.glad_glBindTexture.?(raylib.RL_GL_TEXTURE_2D, @intCast(bound));
         const perf_t_upload = perfNs(out.io);
         raylib.BeginDrawing();
         raylib.ClearBackground(white);
@@ -334,9 +334,6 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
             });
         }
     }
-    log_mod.info("commit: bits=0x{x} enabled={} scale={d} damage_rects={d}", out.io, out.log_cfg, "raylib", .{
-        state.committed, state.enabled, state.scale, state.damage.rects.items.len,
-    });
 }
 
 /// The upload region for this commit: the damage rects' bounding box
@@ -367,54 +364,6 @@ fn uploadRegion(damage: *const Damage, fb_w: i32, fb_h: i32) ?UploadRegion {
     };
 }
 
-/// ARGB8888 u32 (BGRA bytes in little-endian memory) -> RGBA bytes for
-/// the R8G8B8A8 raylib texture. The present hot path (921k pixels/frame):
-/// runtime safety is disabled so the shuffle compiles to plain stores —
-/// the slices are sized by the fixed 1280x720 framebuffer and scratch.
-/// SAFETY NET: a framebuffer larger than the create-time scratch would
-/// overflow dst below (safety is off in the loop); guard it first.
-fn bgraToRgba(io: *std.Io, log_cfg: *const log_mod.Config, dst: []align(1) u32, src: []align(1) const u32) void {
-    if (src.len > dst.len) {
-        log_mod.err(
-            "raylib: framebuffer {d} px exceeds scratch capacity {d} px; skipping upload",
-            io,
-            log_cfg,
-            "raylib",
-            .{ src.len, dst.len },
-        );
-        return;
-    }
-    @setRuntimeSafety(false);
-    for (src, 0..) |px, i| {
-        dst[i] = (px & 0xFF00FF00) | ((px & 0x000000FF) << 16) | ((px >> 16) & 0x000000FF);
-    }
-}
-
-/// Region variant of bgraToRgba: byte-swaps only the box (x, y, w, h)
-/// within `src` (stride `src_stride` pixels per row) into the first w*h
-/// entries of `dst` — the layout UpdateTextureRec expects for a sub-rect
-/// upload (tight rows). Same hot-path safety profile: the box is clamped
-/// to the framebuffer by uploadRegion and the slices are fixed-size.
-fn bgraToRgbaRegion(
-    dst: []align(1) u32,
-    src: []align(1) const u32,
-    src_stride: usize,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-) void {
-    @setRuntimeSafety(false);
-    var row: usize = 0;
-    while (row < h) : (row += 1) {
-        const src_row = src[(y + row) * src_stride + x ..][0..w];
-        const dst_row = dst[row * w ..][0..w];
-        for (src_row, 0..) |px, i| {
-            dst_row[i] = (px & 0xFF00FF00) | ((px & 0x000000FF) << 16) | ((px >> 16) & 0x000000FF);
-        }
-    }
-}
-
 /// Present-stage perf trace format (WAYLAND_PERF=1).
 const perf_raylib_fmt = "perf raylib swap={d}us upload={d}us draw={d}us total={d}us";
 
@@ -426,6 +375,5 @@ fn perfNs(io: *std.Io) u64 {
 fn destroyOutput(allocator: std.mem.Allocator, data: *anyopaque) void {
     const od: *RaylibOutputData = @ptrCast(@alignCast(data));
     raylib.UnloadTexture(od.texture);
-    allocator.free(od.scratch);
     allocator.destroy(od);
 }
