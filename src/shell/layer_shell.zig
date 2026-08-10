@@ -641,6 +641,12 @@ const TestServer = struct {
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, compositor and shell all store it).
     fn init(allocator: std.mem.Allocator) !*TestServer {
+        return initAtVersion(allocator, 5);
+    }
+
+    /// init with zwlr_layer_shell_v1 bound at an explicit version, for the
+    /// legacy-version conformance tests (a v3 client speaks an older wire).
+    fn initAtVersion(allocator: std.mem.Allocator, layer_shell_version: u32) !*TestServer {
         const ts = try allocator.create(TestServer);
         errdefer allocator.destroy(ts);
         ts.* = .{
@@ -678,7 +684,7 @@ const TestServer = struct {
         // Round 2: bind wl_compositor, wl_shm and zwlr_layer_shell_v1.
         ts.wl_compositor = try registry.bind(capture.compositor_name.?, client.wl.Compositor, 7);
         ts.wl_shm = try registry.bind(capture.shm_name.?, client.wl.Shm, 1);
-        ts.layer_shell = try registry.bind(capture.layer_shell_name.?, client.zwlr.LayerShellV1, 5);
+        ts.layer_shell = try registry.bind(capture.layer_shell_name.?, client.zwlr.LayerShellV1, layer_shell_version);
         try ts.pump();
         return ts;
     }
@@ -918,4 +924,72 @@ test "layer surface: NULL commit unmaps and resets; remap needs a fresh configur
     wl_surface.commit();
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     try std.testing.expectEqual(@as(c_int, 2), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "layer surface v3 client: legacy flow, set_layer, keyboard interactivity coercion" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.initAtVersion(allocator, 3);
+    defer ts.deinit();
+
+    // The client bound zwlr_layer_shell_v1 at v3.
+    try std.testing.expectEqual(@as(u32, 3), ts.layer_shell.?.getVersion());
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+    var ls_events: LayerSurfaceEvents = .{};
+    layer_surface.setListener(*LayerSurfaceEvents, LayerSurfaceEvents.listener, &ls_events);
+    // 0x0 size with all four anchors satisfies the zero-dimension rules.
+    layer_surface.setAnchor(@bitCast(anchor_top | anchor_bottom | anchor_left | anchor_right));
+    try ts.pump();
+
+    const ls = ts.shell.?.layer_surfaces.items[0];
+    // The role object carries the shell binding's version.
+    try std.testing.expectEqual(@as(u32, 3), ls.resource.getVersion());
+
+    // set_layer is since 2: valid at v3; the new layer is double-buffered.
+    layer_surface.setLayer(.overlay);
+    // set_keyboard_interactivity is since 1; on a v<4 binding the value goes
+    // through the bool coercion (any nonzero -> exclusive=1).
+    layer_surface.setKeyboardInteractivity(.exclusive);
+    try ts.pump();
+    try std.testing.expectEqual(Layer.overlay, ls.pending.layer);
+    try std.testing.expectEqual(@as(u32, 1), ls.pending.keyboard_interactive);
+
+    // First commit is buffer-less: the compositor replies with the initial
+    // configure and applies the pending layer/keyboard state.
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ls_events.configure_count);
+    try std.testing.expectEqual(@as(u32, 0), ls_events.width);
+    try std.testing.expectEqual(@as(u32, 0), ls_events.height);
+    try std.testing.expectEqual(Layer.overlay, ls.current.layer);
+    try std.testing.expectEqual(@as(u32, 1), ls.current.keyboard_interactive);
+    const serial = ls_events.serial;
+    try std.testing.expectEqual(serial, ls.configure_serial);
+
+    // Ack the configure, then a buffer commit maps the surface.
+    layer_surface.ackConfigure(serial);
+    const buffer = try createShmBuffer(ts);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(ls.configured);
+    try std.testing.expect(ls.surface.mapped);
+
+    // The coercion is real, not an enum round-trip: on_demand (2) does not
+    // exist at v3, so the wire value must be coerced to exclusive (1), never
+    // stored as 2. Re-attach so the commit is a normal buffer commit.
+    layer_surface.setKeyboardInteractivity(.on_demand);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 1), ls.current.keyboard_interactive);
+
+    // Over the v3 surface's whole life it receives exactly one configure and
+    // one closed event (both since 1; the layer surface protocol defines no
+    // event newer than v1, so there is nothing newer to leak).
+    ls.close();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ls_events.closed_count);
+    try std.testing.expectEqual(@as(usize, 1), ls_events.configure_count);
 }

@@ -102,14 +102,14 @@ pub const WlOutput = struct {
         if (version >= 2) resource.sendDone();
     }
 
-    fn bindOutput(client: *wire.Client, wl_output: *WlOutput, version: u32, id: u32) void {
-        const resource = server.wl.Output.create(client, version, id) catch {
-            client.postNoMemory();
+    fn bindOutput(cli: *wire.Client, wl_output: *WlOutput, version: u32, id: u32) void {
+        const resource = server.wl.Output.create(cli, version, id) catch {
+            cli.postNoMemory();
             return;
         };
         resource.setHandler(*WlOutput, outputRequest, null, wl_output);
         wl_output.resources.append(wl_output.allocator, resource) catch {
-            client.postNoMemory();
+            cli.postNoMemory();
             return;
         };
         wl_output.sendState(resource);
@@ -128,4 +128,219 @@ fn outputRequest(resource: *server.wl.Output, request: server.wl.Output.Request,
     switch (request) {
         .release => resource.destroy(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+const client = @import("protocol").client;
+const backend_mod = @import("../backend/backend.zig");
+
+const posix = std.posix;
+
+const FakeImpl = struct {
+    fn testState(_: *output_mod.Output, _: *const output_mod.Output.State) error{InvalidState}!void {}
+    fn commit(_: *output_mod.Output, _: *const output_mod.Output.State) error{CommitFailed}!void {}
+    fn destroy(_: std.mem.Allocator, _: *anyopaque) void {}
+};
+
+const fake_impl: output_mod.Output.Impl = .{
+    .@"test" = FakeImpl.testState,
+    .commit = FakeImpl.commit,
+    .destroy = FakeImpl.destroy,
+};
+
+const FakeBackendImpl = struct {
+    fn start(_: *backend_mod.Backend) error{BackendFailed}!void {}
+    fn destroy(_: std.mem.Allocator, _: *anyopaque) void {}
+};
+
+const fake_backend_impl: backend_mod.Backend.Impl = .{
+    .start = FakeBackendImpl.start,
+    .destroy = FakeBackendImpl.destroy,
+};
+
+const RegistryCapture = struct {
+    output_name: ?u32 = null,
+
+    fn listener(registry: *client.wl.Registry, event: client.wl.Registry.Event, data: *RegistryCapture) void {
+        _ = registry;
+        switch (event) {
+            .global => |g| {
+                const name = std.mem.span(g.interface);
+                if (std.mem.eql(u8, name, "wl_output")) data.output_name = g.name;
+            },
+            .global_remove => {},
+        }
+    }
+};
+
+const OutputEvents = struct {
+    geometry_count: usize = 0,
+    mode_count: usize = 0,
+    done_count: usize = 0,
+    scale_count: usize = 0,
+    name_count: usize = 0,
+    description_count: usize = 0,
+    mode_width: i32 = 0,
+    mode_height: i32 = 0,
+    scale_factor: i32 = 0,
+
+    fn listener(output: *client.wl.Output, event: client.wl.Output.Event, data: *OutputEvents) void {
+        _ = output;
+        switch (event) {
+            .geometry => data.geometry_count += 1,
+            .mode => |m| {
+                data.mode_count += 1;
+                data.mode_width = m.width;
+                data.mode_height = m.height;
+            },
+            .done => data.done_count += 1,
+            .scale => |s| {
+                data.scale_count += 1;
+                data.scale_factor = s.factor;
+            },
+            .name => data.name_count += 1,
+            .description => data.description_count += 1,
+        }
+    }
+};
+
+/// A minimal compositor + wl_output global + in-memory client, for wire
+/// roundtrips. Unlike the shell harnesses, init does NOT pump after binding
+/// wl_output: the bind-time state send (sendState) is exactly what the
+/// legacy-version test asserts on, so it must sit in the socket until the
+/// test attaches its listener and pumps.
+const TestServer = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_cfg: log.Config,
+    display: ?*display_mod.CompositorDisplay = null,
+    backend: ?*backend_mod.Backend = null,
+    output: ?*output_mod.Output = null,
+    wl_output: ?*WlOutput = null,
+    client: ?*wire.Client = null,
+    c_display: ?*client.wl.Display = null,
+    wl_output_proxy: ?*client.wl.Output = null,
+
+    fn init(allocator: std.mem.Allocator, bind_version: u32) !*TestServer {
+        const ts = try allocator.create(TestServer);
+        errdefer allocator.destroy(ts);
+        ts.* = .{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .log_cfg = .{ .min_level = .err },
+        };
+        ts.display = try display_mod.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
+        errdefer if (ts.display) |d| d.deinit();
+        ts.backend = try backend_mod.Backend.init(allocator, &ts.io, &ts.log_cfg, &fake_backend_impl, undefined);
+        errdefer if (ts.backend) |b| b.destroy();
+        const out = try output_mod.Output.create(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.backend.?,
+            &fake_impl,
+            undefined,
+            .{ .width = 1920, .height = 1080, .refresh_msec = 16 },
+        );
+        ts.output = out;
+        errdefer if (ts.output) |o| o.destroy();
+        // The wl_output global is freed by onOutputDestroy when the output
+        // is destroyed; no separate teardown.
+        ts.wl_output = try WlOutput.create(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            out,
+            "WL-1",
+            "wayland debug output",
+        );
+
+        // In-memory client connection: one socketpair end for the server, the
+        // other for the client library.
+        var fds: [2]posix.socket_t = undefined;
+        const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+        if (posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+        ts.client = wire.Client.create(ts.display.?.getServer(), fds[0]) orelse return error.ClientCreateFailed;
+        ts.c_display = client.wl.Display.connectToFd(fds[1]) catch return error.ClientConnectFailed;
+
+        // Round 1: registry + global announcement.
+        const registry = try ts.c_display.?.getRegistry();
+        var capture: RegistryCapture = .{};
+        registry.setListener(*RegistryCapture, RegistryCapture.listener, &capture);
+        try ts.pump();
+        if (capture.output_name == null) return error.GlobalMissing;
+
+        // Round 2: bind wl_output at the requested (legacy) version. No pump:
+        // the bind response events must reach the test's listener.
+        ts.wl_output_proxy = try registry.bind(capture.output_name.?, client.wl.Output, bind_version);
+        return ts;
+    }
+
+    fn deinit(ts: *TestServer) void {
+        if (ts.c_display) |d| d.disconnect();
+        if (ts.client) |c| c.destroy();
+        // Output.destroy emits the destroy signal, which frees the WlOutput.
+        if (ts.output) |o| o.destroy();
+        if (ts.backend) |b| b.destroy();
+        if (ts.display) |d| d.deinit();
+        const allocator = ts.allocator;
+        allocator.destroy(ts);
+    }
+
+    /// Client flush -> server event loop dispatch -> server flush -> client
+    /// dispatch. Drives one roundtrip without blocking.
+    fn pump(ts: *TestServer) !void {
+        if (ts.c_display.?.flush() != .SUCCESS) return error.ClientFlushFailed;
+        try ts.display.?.getServer().getEventLoop().dispatch(0);
+        ts.display.?.flushClients();
+        var fds = [_]posix.pollfd{
+            .{ .fd = ts.c_display.?.getFd(), .events = posix.POLL.IN, .revents = 0 },
+        };
+        if (try posix.poll(&fds, 0) > 0) {
+            if (ts.c_display.?.dispatch() != .SUCCESS) {
+                ts.client = null;
+                return error.ClientDispatchFailed;
+            }
+        }
+    }
+};
+
+test "wl_output v2 client receives geometry/mode/scale/done but never name/description" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator, 2);
+    defer ts.deinit();
+
+    // The client bound wl_output at v2.
+    try std.testing.expectEqual(@as(u32, 2), ts.wl_output_proxy.?.getVersion());
+
+    var events: OutputEvents = .{};
+    ts.wl_output_proxy.?.setListener(*OutputEvents, OutputEvents.listener, &events);
+    // First pump delivers the bind-time state send (sendState): the request
+    // from round 2 was still in the client's outbound buffer.
+    try ts.pump();
+
+    // v1 events: geometry and mode.
+    try std.testing.expectEqual(@as(usize, 1), events.geometry_count);
+    try std.testing.expectEqual(@as(usize, 1), events.mode_count);
+    try std.testing.expectEqual(@as(i32, 1920), events.mode_width);
+    try std.testing.expectEqual(@as(i32, 1080), events.mode_height);
+    // v2 events: scale and done.
+    try std.testing.expectEqual(@as(usize, 1), events.scale_count);
+    try std.testing.expectEqual(@as(i32, 1), events.scale_factor);
+    try std.testing.expectEqual(@as(usize, 1), events.done_count);
+    // name/description are since 4 (wayland.xml wl_output events): a v2
+    // client must never receive them (sendState gates at version >= 4).
+    try std.testing.expectEqual(@as(usize, 0), events.name_count);
+    try std.testing.expectEqual(@as(usize, 0), events.description_count);
+
+    // Another pump sends nothing more: the state was a one-shot at bind.
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), events.geometry_count);
+    try std.testing.expectEqual(@as(usize, 1), events.done_count);
+    try std.testing.expectEqual(@as(usize, 0), events.name_count);
+    try std.testing.expectEqual(@as(usize, 0), events.description_count);
 }

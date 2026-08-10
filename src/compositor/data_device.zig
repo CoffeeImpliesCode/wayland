@@ -176,7 +176,14 @@ fn managerRequest(
 ) void {
     switch (request) {
         .create_data_source => |r| {
-            const src_res = server.wl.DataSource.create(resource.getClient(), 3, r.id) catch {
+            // The child inherits the manager's bound version (wlroots:
+            // client_data_source_create(client,
+            // wl_resource_get_version(manager_resource), ...,
+            // wlr_data_device.c:259). The wire carries only the object id,
+            // so libwayland-server never sets the child version — a v1
+            // manager client must get v1 children, or since-3 requests
+            // would be accepted against a client that never agreed to them.
+            const src_res = server.wl.DataSource.create(resource.getClient(), resource.getVersion(), r.id) catch {
                 resource.getClient().postNoMemory();
                 return;
             };
@@ -201,7 +208,11 @@ fn managerRequest(
         },
         .get_data_device => |r| {
             // The seat argument: only our seat's device matters (one seat).
-            const dev_res = server.wl.DataDevice.create(resource.getClient(), 3, r.id) catch {
+            // The device inherits the manager's bound version (wlroots:
+            // data_device_manager_get_data_device,
+            // wl_resource_get_version(manager_resource),
+            // wlr_data_device.c:232-234).
+            const dev_res = server.wl.DataDevice.create(resource.getClient(), resource.getVersion(), r.id) catch {
                 resource.getClient().postNoMemory();
                 return;
             };
@@ -416,7 +427,11 @@ fn deliverSelectionToFocus(mgr: *DataDeviceManager) void {
     for (mgr.devices.items) |dev| {
         if (dev.resource.getClient() != focus_client) continue;
         if (src) |s| {
-            const offer_res = server.wl.DataOffer.create(focus_client, 3, 0) catch return;
+            // The offer is introduced in a data_device event, so its
+            // version follows the device's (wlroots: data_offer_create,
+            // wl_resource_get_version(device_resource),
+            // wlr_data_offer.c:249-251) — never the module maximum.
+            const offer_res = server.wl.DataOffer.create(focus_client, dev.resource.getVersion(), 0) catch return;
             const offer = mgr.allocator.create(DataOffer) catch {
                 offer_res.destroy();
                 return;
@@ -677,6 +692,14 @@ const TestServer = struct {
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, seat and manager all store it).
     fn init(allocator: std.mem.Allocator) !*TestServer {
+        return initAtVersion(allocator, 3);
+    }
+
+    /// init with wl_data_device_manager bound at an explicit version, for
+    /// the legacy-version conformance tests (a v1 manager client speaks an
+    /// older wire: its child objects must be created at v1, not at the
+    /// module maximum).
+    fn initAtVersion(allocator: std.mem.Allocator, ddm_version: u32) !*TestServer {
         const ts = try allocator.create(TestServer);
         errdefer allocator.destroy(ts);
         ts.* = .{
@@ -722,7 +745,7 @@ const TestServer = struct {
         ts.wl_data_device_manager = try registry.bind(
             capture.data_device_manager_name.?,
             client.wl.DataDeviceManager,
-            3,
+            ddm_version,
         );
         try ts.pump();
         // Production clears the seat focus from main.zig's
@@ -1077,4 +1100,39 @@ test "source.set_actions with invalid bits raises invalid_action_mask" {
     src.setActions(@as(DndAction, @bitCast(@as(u32, 8))));
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "v1 manager creates v1 children" {
+    // A client binding wl_data_device_manager at v1 must get v1
+    // wl_data_source and wl_data_device children. The wire carries only
+    // the object id — libwayland-server never sets the child version, so
+    // a hardcoded 3 would accept since-3 requests (finish, set_actions)
+    // against a client that never agreed to them.
+    const allocator = testing.allocator;
+    var ts = try TestServer.initAtVersion(allocator, 1);
+    defer ts.deinit();
+
+    _ = try ts.wl_data_device_manager.?.createDataSource();
+    _ = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.sources.items.len);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
+    try testing.expectEqual(@as(u32, 1), ts.mgr.?.sources.items[0].resource.getVersion());
+    try testing.expectEqual(@as(u32, 1), ts.mgr.?.devices.items[0].resource.getVersion());
+}
+
+test "v3 manager creates v3 children" {
+    // The default bind (module maximum 3): children carry version 3
+    // server-side, so the since-3 requests stay available to a v3 client.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    _ = try ts.wl_data_device_manager.?.createDataSource();
+    _ = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.sources.items.len);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
+    try testing.expectEqual(@as(u32, 3), ts.mgr.?.sources.items[0].resource.getVersion());
+    try testing.expectEqual(@as(u32, 3), ts.mgr.?.devices.items[0].resource.getVersion());
 }

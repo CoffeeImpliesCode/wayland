@@ -1398,6 +1398,12 @@ const TestServer = struct {
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, compositor, shell and seat all store it).
     fn init(allocator: std.mem.Allocator) !*TestServer {
+        return initAtVersion(allocator, 7);
+    }
+
+    /// init with xdg_wm_base bound at an explicit version, for the
+    /// legacy-version conformance tests (a v5 client speaks an older wire).
+    fn initAtVersion(allocator: std.mem.Allocator, wm_base_version: u32) !*TestServer {
         const ts = try allocator.create(TestServer);
         errdefer allocator.destroy(ts);
         ts.* = .{
@@ -1440,7 +1446,7 @@ const TestServer = struct {
 
         // Round 2: bind wl_compositor, xdg_wm_base, wl_shm and wl_seat.
         ts.wl_compositor = try registry.bind(capture.compositor_name.?, client.wl.Compositor, 7);
-        ts.wm_base = try registry.bind(capture.wm_base_name.?, client.xdg.WmBase, 7);
+        ts.wm_base = try registry.bind(capture.wm_base_name.?, client.xdg.WmBase, wm_base_version);
         ts.shm = try registry.bind(capture.shm_name.?, client.wl.Shm, 1);
         ts.wl_seat = try registry.bind(capture.seat_name.?, client.wl.Seat, 7);
         try ts.pump();
@@ -2032,4 +2038,96 @@ test "invalid utf-8 title is rejected without storing" {
     toplevel.setTitle("ok");
     try ts.pump();
     try std.testing.expectEqualStrings("ok", t.title.?);
+}
+
+test "xdg_wm_base v5 client: legacy toplevel roundtrip with since<=5 states only" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.initAtVersion(allocator, 5);
+    defer ts.deinit();
+
+    // The client bound xdg_wm_base at v5 (the version old toolkits speak).
+    try std.testing.expectEqual(@as(u32, 5), ts.wm_base.?.getVersion());
+
+    var new_toplevel: NewToplevelCapture = .{
+        .listener = wire.Listener(*XdgToplevel).init(NewToplevelCapture.notify),
+    };
+    ts.shell.?.events.new_toplevel.add(&new_toplevel.listener);
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const toplevel = try xdg_surface.getToplevel();
+
+    var tl_events: ToplevelEvents = .{};
+    toplevel.setListener(*ToplevelEvents, ToplevelEvents.listener, &tl_events);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    try ts.pump();
+
+    // set_maximized is since 1: a v5 client may send it.
+    toplevel.setMaximized();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ts.shell.?.toplevels.items.len);
+    const t = ts.shell.?.toplevels.items[0];
+    try std.testing.expect(t.pending.maximized);
+
+    // Initial buffer-less commit: the compositor replies with the first
+    // configure (0x0 = client decides, no states).
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), tl_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 0), tl_events.states_len);
+    try std.testing.expectEqual(@as(usize, 1), xs_events.configure_count);
+    const serial1 = xs_events.serial;
+    try std.testing.expectEqual(serial1, t.xdg_surface.configure_serial);
+    try std.testing.expect(!t.xdg_surface.configured);
+
+    // Ack the configure and commit a real buffer: the surface maps.
+    xdg_surface.ackConfigure(serial1);
+    const buffer = try ts.createBuffer();
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(t.xdg_surface.configured);
+    try std.testing.expect(t.xdg_surface.surface.mapped);
+
+    // Compositor-side configure carrying states valid at v5: maximized (1,
+    // since 1) and tiled_left (5, since 2). States newer than v5
+    // (suspended=9 since 6, constrained_*=10..13 since 7) must not appear
+    // in a configure sent to this client.
+    t.current.maximized = true;
+    t.current.tiled_left = true;
+    try t.configure(800, 600);
+    try ts.pump();
+
+    try std.testing.expectEqual(@as(usize, 2), tl_events.configure_count);
+    try std.testing.expectEqual(@as(i32, 800), tl_events.width);
+    try std.testing.expectEqual(@as(i32, 600), tl_events.height);
+    try std.testing.expectEqual(@as(usize, 2), tl_events.states_len);
+    try std.testing.expectEqual(@as(u32, 1), tl_events.states[0]); // maximized
+    try std.testing.expectEqual(@as(u32, 5), tl_events.states[1]); // tiled_left
+    // Every received state must be since <= 5 (xdg-shell.xml state enum:
+    // maximized/fullscreen/resizing/activated = 1, tiled_* = 2,
+    // suspended = 6, constrained_* = 7).
+    for (tl_events.states[0..tl_events.states_len]) |state| {
+        const since: u32 = switch (state) {
+            1, 2, 3, 4 => 1,
+            5, 6, 7, 8 => 2,
+            9 => 6,
+            10, 11, 12, 13 => 7,
+            else => unreachable,
+        };
+        try std.testing.expect(since <= 5);
+    }
+    const serial2 = xs_events.serial;
+    try std.testing.expect(serial2 != serial1);
+    try std.testing.expectEqual(geom.Size{ .w = 800, .h = 600 }, t.configured_size);
+
+    // The v5 client acks and stays mapped (re-attach: a commit with no
+    // pending buffer is a NULL-buffer commit and would unmap).
+    xdg_surface.ackConfigure(serial2);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(serial2, t.xdg_surface.acked_serial.?);
+    try std.testing.expect(t.xdg_surface.surface.mapped);
 }
