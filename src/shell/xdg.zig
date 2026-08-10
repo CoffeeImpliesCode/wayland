@@ -2248,7 +2248,7 @@ const TestServer = struct {
         errdefer if (ts.compositor) |c| c.deinit();
         ts.shell = try XdgShell.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, ts.compositor.?);
         errdefer if (ts.shell) |s| s.deinit();
-        ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, .{});
         errdefer if (ts.seat) |s| s.deinit();
 
         // In-memory client connection: one socketpair end for the server, the

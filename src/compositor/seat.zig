@@ -32,6 +32,11 @@
 //!
 //! Imports: utils/*, core/wire.zig, core/display.zig, buffers (via the
 //! surface), compositor/surface.zig + xkb.zig (sibling modules).
+//!
+//! Configuration: `Seat.init` takes an `Options` struct for the optional
+//! bits — keyboard layout (forwarded to Xkb) and which capabilities to
+//! announce and serve (keyboard/pointer). Defaults preserve the current
+//! behavior: layout "us", keyboard + pointer on.
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
@@ -153,11 +158,28 @@ const SeatClient = struct {
 /// F9 enforces it in set_cursor.
 const cursor_role: role_mod.SurfaceRole = .{ .name = "wl_pointer-cursor" };
 
+/// Seat configuration. Only optional/defaulted arguments live here;
+/// allocator/io/log_cfg/display stay positional.
+pub const Options = struct {
+    /// Keymap layout for the wl_keyboard (forwarded to Xkb.init).
+    layout: []const u8 = "us",
+    /// Advertise and serve the wl_keyboard capability. Off: the
+    /// capability bit is not announced and get_keyboard yields a dead
+    /// object (no keymap, no events).
+    keyboard: bool = true,
+    /// Advertise and serve the wl_pointer capability. Off: the
+    /// capability bit is not announced and get_pointer yields a dead
+    /// object (no events).
+    pointer: bool = true,
+};
+
 pub const Seat = struct {
     allocator: std.mem.Allocator,
     io: *std.Io,
     log_cfg: *const log.Config,
     display: *display_mod.CompositorDisplay,
+    /// The configured capabilities/layout (see Options).
+    options: Options,
     /// The wl_seat global, for teardown.
     global: ?*wire.Global = null,
     xkb: *xkb_mod.Xkb,
@@ -271,6 +293,11 @@ pub const Seat = struct {
         /// focused surface: the compositor's camera zoom is a viewport
         /// operation, not a client delivery.
         axis: wire.Signal(*Seat),
+        /// wl_pointer.set_cursor applied a new cursor surface + hotspot
+        /// (the seat state cursor_surface_resource/cursor_hotspot_x/y is
+        /// already updated). The cursor compositor hooks this to know
+        /// when the client cursor image changed.
+        cursor_surface: wire.Signal(*Seat),
     },
 
     /// Result of a hit test: the surface and the pointer position in
@@ -286,8 +313,9 @@ pub const Seat = struct {
         io: *std.Io,
         log_cfg: *const log.Config,
         display: *display_mod.CompositorDisplay,
+        options: Options,
     ) error{ OutOfMemory, GlobalCreateFailed, XkbInitFailed, KeymapBuildFailed, KeymapMemfdFailed }!*Seat {
-        const xkb = try xkb_mod.Xkb.init(allocator, io, log_cfg, "us");
+        const xkb = try xkb_mod.Xkb.init(allocator, io, log_cfg, .{ .layout = options.layout });
         errdefer xkb.deinit();
         const self = try allocator.create(Seat);
         errdefer allocator.destroy(self);
@@ -296,6 +324,7 @@ pub const Seat = struct {
             .io = io,
             .log_cfg = log_cfg,
             .display = display,
+            .options = options,
             .xkb = xkb,
             .keyboards = .empty,
             .pressed = .empty,
@@ -319,6 +348,7 @@ pub const Seat = struct {
         self.events.pointer_move.init();
         self.events.keyboard_focus.init();
         self.events.axis.init();
+        self.events.cursor_surface.init();
         self.global = try display.addGlobal(server.wl.Seat, *Seat, bindSeat, seat_version, self);
         log.debug("seat created (keyboard + pointer)", io, log_cfg, "seat", .{});
         return self;
@@ -999,7 +1029,10 @@ fn bindSeat(wl_client: *wire.Client, seat: *Seat, version: u32, id: u32) void {
         return;
     };
     resource.setHandler(*Seat, seatRequest, null, seat);
-    resource.sendCapabilities(.{ .keyboard = true, .pointer = true });
+    resource.sendCapabilities(.{
+        .keyboard = seat.options.keyboard,
+        .pointer = seat.options.pointer,
+    });
     if (resource.getVersion() >= 2) resource.sendName("default");
 }
 
@@ -1011,6 +1044,9 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
                 return;
             };
             kbd.setHandler(*Seat, keyboardRequest, keyboardDestroy, seat);
+            // Capability disabled: keep the object dead (no keymap, no
+            // events, no list entry) — mirrors the get_touch dead object.
+            if (!seat.options.keyboard) return;
             seat.keyboards.append(seat.allocator, kbd) catch {
                 resource.getClient().postNoMemory();
                 return;
@@ -1041,6 +1077,9 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
                 return;
             };
             ptr.setHandler(*Seat, pointerRequest, pointerDestroy, seat);
+            // Capability disabled: keep the object dead (no events, no
+            // list entry) — mirrors the get_touch dead object.
+            if (!seat.options.pointer) return;
             seat.pointers.append(seat.allocator, ptr) catch {
                 resource.getClient().postNoMemory();
                 return;
@@ -1142,6 +1181,7 @@ fn pointerRequest(resource: *server.wl.Pointer, request: server.wl.Pointer.Reque
             seat.cursor_surface_resource = r.surface;
             seat.cursor_hotspot_x = r.hotspot_x;
             seat.cursor_hotspot_y = r.hotspot_y;
+            seat.events.cursor_surface.emit(seat);
             log.debug("cursor surface set (serial={d})", seat.io, seat.log_cfg, "seat", .{r.serial});
         },
         .release => resource.destroy(),
@@ -1303,6 +1343,16 @@ fn testPick(ctx: *anyopaque, x: i32, y: i32) ?Seat.PickResult {
     return null;
 }
 
+/// cursor_surface signal test fixtures (the F9 test): how many times a
+/// set_cursor was accepted.
+var test_cursor_surface_count: usize = 0;
+// SAFETY: test fixture; initialized via .init(handler) inside the test.
+var test_cursor_surface_listener: wire.Listener(*Seat) = undefined;
+
+fn testCursorSurfaceNotify(_: *wire.Listener(*Seat), _: *Seat) void {
+    test_cursor_surface_count += 1;
+}
+
 /// A full compositor + seat + two in-memory clients, for wire
 /// roundtrips. `clients` tracks how many clients are connected so a
 /// failed init can tear down safely.
@@ -1333,7 +1383,7 @@ const TestServer = struct {
         errdefer ts.deinit();
         ts.display = try display_mod.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
         ts.compositor = try compositor_mod.Compositor.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
-        ts.seat = try Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        ts.seat = try Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, .{});
         ts.seat.?.setPick(testPick, &ts.pick_state);
         try connectClient(ts, &ts.a);
         try connectClient(ts, &ts.b);
@@ -1753,11 +1803,19 @@ test "set_cursor requires focus, a valid serial and the cursor role (F9)" {
     const seat = ts.seat.?;
     const surface_a = surfaceForClient(ts, a.server);
 
+    // The cursor_surface signal fires exactly when set_cursor is
+    // accepted (the cursor compositor hooks it to re-import the image).
+    test_cursor_surface_count = 0;
+    test_cursor_surface_listener = wire.Listener(*Seat).init(testCursorSurfaceNotify);
+    seat.events.cursor_surface.add(&test_cursor_surface_listener);
+    defer if (test_cursor_surface_listener.link.prev != null) test_cursor_surface_listener.link.remove();
+
     // Unfocused: any client's set_cursor is ignored (the old code let
     // ANY client set the cursor while the pointer was outside surfaces).
     a.pointer.setCursor(1234, a.surface, 0, 0);
     try ts.pump();
     try std.testing.expect(seat.cursorSurface() == null);
+    try std.testing.expectEqual(@as(usize, 0), test_cursor_surface_count);
 
     // Focus A; the enter serial becomes valid for A.
     ts.pick_state.surface = surface_a;
@@ -1770,18 +1828,22 @@ test "set_cursor requires focus, a valid serial and the cursor role (F9)" {
     a.pointer.setCursor(bogus, a.surface, 1, 2);
     try ts.pump();
     try std.testing.expect(seat.cursorSurface() == null);
+    try std.testing.expectEqual(@as(usize, 0), test_cursor_surface_count);
 
     // The unfocused client B with a valid-looking serial: ignored.
     b.pointer.setCursor(valid_serial, b.surface, 0, 0);
     try ts.pump();
     try std.testing.expect(seat.cursorSurface() == null);
+    try std.testing.expectEqual(@as(usize, 0), test_cursor_surface_count);
 
-    // Focused client + valid serial: accepted, hotspot recorded.
+    // Focused client + valid serial: accepted, hotspot recorded, signal
+    // fired once.
     a.pointer.setCursor(valid_serial, a.surface, 5, 6);
     try ts.pump();
     try std.testing.expect(seat.cursorSurface() != null);
     try std.testing.expectEqual(@as(i32, 5), seat.cursor_hotspot_x);
     try std.testing.expectEqual(@as(i32, 6), seat.cursor_hotspot_y);
+    try std.testing.expectEqual(@as(usize, 1), test_cursor_surface_count);
 
     // Role conflict: a surface with a different role posts
     // WL_POINTER_ERROR_ROLE on the pointer resource (wlroots
@@ -1794,6 +1856,7 @@ test "set_cursor requires focus, a valid serial and the cursor role (F9)" {
     a.pointer.setCursor(valid_serial, a.surface, 0, 0);
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     try std.testing.expectEqual(@as(i32, 5), seat.cursor_hotspot_x);
+    try std.testing.expectEqual(@as(usize, 1), test_cursor_surface_count);
 }
 
 test "keymap change re-broadcasts to all clients (F10)" {

@@ -14,11 +14,9 @@
 //! bindings ("raylib_c", wired in build.zig when -Denable_raylib).
 
 const std = @import("std");
-const wayland = @import("wayland");
+const seat_mod = @import("../compositor/seat.zig");
+const xkb_mod = @import("../compositor/xkb.zig");
 const raylib = @import("raylib_c");
-
-const seat_mod = wayland.seat;
-const xkb_mod = wayland.xkb;
 
 /// raylib KEY_* -> xkb keycode (evdev scancode + 8). Printable ASCII keys
 /// map by table below; raylib uses GLFW-style codes for the rest.

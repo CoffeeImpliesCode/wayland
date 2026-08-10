@@ -660,7 +660,7 @@ const TestServer = struct {
         errdefer if (ts.display) |d| d.deinit();
         ts.compositor = try compositor_mod.Compositor.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
         errdefer if (ts.compositor) |c| c.deinit();
-        ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, .{});
         errdefer if (ts.seat) |s| s.deinit();
         ts.activation = try XdgActivation.init(
             allocator,

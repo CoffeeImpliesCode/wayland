@@ -7,6 +7,10 @@
 //! bindings — the same interpretation clients perform on our keymap.
 //!
 //! Imports: utils/log.zig (sibling module).
+//!
+//! Configuration: `Xkb.init` takes an `Options` struct whose `layout`
+//! field selects the keymap layout (default "us"); `setLayout` replaces
+//! the keymap at runtime.
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
@@ -69,6 +73,13 @@ const xkb_state_layout_effective: c_int = 1 << 16;
 /// so the seat converts at the send sites (note 132 F1).
 pub const Keycode = u32;
 
+/// Xkb configuration. Only optional/defaulted arguments live here;
+/// allocator/io/log_cfg stay positional.
+pub const Options = struct {
+    /// Keymap layout name (e.g. "us", "de"), passed to xkbcommon.
+    layout: []const u8 = "us",
+};
+
 /// Owned xkbcommon context + keymap + state. Not thread-safe (used from
 /// the server's single event-loop thread).
 pub const Xkb = struct {
@@ -86,21 +97,27 @@ pub const Xkb = struct {
     keymap_fd: std.posix.fd_t,
     keymap_size: u32,
 
-    /// Build a keymap from the given layout name (e.g. "us") with default
-    /// rules/model. Fails when xkbcommon cannot load the layout data.
+    /// Build a keymap from the configured layout name (default "us")
+    /// with default rules/model. Fails when xkbcommon cannot load the
+    /// layout data.
     pub fn init(
         allocator: std.mem.Allocator,
         io: *std.Io,
         log_cfg: *const log.Config,
-        layout: [:0]const u8,
+        options: Options,
     ) error{ XkbInitFailed, KeymapBuildFailed, KeymapMemfdFailed, OutOfMemory }!*Xkb {
+        // xkb_rule_names.layout is a C string; Options.layout may be an
+        // unterminated slice, so build a sentinel copy.
+        const layout_z = allocator.dupeZ(u8, options.layout) catch return error.OutOfMemory;
+        defer allocator.free(layout_z);
+
         const ctx = c.xkb_context_new(0) orelse return error.XkbInitFailed;
         errdefer c.xkb_context_unref(ctx);
 
         var names: c.xkb_rule_names = .{
             .rules = null,
             .model = null,
-            .layout = layout.ptr,
+            .layout = layout_z.ptr,
             .variant = null,
             .options = null,
         };
@@ -147,7 +164,7 @@ pub const Xkb = struct {
             .keymap_size = @intCast(text_len),
         };
         log.debug("xkb keymap built (layout {s}, {d} bytes)", io, log_cfg, "xkb", .{
-            layout, text_len,
+            options.layout, text_len,
         });
         return self;
     }
@@ -262,7 +279,7 @@ test "xkb builds the us keymap and resolves keysyms" {
     const io: *std.Io = &io_storage;
     var log_cfg: log.Config = .{ .min_level = .err };
 
-    const xkb = Xkb.init(allocator, io, &log_cfg, "us") catch |err| {
+    const xkb = Xkb.init(allocator, io, &log_cfg, .{}) catch |err| {
         // xkeyboard-config must be available in the test environment.
         std.debug.print("xkb init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
         return;

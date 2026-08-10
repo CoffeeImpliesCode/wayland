@@ -23,6 +23,15 @@ const output_mod = @import("../output/output.zig");
 const renderer_mod = @import("../renderer/renderer.zig");
 const pass_mod = @import("../renderer/pass.zig");
 const texture_mod = @import("../renderer/texture.zig");
+// The surface→scene binding (scene/surface_node.zig): the scene owns the
+// tracked-surface registry (like wlr_scene owning its surface list,
+// types/scene/surface.c). Scene depends on the compositor surface +
+// subsurface types (same direction wlroots takes: wlr_scene includes
+// wlr_surface).
+const surface_mod = @import("../compositor/surface.zig");
+const subsurface_mod = @import("../compositor/subsurface.zig");
+const wl_output_mod = @import("../output/wl_output.zig");
+const surface_node_mod = @import("surface_node.zig");
 
 const Rect = geom.Rect;
 const FRect = geom.FRect;
@@ -34,6 +43,25 @@ pub const Scene = struct {
     io: *std.Io,
     log_cfg: *const log.Config,
     root: *SceneNode, // kind .tree, position (0,0)
+    /// Tracked surface→node bindings (scene/surface_node.zig): the
+    /// library's surface→scene table. The compositor decides which
+    /// surfaces get bindings (trackSurface call sites); the bindings own
+    /// the surface→node lifecycle.
+    surface_nodes: std.AutoHashMap(*surface_mod.Surface, *surface_node_mod.SurfaceNode),
+    /// The frame's presented surfaces (presentation feedback targets),
+    /// rebuilt per frame by collectPresented.
+    presented: std.ArrayList(*surface_mod.Surface) = .empty,
+    /// The scene's output views (SceneOutput.create registers itself):
+    /// the surface enter/leave association (which output a node is
+    /// rendered on) resolves against these.
+    scene_outputs: std.ArrayList(*SceneOutput) = .empty,
+    /// The compositor's wl_output global: the surface enter/leave wire
+    /// events go to the wl_output resources bound by the surface's
+    /// client (set by the compositor; null = no wire enter/leave).
+    wl_output: ?*wl_output_mod.WlOutput = null,
+    /// The compositor's subcompositor: subsurface tree parenting (set by
+    /// the compositor; null = no subsurface support).
+    subcompositor: ?*subsurface_mod.Subcompositor = null,
 
     pub fn init(allocator: std.mem.Allocator, io: *std.Io, log_cfg: *const log.Config) !*Scene {
         const root = try SceneNode.create(allocator, null, .tree);
@@ -45,13 +73,21 @@ pub const Scene = struct {
             .io = io,
             .log_cfg = log_cfg,
             .root = root,
+            .surface_nodes = std.AutoHashMap(*surface_mod.Surface, *surface_node_mod.SurfaceNode).init(allocator),
         };
         log.debug("scene created", io, log_cfg, "scene", .{});
         return self;
     }
 
-    /// Destroy the scene and every node in the tree.
+    /// Destroy the scene: every tracked surface binding first (their
+    /// nodes + surface listeners), then every node and the scene itself.
+    /// The compositor may destroy its surfaces after the scene, so the
+    /// surface destroy signals must not reach freed bindings.
     pub fn deinit(scene: *Scene) void {
+        surface_node_mod.untrackAll(scene);
+        scene.surface_nodes.deinit();
+        scene.presented.deinit(scene.allocator);
+        scene.scene_outputs.deinit(scene.allocator);
         scene.root.destroy(scene.allocator);
         const allocator = scene.allocator;
         allocator.destroy(scene);
@@ -291,6 +327,8 @@ pub const SceneOutput = struct {
             .x = 0,
             .y = 0,
         };
+        // (the errdefer frees self on failure)
+        try scene.scene_outputs.append(allocator, self);
         log.debug(
             "scene output created for output {d}x{d}",
             io,
@@ -305,8 +343,13 @@ pub const SceneOutput = struct {
     /// NOT freed: a scene can be shared across outputs — call Scene.deinit
     /// to destroy the tree.
     pub fn destroy(so: *SceneOutput) void {
-        const allocator = so.scene.allocator;
+        const scene = so.scene;
+        const allocator = scene.allocator;
         so.damage_ring.deinit();
+        // Unregister from the scene (surface enter/leave association).
+        if (std.mem.findScalar(*SceneOutput, scene.scene_outputs.items, so)) |idx| {
+            _ = scene.scene_outputs.orderedRemove(idx);
+        }
         allocator.destroy(so);
     }
 

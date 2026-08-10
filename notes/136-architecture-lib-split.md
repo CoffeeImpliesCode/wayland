@@ -105,17 +105,27 @@ no globals. The Options structs are the missing piece.
 ## 5. Prioritized fix plan
 
 1. [V1, mechanical] Move raylib backend + input to src/backend/, export
-   from root.zig, keep the -Denable_raylib build gate. ~1h.
-2. [V3, small] Xkb/Seat Options: layout + caps configurable. ~2h.
+   from root.zig, keep the -Denable_raylib build gate. — DONE 2026-08-10
+   (src/backend/raylib.zig + raylib_input.zig + raylib_c.h, root.zig
+   exports, build.zig shared build_options/raylib_c module instances).
+2. [V3, small] Xkb/Seat Options: layout + caps configurable. — DONE
+   2026-08-10 (Seat.Options {layout, keyboard, pointer} + Xkb.Options
+   {layout}; core deps stay positional per the author's correction:
+   Options structs are for optional/with-default args only).
 3. [V2, medium] Move the surface->scene binding table + enter/leave into
    the library (scene gets a SurfaceNode binding; the seat/scene wiring
-   for enter/leave moves from main.zig). ~1 day.
+   for enter/leave moves from main.zig). — DONE 2026-08-10
+   (src/scene/surface_node.zig: trackSurface/SurfaceNode/collectPresented/
+   addSurfaceDamage/untrackAll; enter/leave wire events library-side;
+   ~800 lines of main.zig glue removed).
 4. [V2, medium] Move the cursor (update/draw/footprints) into the library
-   as a Cursor helper on the seat + scene. ~1 day.
+   as a Cursor helper on the seat + scene. — DONE 2026-08-10
+   (src/compositor/cursor.zig: Cursor.create/update/footprints/draw/
+   deinit + seat.events.cursor_surface).
 5. [Q3, ongoing] Introduce Options structs per module as inits change
-   (start with Seat/Xkb/backends/shm per the list above). Rolled into the
-   fixes above; keep the positional API stable until each module's
-   options land.
+   (start with Seat/Xkb/backends/shm per the list above). — Partially
+   done: Seat/Xkb; the rest rolls in as their inits change. The
+   positional core deps (allocator/io/log_cfg/display) stay positional.
 6. Defer: the render-loop orchestration stays compositor-side (zio
    decision, note 114/118).
 

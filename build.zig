@@ -151,7 +151,7 @@ pub fn build(b: *Build) void {
     const tracy = b.dependency("tracy", .{ .target = target, .optimize = optimize });
     const tracy_enabled = b.option(bool, "enable_tracy", "Enable the Tracy profiler") orelse false;
 
-    // Raylib debug backend (src/server/raylib.zig): windowed output
+    // Raylib debug backend (src/backend/raylib.zig): windowed output
     // visualization for the test server. ON by default. When disabled the
     // server builds without raylib (main.zig guards the import through the
     // build_options module below).
@@ -159,6 +159,14 @@ pub fn build(b: *Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_raylib", enable_raylib);
+    // ONE shared module instance: lib + server + tests must see the same
+    // "build_options" module, or Zig renames the second instance
+    // (build_options0) and root.zig's import collides.
+    const build_options_mod = build_options.createModule();
+    // root.zig gates its raylib/raylib_input exports' comptime analysis
+    // on build_options.enable_raylib (the files import "raylib_c", which
+    // only exists with -Denable_raylib).
+    lib.addImport("build_options", build_options_mod);
 
     const server_exe = b.addExecutable(.{
         .name = "wayland-server",
@@ -170,7 +178,7 @@ pub fn build(b: *Build) void {
                 .{ .name = "wayland", .module = lib },
                 .{ .name = "zio", .module = zio.module("zio") },
                 .{ .name = "tracy", .module = tracy.module("tracy") },
-                .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "build_options", .module = build_options_mod },
             },
         }),
     });
@@ -187,7 +195,7 @@ pub fn build(b: *Build) void {
         // outside the devenv shell. Linking also goes through pkg-config
         // (use_pkg_config = .force), so the same PKG_CONFIG_PATH applies.
         const raylib_c = b.addTranslateC(.{
-            .root_source_file = b.path("src/server/raylib_c.h"),
+            .root_source_file = b.path("src/backend/raylib_c.h"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -200,7 +208,13 @@ pub fn build(b: *Build) void {
                 break;
             }
         }
-        server_exe.root_module.addImport("raylib_c", raylib_c.createModule());
+        // The library module (root.zig exports backend/raylib.zig) needs
+        // "raylib_c" too, and raylib linked into every artifact using the
+        // library (lib_tests, the demo exe) — same wiring shape as drm_c.
+        const raylib_c_mod = raylib_c.createModule();
+        lib.addImport("raylib_c", raylib_c_mod);
+        lib.linkSystemLibrary("raylib", .{ .use_pkg_config = .force });
+        server_exe.root_module.addImport("raylib_c", raylib_c_mod);
         server_exe.root_module.linkSystemLibrary("raylib", .{ .use_pkg_config = .force });
     }
     server_exe.root_module.linkSystemLibrary("xkbcommon", .{});

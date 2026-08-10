@@ -20,14 +20,14 @@
 //! build.zig when -Denable_raylib).
 
 const std = @import("std");
-const wayland = @import("wayland");
+const log_mod = @import("../utils/log.zig");
+const wire = @import("../core/wire.zig");
+const backend = @import("backend.zig");
+const output = @import("../output/output.zig");
+const pixman = @import("../renderer/pixman.zig");
+const damage_mod = @import("../utils/damage.zig");
+const Damage = damage_mod.Damage;
 const raylib = @import("raylib_c");
-
-const log_mod = wayland.utils.log;
-const wire = wayland.wire;
-const backend = wayland.backend;
-const output = wayland.output;
-const pixman = wayland.pixman;
 
 const Raylib = struct {
     loop: *wire.EventLoop,
@@ -324,7 +324,7 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
 /// (the visible framebuffer content is then unchanged).
 const UploadRegion = struct { x: usize, y: usize, w: usize, h: usize };
 
-fn uploadRegion(damage: *const wayland.utils.damage.Damage, fb_w: i32, fb_h: i32) ?UploadRegion {
+fn uploadRegion(damage: *const Damage, fb_w: i32, fb_h: i32) ?UploadRegion {
     if (damage.whole) return null;
     const box = damage.boundingRect() orelse return null;
     // Saturate the box edges in i64: damage rects are a hint and can lie

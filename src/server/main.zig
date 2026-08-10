@@ -30,7 +30,7 @@ const build_options = @import("build_options");
 /// The raylib debug backend is only linked when build.zig's
 /// -Denable_raylib option is on; main only references it behind a
 /// comptime guard on build_options.enable_raylib.
-const raylib_impl = @import("raylib.zig");
+const raylib_impl = @import("wayland").raylib;
 const raylib_mod = if (build_options.enable_raylib) raylib_impl else null;
 /// DRM/KMS backend (src/backend/drm.zig): native output on /dev/dri/cardN
 /// with dumb-buffer scanout (WAYLAND_BACKEND=drm).
@@ -40,7 +40,7 @@ const drm_mod = @import("wayland").drm;
 const libinput_mod = @import("wayland").libinput;
 /// The raylib input source feeds the seat from the window's keyboard and
 /// mouse; same -Denable_raylib guard.
-const raylib_input_impl = @import("raylib_input.zig");
+const raylib_input_impl = @import("wayland").raylib_input;
 const raylib_input_mod = if (build_options.enable_raylib) raylib_input_impl else null;
 /// The ServerState field type: real pointer with raylib, void without
 /// (a bare `?*null.RaylibInput` would not compile headless-only builds).
@@ -66,10 +66,6 @@ const log = wayland.utils.log;
 const geom = wayland.utils.geom;
 const wire = wayland.wire;
 const pixman = wayland.pixman;
-/// wl_output_transform box/point helpers (utils/matrix.zig): the surface
-/// size of a buffer under the surface's scale+transform (buffer -> surface
-/// per wlroots util/box.c:105-145, ported 1:1).
-const matrix = wayland.utils.matrix;
 
 // Library types not re-exported from root.zig. Zig 0.16 module ownership
 // forbids importing a library file into the server module, so the types
@@ -100,52 +96,11 @@ const watchdog_timeout_ms: u64 = 5000;
 const xdg_ping_interval_ms: u64 = 5000;
 /// Background color (straight alpha RGBA).
 const background_color = [4]f32{ 0.1, 0.1, 0.12, 1.0 };
-/// Fallback cursor: a small light rect when no client cursor surface.
-const cursor_size: i32 = 16;
 /// The pointer-move threshold (px, squared) before a left-button press
 /// becomes a camera drag. A click with sub-threshold micro-movement keeps
 /// the seat's click-to-focus (the terminal gets the keyboard) instead of
 /// panning the camera.
 const drag_threshold_sq: i32 = 16; // 4 px
-const cursor_color = [4]f32{ 0.95, 0.95, 0.95, 1.0 };
-
-/// Per-surface scene state: the SceneBufferNode that draws the surface's
-/// current buffer, plus the listeners that keep it in sync (commit
-/// updates the texture, destroy removes it and frees the entry).
-///
-/// Each surface also owns a .tree container node (`tree`, under
-/// scene.root for toplevels, under the PARENT surface's tree for
-/// subsurfaces). The buffer node is the tree's first child; a surface's
-/// subsurfaces are its siblings' trees appended after it — draw order =
-/// children order, so a subsurface draws above its parent but below any
-/// later sibling, and never above unrelated toplevels (notes/107 gap 9:
-/// the old flat re-append drew every subsurface above EVERYTHING).
-const SurfaceEntry = struct {
-    state: *ServerState,
-    surface: *Surface,
-    /// The .tree container holding `node` (and, for non-subsurfaces, the
-    /// subtrees of this surface's subsurfaces). Null while unmapped.
-    tree: ?*wayland.scene.SceneNode = null,
-    /// The surface's buffer node (the tree's first child; what the seat
-    /// picks and the canvas draws).
-    node: ?*wayland.scene.SceneNode = null,
-    commit_listener: wire.Listener(*Surface),
-    destroy_listener: wire.Listener(*Surface),
-    /// wl_surface.unmap signal listener: drops the scene node when the
-    /// surface stops being mapped. Covers the forced-unmap path (a
-    /// destroyed wl_subsurface unmaps its child, note 132 F6) that has
-    /// no commit to carry it; idempotent with onSurfaceCommit's
-    /// updateSurfaceNode (removeSurfaceNode nulls the node/tree slots).
-    unmap_listener: wire.Listener(*Surface),
-    /// wl_surface.enter/leave signal listeners (the surface module emits
-    /// the signals on output enter/leave; these send the wire events).
-    enter_listener: wire.Listener(*wayland.output.Output),
-    leave_listener: wire.Listener(*wayland.output.Output),
-    /// Enter/leave: whether wl_surface.enter was sent for this surface
-    /// (single-output server). Guards the wire events so map/unmap/destroy
-    /// firing patterns can never double-send.
-    entered: bool = false,
-};
 
 const ServerState = struct {
     allocator: std.mem.Allocator,
@@ -201,21 +156,13 @@ const ServerState = struct {
     /// wl_output protocol global for the backend output.
     wl_output: ?*wayland.wl_output.WlOutput = null,
     screencopy: ?*wayland.screencopy.Screencopy = null,
-    /// Cursor rendering: a fallback rect node plus a buffer node showing
-    /// the client cursor surface (wl_pointer.set_cursor). Non-pickable.
-    cursor_rect_node: ?*wayland.scene.SceneNode = null,
-    cursor_buf_node: ?*wayland.scene.SceneNode = null,
-    cursor_texture: ?*Texture = null,
-    /// M4: the fallback cursor's texture (a light-grey cursor_size²
-    /// square — the M3 fallback rect's color), created lazily on first
-    /// render and owned by the state.
-    cursor_fallback_texture: ?*Texture = null,
+    /// The seat's pointer cursor (compositor/cursor.zig): owns the
+    /// cursor scene nodes, the client cursor surface (wl_pointer.
+    /// set_cursor) texture and the fallback texture; the compositor
+    /// keeps the repaint policy. Created in onNewOutput, freed in
+    /// cleanupSurfaceEntries.
+    cursor: ?*wayland.cursor.Cursor = null,
     presentation: *wayland.presentation.Presentation,
-    /// Per-surface scene state, keyed by the compositor surface
-    /// (initialized in the state literal with the server allocator).
-    surface_entries: std.AutoHashMap(*Surface, *SurfaceEntry),
-    /// Surfaces drawn this frame (presentation feedback targets), reused.
-    presented: std.ArrayList(*Surface) = .empty,
     /// The zio loop, set once initialized (callbacks stop it).
     loop: ?*zio.ev.Loop = null,
     /// One-shot watchdog timer, re-armed on every render.
@@ -407,7 +354,7 @@ pub fn main(init: std.process.Init) !void {
     const layer_shell = try wayland.layer_shell.LayerShell.init(allocator, io, &log_cfg, display, compositor);
     defer layer_shell.deinit();
     // M3: the seat (keyboard + pointer) with the xkbcommon us keymap.
-    const seat = try wayland.seat.Seat.init(allocator, io, &log_cfg, display);
+    const seat = try wayland.seat.Seat.init(allocator, io, &log_cfg, display, .{});
     defer seat.deinit();
     // F10: runtime layout selection (WAYLAND_KEYBOARD_LAYOUT, default
     // "us" compiled by Seat.init) — recompiles the keymap and
@@ -565,7 +512,6 @@ pub fn main(init: std.process.Init) !void {
         },
         .camera_env = init.environ_map.get("WAYLAND_CAMERA"),
         .presentation = presentation,
-        .surface_entries = std.AutoHashMap(*Surface, *SurfaceEntry).init(allocator),
         .toplevels = .empty,
         .layer_surfaces = .empty,
         .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
@@ -839,6 +785,11 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
     // a scene rect node — the scene graph is no longer rendered.
     self.scene = scene;
     self.scene_output = scene_output;
+    // The scene's surface bindings need the compositor's subcompositor
+    // (subsurface tree parenting) and wl_output (the surface enter/leave
+    // wire events). Set before any surface is tracked (surfaces only
+    // appear after backend.start()).
+    scene.subcompositor = self.subcompositor;
     out.events.frame.add(&self.frame_listener);
 
     // M3: expose the output to clients (geometry/mode/scale/name) and
@@ -855,23 +806,22 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
         log.err("wl_output create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
-    const cursor_rect = wayland.scene.SceneNode.create(self.allocator, scene.root, .rect) catch |err| {
-        log.err("cursor rect create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+    // The surface enter/leave wire events ride the wl_output resources.
+    scene.wl_output = self.wl_output;
+    // The seat's pointer cursor: its scene nodes are drawn above the
+    // surfaces, never picked.
+    self.cursor = wayland.cursor.Cursor.create(
+        self.allocator,
+        self.io,
+        self.log_cfg,
+        scene,
+        self.compositor,
+        self.seat,
+        self.renderer,
+    ) catch |err| {
+        log.err("cursor init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
-    cursor_rect.pickable = false;
-    cursor_rect.kind.rect.width = cursor_size;
-    cursor_rect.kind.rect.height = cursor_size;
-    cursor_rect.kind.rect.color = cursor_color;
-    cursor_rect.enable(false);
-    self.cursor_rect_node = cursor_rect;
-    const cursor_buf = wayland.scene.SceneNode.create(self.allocator, scene.root, .buffer) catch |err| {
-        log.err("cursor buffer create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
-    };
-    cursor_buf.pickable = false;
-    cursor_buf.enable(false);
-    self.cursor_buf_node = cursor_buf;
 
     // Enable the output up front: sendFrame gates the frame signal on
     // enabled (wlroots output.c:833-837), so the first requestRender
@@ -972,10 +922,11 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
 }
 
 /// A new zwlr_layer_surface_v1 role object was created. Like toplevels,
-/// layer surfaces composite through the shared surface_entries path
-/// (syncSurfaces/updateSurfaceNode keyed on every compositor surface), so
-/// no scene wiring is needed here. The initial configure is sent by the
-/// module in reply to the client's first buffer-less commit (per the
+/// layer surfaces composite through the shared surface→scene path
+/// (syncSurfaces tracks every compositor surface through the library's
+/// SurfaceNode bindings), so no scene wiring is needed here. The initial
+/// configure is sent by the module in reply to the client's first
+/// buffer-less commit (per the
 /// protocol: "the client must perform an initial commit without any buffer
 /// attached. The compositor will reply with a layer_surface.configure
 /// event"); the module carries the output size as the assigned size for the
@@ -1148,12 +1099,14 @@ fn onDisplayReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     // when the renderer is otherwise idle — a real change already queues
     // a render that presents everything.
     if (!self.repaint_pending and !self.in_render) {
-        var it = self.surface_entries.valueIterator();
-        while (it.next()) |ep| {
-            if (ep.*.surface.current.frame_callbacks.items.len > 0) {
-                self.frame_kick = true;
-                requestRender(self);
-                break;
+        if (self.scene) |scene| {
+            var it = scene.surface_nodes.valueIterator();
+            while (it.next()) |sn| {
+                if (sn.*.surface.current.frame_callbacks.items.len > 0) {
+                    self.frame_kick = true;
+                    requestRender(self);
+                    break;
+                }
             }
         }
     }
@@ -1234,11 +1187,13 @@ fn maybeSynthInput(self: *ServerState) void {
     if (!self.synth_input) return;
     if (!self.synth_fired) {
         var any_mapped = false;
-        var entry_it = self.surface_entries.valueIterator();
-        while (entry_it.next()) |ep| {
-            if (ep.*.node != null) {
-                any_mapped = true;
-                break;
+        if (self.scene) |scene| {
+            var entry_it = scene.surface_nodes.valueIterator();
+            while (entry_it.next()) |sn| {
+                if (sn.*.node != null) {
+                    any_mapped = true;
+                    break;
+                }
             }
         }
         if (any_mapped) {
@@ -1324,12 +1279,10 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     };
 
     // M3 cursor: follow the seat pointer, show the client cursor surface
-    // or the fallback rect. Capture the previous frame's cursor footprints
-    // BEFORE updateCursor moves the nodes: a partial upload must repaint
+    // or the fallback rect. update() captures the previous frame's
+    // footprints BEFORE moving the nodes: a partial upload must repaint
     // both the old and the new position.
-    const old_cursor = cursorFootprints(self);
-    updateCursor(self);
-    const new_cursor = cursorFootprints(self);
+    const cursor_fp = self.cursor.?.update();
     const perf_t_cursor = perfNs(self);
 
     // Damage accumulation: this frame's surface damage translated into
@@ -1343,32 +1296,18 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     }
     const out_rect: geom.Rect = .{ .x = 0, .y = 0, .width = out.mode.width, .height = out.mode.height };
     // The surfaces about to be drawn this frame (presentation feedback
-    // targets): every tracked surface with an active scene node.
-    // Rebuilt each frame; the compositor drives this loop.
-    self.presented.clearRetainingCapacity();
-    var entry_it = self.surface_entries.valueIterator();
-    while (entry_it.next()) |entry| {
-        const node = entry.*.node orelse continue;
-        self.presented.append(self.allocator, entry.*.surface) catch |err| {
-            log.warn("presented list append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        };
-        // Translate the surface's damaged rects (surface coordinates) by
-        // the node's absolute position into output coordinates, clipped
-        // to the output (damage is a hint; clipping is safe).
-        const abs = node.absolutePosition();
-        for (entry.*.surface.current.surface_damage.rects.items) |rect| {
-            const translated: geom.Rect = .{
-                .x = addSat(abs.x, rect.x),
-                .y = addSat(abs.y, rect.y),
-                .width = rect.width,
-                .height = rect.height,
-            };
-            if (out_rect.intersect(translated)) |visible| so.addDamage(visible);
-        }
-    }
-    if (!std.meta.eql(old_cursor[0], new_cursor[0]) or !std.meta.eql(old_cursor[1], new_cursor[1])) {
-        for (old_cursor) |r| if (r) |rr| so.addDamage(rr);
-        for (new_cursor) |r| if (r) |rr| so.addDamage(rr);
+    // targets) + their damage: the library's per-frame surface pass.
+    // collectPresented rebuilds the scene's presented list; the
+    // addSurfaceDamage loop translates each node's committed damage
+    // (surface coordinates) by the node's absolute position into output
+    // coordinates, clipped to the output (damage is a hint; clipping is
+    // safe). The compositor drives the pass; the scene.presented list is
+    // consumed below for frame callbacks + presentation feedback.
+    wayland.surface_node.collectPresented(self.scene.?);
+    wayland.surface_node.addSurfaceDamage(self.scene.?, so, out_rect);
+    if (!std.meta.eql(cursor_fp.old[0], cursor_fp.new[0]) or !std.meta.eql(cursor_fp.old[1], cursor_fp.new[1])) {
+        for (cursor_fp.old) |r| if (r) |rr| so.addDamage(rr);
+        for (cursor_fp.new) |r| if (r) |rr| so.addDamage(rr);
     }
 
     // Composite the canvas into the framebuffer, then present it. M4:
@@ -1388,11 +1327,11 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
             // so the visible cursor is the buf node, not the rect node).
             // Restoring only the rect node left the old client cursor in
             // place, smearing a trail behind the moving pointer.
-            for (old_cursor) |r| {
+            for (cursor_fp.old) |r| {
                 if (r) |rr| copyRegion(base, self.framebuffer, rr);
             }
         }
-        drawCursor(self);
+        self.cursor.?.draw(self.framebuffer);
     } else if (self.frame_kick) {
         // A client is ready for the next frame (pending wl_callback) but
         // the canvas is unchanged. Present the current framebuffer so the
@@ -1443,7 +1382,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // (.awake = CLOCK_MONOTONIC in the 0.16 std.Io.Clock); the u32
     // wrap-around is fine — the protocol defines an undefined base.
     const now_ms: u32 = @truncate(@as(u64, @bitCast(std.Io.Clock.now(.awake, self.io.*).toMilliseconds())));
-    for (self.presented.items) |s| s.sendFrameDone(now_ms);
+    for (self.scene.?.presented.items) |s| s.sendFrameDone(now_ms);
 
     if (self.perf) {
         log.info(perf_frame_fmt, self.io, self.log_cfg, "perf", .{
@@ -1459,7 +1398,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // wp_presentation: every surface drawn this frame was presented. The
     // output's wl_output global names the output for sync_output, and the
     // output's own refresh drives the protocol refresh value.
-    self.presentation.present(self.presented.items, self.wl_output, @intCast(out.mode.refresh_msec), 0);
+    self.presentation.present(self.scene.?.presented.items, self.wl_output, @intCast(out.mode.refresh_msec), 0);
 
     self.frames_rendered += 1;
     // The frame was rendered + committed (the flip is in flight): clear
@@ -1468,7 +1407,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     tracy.frameMark(null);
     log.debug("render frame={d} surfaces={d}", self.io, self.log_cfg, "server", .{
         self.frames_rendered,
-        self.presented.items.len,
+        self.scene.?.presented.items.len,
     });
 
     // Frame-done and presentation events were marshalled above; push them
@@ -1505,7 +1444,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
 ///    surface),
 /// 3. the cursor in SCREEN space through an identity camera (constant
 ///    size, canvas-compositing.md §4). The cursor scene nodes remain as
-///    state (updateCursor/cursorFootprints still position them for the
+///    state (Cursor.update/Cursor.footprints still position them for the
 ///    damage ring) but are no longer drawn by the scene.
 /// Composite the full canvas (background + camera-transformed surfaces +
 /// screen-space cursor) into the display framebuffer. The background +
@@ -1517,7 +1456,7 @@ fn compositeCanvas(self: *ServerState) void {
     ensureBaseFramebuffer(self);
     compositeBase(self);
     copyWhole(self.base_framebuffer.?, self.framebuffer);
-    drawCursor(self);
+    self.cursor.?.draw(self.framebuffer);
 }
 
 /// Render the background + all mapped surfaces through the camera into the
@@ -1539,26 +1478,27 @@ fn compositeBase(self: *ServerState) void {
 
     // 2. Surfaces: world rect = the node's absolute position + the
     //    SURFACE size (the node dst is the surface size — the buffer size
-    //    under the committed transform divided by the scale, see
-    //    updateSurfaceNode). The item carries the surface's buffer
+    //    under the committed transform divided by the scale, set by the
+    //    library's SurfaceNode update). The item carries the surface's buffer
     //    transform so the canvas pass samples the texture through it
     //    (notes/124 gap 1; scale=1 + normal = today's 1:1 blit, byte
     //    identical).
     var items: std.ArrayList(CanvasItem) = .empty;
     defer items.deinit(self.allocator);
-    // The cursor's WlSurface is drawn ONLY as the cursor (drawCursor),
+    // The cursor's WlSurface is drawn ONLY as the cursor (Cursor.draw),
     // never as a normal surface — matching wlroots (the cursor is a
     // separate plane, never a scene node) and niri (the cursor surface is
     // excluded from normal surface rendering via an early return on its
     // commit). Rendering it here too produced a SECOND cursor at the
     // surface's node position.
     const cursor_res = self.seat.cursorSurface();
-    var entry_it = self.surface_entries.valueIterator();
-    while (entry_it.next()) |entry| {
+    const scene = self.scene orelse return;
+    var entry_it = scene.surface_nodes.valueIterator();
+    while (entry_it.next()) |sn| {
         if (cursor_res) |cr| {
-            if (entry.*.surface.resource == cr) continue;
+            if (sn.*.surface.resource == cr) continue;
         }
-        const node = entry.*.node orelse continue;
+        const node = sn.*.node orelse continue;
         const bn = node.kind.buffer;
         const texture = bn.texture orelse continue;
         const rect = node.absolutePosition();
@@ -1569,51 +1509,12 @@ fn compositeBase(self: *ServerState) void {
             .world_w = @floatFromInt(rect.width),
             .world_h = @floatFromInt(rect.height),
             .opacity = 1.0,
-            .transform = entry.*.surface.current.transform,
+            .transform = sn.*.surface.current.transform,
         }) catch |err| {
             log.warn("canvas item append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         };
     }
     wayland.canvas.render(self.allocator, base, &self.camera, items.items, if (self.fast_render) 3 else 1);
-}
-
-/// Draw the screen-space cursor into the display framebuffer at the
-/// pointer's current position (identity camera, constant size). The
-/// fallback rect is a texture now — the canvas pass draws textures, not
-/// scene rects — and the client cursor surface texture wins when one is
-/// set.
-fn drawCursor(self: *ServerState) void {
-    const identity: Camera = .{
-        .center_x = @as(f64, @floatFromInt(self.framebuffer.width)) / 2.0,
-        .center_y = @as(f64, @floatFromInt(self.framebuffer.height)) / 2.0,
-        .zoom = 1,
-        .rotation = 0,
-        .screen_w = @floatFromInt(self.framebuffer.width),
-        .screen_h = @floatFromInt(self.framebuffer.height),
-    };
-    var cursor_items: [1]CanvasItem = undefined;
-    if (self.cursor_texture) |tex| {
-        const seat = self.seat;
-        cursor_items[0] = .{
-            .texture = tex,
-            .world_x = @floatFromInt(seat.pointer_x - seat.cursor_hotspot_x),
-            .world_y = @floatFromInt(seat.pointer_y - seat.cursor_hotspot_y),
-            .world_w = @floatFromInt(tex.width),
-            .world_h = @floatFromInt(tex.height),
-            .opacity = 1.0,
-        };
-    } else {
-        const tex = ensureCursorFallbackTexture(self) orelse return;
-        cursor_items[0] = .{
-            .texture = tex,
-            .world_x = @floatFromInt(self.seat.pointer_x),
-            .world_y = @floatFromInt(self.seat.pointer_y),
-            .world_w = @floatFromInt(cursor_size),
-            .world_h = @floatFromInt(cursor_size),
-            .opacity = 1.0,
-        };
-    }
-    wayland.canvas.render(self.allocator, self.framebuffer, &identity, &cursor_items, 1);
 }
 
 /// Create the base framebuffer (matching the display framebuffer's size)
@@ -1656,65 +1557,6 @@ fn copyWhole(src: *pixman.Framebuffer, dst: *pixman.Framebuffer) void {
     @memcpy(dst.data, src.data);
 }
 
-/// The fallback cursor's texture: a 16x16 pointer arrow (white body, black
-/// outline) so the cursor is visible over the canvas and the terminal —
-/// the old solid cursor_size² grey square was nearly invisible (the
-/// reported "no mouse movement"). Drawn with a premultiplied white fill +
-/// black outline; the shape is the classic X left_ptr. The rest is
-/// transparent (alpha 0), so the over-blend leaves the background.
-/// Owned by the state and destroyed in cleanupSurfaceEntries.
-fn ensureCursorFallbackTexture(self: *ServerState) ?*Texture {
-    if (self.cursor_fallback_texture) |t| return t;
-    const n: usize = @intCast(cursor_size * cursor_size);
-    var pixels: [n * 4]u8 = undefined;
-    // The classic left_ptr arrow, 16x16: '1' = body (white), '2' = outline
-    // (black), '.' = transparent. Hotspot is the top-left tip.
-    const shape = [_][]const u8{
-        "2...............",
-        "22..............",
-        "212.............",
-        "2112............",
-        "21112...........",
-        "211112..........",
-        "2111112.........",
-        "21111112........",
-        "211111112.......",
-        "2111111112......",
-        "21111111112.....",
-        "211111111112....",
-        "2111111111112...",
-        "21..21111112....",
-        "2...21111112....",
-        "....211112......",
-    };
-    var y: usize = 0;
-    while (y < shape.len and y < @as(usize, @intCast(cursor_size))) : (y += 1) {
-        var x: usize = 0;
-        while (x < shape[y].len and x < @as(usize, @intCast(cursor_size))) : (x += 1) {
-            const off = (y * @as(usize, @intCast(cursor_size)) + x) * 4;
-            switch (shape[y][x]) {
-                '2' => pixels[off..][0..4].* = .{ 0, 0, 0, 255 },
-                '1' => pixels[off..][0..4].* = .{ 255, 255, 255, 255 },
-                else => pixels[off..][0..4].* = .{ 0, 0, 0, 0 },
-            }
-        }
-    }
-    const tex = pixman.PixmanRenderer.importMemory(
-        self.renderer,
-        cursor_size,
-        cursor_size,
-        cursor_size * 4,
-        &pixels,
-    ) catch |err| {
-        log.err("cursor fallback texture import failed: {s}", self.io, self.log_cfg, "server", .{
-            @errorName(err),
-        });
-        return null;
-    };
-    self.cursor_fallback_texture = tex;
-    return tex;
-}
-
 /// The M4 camera from WAYLAND_CAMERA ("cx=…,cy=…,zoom=…,rot=…") parsed
 /// with the output size; unset or unparseable values fall back to the
 /// default camera — center at the output center, zoom 1, no rotation —
@@ -1738,45 +1580,21 @@ fn parseCameraEnv(env_value: ?[]const u8, w: i32, h: i32) Camera {
 // Scene surface tracking
 // ---------------------------------------------------------------------------
 
-/// Subscribe to commit/destroy on every compositor surface we do not
-/// track yet, and initialize the scene node from its current state (the
-/// surface may have committed before we subscribed). Called from the
+/// Track every compositor surface we do not track yet. The library's
+/// SurfaceNode owns the surface→scene lifecycle (its commit/unmap/destroy
+/// listeners keep the scene node in sync); the compositor's remaining
+/// policy is WHICH surfaces get bindings — all of them — plus the
+/// renderer/texture integration (surface_node_impl). Called from the
 /// frame handler, so surfaces created in the same dispatch are caught.
 fn syncSurfaces(self: *ServerState) void {
+    const scene = self.scene orelse return;
     var subscribed_new = false;
     for (self.compositor.surfaces.items) |s| {
-        if (self.surface_entries.contains(s)) continue;
-        const entry = self.allocator.create(SurfaceEntry) catch |err| {
+        if (wayland.surface_node.surfaceNodeFor(scene, s) != null) continue;
+        _ = wayland.surface_node.trackSurface(scene, s, &surface_node_impl, self) catch |err| {
             log.warn("failed to track surface: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
             continue;
         };
-        entry.* = .{
-            .state = self,
-            .surface = s,
-            .tree = null,
-            .node = null,
-            .commit_listener = wire.Listener(*Surface).init(onSurfaceCommit),
-            .destroy_listener = wire.Listener(*Surface).init(onSurfaceDestroy),
-            .unmap_listener = wire.Listener(*Surface).init(onSurfaceUnmap),
-            .enter_listener = wire.Listener(*wayland.output.Output).init(onSurfaceEnter),
-            .leave_listener = wire.Listener(*wayland.output.Output).init(onSurfaceLeave),
-        };
-        self.surface_entries.put(s, entry) catch |err| {
-            self.allocator.destroy(entry);
-            log.warn("failed to track surface: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-            continue;
-        };
-        s.events.commit.add(&entry.commit_listener);
-        s.events.destroy.add(&entry.destroy_listener);
-        s.events.unmap.add(&entry.unmap_listener);
-        s.events.enter.add(&entry.enter_listener);
-        s.events.leave.add(&entry.leave_listener);
-        // updateSurfaceNode drives the enter/leave signals (setEntered at
-        // node creation, setLeft at removal), so a surface that mapped
-        // before this subscription still fires enter here — no separate
-        // catch-up needed (the surface module's signals are the single
-        // path; the wire event listeners are below).
-        updateSurfaceNode(self, entry);
         subscribed_new = true;
     }
     // A newly-tracked surface may already have committed its buffer (the
@@ -1786,105 +1604,62 @@ fn syncSurfaces(self: *ServerState) void {
     if (subscribed_new) requestRender(self);
 }
 
-/// wl_surface.commit applied: refresh the surface's scene node from its
-/// current buffer. A committed buffer means the surface maps (or keeps
-/// mapping) with content; a null buffer unmaps it.
-fn onSurfaceCommit(listener: *wire.Listener(*Surface), _: *Surface) void {
-    const entry: *SurfaceEntry = @fieldParentPtr("commit_listener", listener);
-    updateSurfaceNode(entry.state, entry);
-    requestRender(entry.state);
-}
+/// The library SurfaceNode's renderer/texture integration + the
+/// compositor's policy hooks: pixel import/update through the pixman
+/// renderer, subsurface orphan recovery before each commit sync, and
+/// seat/presentation cleanup at surface death.
+const surface_node_impl: wayland.surface_node.Impl = .{
+    .import = surfaceNodeImport,
+    .update = surfaceNodeUpdate,
+    .before_update = surfaceNodeBeforeUpdate,
+    .destroyed = surfaceNodeDestroyed,
+};
 
-/// wl_surface destroyed: drop the scene node, deliver discarded feedback,
-/// and free the tracking entry. The surface is still valid inside the
-/// destroy signal (its buffers are released after the signal).
-fn onSurfaceDestroy(listener: *wire.Listener(*Surface), s: *Surface) void {
-    const entry: *SurfaceEntry = @fieldParentPtr("destroy_listener", listener);
-    const self = entry.state;
-    // removeSurfaceNode drives setLeft, whose leave signal sends the wire
-    // wl_surface.leave — so a destroyed (still entered) surface gets its
-    // leave here too, flag-guarded against double-sends. (wlroots drops
-    // the output tracking silently at surface death, wlr_compositor.c:
-    // 1055-1063; sending the event is harmless on a client-destroyed
-    // resource and keeps the client's enter/leave accounting balanced.)
-    removeSurfaceNode(self, entry);
-    self.seat.surfaceDestroyed(s);
-    self.presentation.discard(s);
-    _ = self.surface_entries.remove(s);
-    self.allocator.destroy(entry);
-}
-
-/// wl_surface.enter signal (surface gained the output; fired by the
-/// surface module at map): send wl_surface.enter to the surface's client.
-fn onSurfaceEnter(listener: *wire.Listener(*wayland.output.Output), _: *wayland.output.Output) void {
-    const entry: *SurfaceEntry = @fieldParentPtr("enter_listener", listener);
-    if (entry.entered) return;
-    entry.entered = true;
-    sendSurfaceEnter(entry.state, entry.surface, true);
-}
-
-/// wl_surface.unmap signal: the surface stopped being mapped — a
-/// null-buffer commit, destroy, or the forced unmap of a destroyed
-/// wl_subsurface's child (note 132 F6). Drop the scene node so the
-/// surface disappears; the entry stays (a later buffer commit remaps it
-/// as a plain surface via updateSurfaceNode). Idempotent with the
-/// commit path (removeSurfaceNode nulls node/tree after destroying).
-fn onSurfaceUnmap(listener: *wire.Listener(*Surface), _: *Surface) void {
-    const entry: *SurfaceEntry = @fieldParentPtr("unmap_listener", listener);
-    removeSurfaceNode(entry.state, entry);
-}
-
-/// wl_surface.leave signal (surface lost the output; fired at unmap):
-/// send wl_surface.leave to the surface's client.
-fn onSurfaceLeave(listener: *wire.Listener(*wayland.output.Output), _: *wayland.output.Output) void {
-    const entry: *SurfaceEntry = @fieldParentPtr("leave_listener", listener);
-    if (!entry.entered) return;
-    entry.entered = false;
-    sendSurfaceEnter(entry.state, entry.surface, false);
-}
-
-/// Send wl_surface.enter/leave for the surface's client: the wl_output
-/// resource that client bound. A surface's events go only to its owner,
-/// and a client that never bound wl_output gets none (wlroots
-/// wlr_surface_send_enter/leave, wlr_compositor.c:1071-1128, iterate the
-/// output's resources and match on the client). Single-output server: the
-/// one WlOutput is the only output that can enter/leave.
-fn sendSurfaceEnter(self: *ServerState, s: *Surface, enter: bool) void {
-    const wl_output = self.wl_output orelse return;
-    const client = s.resource.getClient();
-    for (wl_output.resources.items) |res| {
-        if (res.getClient() != client) continue;
-        if (enter) {
-            s.resource.sendEnter(res);
-        } else {
-            s.resource.sendLeave(res);
-        }
-        break;
-    }
-}
-
-/// Ensure the surface's scene node exists and shows its current buffer;
-/// remove it when the surface has no buffer (unmapped).
-fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
-    const s = entry.surface;
-    const buf = s.buffer orelse {
-        log.debug("surfnode: no buffer", self.io, self.log_cfg, "server", .{});
-        removeSurfaceNode(self, entry);
-        return;
-    };
+/// Import the surface's current buffer into a renderer texture (the
+/// scene node owns the copy).
+fn surfaceNodeImport(ctx: *anyopaque, s: *Surface, buf: *wayland.buffers.Buffer) ?*Texture {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    _ = s;
     const pixels = surfacePixels(self, buf) orelse {
         log.debug("surfnode: no pixels", self.io, self.log_cfg, "server", .{});
-        return;
+        return null;
     };
-    // Orphan recovery: a surface whose wl_subsurface died (the client
-    // destroyed the role object, or the parent surface died —
-    // subsurface.zig tears the entry down and clears the role) renders as
-    // a plain surface again. Its tree leaves the (possibly dead) parent
-    // tree for the root and shows on its next commit (wlroots recursively
-    // unmaps children with the parent, wlr_compositor.c:854-872, and the
-    // surface re-renders once its role object is gone).
-    if (entry.tree) |tree| {
-        if (subsurfaceFor(self, s) == null and tree.parent != self.scene.?.root) {
+    return importSurfacePixels(self, buf, pixels);
+}
+
+/// Same-size commit fast path: update the texture in place (no alloc, no
+/// texture churn — the per-frame hot path).
+fn surfaceNodeUpdate(
+    ctx: *anyopaque,
+    texture: *Texture,
+    s: *Surface,
+    buf: *wayland.buffers.Buffer,
+) bool {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    _ = s;
+    const pixels = surfacePixels(self, buf) orelse return false;
+    const byte_len = @as(usize, @intCast(pixels.stride)) * @as(usize, @intCast(buf.height));
+    return wayland.pixman.PixmanRenderer.updateMemory(
+        texture,
+        buf.width,
+        buf.height,
+        pixels.stride,
+        pixels.ptr[0..byte_len],
+    );
+}
+
+/// Compositor policy before the node syncs from a commit: subsurface
+/// orphan recovery — a surface whose wl_subsurface died (the client
+/// destroyed the role object, or the parent surface died; subsurface.zig
+/// tears the entry down and clears the role) renders as a plain surface
+/// again. Its tree leaves the (possibly dead) parent tree for the root
+/// and shows on its next commit (wlroots recursively unmaps children
+/// with the parent, wlr_compositor.c:854-872, and the surface re-renders
+/// once its role object is gone).
+fn surfaceNodeBeforeUpdate(ctx: *anyopaque, sn: *wayland.surface_node.SurfaceNode) void {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    if (sn.tree) |tree| {
+        if (subsurfaceFor(self, sn.surface) == null and tree.parent != self.scene.?.root) {
             self.scene.?.root.appendChild(self.allocator, tree) catch |err| {
                 // OOM: the subsurface tree is skipped this frame.
                 log.warn("subsurface orphan re-root OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
@@ -1892,95 +1667,17 @@ fn updateSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
             tree.enable(true);
         }
     }
-    // The SURFACE size: the buffer size under the committed transform,
-    // divided by the committed scale (notes/124 gap 1). The node's dst
-    // rect is the surface rect, so pick, damage and the canvas world rect
-    // are all surface-sized; the canvas pass samples the texture through
-    // the transform. Commit validation guarantees integrality.
-    const size = surfaceSize(s, buf);
-    if (entry.node) |node| {
-        // Same-size commit: update the texture in place (no alloc, no
-        // texture churn — the per-frame hot path). The dst rect is still
-        // refreshed: scale/transform can change on a commit that reuses
-        // the same buffer.
-        const bn = node.kind.buffer;
-        if (bn.texture) |tex| {
-            const byte_len = @as(usize, @intCast(pixels.stride)) * @as(usize, @intCast(buf.height));
-            if (wayland.pixman.PixmanRenderer.updateMemory(
-                tex,
-                buf.width,
-                buf.height,
-                pixels.stride,
-                pixels.ptr[0..byte_len],
-            )) {
-                bn.dst_width = size.w;
-                bn.dst_height = size.h;
-                node.enable(true);
-                return;
-            }
-            tex.destroy();
-            bn.texture = null;
-        }
-    }
-    const texture = importSurfacePixels(self, buf, pixels) orelse return;
-    if (entry.node) |node| {
-        // Update in place: swap in the new texture (dst = surface size).
-        const bn = node.kind.buffer;
-        if (bn.texture) |old| old.destroy();
-        bn.texture = texture;
-        bn.dst_width = size.w;
-        bn.dst_height = size.h;
-        node.enable(true);
-    } else {
-        // First map: create the tree container (under the parent surface's
-        // tree for a subsurface, scene.root otherwise), then the buffer
-        // node as its first child.
-        ensureSurfaceTree(self, entry);
-        const tree = entry.tree orelse {
-            texture.destroy();
-            log.warn("scene tree create failed", self.io, self.log_cfg, "server", .{});
-            return;
-        };
-        const node = wayland.scene.SceneNode.create(self.allocator, tree, .buffer) catch |err| {
-            texture.destroy();
-            log.warn("scene node create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-            return;
-        };
-        node.kind.buffer.texture = texture;
-        node.kind.buffer.dst_width = size.w;
-        node.kind.buffer.dst_height = size.h;
-        entry.node = node;
-
-        // The surface maps on the single output: drive the surface's
-        // enter tracking (setEntered emits events.enter on the change;
-        // the enter listener sends the wire event). Idempotent — node
-        // creation happens exactly once per map.
-        if (self.output) |out| s.setEntered(out);
-
-        // First map. The initial configure was 0x0 ("client decides"); the
-        // client maps at its OWN preferred size (weston-terminal ~640x480,
-        // foot its default) and the surface size comes from its committed
-        // buffer, so no configure is needed for the initial render. The
-        // client keeps a natural size on the canvas instead of being blown
-        // up to fill the output (the previous configure-to-output-size made
-        // a terminal enormous).
-    }
 }
 
-/// The surface size of `buf` under the surface's committed transform and
-/// scale: boxTransform of the buffer rect (buffer -> surface per
-/// wl_output_transform, wlroots util/box.c:105-145) divided by the scale.
-/// The commit validation (surface.zig validatePending) guarantees the
-/// transformed buffer size is divisible by the scale, so the division is
-/// exact.
-fn surfaceSize(s: *Surface, buf: *wayland.buffers.Buffer) geom.Size {
-    const rect = matrix.boxTransform(
-        .{ .x = 0, .y = 0, .width = buf.width, .height = buf.height },
-        s.current.transform,
-        buf.width,
-        buf.height,
-    );
-    return .{ .w = @divExact(rect.width, s.current.scale), .h = @divExact(rect.height, s.current.scale) };
+/// The surface was destroyed: drop the seat's surface state and deliver
+/// discarded presentation feedback. The library binding tears itself
+/// down after this hook (its destroy listener detaches the node — the
+/// leave signal sends the wire wl_surface.leave for a still-entered
+/// surface, keeping the client's enter/leave accounting balanced).
+fn surfaceNodeDestroyed(ctx: *anyopaque, s: *Surface) void {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    self.seat.surfaceDestroyed(s);
+    self.presentation.discard(s);
 }
 
 /// The wl_subsurface role object for `s`, or null when `s` is not a
@@ -1991,66 +1688,6 @@ fn subsurfaceFor(self: *ServerState, s: *Surface) ?*Subsurface {
         if (ss.surface == s) return ss;
     }
     return null;
-}
-
-/// Create the surface's tree container if it does not exist yet. A
-/// non-subsurface (potential parent) gets its tree under scene.root; a
-/// subsurface gets its tree under the PARENT surface's tree, or a
-/// disabled root placeholder when the parent is not mapped yet
-/// (syncSubsurfaceNodes reparents it into place once the parent maps).
-fn ensureSurfaceTree(self: *ServerState, entry: *SurfaceEntry) void {
-    if (entry.tree != null) return;
-    const root = self.scene.?.root;
-    var parent_tree: ?*wayland.scene.SceneNode = null;
-    if (subsurfaceFor(self, entry.surface)) |ss| {
-        if (self.surface_entries.get(ss.parent)) |parent_entry| {
-            parent_tree = parent_entry.tree;
-        }
-    }
-    const tree = wayland.scene.SceneNode.create(self.allocator, parent_tree orelse root, .tree) catch |err| {
-        log.warn("scene tree create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
-    };
-    // A placeholder subsurface tree (parent unmapped) stays hidden until
-    // syncSubsurfaceNodes moves it under the parent and enables it.
-    if (parent_tree == null and subsurfaceFor(self, entry.surface) != null) {
-        tree.enable(false);
-    }
-    entry.tree = tree;
-}
-
-/// Remove (and free) the surface's scene nodes; the entry keeps tracking
-/// the surface for a future remap.
-fn removeSurfaceNode(self: *ServerState, entry: *SurfaceEntry) void {
-    // Detach this surface's subsurface trees first: node.destroy cascades
-    // into the whole subtree, which would free the children's nodes out
-    // from under their entries. Reparent them to the root, disabled; they
-    // re-enter the parent's tree when the parent maps again. (On append
-    // OOM the cascade still frees them — a catastrophic-memory path.)
-    for (self.subcompositor.subsurfaces.items) |ss| {
-        if (ss.parent != entry.surface) continue;
-        const child_entry = self.surface_entries.get(ss.surface) orelse continue;
-        const child_tree = child_entry.tree orelse continue;
-        if (child_tree.parent != self.scene.?.root) {
-            self.scene.?.root.appendChild(self.allocator, child_tree) catch |err| {
-                log.warn("subsurface detach failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-            };
-            child_tree.enable(false);
-        }
-    }
-    // The surface left the output: drive the surface's leave tracking
-    // (setLeft emits events.leave on the change; idempotent when the
-    // surface was never entered).
-    if (entry.surface.outputs != null) entry.surface.setLeft();
-    if (entry.node) |node| {
-        if (node.kind.buffer.texture) |texture| texture.destroy();
-        node.destroy(self.allocator);
-        entry.node = null;
-    }
-    if (entry.tree) |tree| {
-        tree.destroy(self.allocator);
-        entry.tree = null;
-    }
 }
 
 /// The surface's shm pixels (with SIGBUS guard active) + stride.
@@ -2103,32 +1740,24 @@ fn perfNs(self: *ServerState) u64 {
     return @intCast(@max(std.Io.Clock.now(.awake, self.io.*).toNanoseconds(), 0));
 }
 
-/// Tear down every surface entry (listeners, scene nodes, allocations).
-/// Runs before the scene and compositor teardown in main().
+/// Tear down the compositor-side per-surface state. The library's
+/// surface bindings (listeners, scene nodes, registry) are freed by
+/// Scene.deinit (untrackAll), which runs after this in main's defer
+/// order — and the compositor's surfaces are destroyed later still, so
+/// no surface signal can reach freed bindings.
 fn cleanupSurfaceEntries(self: *ServerState) void {
-    if (self.cursor_texture) |t| t.destroy();
-    self.cursor_texture = null;
-    if (self.cursor_fallback_texture) |t| t.destroy();
-    self.cursor_fallback_texture = null;
+    // The cursor owns its textures + scene nodes; it detaches from the
+    // seat and the scene root before they are torn down below.
+    if (self.cursor) |c| {
+        c.deinit();
+        self.cursor = null;
+    }
     if (build_options.enable_raylib) {
         if (self.raylib_input) |input| {
             self.allocator.destroy(input);
             self.raylib_input = null;
         }
     }
-    var it = self.surface_entries.valueIterator();
-    while (it.next()) |entry_ptr| {
-        const entry = entry_ptr.*;
-        entry.commit_listener.link.remove();
-        entry.destroy_listener.link.remove();
-        entry.unmap_listener.link.remove();
-        entry.enter_listener.link.remove();
-        entry.leave_listener.link.remove();
-        removeSurfaceNode(self, entry);
-        self.allocator.destroy(entry);
-    }
-    self.surface_entries.deinit();
-    self.presented.deinit(self.allocator);
 }
 
 /// WAYLAND_BACKEND=drm selects the DRM/KMS backend (native output).
@@ -2166,19 +1795,15 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
         @as(f64, std.math.maxInt(i32)),
     ));
     const node = scene.pick(pick_x, pick_y) orelse return null;
-    var it = self.surface_entries.valueIterator();
-    while (it.next()) |entry_ptr| {
-        const entry = entry_ptr.*;
-        if (entry.node == node) {
-            const rect = node.absolutePosition();
-            return .{
-                .surface = entry.surface,
-                .sx = pick_x - rect.x,
-                .sy = pick_y - rect.y,
-            };
-        }
-    }
-    return null;
+    // Back-map the picked node to its surface through the library's
+    // surface→scene table.
+    const surface = wayland.surface_node.surfaceForNode(scene, node) orelse return null;
+    const rect = node.absolutePosition();
+    return .{
+        .surface = surface,
+        .sx = pick_x - rect.x,
+        .sy = pick_y - rect.y,
+    };
 }
 
 /// Capture source for zwlr_screencopy: the display framebuffer (cursor
@@ -2293,84 +1918,6 @@ fn onSeatAxis(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.
     requestRender(self);
 }
 
-/// Sync the cursor nodes with the seat state: position at the pointer
-/// minus the hotspot; client cursor surface texture when one is set and
-/// has a buffer, else the fallback rect.
-fn updateCursor(self: *ServerState) void {
-    const seat = self.seat;
-    const x = seat.pointer_x;
-    const y = seat.pointer_y;
-
-    // Keep the cursor on top of every surface: re-append both nodes to
-    // the scene root (appendChild reparents, moving them to draw last).
-    self.scene.?.root.appendChild(self.allocator, self.cursor_rect_node.?) catch |err| {
-        log.warn("cursor z-order failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-    };
-    self.scene.?.root.appendChild(self.allocator, self.cursor_buf_node.?) catch |err| {
-        log.warn("cursor z-order failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-    };
-
-    const cursor_surface_res = seat.cursorSurface();
-    var surface_texture: ?*Texture = null;
-    if (cursor_surface_res) |res| {
-        // Resolve the wire resource to the compositor surface (the
-        // cursor surface may belong to any client).
-        for (self.compositor.surfaces.items) |s| {
-            if (s.resource == res) {
-                if (s.buffer) |buf| {
-                    if (surfacePixels(self, buf)) |sp| {
-                        surface_texture = importSurfacePixels(self, buf, sp) orelse null;
-                    }
-                }
-                break;
-            }
-        }
-    }
-    if (self.cursor_texture) |old| {
-        if (old != surface_texture) old.destroy();
-        self.cursor_texture = null;
-    }
-    if (surface_texture) |tex| {
-        self.cursor_texture = tex;
-        const node = self.cursor_buf_node.?;
-        node.kind.buffer.texture = tex;
-        node.kind.buffer.dst_width = tex.width;
-        node.kind.buffer.dst_height = tex.height;
-        node.x = x - seat.cursor_hotspot_x;
-        node.y = y - seat.cursor_hotspot_y;
-        node.enable(true);
-        self.cursor_rect_node.?.enable(false);
-    } else {
-        self.cursor_rect_node.?.x = x;
-        self.cursor_rect_node.?.y = y;
-        self.cursor_rect_node.?.enable(true);
-        self.cursor_buf_node.?.enable(false);
-    }
-}
-
-/// The cursor nodes' absolute rects (fallback rect + client cursor
-/// buffer), or null for a disabled node. renderFrame captures the old
-/// footprints before updateCursor moves the nodes so a partial upload
-/// repaints both the old and the new position.
-fn cursorFootprints(self: *ServerState) [2]?geom.Rect {
-    var out: [2]?geom.Rect = .{ null, null };
-    inline for (.{ self.cursor_rect_node, self.cursor_buf_node }, 0..) |node, i| {
-        if (node) |n| {
-            if (n.enabled) out[i] = n.absolutePosition();
-        }
-    }
-    return out;
-}
-
-/// Saturating i32 add: surface damage rects are client-controlled and may
-/// overflow when translated by the node position. Damage is a hint, so a
-/// saturated value is a safe over-report (clipped to the output below).
-fn addSat(a: i32, b: i32) i32 {
-    return std.math.add(i32, a, b) catch blk: {
-        break :blk if (b < 0) std.math.minInt(i32) else std.math.maxInt(i32);
-    };
-}
-
 /// Position every subsurface over its mapped parent and keep its tree
 /// inside the PARENT surface's tree (notes/107 gap 9: the old flat
 /// re-append to the scene root made each subsurface draw above every
@@ -2385,10 +1932,10 @@ fn addSat(a: i32, b: i32) i32 {
 fn syncSubsurfaceNodes(self: *ServerState) void {
     const scene = self.scene orelse return;
     for (self.subcompositor.subsurfaces.items) |ss| {
-        const child_entry = self.surface_entries.get(ss.surface) orelse continue;
-        const child_tree = child_entry.tree orelse continue;
-        const parent_entry = self.surface_entries.get(ss.parent) orelse continue;
-        if (parent_entry.tree) |parent_tree| {
+        const child_sn = wayland.surface_node.surfaceNodeFor(scene, ss.surface) orelse continue;
+        const child_tree = child_sn.tree orelse continue;
+        const parent_sn = wayland.surface_node.surfaceNodeFor(scene, ss.parent) orelse continue;
+        if (parent_sn.tree) |parent_tree| {
             // Move the child tree under the parent's tree (appendChild
             // reparents; a root placeholder lands here on the parent's
             // first map).
@@ -2437,10 +1984,11 @@ fn applyRestack(
     child: *wayland.scene.SceneNode,
     parent_tree: *wayland.scene.SceneNode,
 ) void {
+    const scene = self.scene orelse return;
     const ref_node: ?*wayland.scene.SceneNode = blk: {
         if (ss.restack_sibling_id == ss.parent.resource.getId()) {
-            const parent_entry = self.surface_entries.get(ss.parent) orelse break :blk null;
-            break :blk parent_entry.node;
+            const parent_sn = wayland.surface_node.surfaceNodeFor(scene, ss.parent) orelse break :blk null;
+            break :blk parent_sn.node;
         }
         // The reference is a wl_surface resource id in the child's client
         // namespace, so match the client too (compositor.surfaces spans
@@ -2450,8 +1998,8 @@ fn applyRestack(
             if (other.parent != ss.parent) continue;
             if (other.surface.resource.getClient() != child_client) continue;
             if (other.surface.resource.getId() != ss.restack_sibling_id) continue;
-            const other_entry = self.surface_entries.get(other.surface) orelse break :blk null;
-            break :blk other_entry.tree;
+            const other_sn = wayland.surface_node.surfaceNodeFor(scene, other.surface) orelse break :blk null;
+            break :blk other_sn.tree;
         }
         break :blk null;
     };

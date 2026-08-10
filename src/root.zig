@@ -14,6 +14,7 @@ pub const client = protocol.client;
 
 pub const wire = @import("core/wire.zig");
 
+const build_options = @import("build_options");
 const geom_mod = @import("utils/geom.zig");
 const damage_mod = @import("utils/damage.zig");
 const log_mod = @import("utils/log.zig");
@@ -35,6 +36,10 @@ pub const buffers = @import("buffers/buffer.zig");
 pub const shm = @import("buffers/shm.zig");
 pub const compositor = @import("compositor/compositor.zig");
 pub const seat = @import("compositor/seat.zig");
+/// Cursor rendering helper (compositor/cursor.zig): the seat's pointer
+/// cursor — client cursor surface, fallback texture, scene nodes and
+/// damage footprints.
+pub const cursor = @import("compositor/cursor.zig");
 pub const xkb = @import("compositor/xkb.zig");
 /// wl_subcompositor (compositor/subsurface.zig): nested surfaces.
 pub const subsurface = @import("compositor/subsurface.zig");
@@ -54,6 +59,12 @@ pub const drm = @import("backend/drm.zig");
 /// output paced by a wire event loop timer. Exported for consumers that
 /// run without a GPU (test servers, examples).
 pub const headless = @import("backend/headless.zig");
+/// Raylib debug backend (backend/raylib.zig): one windowed output
+/// presented through a raylib window. Built only with -Denable_raylib.
+pub const raylib = @import("backend/raylib.zig");
+/// Raylib input source (backend/raylib_input.zig): feeds the seat from
+/// the raylib window. Built only with -Denable_raylib.
+pub const raylib_input = @import("backend/raylib_input.zig");
 pub const output = @import("output/output.zig");
 /// wl_output protocol global (output/wl_output.zig): exposes an Output
 /// to clients (geometry/mode/scale/name/description).
@@ -75,6 +86,12 @@ pub const xdg_activation = @import("shell/xdg_activation.zig");
 /// zxdg_decoration_manager_v1 (unstable/xdg-decoration): server-side decorations.
 pub const xdg_decoration = @import("shell/xdg_decoration.zig");
 pub const scene = @import("scene/scene.zig");
+/// Surface→scene binding (scene/surface_node.zig): the library's
+/// wl_surface→scene-node table. Tracks a surface through its
+/// commit/unmap/destroy signals, keeps its scene node attached (texture
+/// sync, damage translation) and implements the wl_surface enter/leave
+/// wire events from the node's output association.
+pub const surface_node = @import("scene/surface_node.zig");
 /// M4 camera (scene/camera.zig): the world→screen view transform for the
 /// canvas pass.
 pub const camera = @import("scene/camera.zig");
@@ -98,6 +115,7 @@ comptime {
     _ = shm;
     _ = compositor;
     _ = seat;
+    _ = cursor;
     _ = xkb;
     _ = subsurface;
     _ = data_device;
@@ -105,6 +123,12 @@ comptime {
     _ = backend;
     _ = libinput;
     _ = drm;
+    // raylib/raylib_input import "raylib_c", which build.zig only wires
+    // with -Denable_raylib; force their analysis only when it exists.
+    if (build_options.enable_raylib) {
+        _ = raylib;
+        _ = raylib_input;
+    }
     _ = output;
     _ = wl_output;
     _ = renderer;
@@ -113,6 +137,7 @@ comptime {
     _ = xdg_activation;
     _ = xdg_decoration;
     _ = scene;
+    _ = surface_node;
     _ = camera;
     _ = canvas;
     _ = presentation;
