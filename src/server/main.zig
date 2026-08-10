@@ -371,6 +371,24 @@ pub fn main(init: std.process.Init) !void {
     const socket_name = try display.addSocketAuto();
     log.info("created socket {s}", io, &log_cfg, "server", .{socket_name});
 
+    // The socket name must be a single flushed stdout line, first thing
+    // harnesses read — BEFORE the backend init (the raylib window open can
+    // take seconds or fail on a headless/broken display). Logging goes to
+    // stderr, so stdout stays parseable.
+    {
+        const stdout_file = std.Io.File.stdout();
+        var buf: [128]u8 = undefined;
+        var w = stdout_file.writer(io.*, &buf);
+        w.interface.print("WAYLAND_SOCKET={s}\n", .{socket_name}) catch |err| {
+            log.err("failed to write socket name to stdout: {s}", io, &log_cfg, "server", .{@errorName(err)});
+            return err;
+        };
+        w.interface.flush() catch |err| {
+            log.err("failed to flush socket name to stdout: {s}", io, &log_cfg, "server", .{@errorName(err)});
+            return err;
+        };
+    }
+
     // Teardown order (LIFO on the defers): wl_shm outlives the compositor,
     // so shm_state.deinit is registered FIRST and runs LAST. Both inits
     // only need the display; setShm wires them together after both exist.
@@ -651,22 +669,6 @@ pub fn main(init: std.process.Init) !void {
         state.raylib_input = input;
         raylib_mod.RaylibBackend.setInputHook(state.backend, raylib_input_mod.poll, input);
         log.info("raylib input source attached", io, &log_cfg, "server", .{});
-    }
-
-    // The socket name must be a single flushed stdout line, first thing
-    // tests read. Logging goes to stderr, so stdout stays parseable.
-    {
-        const stdout_file = std.Io.File.stdout();
-        var buf: [128]u8 = undefined;
-        var w = stdout_file.writer(io.*, &buf);
-        w.interface.print("WAYLAND_SOCKET={s}\n", .{socket_name}) catch |err| {
-            log.err("failed to write socket name to stdout: {s}", io, &log_cfg, "server", .{@errorName(err)});
-            return err;
-        };
-        w.interface.flush() catch |err| {
-            log.err("failed to flush socket name to stdout: {s}", io, &log_cfg, "server", .{@errorName(err)});
-            return err;
-        };
     }
 
     // --- zio event loop ---------------------------------------------------

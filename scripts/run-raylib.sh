@@ -51,7 +51,12 @@ export WAYLAND_WATCHDOG_DISABLE=1
 
 LOG="$XDG_RUNTIME_DIR/raylib-server.log"
 echo "run-raylib: starting server (backend=$WAYLAND_BACKEND, log=$LOG)..."
-./zig-out/bin/wayland-server > "$LOG" 2>&1 &
+# The server's own Wayland socket lives in $XDG_RUNTIME_DIR (our dedicated
+# dir). GLFW would find THAT socket via WAYLAND_DISPLAY and connect to the
+# compositor it is itself serving — a deadlock before the window opens. Run
+# the server with WAYLAND_DISPLAY unset so GLFW opens the window over X11
+# (DISPLAY -> Xwayland on a Wayland session).
+env -u WAYLAND_DISPLAY ./zig-out/bin/wayland-server > "$LOG" 2>&1 &
 SRV=$!
 trap 'kill "$SRV" 2>/dev/null; exit 0' INT TERM EXIT
 
