@@ -143,6 +143,11 @@ const DataSource = struct {
     /// Mime types offered (data_source.offer events), sentinel-terminated
     /// (wl_data_offer.offer takes a C string).
     mime_types: std.ArrayList([:0]const u8),
+    /// DnD actions the source supports (wl_data_source.set_actions).
+    /// Clipboard selection never uses actions, but the mask is validated
+    /// and stored so wl_data_offer.set_actions can run its
+    /// invalid_action check against it (wlr_data_offer.c).
+    actions: u32 = 0,
 };
 
 /// A data offer delivered to a target client.
@@ -215,6 +220,17 @@ fn managerRequest(
                 resource.getClient().postNoMemory();
                 return;
             };
+            // Bind-time delivery: a new device of the focused client
+            // immediately receives the current selection (wlroots
+            // seat_client_send_selection, wlr_seat.c; KWin seat.cpp:
+            // 159-177). The device is already in the list, so
+            // deliverSelectionToFocus re-delivers to every device of the
+            // focused client, including this one.
+            if (mgr.seat.keyboard_focus) |focus| {
+                if (focus.resource.getClient() == dev_res.getClient()) {
+                    deliverSelectionToFocus(mgr);
+                }
+            }
         },
     }
 }
@@ -237,7 +253,19 @@ fn sourceRequest(src_res: *server.wl.DataSource, request: server.wl.DataSource.R
                 return;
             };
         },
-        .set_actions => {}, // tracked but unused in M3
+        .set_actions => |r| {
+            // wayland.xml wl_data_source.set_actions: the source side may
+            // only offer copy and move (ask is destination-only); any
+            // other bit raises the invalid_action_mask protocol error
+            // (wlroots data_source_handle_set_actions, wlr_data_source.c).
+            const valid: u32 = 1 | 2; // copy | move
+            const dnd_actions: u32 = @bitCast(r.dnd_actions);
+            if (dnd_actions & ~valid != 0) {
+                src_res.postError(.invalid_action_mask, "wl_data_source.set_actions: invalid dnd_actions");
+                return;
+            }
+            src.actions = dnd_actions;
+        },
         .destroy => src_res.destroy(),
     }
 }
@@ -404,8 +432,14 @@ fn deliverSelectionToFocus(mgr: *DataDeviceManager) void {
                 offer_res.destroy();
                 return;
             };
-            for (s.mime_types.items) |m| offer_res.sendOffer(m.ptr);
+            // Order matters (wlroots device_resource_send_selection,
+            // wlr_data_device.c): introduce the offer via data_offer
+            // FIRST, then the per-mime offer events, then selection.
+            // libwayland-client discards events for object ids it does
+            // not know yet (queue_event, wayland-client.c), so sending
+            // the mimes before data_offer would silently drop them.
             dev.resource.sendDataOffer(offer_res);
+            for (s.mime_types.items) |m| offer_res.sendOffer(m.ptr);
             dev.resource.sendSelection(offer_res);
             log.debug("selection delivered to focused client ({d} mimes)", mgr.io, mgr.log_cfg, "data_device", .{
                 s.mime_types.items.len,
@@ -446,10 +480,44 @@ fn offerRequest(offer_res: *server.wl.DataOffer, request: server.wl.DataOffer.Re
             });
         },
         .destroy => offer_res.destroy(),
-        .finish => {},
+        .finish => {
+            // wayland.xml: "If wl_data_offer.finish request is received
+            // for a non drag and drop operation, the invalid_finish
+            // protocol error is raised." Our offers are always clipboard
+            // offers (DnD is not implemented), so finish is never
+            // eligible.
+            offer_res.postError(.invalid_finish, "wl_data_offer.finish: not a drag-and-drop offer");
+        },
         .set_actions => |r| {
-            _ = r;
-            // Ignored in M3.
+            // wayland.xml wl_data_offer.set_actions (wlroots
+            // data_offer_handle_set_actions, wlr_data_offer.c):
+            //   - dnd_actions must contain only dnd_action enum values
+            //     and preferred_action must be a single one of them,
+            //     else invalid_action_mask;
+            //   - a preferred action the source does not support (a
+            //     source without action support has mask 0) is
+            //     invalid_action.
+            const valid: u32 = 1 | 2 | 4; // copy | move | ask
+            const dnd_actions: u32 = @bitCast(r.dnd_actions);
+            const preferred_action: u32 = @bitCast(r.preferred_action);
+            if ((dnd_actions & ~valid) != 0 or
+                (preferred_action & ~valid) != 0 or
+                (preferred_action != 0 and (preferred_action & (preferred_action - 1)) != 0))
+            {
+                offer_res.postError(.invalid_action_mask, "wl_data_offer.set_actions: invalid action mask");
+                return;
+            }
+            const src = offer.source orelse {
+                offer_res.postError(.invalid_action, "wl_data_offer.set_actions: offer has no source");
+                return;
+            };
+            if (preferred_action != 0 and (src.actions & preferred_action) == 0) {
+                offer_res.postError(
+                    .invalid_action,
+                    "wl_data_offer.set_actions: preferred action not supported by the source",
+                );
+                return;
+            }
         },
     }
 }
@@ -512,6 +580,9 @@ fn destroyAllOffers(mgr: *DataDeviceManager) void {
 
 const testing = std.testing;
 const posix = std.posix;
+
+/// libwayland-client >= 1.18: return the code of the last protocol error.
+extern fn wl_display_get_protocol_error(display: *client.wl.Display, interface: ?*anyopaque, id: ?*u32) c_int;
 
 const RegistryCapture = struct {
     compositor_name: ?u32 = null,
@@ -927,4 +998,83 @@ test "re-delivering the selection supersedes the previous offer" {
     try testing.expectEqual(src_b.getId(), ts.mgr.?.selection_source.?.resource.getId());
     try testing.expectEqual(@as(usize, 1), events_a.cancelled_count);
     try testing.expectEqual(@as(usize, 0), events_b.cancelled_count);
+}
+
+test "new data device binding receives the current selection at bind time" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device1 = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var dev1_events: DeviceEvents = .{};
+    device1.setListener(*DeviceEvents, DeviceEvents.listener, &dev1_events);
+    try ts.pump();
+
+    // Focus the client so the selection can be set and delivered.
+    ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client.?));
+    try ts.pump();
+    const serial = ts.seat.?.last_serial;
+
+    device1.setSelection(src, serial);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 2), dev1_events.selection_count); // focus NULL + the selection
+    try testing.expect(!dev1_events.last_selection_null);
+
+    // A second device bound while the client is focused immediately
+    // receives the current selection (wlroots seat_client_send_selection
+    // on bind, wlr_seat.c; KWin seat.cpp:159-177).
+    const device2 = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    var dev2_events: DeviceEvents = .{};
+    device2.setListener(*DeviceEvents, DeviceEvents.listener, &dev2_events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), dev2_events.selection_count);
+    try testing.expect(!dev2_events.last_selection_null);
+    // One live offer per device of the focused client.
+    try testing.expectEqual(@as(usize, 2), ts.mgr.?.offers.items.len);
+}
+
+test "offer.finish on a clipboard offer raises invalid_finish" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    var dev_events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &dev_events);
+    try ts.pump();
+
+    ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client.?));
+    try ts.pump();
+    const serial = ts.seat.?.last_serial;
+    device.setSelection(src, serial);
+    try ts.pump();
+    try testing.expect(dev_events.last_offer != null);
+
+    // finish on a non drag-and-drop (clipboard) offer: invalid_finish
+    // (0) is raised on the wl_data_offer (wayland.xml), killing the
+    // connection.
+    dev_events.last_offer.?.finish();
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "source.set_actions with invalid bits raises invalid_action_mask" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    try ts.pump();
+
+    // A bit outside {copy, move}: invalid_action_mask (0) on the
+    // wl_data_source (wayland.xml: the source side may only offer copy
+    // and move; wlroots data_source_handle_set_actions,
+    // wlr_data_source.c).
+    const DndAction = client.wl.DataDeviceManager.DndAction;
+    src.setActions(@as(DndAction, @bitCast(@as(u32, 8))));
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
 }

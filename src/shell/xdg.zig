@@ -46,6 +46,7 @@ const client = protocol.client;
 const role_mod = @import("../compositor/role.zig");
 const surface_mod = @import("../compositor/surface.zig");
 const compositor_mod = @import("../compositor/compositor.zig");
+const seat_mod = @import("../compositor/seat.zig");
 const display_mod = @import("../core/display.zig");
 
 const log_tag = "xdg";
@@ -125,42 +126,109 @@ pub const XdgShell = struct {
     }
 };
 
+/// Per xdg_wm_base binding (the wm_base resource's user data). The binding
+/// tracks the xdg_surfaces created through it so that wm_base.destroy can
+/// enforce the defunct_surfaces check (destroying a bound wm_base with live
+/// surfaces is a client error).
+const WmBaseState = struct {
+    shell: *XdgShell,
+    /// The wm_base resource itself; errors that belong to the xdg_wm_base
+    /// interface (role, defunct_surfaces, invalid_popup_parent,
+    /// invalid_positioner) are posted here so the client attributes them to
+    /// the right interface.
+    res: *server.xdg.WmBase,
+    /// Live xdg_surfaces created through this binding, in creation order.
+    surfaces: std.ArrayList(*XdgSurface) = .empty,
+    /// The wm_base resource was destroyed (client teardown destroys a
+    /// client's resources in object-id order, so the wm_base — created
+    /// before its xdg_surfaces — goes first). The state stays allocated
+    /// until the last xdg_surface detaches and frees it (see
+    /// xdgSurfaceDestroy).
+    dead: bool = false,
+};
+
 fn wmBaseBind(client_wire: *wire.Client, shell: *XdgShell, version: u32, id: u32) void {
     const wm_base = server.xdg.WmBase.create(client_wire, version, id) catch {
         client_wire.postNoMemory();
         return;
     };
-    wm_base.setHandler(*XdgShell, wmBaseRequest, null, shell);
+    const state = shell.allocator.create(WmBaseState) catch {
+        wm_base.postNoMemory();
+        return;
+    };
+    state.* = .{ .shell = shell, .res = wm_base };
+    wm_base.setHandler(*WmBaseState, wmBaseRequest, wmBaseDestroy, state);
 }
 
-fn wmBaseRequest(wm_base: *server.xdg.WmBase, request: server.xdg.WmBase.Request, shell: *XdgShell) void {
+fn wmBaseRequest(wm_base: *server.xdg.WmBase, request: server.xdg.WmBase.Request, state: *WmBaseState) void {
+    const shell = state.shell;
     switch (request) {
-        // Destructor: libwayland does not auto-destroy; we do.
-        .destroy => wm_base.destroy(),
+        // Destructor: libwayland does not auto-destroy; we do. Destroying the
+        // binding while xdg_surfaces created through it are still alive is
+        // illegal (defunct_surfaces); the connection is doomed either way, so
+        // the binding stays alive until the client is torn down.
+        .destroy => {
+            if (state.surfaces.items.len > 0) {
+                wm_base.postError(.defunct_surfaces, "xdg_wm_base destroyed with live xdg_surfaces");
+                return;
+            }
+            wm_base.destroy();
+        },
         .create_positioner => |r| {
             const res = server.xdg.Positioner.create(wm_base.getClient(), wm_base.getVersion(), r.id) catch {
                 wm_base.postNoMemory();
                 return;
             };
-            const state = shell.allocator.create(PositionerState) catch {
+            const pos_state = shell.allocator.create(PositionerState) catch {
                 wm_base.postNoMemory();
                 return;
             };
-            state.* = .{ .shell = shell };
-            res.setHandler(*PositionerState, positionerRequest, positionerDestroy, state);
+            pos_state.* = .{ .shell = shell };
+            res.setHandler(*PositionerState, positionerRequest, positionerDestroy, pos_state);
         },
-        .get_xdg_surface => |r| wmBaseGetXdgSurface(wm_base, shell, r),
+        .get_xdg_surface => |r| wmBaseGetXdgSurface(wm_base, state, r),
         .pong => |r| log.debug("xdg_wm_base.pong serial={d}", shell.io, shell.log_cfg, log_tag, .{r.serial}),
     }
 }
 
-fn wmBaseGetXdgSurface(wm_base: *server.xdg.WmBase, shell: *XdgShell, r: anytype) void {
+fn wmBaseDestroy(wm_base: *server.xdg.WmBase, state: *WmBaseState) void {
+    _ = wm_base;
+    // Client teardown destroys resources in object-id order: the wm_base
+    // (created before its xdg_surfaces) is destroyed FIRST, while the
+    // surfaces still need the state to detach. Defer the free until the
+    // last xdg_surface detaches (xdgSurfaceDestroy).
+    state.dead = true;
+    if (state.surfaces.items.len == 0) {
+        state.surfaces.deinit(state.shell.allocator);
+        state.shell.allocator.destroy(state);
+    }
+}
+
+fn wmBaseGetXdgSurface(wm_base: *server.xdg.WmBase, state: *WmBaseState, r: anytype) void {
+    const shell = state.shell;
     // The wl_surface resource's user data is the compositor's Surface.
     const surface: *surface_mod.Surface = @ptrCast(@alignCast(r.surface.getUserData()));
+    // Creating an xdg_surface for a wl_surface that already has a role is
+    // illegal (role error on the wm_base, per the XML's get_xdg_surface
+    // text). The role is permanent, so any role — including a previous
+    // xdg_surface role — conflicts; role.zig's assignRole would post a
+    // wl_surface error instead, so the check happens here.
+    if (surface.role != null) {
+        wm_base.postError(.role, "wl_surface already has a role");
+        return;
+    }
     const res = server.xdg.Surface.create(wm_base.getClient(), wm_base.getVersion(), r.id) catch {
         wm_base.postNoMemory();
         return;
     };
+    // Creating an xdg_surface from a wl_surface with a buffer attached or
+    // committed is a client error (unconfigured_buffer), caught at creation
+    // time rather than at the next commit.
+    if (surface.current.buffer != null or surface.pending.buffer != null) {
+        res.postError(.unconfigured_buffer, "wl_surface already has a buffer attached or committed");
+        res.destroy();
+        return;
+    }
     const xdg = shell.allocator.create(XdgSurface) catch {
         res.destroy();
         wm_base.postNoMemory();
@@ -171,6 +239,7 @@ fn wmBaseGetXdgSurface(wm_base: *server.xdg.WmBase, shell: *XdgShell, r: anytype
         .io = shell.io,
         .log_cfg = shell.log_cfg,
         .shell = shell,
+        .wm_base = state,
         .resource = res,
         .surface = surface,
         // SAFETY: initialized via .init() immediately after construction, before any emit.
@@ -178,10 +247,14 @@ fn wmBaseGetXdgSurface(wm_base: *server.xdg.WmBase, shell: *XdgShell, r: anytype
     };
     xdg.events.destroy.init();
     res.setHandler(*XdgSurface, xdgSurfaceRequest, xdgSurfaceDestroy, xdg);
-    // Assigns the "xdg_surface" role to the wl_surface. On a role conflict
-    // assignRole posts the wl_surface role error; drop the new object.
     role_mod.assignRole(surface, &xdg_surface_role, @as(?*wire.Resource, @ptrCast(res))) catch {
         res.destroy();
+        return;
+    };
+    // Track for the defunct_surfaces check on wm_base.destroy.
+    state.surfaces.append(shell.allocator, xdg) catch {
+        res.destroy();
+        wm_base.postNoMemory();
         return;
     };
     log.info("new xdg_surface for wl_surface {*}", shell.io, shell.log_cfg, log_tag, .{surface});
@@ -196,6 +269,10 @@ pub const XdgSurface = struct {
     io: *std.Io,
     log_cfg: *const log.Config,
     shell: *XdgShell,
+    /// The wm_base binding that created this xdg_surface; errors that belong
+    /// to the xdg_wm_base interface are posted on its resource, and the
+    /// binding's surface list tracks this surface until destroy.
+    wm_base: *WmBaseState,
     resource: *server.xdg.Surface,
     surface: *surface_mod.Surface,
     /// Which role object this xdg_surface currently has.
@@ -234,12 +311,29 @@ pub const XdgSurface = struct {
         };
     }
 
+    /// Reset the configure state machine: after an unmap (role object
+    /// destroyed or NULL-buffer commit) the client must perform the initial
+    /// buffer-less commit again, receive and ack a fresh configure before it
+    /// may attach a buffer (xdg-shell "Unmapping" semantics).
+    fn resetConfigureState(xdg: *XdgSurface) void {
+        xdg.configure_sent = false;
+        xdg.configured = false;
+        xdg.acked_serial = null;
+        xdg.sent_serials.clearRetainingCapacity();
+    }
+
     /// Handle xdg_surface.ack_configure. The serial must have been sent
     /// (present in the sent list) and must be newer than the last acked
     /// one — a client may ack a configure that was superseded by a newer
     /// one, but never one that was not sent or already acked (wlroots
     /// configure-list semantics; re-configures race client acks).
     fn ackConfigure(xdg: *XdgSurface, serial: u32) void {
+        // A role must be assigned before any other request on the xdg_surface
+        // (XML xdg_surface description).
+        if (xdg.role == .none) {
+            xdg.resource.postError(.not_constructed, "ack_configure before a role was assigned");
+            return;
+        }
         if (std.mem.indexOfScalar(u32, xdg.sent_serials.items, serial) == null) {
             xdg.resource.postError(.invalid_serial, "ack_configure: unknown serial");
             return;
@@ -266,7 +360,8 @@ pub const XdgSurface = struct {
     }
 
     /// Unmap the wl_surface. Used when a role object or the xdg_surface is
-    /// destroyed; NULL-buffer commits unmap via the compositor's transition.
+    /// destroyed; NULL-buffer commits unmap via the compositor's transition
+    /// (which fires the role's unmap hook, xdgSurfaceUnmap).
     fn unmapSurface(xdg: *XdgSurface) void {
         const surface = xdg.surface;
         if (!surface.mapped) return;
@@ -274,9 +369,9 @@ pub const XdgSurface = struct {
         if (surface.role) |r| if (r.unmap) |f| f(surface);
         surface.events.unmap.emit(surface);
         // The next commit after a re-map must trigger a fresh configure.
-        xdg.configure_sent = false;
-        xdg.acked_serial = null;
-        xdg.sent_serials.clearRetainingCapacity();
+        // (The role hook normally does this; role may already be detached
+        // on the destroy path, so reset explicitly here too.)
+        xdg.resetConfigureState();
         log.info("surface unmapped role={s}", xdg.io, xdg.log_cfg, log_tag, .{@tagName(xdg.role)});
     }
 };
@@ -287,6 +382,12 @@ fn xdgSurfaceRequest(xdg_res: *server.xdg.Surface, request: server.xdg.Surface.R
         .get_toplevel => |r| xdgSurfaceGetToplevel(xdg, r.id),
         .get_popup => |r| xdgSurfaceGetPopup(xdg, r),
         .set_window_geometry => |r| {
+            // A role must be assigned before any other request on the
+            // xdg_surface (XML xdg_surface description).
+            if (xdg.role == .none) {
+                xdg_res.postError(.not_constructed, "set_window_geometry before a role was assigned");
+                return;
+            }
             if (r.width <= 0 or r.height <= 0) {
                 xdg_res.postError(.invalid_size, "set_window_geometry: width and height must be positive");
                 return;
@@ -360,12 +461,23 @@ fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
         return;
     }
     const shell = xdg.shell;
+    // The parent, if given, must itself carry an xdg_surface-based role;
+    // a bare xdg_surface without a role object is not a valid parent
+    // (invalid_popup_parent on the wm_base).
+    if (r.parent) |parent_res| {
+        const parent_xdg: *XdgSurface = @ptrCast(@alignCast(parent_res.getUserData()));
+        if (parent_xdg.role == .none) {
+            xdg.wm_base.res.postError(.invalid_popup_parent, "xdg_popup parent has no role");
+            return;
+        }
+    }
     const positioner: *PositionerState = @ptrCast(@alignCast(r.positioner.getUserData()));
     if (!positioner.size_set or !positioner.anchor_rect_set) {
-        // wlroots posts the wm_base invalid_positioner error on the
-        // xdg_surface resource; the xdg_surface error enum has no code for it.
-        xdg.resource.postError(
-            @enumFromInt(@intFromEnum(server.xdg.WmBase.Error.invalid_positioner)),
+        // invalid_positioner belongs to the xdg_wm_base interface; posting
+        // its code on the xdg_surface resource would make the client read
+        // xdg_surface.invalid_size (code 5 collides).
+        xdg.wm_base.res.postError(
+            .invalid_positioner,
             "xdg_positioner is incomplete: set_size and set_anchor_rect are required",
         );
         return;
@@ -418,6 +530,18 @@ fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
 fn xdgSurfaceDestroy(res: *server.xdg.Surface, xdg: *XdgSurface) void {
     _ = res;
     const shell = xdg.shell;
+    // Detach from the binding. The wm_base may already be destroyed (client
+    // teardown destroys resources in object-id order, wm_base first): when
+    // this was the last surface, free the binding state. `xdg.wm_base` is
+    // not dereferenced again after this.
+    if (std.mem.findScalar(*XdgSurface, xdg.wm_base.surfaces.items, xdg)) |i| {
+        _ = xdg.wm_base.surfaces.swapRemove(i);
+    }
+    if (xdg.wm_base.dead and xdg.wm_base.surfaces.items.len == 0) {
+        const wm_state = xdg.wm_base;
+        wm_state.surfaces.deinit(shell.allocator);
+        shell.allocator.destroy(wm_state);
+    }
     // Destroy role objects first: their destroy handlers detach from `xdg`.
     if (xdg.toplevel) |t| t.resource.destroy();
     if (xdg.popup) |p| p.resource.destroy();
@@ -443,11 +567,27 @@ pub const ToplevelState = struct {
     fullscreen: bool = false,
     resizing: bool = false,
     activated: bool = false,
+    tiled_left: bool = false,
+    tiled_right: bool = false,
+    tiled_top: bool = false,
+    tiled_bottom: bool = false,
+    suspended: bool = false,
+    constrained_left: bool = false,
+    constrained_right: bool = false,
+    constrained_top: bool = false,
+    constrained_bottom: bool = false,
     /// Current/pending window geometry size (0 = client decides).
     width: i32 = 0,
     height: i32 = 0,
     min_size: geom.Size = .{ .w = 0, .h = 0 },
     max_size: geom.Size = .{ .w = 0, .h = 0 },
+};
+
+/// Payload of the XdgToplevel request_resize signal: the validated
+/// resize_edge value the client asked to resize from (none is legal).
+pub const ResizeRequest = struct {
+    toplevel: *XdgToplevel,
+    edges: server.xdg.Toplevel.ResizeEdge,
 };
 
 pub const XdgToplevel = struct {
@@ -470,8 +610,9 @@ pub const XdgToplevel = struct {
     events: struct {
         /// Client requested an interactive move (seat serials land in M3).
         request_move: wire.Signal(*XdgToplevel),
-        /// Client requested an interactive resize.
-        request_resize: wire.Signal(*XdgToplevel),
+        /// Client requested an interactive resize; the payload carries the
+        /// validated resize_edge.
+        request_resize: wire.Signal(*ResizeRequest),
         /// Client requested maximize/unmaximize.
         request_maximize: wire.Signal(*XdgToplevel),
         /// Client requested fullscreen/unfullscreen.
@@ -487,7 +628,7 @@ pub const XdgToplevel = struct {
     pub fn configure(t: *XdgToplevel, width: i32, height: i32) !void {
         const xdg = t.xdg_surface;
         const serial = xdg.shell.display.nextSerial();
-        var buf: [4]u32 = undefined;
+        var buf: [13]u32 = undefined;
         const states = stateValues(&t.current, &buf);
         // libwayland marshals the array synchronously; a stack buffer is safe.
         var array: server.wl.Array = .{
@@ -509,7 +650,16 @@ pub const XdgToplevel = struct {
     }
 
     fn setTitle(t: *XdgToplevel, title: [*:0]const u8) void {
-        const copy = t.allocator.dupe(u8, std.mem.span(title)) catch {
+        // The XML requires UTF-8 ("The string must be encoded in UTF-8")
+        // but defines no error code for a violation; reject the value with a
+        // log instead of storing garbage (wlroots posts error -1, which has
+        // no XML backing).
+        const span = std.mem.span(title);
+        if (!std.unicode.utf8ValidateSlice(span)) {
+            log.warn("xdg_toplevel.set_title: title is not valid UTF-8; rejected", t.io, t.log_cfg, log_tag, .{});
+            return;
+        }
+        const copy = t.allocator.dupe(u8, span) catch {
             t.resource.postNoMemory();
             return;
         };
@@ -527,9 +677,9 @@ pub const XdgToplevel = struct {
     }
 };
 
-/// Serialize the states set in `st` into `out` (at most 4 entries, in protocol
-/// enum value order: maximized, fullscreen, resizing, activated).
-fn stateValues(st: *const ToplevelState, out: *[4]u32) []u32 {
+/// Serialize the states set in `st` into `out`, in protocol enum value
+/// order (maximized=1 .. constrained_bottom=13; at most 13 entries).
+fn stateValues(st: *const ToplevelState, out: *[13]u32) []u32 {
     var n: usize = 0;
     if (st.maximized) {
         out[n] = @intFromEnum(server.xdg.Toplevel.State.maximized);
@@ -547,25 +697,105 @@ fn stateValues(st: *const ToplevelState, out: *[4]u32) []u32 {
         out[n] = @intFromEnum(server.xdg.Toplevel.State.activated);
         n += 1;
     }
+    if (st.tiled_left) {
+        out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_left);
+        n += 1;
+    }
+    if (st.tiled_right) {
+        out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_right);
+        n += 1;
+    }
+    if (st.tiled_top) {
+        out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_top);
+        n += 1;
+    }
+    if (st.tiled_bottom) {
+        out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_bottom);
+        n += 1;
+    }
+    if (st.suspended) {
+        out[n] = @intFromEnum(server.xdg.Toplevel.State.suspended);
+        n += 1;
+    }
+    if (st.constrained_left) {
+        out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_left);
+        n += 1;
+    }
+    if (st.constrained_right) {
+        out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_right);
+        n += 1;
+    }
+    if (st.constrained_top) {
+        out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_top);
+        n += 1;
+    }
+    if (st.constrained_bottom) {
+        out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_bottom);
+        n += 1;
+    }
     return out[0..n];
 }
 
 fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Toplevel.Request, t: *XdgToplevel) void {
+    const xdg = t.xdg_surface;
     switch (request) {
         // Destructor: libwayland does not auto-destroy; we do (runs toplevelDestroy).
         .destroy => t.resource.destroy(),
-        .set_parent => log.debug("xdg_toplevel.set_parent ignored in M1", t.io, t.log_cfg, log_tag, .{}),
+        .set_parent => |r| {
+            // The parent must not be the toplevel itself (invalid_parent);
+            // descendant-cycle detection needs real parenting/stacking and
+            // is deferred. Parenting itself is not implemented in M1.
+            if (r.parent) |parent_res| {
+                if (parent_res == t.resource) {
+                    toplevel_res.postError(.invalid_parent, "xdg_toplevel cannot be its own parent");
+                    return;
+                }
+            }
+            log.debug("xdg_toplevel.set_parent ignored (parenting deferred)", t.io, t.log_cfg, log_tag, .{});
+        },
         .set_title => |r| t.setTitle(r.title),
         .set_app_id => |r| t.setAppId(r.app_id),
-        .show_window_menu => log.debug(
-            "xdg_toplevel.show_window_menu ignored (seat is M3)",
-            t.io,
-            t.log_cfg,
-            log_tag,
-            .{},
-        ),
-        .move => t.events.request_move.emit(t),
-        .resize => t.events.request_resize.emit(t),
+        .show_window_menu => {
+            // Interactive requests need a configured (constructed) surface.
+            if (!xdg.configured) {
+                xdg.resource.postError(.not_constructed, "show_window_menu before the surface is configured");
+                return;
+            }
+            log.debug(
+                "xdg_toplevel.show_window_menu ignored (seat interaction deferred)",
+                t.io,
+                t.log_cfg,
+                log_tag,
+                .{},
+            );
+        },
+        .move => {
+            if (!xdg.configured) {
+                xdg.resource.postError(.not_constructed, "move before the surface is configured");
+                return;
+            }
+            t.events.request_move.emit(t);
+        },
+        .resize => |r| {
+            if (!xdg.configured) {
+                xdg.resource.postError(.not_constructed, "resize before the surface is configured");
+                return;
+            }
+            // Values not matching a resize_edge variant are an error
+            // (invalid_resize_edge on the toplevel); valid: none, top,
+            // bottom, left, top_left, bottom_left, right, top_right,
+            // bottom_right (XML enum values 0,1,2,4,5,6,8,9,10).
+            const edge = @intFromEnum(r.edges);
+            switch (edge) {
+                0, 1, 2, 4, 5, 6, 8, 9, 10 => {},
+                else => {
+                    toplevel_res.postError(.invalid_resize_edge, "xdg_toplevel.resize: invalid resize edge");
+                    return;
+                },
+            }
+            var req: ResizeRequest = .{ .toplevel = t, .edges = r.edges };
+            t.events.request_resize.emit(&req);
+        },
         .set_max_size => |r| {
             t.pending.max_size = .{ .w = r.width, .h = r.height };
             // Validated at commit, in xdgSurfaceClientCommit (wlroots order).
@@ -591,7 +821,6 @@ fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Tople
         },
         .set_minimized => log.debug("xdg_toplevel.set_minimized ignored in M1", t.io, t.log_cfg, log_tag, .{}),
     }
-    _ = toplevel_res;
 }
 
 fn toplevelDestroy(toplevel_res: *server.xdg.Toplevel, t: *XdgToplevel) void {
@@ -791,9 +1020,33 @@ fn positionerRequest(
             state.anchor_rect = .{ .x = r.x, .y = r.y, .width = r.width, .height = r.height };
             state.anchor_rect_set = true;
         },
-        .set_anchor => |r| state.anchor = r.anchor,
-        .set_gravity => |r| state.gravity = r.gravity,
-        .set_constraint_adjustment => |r| state.constraint_adjustment = r.constraint_adjustment,
+        .set_anchor => |r| {
+            // Valid anchors are the 9 enum values 0..8 (none..bottom_right).
+            if (@intFromEnum(r.anchor) > @intFromEnum(server.xdg.Positioner.Anchor.bottom_right)) {
+                pos_res.postError(.invalid_input, "xdg_positioner.set_anchor: value not in the anchor enum");
+                return;
+            }
+            state.anchor = r.anchor;
+        },
+        .set_gravity => |r| {
+            // The XML explicitly requires invalid_input when the gravity is
+            // not in the gravity enum (values 0..8).
+            if (@intFromEnum(r.gravity) > @intFromEnum(server.xdg.Positioner.Gravity.bottom_right)) {
+                pos_res.postError(.invalid_input, "xdg_positioner.set_gravity: value not in the gravity enum");
+                return;
+            }
+            state.gravity = r.gravity;
+        },
+        .set_constraint_adjustment => |r| {
+            // Valid bits per the XML bitfield: slide_x=1, slide_y=2,
+            // flip_x=4, flip_y=8, resize_x=16, resize_y=32 (mask 0x3F).
+            const bits = @as(u32, @bitCast(r.constraint_adjustment));
+            if (bits & ~@as(u32, 0b11_1111) != 0) {
+                pos_res.postError(.invalid_input, "xdg_positioner.set_constraint_adjustment: invalid adjustment bits");
+                return;
+            }
+            state.constraint_adjustment = r.constraint_adjustment;
+        },
         .set_offset => |r| state.offset = .{ .x = r.x, .y = r.y },
         .set_reactive => state.reactive = true,
         .set_parent_size => |r| state.parent_size = .{ .w = r.parent_width, .h = r.parent_height },
@@ -822,6 +1075,15 @@ fn xdgFromSurface(surface: *surface_mod.Surface) ?*XdgSurface {
 /// the protocol checks that must happen at commit time.
 fn xdgSurfaceClientCommit(surface: *surface_mod.Surface) void {
     const xdg = xdgFromSurface(surface) orelse return;
+    // A popup created with a NULL parent must be given one through another
+    // protocol before its initial commit (XML get_popup: "before committing
+    // the initial state"); layer-shell parenting is M4.
+    if (xdg.role == .popup) if (xdg.popup) |p| {
+        if (p.parent == null) {
+            xdg.resource.postError(.not_constructed, "xdg_popup committed without a parent");
+            return;
+        }
+    };
     // Protocol: attaching a buffer before the surface is configured is an error.
     if (!xdg.configured and surface.current.buffer != null) {
         xdg.resource.postError(.unconfigured_buffer, "xdg_surface committed a buffer before ack_configure");
@@ -873,6 +1135,16 @@ fn xdgSurfaceMap(surface: *surface_mod.Surface) void {
     log.info("surface mapped role={s}", xdg.io, xdg.log_cfg, log_tag, .{@tagName(xdg.role)});
 }
 
+/// The compositor's unmap transition ran (a NULL-buffer commit): reset the
+/// configure state machine so the client must redo the initial buffer-less
+/// commit, receive and ack a fresh configure before it may map again
+/// (xdg-shell "Unmapping" semantics; the same reset as the destroy paths).
+fn xdgSurfaceUnmap(surface: *surface_mod.Surface) void {
+    const xdg = xdgFromSurface(surface) orelse return;
+    xdg.resetConfigureState();
+    log.info("surface unmapped via NULL buffer role={s}", xdg.io, xdg.log_cfg, log_tag, .{@tagName(xdg.role)});
+}
+
 /// The wl_surface is going away; tear down the xdg_surface (which cascades
 /// through xdgSurfaceDestroy and frees everything).
 fn xdgSurfaceRoleDestroy(surface: *surface_mod.Surface) void {
@@ -885,7 +1157,7 @@ const xdg_surface_role: role_mod.SurfaceRole = .{
     .client_commit = xdgSurfaceClientCommit,
     .commit = xdgSurfaceCommit,
     .map = xdgSurfaceMap,
-    .unmap = null,
+    .unmap = xdgSurfaceUnmap,
     .destroy = xdgSurfaceRoleDestroy,
 };
 
@@ -943,7 +1215,7 @@ test "positioner edge mapping" {
 }
 
 test "toplevel state values" {
-    var buf: [4]u32 = undefined;
+    var buf: [13]u32 = undefined;
     const empty = stateValues(&.{}, &buf);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
@@ -952,6 +1224,26 @@ test "toplevel state values" {
     try std.testing.expectEqual(@as(usize, 2), vals.len);
     try std.testing.expectEqual(@as(u32, 1), vals[0]); // maximized
     try std.testing.expectEqual(@as(u32, 4), vals[1]); // activated
+
+    // Full state set: 13 entries in XML enum value order (1..13).
+    const all: ToplevelState = .{
+        .maximized = true,
+        .fullscreen = true,
+        .resizing = true,
+        .activated = true,
+        .tiled_left = true,
+        .tiled_right = true,
+        .tiled_top = true,
+        .tiled_bottom = true,
+        .suspended = true,
+        .constrained_left = true,
+        .constrained_right = true,
+        .constrained_top = true,
+        .constrained_bottom = true,
+    };
+    const all_vals = stateValues(&all, &buf);
+    try std.testing.expectEqual(@as(usize, 13), all_vals.len);
+    for (all_vals, 1..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(i)), v);
 }
 
 // --- socketpair roundtrip harness (no filesystem server socket) ------------
@@ -961,9 +1253,23 @@ const posix = std.posix;
 /// libwayland-client >= 1.18: return the code of the last protocol error.
 extern fn wl_display_get_protocol_error(display: *client.wl.Display, interface: ?*anyopaque, id: ?*u32) c_int;
 
+/// The (code, interface name, object id) of the client's last protocol
+/// error. Call after ts.pump() failed with ClientDispatchFailed.
+const ProtocolError = struct { code: c_int, interface: []const u8, id: u32 };
+
+fn protocolError(ts: *TestServer) ProtocolError {
+    var interface: ?*client.wl.Interface = null;
+    var id: u32 = 0;
+    const code = wl_display_get_protocol_error(ts.c_display.?, @ptrCast(&interface), &id);
+    const name = if (interface) |i| std.mem.span(i.name) else "";
+    return .{ .code = code, .interface = name, .id = id };
+}
+
 const RegistryCapture = struct {
     compositor_name: ?u32 = null,
     wm_base_name: ?u32 = null,
+    shm_name: ?u32 = null,
+    seat_name: ?u32 = null,
 
     fn listener(registry: *client.wl.Registry, event: client.wl.Registry.Event, data: *RegistryCapture) void {
         _ = registry;
@@ -974,6 +1280,10 @@ const RegistryCapture = struct {
                     data.compositor_name = g.name;
                 } else if (std.mem.eql(u8, name, "xdg_wm_base")) {
                     data.wm_base_name = g.name;
+                } else if (std.mem.eql(u8, name, "wl_shm")) {
+                    data.shm_name = g.name;
+                } else if (std.mem.eql(u8, name, "wl_seat")) {
+                    data.seat_name = g.name;
                 }
             },
             .global_remove => {},
@@ -986,7 +1296,7 @@ const ToplevelEvents = struct {
     width: i32 = 0,
     height: i32 = 0,
     states_len: usize = 0,
-    states: [4]u32 = [_]u32{0} ** 4,
+    states: [13]u32 = [_]u32{0} ** 13,
 
     fn listener(toplevel: *client.xdg.Toplevel, event: client.xdg.Toplevel.Event, data: *ToplevelEvents) void {
         _ = toplevel;
@@ -1065,7 +1375,7 @@ const NewPopupCapture = struct {
     }
 };
 
-/// A full compositor + shell + in-memory client, for wire roundtrips.
+/// A full compositor + shell + seat + in-memory client, for wire roundtrips.
 const TestServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1073,13 +1383,20 @@ const TestServer = struct {
     display: ?*display_mod.CompositorDisplay = null,
     compositor: ?*compositor_mod.Compositor = null,
     shell: ?*XdgShell = null,
+    seat: ?*seat_mod.Seat = null,
     client: ?*wire.Client = null,
     c_display: ?*client.wl.Display = null,
     wl_compositor: ?*client.wl.Compositor = null,
     wm_base: ?*client.xdg.WmBase = null,
+    shm: ?*client.wl.Shm = null,
+    wl_seat: ?*client.wl.Seat = null,
+    /// Lazily-created shm pool + buffer for mapping surfaces in tests; the
+    /// pool is retained so the buffer stays valid across re-attaches.
+    shm_pool: ?*client.wl.ShmPool = null,
+    buffer: ?*client.wl.Buffer = null,
 
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
-    /// display, compositor and shell all store it).
+    /// display, compositor, shell and seat all store it).
     fn init(allocator: std.mem.Allocator) !*TestServer {
         const ts = try allocator.create(TestServer);
         errdefer allocator.destroy(ts);
@@ -1090,10 +1407,15 @@ const TestServer = struct {
         };
         ts.display = try display_mod.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
         errdefer if (ts.display) |d| d.deinit();
+        // The internal wl_shm global (libwayland) must exist before the
+        // client's first registry roundtrip so it can bind it for buffers.
+        try ts.display.?.initShm();
         ts.compositor = try compositor_mod.Compositor.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
         errdefer if (ts.compositor) |c| c.deinit();
         ts.shell = try XdgShell.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, ts.compositor.?);
         errdefer if (ts.shell) |s| s.deinit();
+        ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.seat) |s| s.deinit();
 
         // In-memory client connection: one socketpair end for the server, the
         // other for the client library.
@@ -1108,11 +1430,19 @@ const TestServer = struct {
         var capture: RegistryCapture = .{};
         registry.setListener(*RegistryCapture, RegistryCapture.listener, &capture);
         try ts.pump();
-        if (capture.compositor_name == null or capture.wm_base_name == null) return error.GlobalMissing;
+        if (capture.compositor_name == null or
+            capture.wm_base_name == null or
+            capture.shm_name == null or
+            capture.seat_name == null)
+        {
+            return error.GlobalMissing;
+        }
 
-        // Round 2: bind wl_compositor and xdg_wm_base.
+        // Round 2: bind wl_compositor, xdg_wm_base, wl_shm and wl_seat.
         ts.wl_compositor = try registry.bind(capture.compositor_name.?, client.wl.Compositor, 7);
         ts.wm_base = try registry.bind(capture.wm_base_name.?, client.xdg.WmBase, 7);
+        ts.shm = try registry.bind(capture.shm_name.?, client.wl.Shm, 1);
+        ts.wl_seat = try registry.bind(capture.seat_name.?, client.wl.Seat, 7);
         try ts.pump();
         return ts;
     }
@@ -1121,10 +1451,27 @@ const TestServer = struct {
         if (ts.c_display) |d| d.disconnect();
         if (ts.client) |c| c.destroy();
         if (ts.shell) |s| s.deinit();
+        if (ts.seat) |s| s.deinit();
         if (ts.compositor) |c| c.deinit();
         if (ts.display) |d| d.deinit();
         const allocator = ts.allocator;
         allocator.destroy(ts);
+    }
+
+    /// Create a 64x64 ARGB8888 wl_shm buffer for mapping the test surface.
+    /// The pool is retained so the buffer stays valid for later re-attaches.
+    fn createBuffer(ts: *TestServer) !*client.wl.Buffer {
+        if (ts.buffer) |b| return b;
+        const width: i32 = 64;
+        const height: i32 = 64;
+        const fd = try std.posix.memfd_create("xdg-test-buffer", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(fd);
+        const pool_size = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+        const rc = std.os.linux.ftruncate(fd, @intCast(pool_size));
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
+        ts.shm_pool = try ts.shm.?.createPool(fd, @intCast(pool_size));
+        ts.buffer = try ts.shm_pool.?.createBuffer(0, width, height, width * 4, .argb8888);
+        return ts.buffer.?;
     }
 
     /// Client flush -> server event loop dispatch -> server flush -> client
@@ -1238,6 +1585,11 @@ test "xdg popup configure and positioner errors" {
     };
     ts.shell.?.events.new_popup.add(&new_popup.listener);
 
+    // The popup needs a parent with an xdg_surface role: a toplevel.
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+
     const wl_surface = try ts.wl_compositor.?.createSurface();
     const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
     var xs_events: XdgSurfaceEvents = .{};
@@ -1252,7 +1604,7 @@ test "xdg popup configure and positioner errors" {
     positioner.setAnchor(.bottom_right);
     positioner.setGravity(.bottom_right);
     positioner.setOffset(0, 0);
-    const popup = try xdg_surface.getPopup(null, positioner);
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
     popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
     positioner.destroy(); // rules were copied at get_popup
     try ts.pump();
@@ -1293,13 +1645,391 @@ test "xdg popup configure and positioner errors" {
     try std.testing.expect(p.xdg_surface.role == .none);
 
     // An incomplete positioner (size never set) is rejected with the wm_base
-    // invalid_positioner error (code 5) on the xdg_surface resource.
+    // invalid_positioner error (code 5) posted on the xdg_wm_base resource —
+    // posting it on the xdg_surface would read as xdg_surface.invalid_size.
     const wl_surface2 = try ts.wl_compositor.?.createSurface();
     const xdg_surface2 = try ts.wm_base.?.getXdgSurface(wl_surface2);
     const bad_positioner = try ts.wm_base.?.createPositioner();
     bad_positioner.setAnchorRect(0, 0, 10, 10);
     _ = try xdg_surface2.getPopup(null, bad_positioner);
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
-    // invalid_positioner (wm_base error code 5).
-    try std.testing.expectEqual(@as(c_int, 5), wl_display_get_protocol_error(ts.c_display.?, null, null));
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 5), err.code); // invalid_positioner
+    try std.testing.expectEqualStrings("xdg_wm_base", err.interface);
+}
+
+/// Shared setup for the toplevel adversarial tests: surface + xdg_surface +
+/// toplevel, first configure sent and acked (configured == true).
+fn setupConfiguredToplevel(ts: *TestServer, xs_events: *XdgSurfaceEvents) !*client.xdg.Toplevel {
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, xs_events);
+    const toplevel = try xdg_surface.getToplevel();
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), xs_events.configure_count);
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(xdgSurfaceConfigured(ts));
+    return toplevel;
+}
+
+/// True when the server-side XdgSurface for the test client's toplevel is
+/// configured (helper: the shell keeps exactly the toplevels we create).
+fn xdgSurfaceConfigured(ts: *TestServer) bool {
+    return ts.shell.?.toplevels.items[0].xdg_surface.configured;
+}
+
+test "unmap via null buffer resets the configure state machine" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    _ = try xdg_surface.getToplevel();
+    const buffer = try ts.createBuffer();
+
+    // Map: initial commit -> configure, ack, attach buffer, commit.
+    wl_surface.commit();
+    try ts.pump();
+    const serial1 = xs_events.serial;
+    xdg_surface.ackConfigure(serial1);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    const srv = ts.shell.?.toplevels.items[0].xdg_surface;
+    try std.testing.expect(srv.surface.mapped);
+    try std.testing.expect(srv.configured);
+
+    // Unmap via NULL buffer: the configure state machine resets.
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(!srv.surface.mapped);
+    try std.testing.expect(!srv.configured);
+    try std.testing.expect(!srv.configure_sent);
+    try std.testing.expect(srv.acked_serial == null);
+
+    // Re-map requires a fresh configure: a buffer-less commit first...
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), xs_events.configure_count);
+    const serial2 = xs_events.serial;
+    try std.testing.expect(serial2 != serial1);
+    xdg_surface.ackConfigure(serial2);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(srv.surface.mapped);
+    try std.testing.expect(srv.configured);
+
+    // ...and committing a buffer without the fresh configure is an error:
+    // unmap again, then attach a buffer and commit before any configure.
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(!srv.surface.mapped);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 3), err.code); // unconfigured_buffer
+    try std.testing.expectEqualStrings("xdg_surface", err.interface);
+}
+
+test "wm_base.destroy with live surfaces posts defunct_surfaces" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+
+    ts.wm_base.?.destroy();
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 1), err.code); // defunct_surfaces
+    // The interface name is NOT asserted: the client destroyed its wm_base
+    // proxy before the error arrived, so libwayland-client cannot map the
+    // object to the xdg_wm_base interface anymore.
+}
+
+test "get_xdg_surface on a surface with a role posts wm_base role error" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+
+    // The wl_surface already carries the xdg_surface role: a second
+    // get_xdg_surface is a role error on the wm_base, not a wl_surface
+    // error (role.zig's assignRole would post the wrong resource).
+    _ = try ts.wm_base.?.getXdgSurface(wl_surface);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 0), err.code); // role
+    try std.testing.expectEqualStrings("xdg_wm_base", err.interface);
+}
+
+test "ack_configure before a role is assigned posts not_constructed" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    try ts.pump();
+
+    xdg_surface.ackConfigure(1);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 1), err.code); // not_constructed
+    try std.testing.expectEqualStrings("xdg_surface", err.interface);
+}
+
+test "set_window_geometry before a role is assigned posts not_constructed" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    try ts.pump();
+
+    xdg_surface.setWindowGeometry(0, 0, 100, 100);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 1), err.code); // not_constructed
+    try std.testing.expectEqualStrings("xdg_surface", err.interface);
+}
+
+test "toplevel move before configured posts not_constructed" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const toplevel = try xdg_surface.getToplevel();
+    try ts.pump();
+
+    // Role assigned but never configured: interactive requests are errors.
+    toplevel.move(ts.wl_seat.?, 1);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 1), err.code); // not_constructed
+    try std.testing.expectEqualStrings("xdg_surface", err.interface);
+}
+
+const ResizeCapture = struct {
+    count: usize = 0,
+    edges: server.xdg.Toplevel.ResizeEdge = .none,
+    listener: wire.Listener(*ResizeRequest),
+
+    fn notify(listener: *wire.Listener(*ResizeRequest), req: *ResizeRequest) void {
+        const self: *ResizeCapture = @fieldParentPtr("listener", listener);
+        self.count += 1;
+        self.edges = req.edges;
+    }
+};
+
+test "resize with an invalid edge posts invalid_resize_edge" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var xs_events: XdgSurfaceEvents = .{};
+    const toplevel = try setupConfiguredToplevel(ts, &xs_events);
+
+    // 3 is not a resize_edge variant (none=0, top=1, bottom=2, left=4, ...).
+    toplevel.resize(ts.wl_seat.?, 2, @enumFromInt(3));
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 0), err.code); // invalid_resize_edge
+    try std.testing.expectEqualStrings("xdg_toplevel", err.interface);
+}
+
+test "resize carries the validated edges in the signal payload" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var xs_events: XdgSurfaceEvents = .{};
+    const toplevel = try setupConfiguredToplevel(ts, &xs_events);
+
+    var capture: ResizeCapture = .{ .listener = wire.Listener(*ResizeRequest).init(ResizeCapture.notify) };
+    ts.shell.?.toplevels.items[0].events.request_resize.add(&capture.listener);
+
+    toplevel.resize(ts.wl_seat.?, 2, .top_left);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(server.xdg.Toplevel.ResizeEdge.top_left, capture.edges);
+}
+
+test "positioner rejects invalid anchor, gravity and constraint adjustments" {
+    const allocator = std.testing.allocator;
+
+    // Anchor out of range (valid values 0..8).
+    {
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const positioner = try ts.wm_base.?.createPositioner();
+        positioner.setAnchor(@enumFromInt(99));
+        try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+        const err = protocolError(ts);
+        try std.testing.expectEqual(@as(c_int, 0), err.code); // invalid_input
+        try std.testing.expectEqualStrings("xdg_positioner", err.interface);
+    }
+
+    // Gravity out of range.
+    {
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const positioner = try ts.wm_base.?.createPositioner();
+        positioner.setGravity(@enumFromInt(99));
+        try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+        const err = protocolError(ts);
+        try std.testing.expectEqual(@as(c_int, 0), err.code); // invalid_input
+        try std.testing.expectEqualStrings("xdg_positioner", err.interface);
+    }
+
+    // Constraint adjustment bits outside slide/flip/resize (mask 0x3F).
+    {
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const positioner = try ts.wm_base.?.createPositioner();
+        positioner.setConstraintAdjustment(@bitCast(@as(u32, 64)));
+        try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+        const err = protocolError(ts);
+        try std.testing.expectEqual(@as(c_int, 0), err.code); // invalid_input
+        try std.testing.expectEqualStrings("xdg_positioner", err.interface);
+    }
+}
+
+test "get_popup with a parent without a role posts invalid_popup_parent" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface); // no role object
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    try ts.pump();
+
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(0, 0, 10, 10);
+    _ = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 3), err.code); // invalid_popup_parent
+    try std.testing.expectEqualStrings("xdg_wm_base", err.interface);
+}
+
+test "popup with a null parent posts not_constructed at commit" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    try ts.pump();
+
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(0, 0, 10, 10);
+    _ = try xdg_surface.getPopup(null, positioner);
+
+    // Committing the initial state without a parent is an error.
+    wl_surface.commit();
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 1), err.code); // not_constructed
+    try std.testing.expectEqualStrings("xdg_surface", err.interface);
+}
+
+test "set_parent to itself posts invalid_parent" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const toplevel = try xdg_surface.getToplevel();
+    try ts.pump();
+
+    toplevel.setParent(toplevel);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 1), err.code); // invalid_parent
+    try std.testing.expectEqualStrings("xdg_toplevel", err.interface);
+}
+
+test "get_xdg_surface on a surface with a committed buffer posts unconfigured_buffer" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const buffer = try ts.createBuffer();
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+
+    _ = try ts.wm_base.?.getXdgSurface(wl_surface);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 3), err.code); // unconfigured_buffer
+    try std.testing.expectEqualStrings("xdg_surface", err.interface);
+}
+
+test "second role object on one xdg_surface posts already_constructed" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+
+    // A second role object: already_constructed on the xdg_surface (kept
+    // over wlroots' cross-interface role post; see notes/129).
+    _ = try xdg_surface.getToplevel();
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 2), err.code); // already_constructed
+    try std.testing.expectEqualStrings("xdg_surface", err.interface);
+}
+
+test "invalid utf-8 title is rejected without storing" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const toplevel = try xdg_surface.getToplevel();
+    try ts.pump();
+
+    // 0xFF is not valid UTF-8; the title must be rejected, not stored.
+    toplevel.setTitle("\xff\xfe");
+    try ts.pump();
+    const t = ts.shell.?.toplevels.items[0];
+    try std.testing.expect(t.title == null);
+    // The connection survives: a well-formed title still works.
+    toplevel.setTitle("ok");
+    try ts.pump();
+    try std.testing.expectEqualStrings("ok", t.title.?);
 }

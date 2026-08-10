@@ -40,6 +40,9 @@ pub const xkb = @import("compositor/xkb.zig");
 pub const subsurface = @import("compositor/subsurface.zig");
 /// wl_data_device_manager (compositor/data_device.zig): clipboard relay.
 pub const data_device = @import("compositor/data_device.zig");
+/// zwp_primary_selection_device_manager_v1 (compositor/primary_selection.zig):
+/// the X11 PRIMARY analogue, keyboard-focus-owned.
+pub const primary_selection = @import("compositor/primary_selection.zig");
 pub const backend = @import("backend/backend.zig");
 /// libinput input backend (backend/libinput.zig): evdev devices via
 /// libinput (udev context). Exported for the test server.
@@ -64,6 +67,13 @@ pub const pixman = @import("renderer/pixman.zig");
 /// texture compositing into a pixman framebuffer.
 pub const canvas = @import("renderer/canvas.zig");
 pub const shell = @import("shell/xdg.zig");
+/// zwlr_layer_shell_v1 (shell/layer_shell.zig): layer surfaces with
+/// double-buffered size/anchor/zone/margin/keyboard/layer state.
+pub const layer_shell = @import("shell/layer_shell.zig");
+/// xdg_activation_v1 (staging/xdg-activation): activation tokens.
+pub const xdg_activation = @import("shell/xdg_activation.zig");
+/// zxdg_decoration_manager_v1 (unstable/xdg-decoration): server-side decorations.
+pub const xdg_decoration = @import("shell/xdg_decoration.zig");
 pub const scene = @import("scene/scene.zig");
 /// M4 camera (scene/camera.zig): the world→screen view transform for the
 /// canvas pass.
@@ -85,6 +95,7 @@ comptime {
     _ = xkb;
     _ = subsurface;
     _ = data_device;
+    _ = primary_selection;
     _ = backend;
     _ = libinput;
     _ = drm;
@@ -92,6 +103,9 @@ comptime {
     _ = wl_output;
     _ = renderer;
     _ = shell;
+    _ = layer_shell;
+    _ = xdg_activation;
+    _ = xdg_decoration;
     _ = scene;
     _ = camera;
     _ = canvas;

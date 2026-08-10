@@ -145,6 +145,12 @@ const ServerState = struct {
     compositor: *wayland.compositor.Compositor,
     shm_state: *wayland.shm.ShmState,
     shell: *wayland.shell.XdgShell,
+    /// zwlr_layer_shell_v1 (layer surfaces with their own stacking layer).
+    layer_shell: *wayland.layer_shell.LayerShell,
+    /// xdg_activation_v1 (activation tokens for focus requests).
+    xdg_activation: *wayland.xdg_activation.XdgActivation,
+    /// zxdg_decoration_manager_v1 (server-side decorations).
+    xdg_decoration: *wayland.xdg_decoration.XdgDecoration,
     renderer: *wayland.renderer.Renderer,
     backend: *wayland.backend.Backend,
     framebuffer: *pixman.Framebuffer,
@@ -168,6 +174,10 @@ const ServerState = struct {
     subcompositor: *wayland.subsurface.Subcompositor,
     /// wl_data_device_manager: clipboard selection relay.
     data_device: *wayland.data_device.DataDeviceManager,
+    /// zwp_primary_selection_device_manager_v1: the primary selection
+    /// (X11 PRIMARY analogue, keyboard-focus-owned). Self-subscribes to
+    /// the seat's keyboard-focus signal.
+    primary_selection: *wayland.primary_selection.PrimarySelection,
     /// The raylib input poll object (null in headless mode).
     raylib_input: RaylibInputPtr = if (build_options.enable_raylib) null else {},
     /// The libinput backend (evdev input source), when active.
@@ -208,6 +218,8 @@ const ServerState = struct {
     output: ?*wayland.output.Output = null,
     /// Toplevels created by clients (tracked for observability).
     toplevels: std.ArrayList(*wayland.shell.XdgToplevel) = .empty,
+    /// Layer surfaces created by clients (tracked for observability).
+    layer_surfaces: std.ArrayList(*wayland.layer_shell.LayerSurface) = .empty,
     frames_rendered: u32 = 0,
     /// Idle-frame skip: a frame only renders when something changed this
     /// cycle (a surface commit, a camera move, a cursor move). Cleared
@@ -288,6 +300,9 @@ const ServerState = struct {
     frame_listener: wire.Listener(*wayland.output.Output),
     new_toplevel_listener: wire.Listener(*wayland.shell.XdgToplevel),
     new_popup_listener: wire.Listener(*wayland.shell.XdgPopup),
+    new_layer_surface_listener: wire.Listener(*wayland.layer_shell.LayerSurface),
+    request_activate_listener: wire.Listener(*wayland.xdg_activation.ActivateRequest),
+    request_mode_listener: wire.Listener(*wayland.xdg_decoration.RequestMode),
     seat_key_listener: wire.Listener(*wayland.seat.Seat),
     /// M4 Phase B camera controls: seat listeners for the drag-pan
     /// (button + pointer_move signals) and the wheel-zoom (axis signal).
@@ -352,15 +367,42 @@ pub fn main(init: std.process.Init) !void {
     compositor.setShm(shm_state);
     const shell = try wayland.shell.XdgShell.init(allocator, io, &log_cfg, display, compositor);
     defer shell.deinit();
+    // zwlr_layer_shell_v1: layer surfaces (panels, wallpapers, lock screens).
+    const layer_shell = try wayland.layer_shell.LayerShell.init(allocator, io, &log_cfg, display, compositor);
+    defer layer_shell.deinit();
     // M3: the seat (keyboard + pointer) with the xkbcommon us keymap.
     const seat = try wayland.seat.Seat.init(allocator, io, &log_cfg, display);
     defer seat.deinit();
+    // xdg_activation_v1 (staging): activation tokens for focus requests
+    // (needs the seat for serial/focus validation).
+    const xdg_activation = try wayland.xdg_activation.XdgActivation.init(
+        allocator,
+        io,
+        &log_cfg,
+        display,
+        seat,
+        compositor,
+    );
+    defer xdg_activation.deinit();
+    // zxdg_decoration_manager_v1 (unstable): server-side decorations.
+    const xdg_decoration = try wayland.xdg_decoration.XdgDecoration.init(allocator, io, &log_cfg, display, shell);
+    defer xdg_decoration.deinit();
     // Subcompositor (foot needs wl_subcompositor).
     const subcompositor = try wayland.subsurface.Subcompositor.init(allocator, io, &log_cfg, display, compositor);
     defer subcompositor.deinit();
     // Data device manager (foot requires it; clipboard selection relay).
     const data_device = try wayland.data_device.DataDeviceManager.init(allocator, io, &log_cfg, display, seat);
     defer data_device.deinit();
+    // Primary selection (zwp_primary_selection_device_manager_v1, the
+    // X11 PRIMARY analogue): per-seat, keyboard-focus-owned.
+    const primary_selection = try wayland.primary_selection.PrimarySelection.init(
+        allocator,
+        io,
+        &log_cfg,
+        display,
+        seat,
+    );
+    defer primary_selection.deinit();
     const renderer = try pixman.PixmanRenderer.create(allocator, io, &log_cfg);
     defer renderer.destroy();
     // Backend selection: WAYLAND_BACKEND=raylib uses the windowed raylib
@@ -461,10 +503,14 @@ pub fn main(init: std.process.Init) !void {
         .compositor = compositor,
         .shm_state = shm_state,
         .shell = shell,
+        .layer_shell = layer_shell,
         .seat = seat,
         .subcompositor = subcompositor,
         .data_device = data_device,
+        .primary_selection = primary_selection,
         .renderer = renderer,
+        .xdg_activation = xdg_activation,
+        .xdg_decoration = xdg_decoration,
         .backend = backend,
         .framebuffer = framebuffer,
         .camera = Camera{
@@ -479,11 +525,15 @@ pub fn main(init: std.process.Init) !void {
         .presentation = presentation,
         .surface_entries = std.AutoHashMap(*Surface, *SurfaceEntry).init(allocator),
         .toplevels = .empty,
+        .layer_surfaces = .empty,
         .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
         .new_input_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onNewInput),
         .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
         .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
         .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
+        .new_layer_surface_listener = wire.Listener(*wayland.layer_shell.LayerSurface).init(onNewLayerSurface),
+        .request_activate_listener = wire.Listener(*wayland.xdg_activation.ActivateRequest).init(onRequestActivate),
+        .request_mode_listener = wire.Listener(*wayland.xdg_decoration.RequestMode).init(onDecorationMode),
         .seat_key_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKey),
         .seat_button_listener = wire.Listener(*wayland.seat.Seat).init(onSeatButton),
         .seat_pointer_move_listener = wire.Listener(*wayland.seat.Seat).init(onSeatPointerMove),
@@ -491,6 +541,7 @@ pub fn main(init: std.process.Init) !void {
     };
     if (backend_is_drm) state.drm_backend = backend;
     defer state.toplevels.deinit(allocator);
+    defer state.layer_surfaces.deinit(allocator);
     // Scene teardown (LIFO): drop the per-surface scene state first, then
     // the scene output view, then the scene tree itself. The compositor
     // (deferred earlier in main) destroys its surfaces afterwards; the
@@ -506,6 +557,7 @@ pub fn main(init: std.process.Init) !void {
     }
     shell.events.new_toplevel.add(&state.new_toplevel_listener);
     shell.events.new_popup.add(&state.new_popup_listener);
+    layer_shell.events.new_layer_surface.add(&state.new_layer_surface_listener);
     seat.events.key.add(&state.seat_key_listener);
     // M4 Phase B camera controls: wheel zoom + drag pan hook the seat's
     // existing event surface (button, pointer_move, axis). The raylib
@@ -515,6 +567,12 @@ pub fn main(init: std.process.Init) !void {
     seat.events.button.add(&state.seat_button_listener);
     seat.events.pointer_move.add(&state.seat_pointer_move_listener);
     seat.events.axis.add(&state.seat_axis_listener);
+    // xdg_activation_v1: activation requests with known tokens (focus
+    // policy is out of scope — the handler logs and accepts).
+    xdg_activation.events.request_activate.add(&state.request_activate_listener);
+    // zxdg_decoration_manager_v1: mode requests; the handler replies with
+    // the effective mode via sendConfigure.
+    xdg_decoration.events.request_mode.add(&state.request_mode_listener);
     // The compositor hit-tests over the scene graph: surfaces map to
     // scene nodes through the surface entries.
     seat.setPick(pickSurface, &state);
@@ -773,11 +831,80 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
     });
 }
 
+/// A new zwlr_layer_surface_v1 role object was created. Like toplevels,
+/// layer surfaces composite through the shared surface_entries path
+/// (syncSurfaces/updateSurfaceNode keyed on every compositor surface), so
+/// no scene wiring is needed here. The initial configure is sent by the
+/// module in reply to the client's first buffer-less commit (per the
+/// protocol: "the client must perform an initial commit without any buffer
+/// attached. The compositor will reply with a layer_surface.configure
+/// event"). Layer z-ordering and layout are compositor policy and are not
+/// implemented yet (see notes/129-layer-shell-impl.md).
+fn onNewLayerSurface(
+    listener: *wire.Listener(*wayland.layer_shell.LayerSurface),
+    ls: *wayland.layer_shell.LayerSurface,
+) void {
+    const self: *ServerState = @fieldParentPtr("new_layer_surface_listener", listener);
+    self.layer_surfaces.append(self.allocator, ls) catch |err| {
+        log.warn("failed to track layer surface: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+    };
+    log.info("new layer surface (namespace={s} layer={d}) total={d}", self.io, self.log_cfg, "server", .{
+        ls.namespace orelse "(none)",
+        @intFromEnum(ls.current.layer),
+        self.layer_surfaces.items.len,
+    });
+}
+
 fn onNewPopup(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.shell.XdgPopup) void {
     const self: *ServerState = @fieldParentPtr("new_popup_listener", listener);
     log.info("new popup at {d},{d} {d}x{d}", self.io, self.log_cfg, "server", .{
         p.geometry.x, p.geometry.y, p.geometry.width, p.geometry.height,
     });
+}
+
+fn onRequestActivate(
+    listener: *wire.Listener(*wayland.xdg_activation.ActivateRequest),
+    req: *wayland.xdg_activation.ActivateRequest,
+) void {
+    const self: *ServerState = @fieldParentPtr("request_activate_listener", listener);
+    // Focus policy is out of scope for this phase: accept the activation
+    // request by logging it (the token was already validated by the
+    // activation module; the toplevel is not actually focused). See
+    // notes/129-shell-protocols-impl.md.
+    log.info("xdg_activation: request_activate surface={*} token={s}", self.io, self.log_cfg, "server", .{
+        req.surface, req.token,
+    });
+}
+
+fn onDecorationMode(
+    listener: *wire.Listener(*wayland.xdg_decoration.RequestMode),
+    req: *wayland.xdg_decoration.RequestMode,
+) void {
+    const self: *ServerState = @fieldParentPtr("request_mode_listener", listener);
+    // Placeholder policy (the compositor has no real decorations):
+    // server-side for the focused toplevel, client-side otherwise. See
+    // notes/129-shell-protocols-impl.md.
+    const mode: wayland.server.zxdg.ToplevelDecorationV1.Mode = blk: {
+        const toplevel = req.decoration.toplevel orelse break :blk .client_side;
+        break :blk if (self.seat.keyboard_focus == toplevel.xdg_surface.surface)
+            .server_side
+        else
+            .client_side;
+    };
+    log.info("xdg_decoration: request_mode {s} -> {s}", self.io, self.log_cfg, "server", .{
+        modeLabel(req.mode), modeLabel(mode),
+    });
+    req.decoration.sendConfigure(mode);
+}
+
+/// Short label for a decoration mode (or unset) for logging.
+fn modeLabel(mode: ?wayland.server.zxdg.ToplevelDecorationV1.Mode) []const u8 {
+    const m = mode orelse return "unset";
+    return switch (m) {
+        .client_side => "client_side",
+        .server_side => "server_side",
+        else => "invalid",
+    };
 }
 
 // ---------------------------------------------------------------------------

@@ -20,6 +20,9 @@ pub fn build(b: *Build) void {
     scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
     scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
+    scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-screencopy-unstable-v1.xml"));
 
@@ -34,6 +37,9 @@ pub fn build(b: *Build) void {
     scanner.generate("wl_data_device_manager", 3);
     scanner.generate("wl_output", 4);
     scanner.generate("xdg_wm_base", 7);
+    scanner.generate("xdg_activation_v1", 1);
+    scanner.generate("zxdg_decoration_manager_v1", 1);
+    scanner.generate("zwp_primary_selection_device_manager_v1", 1);
     scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("zwlr_screencopy_manager_v1", 3);
     scanner.generate("wp_viewporter", 1);
