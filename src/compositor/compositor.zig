@@ -56,6 +56,16 @@ pub const Compositor = struct {
     /// SHM buffer registry; attach() routes buffers through the tracked
     /// wrapper when set (release-delivering, deduped per resource).
     shm: ?*shm_mod.ShmState = null,
+    /// Compositor lifecycle events (wlroots events.new_surface /
+    /// events.destroy, wlr_compositor.c:1318-1320, 1348-1350). Consumers
+    /// observe surface creation instead of polling `surfaces`.
+    events: struct {
+        /// A new wl_surface was created.
+        new_surface: wire.Signal(*Surface),
+        /// The compositor is being torn down; remaining surfaces are
+        /// destroyed right after this signal.
+        destroy: wire.Signal(*Compositor),
+    },
 
     /// Attach the SHM buffer registry to this compositor.
     pub fn setShm(c: *Compositor, state: *shm_mod.ShmState) void {
@@ -78,16 +88,25 @@ pub const Compositor = struct {
             .display = display,
             .global = null,
             .shm = null,
+            // SAFETY: initialized via .init() immediately after construction, before any emit.
+            .events = undefined,
         };
+        c.events.new_surface.init();
+        c.events.destroy.init();
         errdefer c.surfaces.deinit(allocator);
         c.global = try display.addGlobal(server.wl.Compositor, *Compositor, bindCompositor, compositor_version, c);
         return c;
     }
 
-    /// Destroy the compositor: unregister the global and destroy every
-    /// remaining surface (each removes itself from the list).
+    /// Destroy the compositor: emit the destroy signal, destroy the global
+    /// and destroy every remaining surface (each removes itself from the
+    /// list). The global is destroyed (wl_global_destroy), not just
+    /// unpublished: remove() keeps it registered and bindable, so a late
+    /// registry_bind could call into the freed Compositor (F12). Order
+    /// matches compositor_handle_display_destroy (wlr_compositor.c:1346-1359).
     pub fn deinit(c: *Compositor) void {
-        if (c.global) |g| g.remove();
+        c.events.destroy.emit(c);
+        if (c.global) |g| g.destroy();
         while (c.surfaces.items.len > 0) {
             c.surfaces.items[0].destroy();
         }
@@ -119,6 +138,7 @@ pub const Compositor = struct {
             client.postNoMemory();
             return;
         };
+        c.events.new_surface.emit(surface);
         log.debug("wl_surface@{d} created", c.io, c.log_cfg, "compositor", .{id});
     }
 
@@ -176,7 +196,11 @@ test "compositor tracks and removes surfaces" {
         .io = io,
         .log_cfg = &log_cfg,
         .display = @ptrFromInt(0x10), // dummy: never dereferenced
+        // SAFETY: initialized via .init() immediately after construction, before any emit.
+        .events = undefined,
     };
+    c.events.new_surface.init();
+    c.events.destroy.init();
     defer allocator.destroy(c);
     defer c.surfaces.deinit(allocator);
 
@@ -192,3 +216,54 @@ test "compositor tracks and removes surfaces" {
     c.removeSurface(fake_a); // unknown surface: no-op
     try testing.expectEqual(@as(usize, 1), c.surfaces.items.len);
 }
+
+test "compositor new_surface and destroy signals fire (F21)" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    const c = try allocator.create(Compositor);
+    c.* = .{
+        .allocator = allocator,
+        .io = io,
+        .log_cfg = &log_cfg,
+        .display = @ptrFromInt(0x10), // dummy: never dereferenced
+        // SAFETY: initialized via .init() immediately after construction, before any emit.
+        .events = undefined,
+    };
+    c.events.new_surface.init();
+    c.events.destroy.init();
+    defer allocator.destroy(c);
+    defer c.surfaces.deinit(allocator);
+
+    var created: CreatedCapture = .{ .listener = wire.Listener(*Surface).init(CreatedCapture.notify) };
+    var destroyed: DestroyedCapture = .{ .listener = wire.Listener(*Compositor).init(DestroyedCapture.notify) };
+    c.events.new_surface.add(&created.listener);
+    c.events.destroy.add(&destroyed.listener);
+
+    const fake: *Surface = @ptrFromInt(0x300);
+    c.events.new_surface.emit(fake);
+    try testing.expect(created.surface == fake);
+
+    c.events.destroy.emit(c);
+    try testing.expect(destroyed.compositor == c);
+}
+
+const CreatedCapture = struct {
+    surface: ?*Surface = null,
+    listener: wire.Listener(*Surface),
+
+    fn notify(listener: *wire.Listener(*Surface), surface: *Surface) void {
+        @as(*CreatedCapture, @fieldParentPtr("listener", listener)).surface = surface;
+    }
+};
+
+const DestroyedCapture = struct {
+    compositor: ?*Compositor = null,
+    listener: wire.Listener(*Compositor),
+
+    fn notify(listener: *wire.Listener(*Compositor), compositor: *Compositor) void {
+        @as(*DestroyedCapture, @fieldParentPtr("listener", listener)).compositor = compositor;
+    }
+};

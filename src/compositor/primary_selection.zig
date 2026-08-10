@@ -11,13 +11,28 @@
 //! XML ground truth protocols/wayland-protocols/unstable/primary-selection/
 //! primary-selection-unstable-v1.xml — the protocol has NO error enums, so
 //! every violation below is a silent denial, never a protocol error):
-//!   - set_selection(source, serial): the serial is NOT validated (the
-//!     XML is advisory; no reference validates it — contrast
-//!     wl_data_device.set_selection). The caller must be the
+//!   - set_selection(source, serial): the caller must be the
 //!     keyboard-focused client, else the request is denied silently
-//!     (smithay model).
-//!   - A source is used once: after a successful set_selection the same
-//!     source cannot be set again (wlroots finalizes it).
+//!     (smithay model — the XML is silent, so this is never a protocol
+//!     error; the protocol has NO error enums). The serial is validated
+//!     for ORDERING only: a set whose serial is older than the current
+//!     selection's by more than half the wrap range is superseded and
+//!     denied silently (wlroots wlr_seat_request_set_primary_selection,
+//!     wlr_primary_selection.c:54-62). Positive serial validity is NOT
+//!     checked — the XML calls the serial only "the serial of the event
+//!     that triggered this request" (advisory), the seat exposes no
+//!     per-client serial ring for this path, and the focus gate already
+//!     blocks background hijack. Reference split: wlroots validates
+//!     (per-client ring + superseded); smithay ignores the serial
+//!     entirely (focus-gated only, primary_selection/device.rs); KWin
+//!     checks ordering only (seat.cpp:319-333). Ours: smithay's focus
+//!     gate + wlroots' superseded ordering guard.
+//!   - A source is used once: set_selection finalizes it BEFORE the
+//!     focus/ordering gates (wlroots device_handle_set_selection,
+//!     wlr_primary_selection_v1.c:213-216), so a denied set still burns
+//!     the source and a second set_selection with the same source is
+//!     denied silently. smithay deliberately does NOT enforce used-once
+//!     (device.rs) — ours is stricter than smithay, matching wlroots.
 //!   - set_selection delivers data_offer + one offer event per mime +
 //!     selection to the focused client's devices; a NULL source delivers
 //!     selection(NULL).
@@ -25,7 +40,12 @@
 //!   - A new device binding gets the current selection immediately when
 //!     the binding client is focused (KWin/wlroots).
 //!   - On keyboard focus change the previous focused client receives
-//!     selection(NULL) (its offer dies with the focus).
+//!     selection(NULL) (its offer dies with the focus). Deliberate
+//!     XML-literal choice: the selection event says the offer is valid
+//!     "until the client loses keyboard focus"; wlroots only delivers to
+//!     the new focused client and lets old offers linger (TODO comment,
+//!     wlr_primary_selection_v1.c:279-280), smithay re-offers the new
+//!     client only, KWin destroys old offers without an explicit NULL.
 //!   - offer.receive(mime, fd) relays the fd to the source's
 //!     send(mime, fd); with no source the fd is closed, no crash.
 //!   - source destroy: cancelled + every offer referencing it becomes
@@ -62,6 +82,13 @@ pub const PrimarySelection = struct {
     /// field holds the selection for the whole seat: a selection set by
     /// one client is delivered to whichever client holds keyboard focus.
     selection_source: ?*PrimarySelectionSource = null,
+    /// The serial the current selection was set with (wlr_seat
+    /// .primary_selection_serial). A set_selection whose serial is older
+    /// than this by more than half the wrap range is superseded and
+    /// rejected (wlroots
+    /// wlr_seat_request_set_primary_selection,
+    /// wlr_primary_selection.c:54-62).
+    selection_serial: u32 = 0,
     /// Every source created by clients (lifetime mirror of the manager;
     /// see DataDeviceManager.sources in data_device.zig).
     sources: std.ArrayList(*PrimarySelectionSource) = .empty,
@@ -315,12 +342,34 @@ fn deviceRequest(
     switch (request) {
         .set_selection => |r| {
             const mgr = dev.manager;
+            const caller = dev.resource.getClient();
+            // The source is finalized (used once) BEFORE the focus and
+            // ordering gates, per wlroots device_handle_set_selection
+            // (wlr_primary_selection_v1.c:213-216): a request the gates
+            // reject still burns the source.
+            var new_source: ?*PrimarySelectionSource = null;
+            if (r.source) |src_res| {
+                const src: *PrimarySelectionSource = @ptrCast(@alignCast(src_res.getUserData()));
+                // A source is used once: a second set_selection with the
+                // same source is denied silently.
+                if (src.finalized) {
+                    log.debug(
+                        "denying primary selection: source already used",
+                        mgr.io,
+                        mgr.log_cfg,
+                        "primary_selection",
+                        .{},
+                    );
+                    return;
+                }
+                src.finalized = true;
+                new_source = src;
+            }
             // Only the keyboard-focused client may set the primary
             // selection; everyone else is denied silently (smithay:
             // selection/primary_selection.rs denies a set_selection from
             // a client without keyboard focus; the XML is silent, so
             // this is never a protocol error).
-            const caller = dev.resource.getClient();
             const focus = mgr.seat.keyboard_focus orelse {
                 log.debug(
                     "denying primary selection: no keyboard focus",
@@ -341,28 +390,33 @@ fn deviceRequest(
                 );
                 return;
             }
-            // No serial validation: the XML's serial argument is
-            // advisory and no reference implementation validates it.
-            if (r.source) |src_res| {
-                const src: *PrimarySelectionSource = @ptrCast(@alignCast(src_res.getUserData()));
-                // A source is used once (wlroots finalizes it): a second
-                // set_selection with the same source is denied silently.
-                if (src.finalized) {
-                    log.debug(
-                        "denying primary selection: source already used",
-                        mgr.io,
-                        mgr.log_cfg,
-                        "primary_selection",
-                        .{},
-                    );
-                    return;
-                }
+            // Ordering guard (wlroots
+            // wlr_seat_request_set_primary_selection,
+            // wlr_primary_selection.c:54-62): a serial older than the
+            // current selection's by more than half the wrap range is
+            // superseded and denied silently. Positive serial validity
+            // is not checked (no per-client ring for this path; the
+            // focus gate above blocks background hijack — see the module
+            // doc for the reference split).
+            if (mgr.selection_source != null and
+                r.serial -% mgr.selection_serial > std.math.maxInt(u32) / 2)
+            {
+                log.debug(
+                    "denying primary selection: serial {d} indicates superseded (selection at {d})",
+                    mgr.io,
+                    mgr.log_cfg,
+                    "primary_selection",
+                    .{ r.serial, mgr.selection_serial },
+                );
+                return;
+            }
+            if (new_source) |src| {
                 // A new selection: cancel the previous owner.
                 if (mgr.selection_source) |old| {
                     if (old != src) old.resource.sendCancelled();
                 }
-                src.finalized = true;
                 mgr.selection_source = src;
+                mgr.selection_serial = r.serial;
                 log.debug("primary selection set with {d} mime types", mgr.io, mgr.log_cfg, "primary_selection", .{
                     src.mime_types.items.len,
                 });
@@ -371,6 +425,7 @@ fn deviceRequest(
                 // Null source: clear the selection.
                 if (mgr.selection_source) |old| old.resource.sendCancelled();
                 mgr.selection_source = null;
+                mgr.selection_serial = r.serial;
                 log.debug("primary selection cleared", mgr.io, mgr.log_cfg, "primary_selection", .{});
                 mgr.events.selection_cleared.emit(mgr);
             }
@@ -896,7 +951,11 @@ test "primary selection: focused set_selection (serial ignored) delivers to the 
     try ts.pump();
 
     // serial=0 is accepted: the primary-selection XML's serial is
-    // advisory and nothing validates it (contrast wl_data_device).
+    // advisory ("serial of the event that triggered this request").
+    // Positive validity is not checked (no per-client ring; the focus
+    // gate guards instead); only ordering — a superseded serial — is
+    // rejected (PS-1; wlroots wlr_primary_selection.c:54-62). With the
+    // first set, selection_serial is 0, so 0 is not superseded.
     const src = try a.wl_manager.createSource();
     src.offer("text/plain");
     var src_events: SourceEvents = .{};
@@ -943,7 +1002,9 @@ test "primary selection: non-focused set_selection is denied silently" {
 
     // The unfocused client tries to set the selection: denied silently —
     // no selection stored, no delivery to the focused client, and the
-    // source is not cancelled (it was never accepted).
+    // source is not cancelled (it was never accepted). The source IS
+    // burned though (PS-2: wlroots finalizes before the seat checks,
+    // wlr_primary_selection_v1.c:213-216).
     const src_b = try b.wl_manager.createSource();
     src_b.offer("text/plain");
     var src_b_events: SourceEvents = .{};
@@ -953,6 +1014,7 @@ test "primary selection: non-focused set_selection is denied silently" {
     try testing.expectEqual(@as(?*PrimarySelectionSource, null), ts.mgr.?.selection_source);
     try testing.expectEqual(baseline, events_a.selection_count);
     try testing.expectEqual(@as(usize, 0), src_b_events.cancelled_count);
+    try testing.expect(ts.mgr.?.sources.items[0].finalized);
     // The client survived (no protocol error — the protocol has no error
     // enum, and the denial is silent).
     device_a.setSelection(null, 0); // still functional
@@ -1139,4 +1201,130 @@ test "primary selection: duplicate source.offer is ignored" {
     // One offer event per distinct mime — the duplicate was not
     // delivered twice.
     try testing.expectEqual(@as(usize, 1), events.mimes.mime_count);
+}
+
+test "primary selection: a superseded serial is denied silently" {
+    // PS-1: the serial is validated for ordering only — wlroots
+    // wlr_seat_request_set_primary_selection (wlr_primary_selection.c:
+    // 54-62) rejects a serial older than the current selection's by
+    // more than half the wrap range. Positive validity is not checked
+    // (no per-client ring; the focus gate guards instead) — see the
+    // module doc for the reference split.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    const a = &ts.client_a.?;
+
+    focusClient(ts, a);
+    const device = try a.wl_manager.getDevice(a.wl_seat);
+    var events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &events);
+    const src = try a.wl_manager.createSource();
+    src.offer("text/plain");
+    try ts.pump();
+
+    device.setSelection(src, 0);
+    try ts.pump();
+    try testing.expectEqual(@as(u32, 0), ts.mgr.?.selection_serial);
+    try testing.expect(ts.mgr.?.selection_source != null);
+    try testing.expectEqual(@as(usize, 2), events.selection_count); // bind NULL + the set
+
+    // Simulate the selection having been set with a serial half a wrap
+    // in the future (unreachable through the wire in a test session):
+    // any request serial is now superseded and denied silently — no
+    // selection change, no cancel, no delivery.
+    ts.mgr.?.selection_serial = 0x8000_0000;
+    const src2 = try a.wl_manager.createSource();
+    src2.offer("text/plain");
+    var src2_events: SourceEvents = .{};
+    src2.setListener(*SourceEvents, SourceEvents.listener, &src2_events);
+    device.setSelection(src2, 0);
+    try ts.pump();
+    try testing.expectEqual(src.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    try testing.expectEqual(@as(usize, 0), src2_events.cancelled_count);
+    try testing.expectEqual(@as(usize, 2), events.selection_count);
+    // The source was still burned (PS-2: finalize before the gates).
+    try testing.expect(ts.mgr.?.sources.items[1].finalized);
+}
+
+test "primary selection: a denied set_selection still finalizes the source" {
+    // PS-2: wlroots finalizes the source BEFORE the seat checks
+    // (device_handle_set_selection, wlr_primary_selection_v1.c:213-216)
+    // — a request the focus gate rejects still burns the source, and
+    // the used-once rule then blocks a later set with the same source.
+    // smithay deliberately does NOT enforce used-once at all (device.rs);
+    // ours is stricter, matching wlroots.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    const a = &ts.client_a.?;
+    const b = &ts.client_b.?;
+
+    focusClient(ts, a);
+    const device_b = try b.wl_manager.getDevice(b.wl_seat);
+    try ts.pump();
+
+    // b is not focused: the set is denied by the focus gate, but the
+    // source is burned before the gate.
+    const src_b = try b.wl_manager.createSource();
+    src_b.offer("text/plain");
+    device_b.setSelection(src_b, 0);
+    try ts.pump();
+    try testing.expectEqual(@as(?*PrimarySelectionSource, null), ts.mgr.?.selection_source);
+    try testing.expect(ts.mgr.?.sources.items[0].finalized);
+
+    // The used-once rule now blocks b from setting it even when focused.
+    focusClient(ts, b);
+    var events_b: DeviceEvents = .{};
+    device_b.setListener(*DeviceEvents, DeviceEvents.listener, &events_b);
+    try ts.pump();
+    const baseline = events_b.selection_count;
+    device_b.setSelection(src_b, 0);
+    try ts.pump();
+    try testing.expectEqual(@as(?*PrimarySelectionSource, null), ts.mgr.?.selection_source);
+    try testing.expectEqual(baseline, events_b.selection_count);
+    try testing.expectEqual(@as(usize, 0), events_b.mimes.mime_count);
+}
+
+test "primary selection: focus change delivers selection(NULL) to the previous focused client" {
+    // PS-3: deliberate XML-literal choice — the selection event says the
+    // offer is valid "until the client loses keyboard focus"
+    // (primary-selection-unstable-v1.xml), so the previously focused
+    // client receives selection(NULL) when the focus moves. wlroots only
+    // delivers to the new client and lets old offers linger (TODO,
+    // wlr_primary_selection_v1.c:279-280); smithay re-offers the new
+    // client only; KWin destroys old offers without an explicit NULL.
+    // Kept by decision — see the module doc.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    const a = &ts.client_a.?;
+    const b = &ts.client_b.?;
+
+    focusClient(ts, a);
+    const device_a = try a.wl_manager.getDevice(a.wl_seat);
+    const device_b = try b.wl_manager.getDevice(b.wl_seat);
+    var events_a: DeviceEvents = .{};
+    var events_b: DeviceEvents = .{};
+    device_a.setListener(*DeviceEvents, DeviceEvents.listener, &events_a);
+    device_b.setListener(*DeviceEvents, DeviceEvents.listener, &events_b);
+    try ts.pump();
+
+    const src = try a.wl_manager.createSource();
+    src.offer("text/plain");
+    device_a.setSelection(src, 0);
+    try ts.pump();
+    // a was focused at bind time: bind NULL (1) + the set (2).
+    try testing.expectEqual(@as(usize, 2), events_a.selection_count);
+    try testing.expect(!events_a.last_selection_null);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+
+    // Focus moves to b: a's offer dies with the focus — selection(NULL)
+    // — and b receives the offer.
+    focusClient(ts, b);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 3), events_a.selection_count);
+    try testing.expect(events_a.last_selection_null);
+    try testing.expectEqual(@as(usize, 1), events_b.selection_count);
+    try testing.expect(!events_b.last_selection_null);
 }

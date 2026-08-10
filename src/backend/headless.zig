@@ -107,9 +107,19 @@ fn frameCb(headless: *Headless) c_int {
     return 1;
 }
 
-fn testState(_: *output.Output, _: *const output.Output.State) error{InvalidState}!void {}
+/// What the headless backend can apply: enable/mode/buffer. Scale and
+/// transform are rejected — the output draws its framebuffer 1:1, so a
+/// scale/transform commit would mutate output.width/height with no
+/// backend effect (wlroots SUPPORTED_OUTPUT_STATE, headless/output.c:10-14).
+fn testState(_: *output.Output, state: *const output.Output.State) error{InvalidState}!void {
+    const supported = output.Output.State.committed_enabled |
+        output.Output.State.committed_mode |
+        output.Output.State.committed_buffer;
+    if (state.committed & ~supported != 0) return error.InvalidState;
+}
 
 fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFailed}!void {
+    const self: *Headless = @ptrCast(@alignCast(out.data));
     if (state.committed & output.Output.State.committed_mode != 0) {
         if (state.mode) |m| {
             log_mod.info(
@@ -127,6 +137,16 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
                     state.damage.rects.items.len,
                 },
             );
+            // Apply the committed mode to the frame pacing: the timer
+            // must run at the new mode's refresh, not the START mode's
+            // (wlroots headless/output.c:56-78 output_commit updates
+            // frame_delay from custom_mode.refresh and re-arms the
+            // timer). The Output wrapper applies the mode/size fields in
+            // commitState; this backend copy drives frameCb.
+            self.mode = m;
+            if (self.timer) |timer| {
+                timer.timerUpdate(m.refresh_msec) catch return error.CommitFailed;
+            }
             return;
         }
     }
@@ -181,10 +201,79 @@ test "headless backend paces frames on the event loop" {
     try std.testing.expectEqual(mode.height, out.height);
     out.events.frame.add(&rec.frame_listener);
 
+    // sendFrame gates the emit on enabled (wlroots output.c:833-837):
+    // enable the output the way the compositor does, then the timer paces
+    // frame signals.
+    var enable = output.Output.State.init(allocator);
+    defer enable.deinit();
+    enable.committed = output.Output.State.committed_enabled |
+        output.Output.State.committed_mode;
+    enable.enabled = true;
+    enable.mode = mode;
+    try out.commitState(&enable);
+
     // One dispatch with a short timeout: the timer fires and the frame
     // signal is emitted synchronously.
     try loop.dispatch(100);
     try std.testing.expectEqual(@as(usize, 1), rec.frames);
     try loop.dispatch(100);
     try std.testing.expectEqual(@as(usize, 2), rec.frames);
+}
+
+test "headless commit applies a committed mode to the frame pacing" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+
+    const loop = try wire.EventLoop.create();
+    defer loop.destroy();
+
+    const mode: output.Mode = .{ .width = 320, .height = 240, .refresh_msec = 10 };
+    const base = try HeadlessBackend.create(allocator, &io, &log_cfg, loop, mode);
+    defer base.destroy();
+
+    var rec: FrameRecorder = .{
+        .listener = wire.Listener(*output.Output).init(FrameRecorder.onNewOutput),
+        .frame_listener = wire.Listener(*output.Output).init(FrameRecorder.onFrame),
+    };
+    base.events.new_output.add(&rec.listener);
+
+    try base.start();
+    const out = rec.out.?;
+    out.events.frame.add(&rec.frame_listener);
+
+    // Enable the output first: sendFrame gates the emit on enabled
+    // (wlroots output.c:833-837), so a never-enabled output stays silent.
+    var enable = output.Output.State.init(allocator);
+    defer enable.deinit();
+    enable.committed = output.Output.State.committed_enabled |
+        output.Output.State.committed_mode;
+    enable.enabled = true;
+    enable.mode = mode;
+    try out.commitState(&enable);
+
+    // Commit a new mode: the backend must adopt it for pacing (the frame
+    // timer's period follows mode.refresh_msec), and the Output wrapper
+    // applies the new size in commitState.
+    var state = output.Output.State.init(allocator);
+    defer state.deinit();
+    state.committed = output.Output.State.committed_mode;
+    state.mode = .{ .width = 640, .height = 480, .refresh_msec = 1 };
+    try out.commitState(&state);
+
+    try std.testing.expectEqual(@as(i32, 640), out.width);
+    try std.testing.expectEqual(@as(i32, 480), out.height);
+    try std.testing.expectEqual(@as(i32, 1), out.mode.refresh_msec);
+
+    // The backend copy that drives the frame timer must reflect the new
+    // refresh (this is the pacing source frameCb re-arms with).
+    const headless: *Headless = @ptrCast(@alignCast(base.data));
+    try std.testing.expectEqual(@as(i32, 640), headless.mode.width);
+    try std.testing.expectEqual(@as(i32, 480), headless.mode.height);
+    try std.testing.expectEqual(@as(i32, 1), headless.mode.refresh_msec);
+
+    // The re-armed timer still produces frames at the new (faster) rate.
+    try loop.dispatch(100);
+    try std.testing.expect(rec.frames > 0);
 }

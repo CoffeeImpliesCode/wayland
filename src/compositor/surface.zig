@@ -4,33 +4,38 @@
 //! Commit pipeline order (client commit):
 //!   1. validate pending state (posts wl_surface protocol errors and
 //!      discards the commit on failure)
-//!   2. emit the client_commit signal BEFORE the apply decision, mirroring
+//!   2. role.client_commit hook — once per client commit, before the
+//!      apply decision (wlroots wlr_compositor.c:582-584; F36)
+//!   3. emit the client_commit signal BEFORE the apply decision, mirroring
 //!      wlroots surface_handle_commit (wlr_compositor.c:577-598): the
 //!      subcompositor's sync handler locks the pending state here
 //!      (wlr_subcompositor.c:224-235)
-//!   3. if cached_state_locks is set, the commit is DEFERRED: the pending
+//!   4. if cached_state_locks is set, the commit is DEFERRED: the pending
 //!      state keeps accumulating (sync-subsurface caching) and nothing is
 //!      applied or signaled until the lock clears (parent commit, desync,
 //!      or teardown — see wlroots surface_cache_pending,
-//!      wlr_compositor.c:484-501)
-//!   4. applyCommit (wlroots surface_commit_state, wlr_compositor.c:511-575):
-//!      swap pending -> current (scalar copy; damage lists transfer so
-//!      the pending state restarts empty; frame callbacks accumulate on
-//!      current across commits — each waits for the next present)
-//!   5. drop the buffer the surface stopped using (its lock was already
-//!      released at the end of the previous commit)
-//!   6. translate the committed surface damage into buffer coordinates
-//!      (scale + inverse transform) and union into current.buffer_damage
-//!   7. role.client_commit hook
-//!   8. role.commit hook
-//!   9. emit the commit signal
-//!  10. map/unmap transition: mapped = (current.buffer != null and
-//!      width/height > 0); on change, run the role.map/role.unmap hook
-//!      and the map/unmap signal
-//!  11. unlock the current buffer (wlroots wlr_compositor.c:570-574) so
-//!      the client may reuse it (double buffering); the release signal
-//!      fires here (buffers/buffer.zig) and completes get_release
-//!      callbacks
+//!      wlr_compositor.c:484-501). F35: wlroots keeps a per-commit
+//!      cached-state list and applies only committed states at flush;
+//!      the merged single slot also applies post-commit requests
+//!      (STRUCTURAL, deferred).
+//!   5. applyCommit (wlroots surface_commit_state, wlr_compositor.c:511-575),
+//!      TRANSACTIONAL (F31): all fallible work (frame-callback append,
+//!      damage translation) runs before the swap; an OOM aborts with the
+//!      state untouched + postNoMemory. Then:
+//!      a. snapshot previous geometry (scale/transform/buffer size, F38)
+//!      b. swap pending -> current (committed-mask filtered, F33)
+//!      c. drop the buffer the surface stopped using (its lock was
+//!         already released at the end of the previous commit)
+//!      d. move the get_release callback lists with the buffer
+//!      e. role.commit hook
+//!      f. emit the commit signal
+//!      g. map/unmap transition: mapped = (current.buffer != null and
+//!         width/height > 0); on change, run the map/unmap signal and
+//!         the role hook (unmap: signal first, then role — F37)
+//!      h. unlock the current buffer (wlroots wlr_compositor.c:570-574) so
+//!         the client may reuse it (double buffering); the release signal
+//!         fires here (buffers/buffer.zig) and completes get_release
+//!         callbacks
 //!
 //! applyCommit also runs directly — without the client_commit phase — when
 //! the subcompositor flushes a deferred (cached) commit on the parent's
@@ -123,7 +128,7 @@ pub const State = struct {
     surface_damage: Damage,
     /// Accumulated damaged rects in buffer coordinates. wl_surface.damage_buffer
     /// requests accumulate here; the commit unions the surface damage
-    /// translated into buffer coordinates on top (see commit/updateBufferDamage).
+    /// translated into buffer coordinates on top (see commit/translateDamage).
     buffer_damage: Damage,
     /// Opaque region hint, in surface coordinates; null = no opaque area.
     /// Owned rect list, deep-copied from the wl_region at request time so
@@ -145,10 +150,45 @@ pub const State = struct {
     /// transformed and divided by it (wlr_surface_state_has_buffer,
     /// wlr_compositor.h:356).
     scale: i32 = 1,
+    /// Buffer position within the surface (wlroots wlr_surface_state.dx/dy,
+    /// wlr_compositor.h:58): wl_surface.offset (v5) or the pre-v5 attach
+    /// dx/dy (F34). Consumers: XWayland positioning, cursor hotspots,
+    /// popup placement. Cleared by a commit that carried no offset
+    /// (wlroots surface_state_move wlr_compositor.c:340-346).
+    dx: i32 = 0,
+    dy: i32 = 0,
+    /// Which fields the client changed since the last commit (wlroots
+    /// wlr_surface_state.committed, wlr_compositor.h:38). swapState
+    /// applies only the committed fields; uncommitted fields keep their
+    /// current value across commits (F33). The pending state persists, so
+    /// this is observably equivalent to a full copy EXCEPT where wlroots
+    /// explicitly clears on an absent bit: the offset (dx/dy reset to 0,
+    /// F34) and opaque/input regions (which pending does not persist —
+    /// the swap nulls them). Damage transfers unconditionally: pending
+    /// damage is always empty after a transfer, so wlroots' conditional
+    /// clear-and-copy (wlr_compositor.c:374-385) is identical.
+    committed: Committed = .{},
     /// wl_callback resources created by wl_surface.frame. Completed with
     /// done(ms) at present time by Surface.sendFrameDone (wlroots
     /// wlr_surface_send_frame_done); they accumulate here until then.
     frame_callbacks: std.ArrayList(*server.wl.Callback) = .empty,
+
+    /// Committed-field mask (see `committed`).
+    pub const Committed = struct {
+        /// A wl_surface.attach arrived (null attach included: the
+        /// NULL-buffer unmap commit).
+        buffer: bool = false,
+        /// A wl_surface.set_opaque_region arrived.
+        @"opaque": bool = false,
+        /// A wl_surface.set_input_region arrived.
+        input: bool = false,
+        /// A wl_surface.set_buffer_transform arrived.
+        transform: bool = false,
+        /// A wl_surface.set_buffer_scale arrived.
+        scale: bool = false,
+        /// A wl_surface.offset (or pre-v5 attach offset) arrived.
+        offset: bool = false,
+    };
 
     pub fn init(allocator: std.mem.Allocator) State {
         return .{
@@ -168,6 +208,18 @@ pub const State = struct {
 };
 
 pub const Surface = struct {
+    /// Snapshot of the committed state before the last applyCommit
+    /// (wlroots surface->previous, wlr_compositor.c:523-528): consumers
+    /// diff this against the new current to damage the OLD footprint when
+    /// the surface geometry changes (scale/transform/buffer size — M2
+    /// damage ring). Populated at the top of every applyCommit; stale
+    /// (from the last apply) while a commit is deferred or aborted.
+    pub const Previous = struct {
+        scale: i32 = 1,
+        transform: geom.Transform = .normal,
+        buffer_width: i32 = 0,
+        buffer_height: i32 = 0,
+    };
     allocator: std.mem.Allocator,
     io: *std.Io,
     log_cfg: *const log.Config,
@@ -180,8 +232,27 @@ pub const Surface = struct {
     /// lock). False when the pending buffer is a lockless re-attach of
     /// the current buffer (which already holds the surface's reference).
     pending_locked: bool = false,
+    /// The wl_buffer wire resource attached to the pending slot (null
+    /// for a null attach). Mirrors wlroots' surface->pending.buffer_resource
+    /// (wlr_compositor.c:38): its destroy listener (F42,
+    /// pending_buffer_destroy) clears the pending slot when the client
+    /// destroys the resource, so the next commit is a NULL-buffer commit
+    /// (unmap) instead of committing a dead wrapper.
+    pending_resource: ?*wire.Resource = null,
+    /// Same tracking for the committed (current) slot; pending_resource
+    /// moves here at applyCommit. When the client destroys the displayed
+    /// buffer's resource, the listener clears current so the surface does
+    /// not keep a dead wrapper in its canonical buffer slot (F42).
+    current_resource: ?*wire.Resource = null,
+    /// Destroy listener on the buffer resource of the most recently
+    /// attached buffer (the F42 wrapper-death observer). Attached to at
+    /// most one resource at a time; the handler detaches itself.
+    pending_buffer_destroy: wire.Listener(*wire.Resource),
     current: State,
     pending: State,
+    /// Snapshot of the committed state before the last applyCommit
+    /// (see Previous above).
+    previous: Previous = .{},
     /// Whether the surface currently presents content (buffer with a
     /// positive size; see the map transition in commit).
     mapped: bool = false,
@@ -259,6 +330,9 @@ pub const Surface = struct {
             .mapped = false,
             .role = null,
             .role_resource = null,
+            // SAFETY: initialized via .link.init() immediately after
+            // construction, before it can be attached to a resource.
+            .pending_buffer_destroy = wire.Listener(*wire.Resource).init(onPendingBufferDestroy),
             .events = .{
                 // SAFETY: initialized via .init() immediately after construction, before any emit.
                 .client_commit = undefined,
@@ -283,6 +357,10 @@ pub const Surface = struct {
         s.events.enter.init();
         s.events.leave.init();
         s.events.destroy.init();
+        // Listener.init leaves the intrusive link undefined; put it in the
+        // detached state (link.prev == link.next == &link) so the
+        // attached-or-not check in detachBufferDestroyListener works.
+        s.pending_buffer_destroy.link.init();
         resource.setHandler(*Surface, handleRequest, handleDestroy, s);
         return s;
     }
@@ -305,11 +383,24 @@ pub const Surface = struct {
 
         if (s.mapped) {
             s.mapped = false;
-            if (s.role) |role| if (role.unmap) |f| f(s);
+            // F37: wlroots emits the unmap signal BEFORE the role hook
+            // (wlr_surface_unmap wlr_compositor.c:854-872); listeners see
+            // the signal first.
             s.events.unmap.emit(s);
+            if (s.role) |role| if (role.unmap) |f| f(s);
         }
         if (s.role) |role| if (role.destroy) |f| f(s);
         s.events.destroy.emit(s);
+
+        // Detach the buffer-resource destroy listener: the client's
+        // wl_buffer resources outlive the surface, and the listener lives
+        // inside the freed Surface. If the resource was already destroyed,
+        // the handler detached itself (link in the detached state).
+        if (s.pending_buffer_destroy.link.prev != null and
+            s.pending_buffer_destroy.link.prev != &s.pending_buffer_destroy.link)
+        {
+            s.pending_buffer_destroy.link.remove();
+        }
 
         // Release the buffers we referenced. drop() then unlock(): the
         // release signal fires inside the last unlock, after which the
@@ -396,6 +487,10 @@ pub const Surface = struct {
             }
         }
         s.pending.buffer = buffer;
+        // The attach request changed the pending buffer (F33 committed
+        // mask); a null attach sets it too, so a NULL-buffer commit swaps
+        // the pending null into current and unmaps.
+        s.pending.committed.buffer = true;
     }
 
     /// Commit pipeline: see the module comment for the step order.
@@ -403,20 +498,30 @@ pub const Surface = struct {
         // 1. Validate; posts protocol errors and discards the commit.
         if (!s.validatePending()) return;
 
-        // 2. The client_commit signal fires BEFORE the apply decision,
+        // 2. Role-specific processing of the client's committed state
+        // (F36). wlroots runs role->client_commit inside surface_handle_commit
+        // for EVERY client commit, before the deferral decision
+        // (wlr_compositor.c:582-584), so it runs exactly once per client
+        // commit and NOT on cache flushes (applyCommit from the
+        // subcompositor is not a client commit).
+        if (s.role) |role| if (role.client_commit) |f| f(s);
+
+        // 3. The client_commit signal fires BEFORE the apply decision,
         // mirroring wlroots surface_handle_commit (wlr_compositor.c:577-598):
         // the subcompositor's sync handler decides here whether this commit
         // is deferred (wlr_subcompositor.c:224-235).
         s.events.client_commit.emit(s);
 
-        // 3. Deferred (sync-subsurface caching): the pending state keeps
+        // 4. Deferred (sync-subsurface caching): the pending state keeps
         // accumulating; nothing is applied and no signals fire until the
         // lock clears (parent commit, desync, or teardown — wlroots
         // surface_cache_pending, wlr_compositor.c:594-598). The cached
         // commits merge into the single pending slot, so the eventual
-        // flush applies the latest state in one commit (wlroots keeps a
-        // cached-state list and applies each; observationally equivalent
-        // for buffer/damage/frame-callback behavior).
+        // flush applies the latest state in one commit. F35 (STRUCTURAL):
+        // wlroots keeps a per-commit cached-state list and the flush
+        // applies only committed states in order; the merged-slot
+        // approximation also applies requests the client made after its
+        // last deferred commit.
         if (s.cached_state_locks) return;
 
         s.applyCommit();
@@ -428,29 +533,54 @@ pub const Surface = struct {
     /// (wlroots wlr_surface_unlock_cached, wlr_compositor.c:947-986): the
     /// flush is not a client commit, so the client_commit phase is
     /// skipped. See the module comment for the step order.
+    ///
+    /// Transactional (F31): everything that can fail — the frame-callback
+    /// append and the damage translation — happens BEFORE the swap, while
+    /// the current state is untouched. On OOM the commit aborts with the
+    /// state intact (pending stays pending with its attach lock held; no
+    /// role hooks, signals, or unlock) and the client is told via
+    /// postNoMemory, mirroring wlroots' surface_cache_pending
+    /// (wlr_compositor.c:475-510). The damage translation is a hint: its
+    /// OOM posts no_memory but does not abort the commit.
     pub fn applyCommit(s: *Surface) void {
-        // 4. Swap pending -> current.
+        // 4. Snapshot the previous committed geometry (F38, wlroots
+        // wlr_compositor.c:523-528): consumers diff old vs new to damage
+        // the OLD footprint when scale/transform/buffer size change.
         const old_buffer = s.current.buffer;
-        swapState(&s.current, s.allocator, &s.pending);
+        s.previous.scale = s.current.scale;
+        s.previous.transform = s.current.transform;
+        s.previous.buffer_width = if (old_buffer) |b| b.width else 0;
+        s.previous.buffer_height = if (old_buffer) |b| b.height else 0;
 
-        // Frame callbacks accumulate across commits until the next
+        // 5. Frame callbacks accumulate across commits until the next
         // present: each wl_surface.frame waits for the present that
         // follows its commit (wlroots surface_state_move appends the
-        // pending list to current, wlr_compositor.c:341-348).
+        // pending list to current, wlr_compositor.c:341-348). Before the
+        // swap so an OOM aborts with the state untouched (F31).
         s.current.frame_callbacks.appendSlice(s.allocator, s.pending.frame_callbacks.items) catch {
             s.resource.postNoMemory();
-            // The swap already made the pending buffer current; release
-            // its attach lock (mirror step 10) so it is not stranded —
-            // otherwise the client waits for the buffer until the next
-            // successful commit or the surface is destroyed. OOM-only.
-            if (s.current.buffer) |b| {
-                if (b.n_locks > 0) b.unlock();
-            }
             return;
         };
         s.pending.frame_callbacks.clearRetainingCapacity();
 
-        // 5. The surface stopped using the previous buffer. Its lock was
+        // 6. Translate the committed surface damage into buffer
+        // coordinates (wlroots surface_update_damage, wlr_compositor.c:
+        // 248-296) BEFORE the swap: same input state (the pending fields
+        // are about to become current), and the pending damage list is
+        // swapped over — so the union lands where the post-swap version
+        // would have put it, and no allocation remains after the swap
+        // (F31). Damage is a hint: on OOM the commit proceeds with the
+        // rects translated so far.
+        s.translateDamage();
+
+        // 7. Swap pending -> current.
+        swapState(&s.current, s.allocator, &s.pending);
+        // The buffer resource moves with the buffer (F42): the destroy
+        // listener now watches the current slot.
+        s.current_resource = s.pending_resource;
+        s.pending_resource = null;
+
+        // 8. The surface stopped using the previous buffer. Its lock was
         // already released at the end of the previous commit, so this only
         // marks the producer done; the guard keeps a zero-count buffer
         // (lockless re-attach) from being unlocked.
@@ -470,25 +600,19 @@ pub const Surface = struct {
         s.release_callbacks_pending.clearRetainingCapacity();
         s.buffer = s.current.buffer;
 
-        // 6. Translate the committed surface damage into buffer
-        // coordinates (wlroots surface_update_damage, wlr_compositor.c:248-296).
-        s.updateBufferDamage();
-
-        // 7. Role-specific processing of the committed state.
-        if (s.role) |role| if (role.client_commit) |f| f(s);
-
-        // 8. Role commit hook, then the commit signal. Frame callbacks
+        // 9. Role commit hook, then the commit signal. Frame callbacks
         // are not completed here: sendFrameDone fires them at present
         // time (wlroots wlr_surface_send_frame_done). The client_commit
         // signal was already emitted by commit() before the apply
-        // decision (step 2); a flush via applyCommit is not a client
-        // commit, so it must not re-emit it.
+        // decision (step 3); role.client_commit likewise ran there (F36).
+        // A flush via applyCommit is not a client commit, so neither
+        // re-runs here.
         if (s.role) |role| if (role.commit) |f| f(s);
         s.events.commit.emit(s);
 
-        // 9. Map/unmap transition. wlroots maps only when the buffer has a
-        // positive size (wlr_surface_state_has_buffer, wlr_compositor.h:356);
-        // the unmap transition stays buffer == null.
+        // 10. Map/unmap transition. wlroots maps only when the buffer has
+        // a positive size (wlr_surface_state_has_buffer,
+        // wlr_compositor.h:356); the unmap transition stays buffer == null.
         const now_mapped = blk: {
             const b = s.current.buffer orelse break :blk false;
             break :blk b.width > 0 and b.height > 0;
@@ -499,11 +623,14 @@ pub const Surface = struct {
             s.events.map.emit(s);
         } else if (!now_mapped and s.mapped) {
             s.mapped = false;
-            if (s.role) |role| if (role.unmap) |f| f(s);
+            // F37: wlroots emits the unmap signal BEFORE the role hook
+            // (wlr_surface_unmap wlr_compositor.c:854-872); listeners see
+            // the signal first.
             s.events.unmap.emit(s);
+            if (s.role) |role| if (role.unmap) |f| f(s);
         }
 
-        // 10. Unlock the current buffer (wlroots wlr_compositor.c:570-574)
+        // 11. Unlock the current buffer (wlroots wlr_compositor.c:570-574)
         // so the client can reuse it immediately (double buffering). The
         // lockless re-attach special case leaves n_locks at 0, so guard the
         // unlock; the release signal fires here (buffers/buffer.zig) and
@@ -572,28 +699,67 @@ pub const Surface = struct {
             s.resource.postError(.invalid_offset, "wl_surface.attach with non-zero offset (use wl_surface.offset)");
             return;
         }
-        const b: ?*Buffer = if (buffer) |wl_buffer| blk: {
+        // The attach carries the buffer position: at v5+ it is the
+        // (mandatorily zero) offset that resets the pending dx/dy; below
+        // v5 it is the real offset (F34, wlroots surface_handle_attach
+        // wlr_compositor.c:68-83 stores dx/dy at every version).
+        s.pending.dx = x;
+        s.pending.dy = y;
+        s.pending.committed.offset = true;
+
+        if (buffer) |wl_buffer| {
             const res: *wire.Resource = @ptrCast(wl_buffer);
-            const wrapped: ?*Buffer = if (s.compositor.shm) |st|
-                st.fromResource(s.allocator, res) catch null
+            const wrapped: *Buffer = (if (s.compositor.shm) |st|
+                st.fromResource(s.allocator, res)
             else
-                shm_mod.fromResource(s.allocator, res) catch null;
-            if (wrapped == null) {
-                log.warn(
-                    "attach: unsupported wl_buffer, keeping previous pending buffer",
-                    s.io,
-                    s.log_cfg,
-                    "surface",
-                    .{},
-                );
-                return;
+                shm_mod.fromResource(s.allocator, res)) catch |err| switch (err) {
+                error.InvalidBuffer => {
+                    // F56: unknown buffer type. wlroots rejects the pending
+                    // buffer at commit with an error on the buffer resource
+                    // (wlr_surface_reject_pending, wlr_compositor.c:874-889);
+                    // ours discovers the type at attach, so the fatal error
+                    // fires here. The resource is destroyed like wlroots.
+                    res.postError(@as(u32, @bitCast(@as(i32, -1))), "unknown buffer type");
+                    res.destroy();
+                    return;
+                },
+                error.OutOfMemory => {
+                    // F55: an attach-time OOM must reach the client
+                    // (postNoMemory), not silently keep the previous
+                    // pending buffer.
+                    s.resource.postNoMemory();
+                    return;
+                },
+            };
+            s.attachBuffer(wrapped);
+            // F42: observe the attached wl_buffer's death (wlroots
+            // pending_buffer_resource_handle_destroy, wlr_compositor.c:49-54)
+            // so a client destroying the resource clears the pending slot
+            // and the next commit unmaps instead of presenting a dead
+            // wrapper. The listener watches one resource at a time (the
+            // most recently attached); the handler matches it against both
+            // slots by resource pointer.
+            if (s.pending_buffer_destroy.link.prev != null and
+                s.pending_buffer_destroy.link.prev != &s.pending_buffer_destroy.link)
+            {
+                s.pending_buffer_destroy.link.remove();
             }
-            break :blk wrapped;
-        } else null;
-        s.attachBuffer(b);
+            res.addDestroyListener(&s.pending_buffer_destroy);
+            s.pending_resource = res;
+            return;
+        }
+        // Null attach: no pending buffer; the F42 listener stays where it
+        // is (it may be watching the current buffer).
+        s.pending_resource = null;
+        s.attachBuffer(null);
     }
 
     fn handleDamage(s: *Surface, x: i32, y: i32, width: i32, height: i32) void {
+        // The spec does not define damage with negative extents; wlroots
+        // ignores them (wlr_compositor.c:91-106), as do smithay and KWin
+        // (QRegion clamp). Negative dims would otherwise grow the damage
+        // list and feed overflow paths (F39, F41).
+        if (width < 0 or height < 0) return;
         s.pending.surface_damage.add(.{ .x = x, .y = y, .width = width, .height = height }) catch {
             s.resource.postNoMemory();
             return;
@@ -601,9 +767,12 @@ pub const Surface = struct {
     }
 
     fn handleDamageBuffer(s: *Surface, x: i32, y: i32, width: i32, height: i32) void {
+        // Negative extents are ignored like in wl_surface.damage (F39;
+        // wlroots wlr_compositor.c:626-639, smithay handlers.rs:304-309).
+        if (width < 0 or height < 0) return;
         // Damage is in buffer coordinates and stays in buffer_damage; the
         // commit unions the surface damage translated into buffer
-        // coordinates on top (see updateBufferDamage).
+        // coordinates on top (see translateDamage).
         s.pending.buffer_damage.add(.{ .x = x, .y = y, .width = width, .height = height }) catch {
             s.resource.postNoMemory();
             return;
@@ -656,6 +825,7 @@ pub const Surface = struct {
             s.resource.postNoMemory();
             return;
         };
+        s.pending.committed.@"opaque" = true;
     }
 
     fn handleSetInputRegion(s: *Surface, region: ?*server.wl.Region) void {
@@ -671,6 +841,7 @@ pub const Surface = struct {
             s.resource.postNoMemory();
             return;
         };
+        s.pending.committed.input = true;
     }
 
     fn handleSetBufferTransform(s: *Surface, transform: server.wl.Output.Transform) void {
@@ -680,6 +851,7 @@ pub const Surface = struct {
             return;
         }
         s.pending.transform = @enumFromInt(@as(u32, @intCast(value)));
+        s.pending.committed.transform = true;
     }
 
     fn handleSetBufferScale(s: *Surface, scale: i32) void {
@@ -688,12 +860,18 @@ pub const Surface = struct {
             return;
         }
         s.pending.scale = scale;
+        s.pending.committed.scale = true;
     }
 
-    fn handleOffset(_: *Surface, _: i32, _: i32) void {
+    fn handleOffset(s: *Surface, x: i32, y: i32) void {
         // wl_surface.offset (v5): role-specific location of the pending
-        // buffer. M1 stores no attach/offset position (the write-only
-        // State.dx/dy were removed); the role ignores it.
+        // buffer (wlroots surface_handle_offset wlr_compositor.c:640-647).
+        // Consumers: XWayland positioning, cursor hotspots, popup
+        // placement. The offset is committed with the state and cleared by
+        // a commit that carries none (see swapState / F34).
+        s.pending.dx = x;
+        s.pending.dy = y;
+        s.pending.committed.offset = true;
     }
 
     fn fireReleaseCallbacksCurrent(s: *Surface) void {
@@ -706,26 +884,27 @@ pub const Surface = struct {
         s.release_callbacks_pending.clearRetainingCapacity();
     }
 
-    /// wlroots surface_update_damage (wlr_compositor.c:248-296): translate
-    /// the committed surface damage into buffer coordinates and union it
-    /// with the damage_buffer rects already swapped into
-    /// current.buffer_damage. Scale first, then invert the buffer
-    /// transform. Damage is a hint, so over-reporting (saturating on
-    /// overflow) is safe.
-    fn updateBufferDamage(s: *Surface) void {
-        const buf = s.current.buffer orelse return;
-        const transform = s.current.transform;
+    /// Translate the pending surface damage into buffer coordinates and
+    /// union it into the pending buffer_damage list (wlroots
+    /// surface_update_damage, wlr_compositor.c:248-296) — run BEFORE the
+    /// swap so the commit path is allocation-free after it (F31). Scale
+    /// first, then invert the buffer transform. Damage is a hint, so
+    /// over-reporting (saturating on overflow) is safe; on OOM the rects
+    /// translated so far are kept and the commit proceeds.
+    fn translateDamage(s: *Surface) void {
+        const buf = s.pending.buffer orelse return;
+        const transform = s.pending.transform;
         const size = transform.transformedSize(buf.width, buf.height);
         const inv = inverseTransform(transform);
-        for (s.current.surface_damage.rects.items) |rect| {
+        for (s.pending.surface_damage.rects.items) |rect| {
             const scaled: Rect = .{
-                .x = scaleCoord(rect.x, s.current.scale),
-                .y = scaleCoord(rect.y, s.current.scale),
-                .width = scaleCoord(rect.width, s.current.scale),
-                .height = scaleCoord(rect.height, s.current.scale),
+                .x = scaleCoord(rect.x, s.pending.scale),
+                .y = scaleCoord(rect.y, s.pending.scale),
+                .width = scaleCoord(rect.width, s.pending.scale),
+                .height = scaleCoord(rect.height, s.pending.scale),
             };
             const r = transformRect(scaled, inv, size.w, size.h);
-            s.current.buffer_damage.add(r) catch {
+            s.pending.buffer_damage.add(r) catch {
                 s.resource.postNoMemory();
                 return;
             };
@@ -733,28 +912,87 @@ pub const Surface = struct {
     }
 };
 
-/// Apply pending to current. Scalar state copies; the damage lists
-/// transfer so the pending state restarts empty (the old current damage
-/// is stale — M2's damage ring accumulates properly). Frame callbacks do
-/// NOT transfer here: Surface.commit accumulates them across commits.
+/// The client destroyed the wl_buffer resource backing the attached
+/// (pending) or committed (current) buffer (F42). Mirrors wlroots'
+/// pending_buffer_resource_handle_destroy (wlr_compositor.c:49-54): the
+/// pending slot must not commit a dead wrapper — a commit after this
+/// clears the pending slot becomes a NULL-buffer commit and unmaps. The
+/// shm module's own resource listener runs first in this emission (it
+/// registered at wrapper creation): by the time this runs the wrapper is
+/// dropped, nulled, and possibly freed (F52's OOM fallback), so this
+/// handler ONLY compares resource pointers and nulls its own slots — it
+/// must never dereference the wrapper.
+fn onPendingBufferDestroy(listener: *wire.Listener(*wire.Resource), resource: *wire.Resource) void {
+    const s: *Surface = @fieldParentPtr("pending_buffer_destroy", listener);
+    // Self-detach: the observed resource is going away; the link must not
+    // outlive it (the destroy-path detach checks the link state).
+    if (s.pending_buffer_destroy.link.prev != null and
+        s.pending_buffer_destroy.link.prev != &s.pending_buffer_destroy.link)
+    {
+        s.pending_buffer_destroy.link.remove();
+    }
+    if (s.pending_resource == resource) {
+        s.pending.buffer = null;
+        s.pending_locked = false;
+        s.pending_resource = null;
+        s.fireReleaseCallbacksPending();
+    }
+    if (s.current_resource == resource) {
+        s.current.buffer = null;
+        s.current_resource = null;
+        s.buffer = null;
+        s.fireReleaseCallbacksCurrent();
+    }
+}
+
+/// Apply pending to current (wlroots surface_state_move,
+/// wlr_compositor.c:321-405). Only the fields the client actually changed
+/// this cycle (pending.committed, F33) are applied; uncommitted fields
+/// keep their current value across commits. Pending values persist, so
+/// this is observably equivalent to a full copy except where wlroots
+/// explicitly clears on an absent bit: the offset (dx/dy reset, F34) and
+/// opaque/input regions (which pending does not persist — the swap nulls
+/// them). The committed mask is consumed by this swap; pending restarts
+/// empty and accumulates a fresh mask from the next requests (wlroots
+/// clears it in surface_state_move, wlr_compositor.c:397-399).
+/// Scalar state copies; the damage lists transfer so the pending state
+/// restarts empty (the old current damage is stale — M2's damage ring
+/// accumulates properly). Frame callbacks do NOT transfer here:
+/// Surface.commit accumulates them across commits.
 pub fn swapState(current: *State, allocator: Allocator, pending: *State) void {
-    current.buffer = pending.buffer;
-    pending.buffer = null;
-    // Region lists transfer ownership; the previous current lists are
-    // discarded. Pending restarts without a region (null opaque = no
-    // opaque area, null input = infinite).
-    if (current.@"opaque") |*list| list.deinit(allocator);
-    current.@"opaque" = pending.@"opaque";
-    pending.@"opaque" = null;
-    if (current.input) |*list| list.deinit(allocator);
-    current.input = pending.input;
-    pending.input = null;
-    current.transform = pending.transform;
-    current.scale = pending.scale;
+    if (pending.committed.buffer) {
+        current.buffer = pending.buffer;
+        pending.buffer = null;
+    }
+    // Damage transfers unconditionally: pending damage is always empty
+    // after a transfer, so the committed damage bits add nothing (wlroots
+    // clears current damage when the bit is absent, wlr_compositor.c:374-385).
     std.mem.swap(Damage, &current.surface_damage, &pending.surface_damage);
     pending.surface_damage.clear();
     std.mem.swap(Damage, &current.buffer_damage, &pending.buffer_damage);
     pending.buffer_damage.clear();
+    if (pending.committed.@"opaque") {
+        if (current.@"opaque") |*list| list.deinit(allocator);
+        current.@"opaque" = pending.@"opaque";
+        pending.@"opaque" = null;
+    }
+    if (pending.committed.input) {
+        if (current.input) |*list| list.deinit(allocator);
+        current.input = pending.input;
+        pending.input = null;
+    }
+    if (pending.committed.transform) current.transform = pending.transform;
+    if (pending.committed.scale) current.scale = pending.scale;
+    if (pending.committed.offset) {
+        current.dx = pending.dx;
+        current.dy = pending.dy;
+    } else {
+        // A commit that carried no offset clears it (wlroots
+        // surface_state_move, wlr_compositor.c:340-346).
+        current.dx = 0;
+        current.dy = 0;
+    }
+    pending.committed = .{};
     // Frame callbacks are NOT transferred here: they accumulate on
     // current in Surface.commit until the next present (a commit must not
     // drop callbacks that are still waiting for wl_callback.done).
@@ -937,7 +1175,11 @@ pub fn testCompositor(
         .io = io,
         .log_cfg = log_cfg,
         .display = @ptrFromInt(0x10), // dummy: never dereferenced
+        // SAFETY: initialized via .init() immediately after construction, before any emit.
+        .events = undefined,
     };
+    c.events.new_surface.init();
+    c.events.destroy.init();
     return c;
 }
 
@@ -1042,7 +1284,7 @@ fn testLeaveNotify(listener: *wire.Listener(*output_mod.Output), _: *output_mod.
     test_leave_count += 1;
 }
 
-test "state swap transfers damage and regions, resets pending" {
+test "state swap transfers committed fields, resets pending" {
     const allocator = testing.allocator;
     var current = State.init(allocator);
     defer current.deinit(allocator);
@@ -1065,6 +1307,16 @@ test "state swap transfers damage and regions, resets pending" {
     }
     pending.transform = .@"90";
     pending.scale = 2;
+    pending.dx = 3;
+    pending.dy = -4;
+    // Only the committed fields transfer (F33); the rest keep their
+    // current value (and the offset clears without the offset bit, F34).
+    pending.committed.buffer = true;
+    pending.committed.@"opaque" = true;
+    pending.committed.input = true;
+    pending.committed.transform = true;
+    pending.committed.scale = true;
+    pending.committed.offset = true;
 
     swapState(&current, allocator, &pending);
 
@@ -1077,14 +1329,76 @@ test "state swap transfers damage and regions, resets pending" {
     try testing.expect(pending.input == null);
     try testing.expectEqual(geom.Transform.@"90", current.transform);
     try testing.expectEqual(@as(i32, 2), current.scale);
+    try testing.expectEqual(@as(i32, 3), current.dx);
+    try testing.expectEqual(@as(i32, -4), current.dy);
     try testing.expectEqual(@as(usize, 1), current.surface_damage.rects.items.len);
     try testing.expect(pending.surface_damage.isEmpty());
     try testing.expectEqual(@as(usize, 1), current.buffer_damage.rects.items.len);
     try testing.expect(pending.buffer_damage.isEmpty());
+    // The mask is consumed by the swap; pending accumulates a fresh one.
+    try testing.expect(!pending.committed.buffer);
+    try testing.expect(!pending.committed.@"opaque");
+    try testing.expect(!pending.committed.input);
+    try testing.expect(!pending.committed.transform);
+    try testing.expect(!pending.committed.scale);
+    try testing.expect(!pending.committed.offset);
     // Frame callbacks are NOT moved by swapState: Surface.commit
     // accumulates them on current across commits until the next present.
     try testing.expectEqual(@as(usize, 0), current.frame_callbacks.items.len);
     try testing.expectEqual(@as(usize, 1), pending.frame_callbacks.items.len);
+}
+
+test "uncommitted fields keep their current value across the swap" {
+    const allocator = testing.allocator;
+    var current = State.init(allocator);
+    defer current.deinit(allocator);
+    var pending = State.init(allocator);
+    defer pending.deinit(allocator);
+
+    // First commit sets everything.
+    pending.buffer = @as(?*Buffer, @ptrFromInt(0x200));
+    pending.scale = 2;
+    pending.dx = 3;
+    pending.committed.buffer = true;
+    pending.committed.scale = true;
+    pending.committed.offset = true;
+    swapState(&current, allocator, &pending);
+    try testing.expectEqual(@as(i32, 2), current.scale);
+    try testing.expectEqual(@as(i32, 3), current.dx);
+
+    // Second commit changes only the buffer: scale keeps its current
+    // value; the absent offset bit clears dx/dy (F34, wlroots
+    // surface_state_move wlr_compositor.c:340-346).
+    pending.buffer = @as(?*Buffer, @ptrFromInt(0x300));
+    pending.committed.buffer = true;
+    swapState(&current, allocator, &pending);
+    try testing.expectEqual(@as(?*Buffer, @ptrFromInt(0x300)), current.buffer);
+    try testing.expectEqual(@as(i32, 2), current.scale);
+    try testing.expectEqual(@as(i32, 0), current.dx);
+    try testing.expectEqual(@as(i32, 0), current.dy);
+}
+
+test "opaque and input regions persist until replaced by a commit" {
+    const allocator = testing.allocator;
+    var current = State.init(allocator);
+    defer current.deinit(allocator);
+    var pending = State.init(allocator);
+    defer pending.deinit(allocator);
+
+    {
+        var list: std.ArrayList(Rect) = .empty;
+        try list.append(allocator, .{ .x = 1, .y = 1, .width = 2, .height = 2 });
+        pending.@"opaque" = list;
+    }
+    pending.committed.@"opaque" = true;
+    swapState(&current, allocator, &pending);
+    try testing.expectEqual(@as(usize, 1), current.@"opaque".?.items.len);
+
+    // A commit without set_opaque keeps the current region (wlroots
+    // applies fields only on their committed bit): the old full-copy
+    // behavior lost it here, because the swap nulls pending.
+    swapState(&current, allocator, &pending);
+    try testing.expectEqual(@as(usize, 1), current.@"opaque".?.items.len);
 }
 
 test "damage requests accumulate in separate coordinate spaces" {
@@ -1104,6 +1418,34 @@ test "damage requests accumulate in separate coordinate spaces" {
 
     // wl_surface.damage stays in surface coordinates; damage_buffer keeps
     // its own buffer-coordinate list (they are not folded together).
+    try testing.expectEqual(@as(usize, 1), s.pending.surface_damage.rects.items.len);
+    try testing.expectEqual(@as(usize, 1), s.pending.buffer_damage.rects.items.len);
+}
+
+test "negative damage extents are ignored (F39)" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    // Negative w/h are ignored per wlroots (wlr_compositor.c:91-106,
+    // 626-639) — no protocol error, no accumulation.
+    s.handleDamage(0, 0, -1, 10);
+    s.handleDamage(0, 0, 10, -1);
+    s.handleDamageBuffer(0, 0, -1, 10);
+    s.handleDamageBuffer(0, 0, 10, -1);
+    try testing.expectEqual(@as(usize, 0), s.pending.surface_damage.rects.items.len);
+    try testing.expectEqual(@as(usize, 0), s.pending.buffer_damage.rects.items.len);
+
+    // Valid damage still accumulates after the rejected rects.
+    s.handleDamage(0, 0, 5, 5);
+    s.handleDamageBuffer(0, 0, 5, 5);
     try testing.expectEqual(@as(usize, 1), s.pending.surface_damage.rects.items.len);
     try testing.expectEqual(@as(usize, 1), s.pending.buffer_damage.rects.items.len);
 }
@@ -1426,8 +1768,13 @@ test "role hooks fire at commit, map and unmap" {
 var test_role_commits: usize = 0;
 var test_role_maps: usize = 0;
 var test_role_unmaps: usize = 0;
+var test_role_client_commits: usize = 0;
 
 const TestRoleHooks = struct {
+    fn clientCommit(s: *Surface) void {
+        _ = s;
+        test_role_client_commits += 1;
+    }
     fn commit(s: *Surface) void {
         _ = s;
         test_role_commits += 1;
@@ -1439,11 +1786,16 @@ const TestRoleHooks = struct {
     fn unmap(s: *Surface) void {
         _ = s;
         test_role_unmaps += 1;
+        // Record the order relative to the unmap signal listener (1 =
+        // role hook; the signal listener records 2).
+        test_unmap_seq[test_unmap_seq_len] = 1;
+        test_unmap_seq_len += 1;
     }
 };
 
 var test_role: SurfaceRole = .{
     .name = "test-role",
+    .client_commit = TestRoleHooks.clientCommit,
     .commit = TestRoleHooks.commit,
     .map = TestRoleHooks.map,
     .unmap = TestRoleHooks.unmap,
@@ -1610,4 +1962,343 @@ test "surface damage translation applies scale and transform" {
     // the 10x10 surface box: (x,y,w,h) = (4,2,8,6).
     try testing.expectEqual(@as(usize, 1), s.current.buffer_damage.rects.items.len);
     try testing.expectEqual(Rect{ .x = 4, .y = 2, .width = 8, .height = 6 }, s.current.buffer_damage.rects.items[0]);
+}
+
+test "OOM in the commit path aborts without applying partial state" {
+    // F31: the commit is transactional — the frame-callback append (the
+    // only fallible step that used to run after the swap) happens before
+    // any state is mutated, so an OOM leaves the state untouched and the
+    // client is told (postNoMemory), like wlroots' surface_cache_pending
+    // (wlr_compositor.c:475-510).
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(failing.allocator(), io, &log_cfg);
+    defer destroyTestCompositor(&failing, comp);
+    defer tw.deinit();
+    const s = try testSurface(failing.allocator(), io, &log_cfg, comp, &tw);
+
+    var buffer: Buffer = undefined;
+    testBuffer(failing.allocator(), &buffer);
+    s.attachBuffer(&buffer);
+    s.handleFrame(tw.newId());
+
+    // The next allocation inside commit() is the frame-callback append
+    // (pre-swap): fail it.
+    failing.fail_index = failing.alloc_index;
+    s.commit();
+
+    // Nothing was applied: no swap, no map, the pending state (with its
+    // attach lock) is intact, and the callback was not moved.
+    try testing.expect(s.current.buffer == null);
+    try testing.expect(!s.mapped);
+    try testing.expect(s.pending.buffer == &buffer);
+    try testing.expectEqual(@as(u32, 1), buffer.n_locks);
+    try testing.expectEqual(@as(usize, 1), s.pending.frame_callbacks.items.len);
+    try testing.expectEqual(@as(usize, 0), s.current.frame_callbacks.items.len);
+
+    // A later successful commit applies the same pending state.
+    failing.fail_index = std.math.maxInt(usize);
+    s.commit();
+    try testing.expect(s.mapped);
+    try testing.expect(s.current.buffer == &buffer);
+    try testing.expectEqual(@as(u32, 0), buffer.n_locks);
+    try testing.expectEqual(@as(usize, 0), s.pending.frame_callbacks.items.len);
+    try testing.expectEqual(@as(usize, 1), s.current.frame_callbacks.items.len);
+}
+
+/// Destroy a test compositor allocated with a possibly-failing allocator
+/// (the failing allocator wraps testing.allocator, so a plain destroy is
+/// fine once failures are disabled).
+fn destroyTestCompositor(failing: *std.testing.FailingAllocator, comp: *Compositor) void {
+    failing.fail_index = std.math.maxInt(usize);
+    testing.allocator.destroy(comp);
+}
+
+test "offset is stored, committed, and cleared by a commit without one" {
+    // F34: wl_surface.offset stores the pending dx/dy (wlroots
+    // surface_handle_offset wlr_compositor.c:640-647); the commit applies
+    // it; a commit that carried no offset clears it (surface_state_move
+    // wlr_compositor.c:340-346).
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    s.handleOffset(7, -9);
+    try testing.expectEqual(@as(i32, 7), s.pending.dx);
+    try testing.expectEqual(@as(i32, -9), s.pending.dy);
+    try testing.expect(s.pending.committed.offset);
+
+    var buffer: Buffer = undefined;
+    testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    s.commit();
+    try testing.expectEqual(@as(i32, 7), s.current.dx);
+    try testing.expectEqual(@as(i32, -9), s.current.dy);
+
+    // A commit with no offset bit resets the current offset.
+    s.attachBuffer(&buffer);
+    s.commit();
+    try testing.expectEqual(@as(i32, 0), s.current.dx);
+    try testing.expectEqual(@as(i32, 0), s.current.dy);
+}
+
+test "pre-v5 attach stores the offset" {
+    // F34: below wl_surface v5 the attach dx/dy ARE the buffer position
+    // (wlroots surface_handle_attach wlr_compositor.c:68-83). The offset
+    // is stored even when the buffer wrap fails (the error path leaves
+    // the pending state's offset intact).
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const v4_res = try server.wl.Surface.create(tw.client, 4, tw.newId());
+    const s4 = try Surface.create(allocator, io, &log_cfg, comp, v4_res);
+    defer s4.destroy();
+
+    // A fabricated wl_buffer (never created by the internal shm pipeline)
+    // fails the wrap with InvalidBuffer; the offset survives the error.
+    const foreign = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    const foreign_buf: *server.wl.Buffer = @ptrCast(foreign);
+    s4.handleAttach(foreign_buf, 3, 5);
+    try testing.expectEqual(@as(i32, 3), s4.pending.dx);
+    try testing.expectEqual(@as(i32, 5), s4.pending.dy);
+    try testing.expect(s4.pending.committed.offset);
+}
+
+test "previous state snapshots the pre-commit geometry" {
+    // F38: applyCommit copies the current scale/transform/buffer size
+    // into `previous` before the swap (wlroots wlr_compositor.c:523-528)
+    // so consumers can damage the OLD footprint on geometry changes.
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    var b1: Buffer = undefined;
+    testBuffer(allocator, &b1); // 10x10
+    s.attachBuffer(&b1);
+    s.commit();
+    try testing.expectEqual(@as(i32, 1), s.previous.scale);
+    try testing.expectEqual(geom.Transform.normal, s.previous.transform);
+    try testing.expectEqual(@as(i32, 0), s.previous.buffer_width); // nothing before the first commit
+
+    s.handleSetBufferScale(2);
+    s.handleSetBufferTransform(server.wl.Output.Transform.@"90");
+    var b2: Buffer = undefined;
+    testBuffer(allocator, &b2);
+    s.attachBuffer(&b2);
+    s.commit();
+
+    try testing.expectEqual(@as(i32, 1), s.previous.scale);
+    try testing.expectEqual(geom.Transform.normal, s.previous.transform);
+    try testing.expectEqual(@as(i32, 10), s.previous.buffer_width);
+    try testing.expectEqual(@as(i32, 10), s.previous.buffer_height);
+    try testing.expectEqual(@as(i32, 2), s.current.scale);
+    try testing.expectEqual(geom.Transform.@"90", s.current.transform);
+}
+
+test "destroying the attached buffer resource unmaps on the next commit" {
+    // F42: client destroys the wl_buffer resource backing the pending
+    // buffer; the next commit must be a NULL-buffer commit (unmap) instead
+    // of committing the dead wrapper (wlroots
+    // pending_buffer_resource_handle_destroy wlr_compositor.c:49-54).
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    var buffer: Buffer = undefined;
+    testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    // Simulate handleAttach's wiring: the pending slot tracks the wire
+    // resource and observes its death.
+    const buf_res = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    s.pending_resource = buf_res;
+    buf_res.addDestroyListener(&s.pending_buffer_destroy);
+    try testing.expect(s.pending.buffer == &buffer);
+
+    buf_res.destroy();
+    try testing.expect(s.pending.buffer == null);
+    try testing.expect(!s.pending_locked);
+    try testing.expect(s.pending_resource == null);
+
+    // The commit is now a NULL-buffer commit: nothing maps.
+    s.commit();
+    try testing.expect(!s.mapped);
+    try testing.expect(s.current.buffer == null);
+}
+
+test "destroying the displayed buffer's resource clears the current slot" {
+    // F42 displayed case: the resource dies while its buffer is CURRENT.
+    // applyCommit moves pending_resource -> current_resource, so the
+    // destroy listener clears the current slot (and the s.buffer mirror).
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    var buffer: Buffer = undefined;
+    testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    const buf_res = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    s.pending_resource = buf_res;
+    buf_res.addDestroyListener(&s.pending_buffer_destroy);
+    s.commit();
+    try testing.expect(s.mapped);
+    try testing.expect(s.current_resource == buf_res);
+    try testing.expect(s.pending_resource == null);
+
+    buf_res.destroy();
+    try testing.expect(s.current.buffer == null);
+    try testing.expect(s.buffer == null);
+    try testing.expect(s.current_resource == null);
+    // The next commit is a NULL-buffer commit: unmap.
+    s.commit();
+    try testing.expect(!s.mapped);
+}
+
+test "attach of an unknown buffer type posts an error and keeps the previous pending" {
+    // F56: a wl_buffer the internal shm pipeline never created fails the
+    // wrap; the client is rejected with a fatal error on the buffer
+    // resource (wlroots wlr_surface_reject_pending, wlr_compositor.c:
+    // 874-889) and the resource is destroyed. The previous pending buffer
+    // is untouched (the error path never reaches attachBuffer).
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    var buffer: Buffer = undefined;
+    testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+
+    const foreign = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    const foreign_buf: *server.wl.Buffer = @ptrCast(foreign);
+    s.handleAttach(foreign_buf, 0, 0);
+    try testing.expect(s.pending.buffer == &buffer);
+    try testing.expect(s.pending_resource == null);
+}
+
+test "role client_commit runs per client commit, not on cache flushes" {
+    // F36: role.client_commit runs inside commit() (wlroots
+    // surface_handle_commit wlr_compositor.c:582-584), exactly once per
+    // client commit — NOT on the applyCommit of a cache flush
+    // (wlr_surface_unlock_cached), which is not a client commit.
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    test_role_client_commits = 0;
+    test_role_commits = 0;
+    try role_mod.assignRole(s, &test_role, null);
+
+    var buffer: Buffer = undefined;
+    testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    s.commit();
+    try testing.expectEqual(@as(usize, 1), test_role_client_commits);
+    try testing.expectEqual(@as(usize, 1), test_role_commits);
+
+    // A cache flush (applyCommit directly, like subsurface flushCached)
+    // runs role.commit but not role.client_commit.
+    var buffer2: Buffer = undefined;
+    testBuffer(allocator, &buffer2);
+    s.attachBuffer(&buffer2);
+    s.applyCommit();
+    try testing.expectEqual(@as(usize, 1), test_role_client_commits);
+    try testing.expectEqual(@as(usize, 2), test_role_commits);
+}
+
+test "unmap signal fires before the role unmap hook" {
+    // F37: wlroots emits the unmap signal before role->unmap
+    // (wlr_surface_unmap wlr_compositor.c:854-872); ours used to run the
+    // hook first.
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    test_unmap_seq_len = 0;
+    test_unmap_order_listener = wire.Listener(*Surface).init(testUnmapOrderNotify);
+    s.events.unmap.add(&test_unmap_order_listener);
+    try role_mod.assignRole(s, &test_role, null);
+
+    var buffer: Buffer = undefined;
+    testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    s.commit();
+    try testing.expect(s.mapped);
+
+    s.attachBuffer(null);
+    s.commit();
+    try testing.expect(!s.mapped);
+    // Sequence: 2 = unmap signal listener, 1 = role.unmap hook.
+    try testing.expectEqual(@as(usize, 2), test_unmap_seq_len);
+    try testing.expectEqual(@as(u8, 2), test_unmap_seq[0]);
+    try testing.expectEqual(@as(u8, 1), test_unmap_seq[1]);
+}
+
+var test_unmap_seq: [8]u8 = undefined;
+var test_unmap_seq_len: usize = 0;
+// SAFETY: test fixture; initialized via .init(handler) inside the tests before use.
+var test_unmap_order_listener: wire.Listener(*Surface) = undefined;
+
+fn testUnmapOrderNotify(listener: *wire.Listener(*Surface), surface: *Surface) void {
+    _ = listener;
+    _ = surface;
+    test_unmap_seq[test_unmap_seq_len] = 2; // the unmap signal
+    test_unmap_seq_len += 1;
 }

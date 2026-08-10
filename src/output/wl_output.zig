@@ -2,9 +2,10 @@
 //!
 //! One global per Output, created by the compositor when the backend
 //! announces an output. On bind the current state is sent (geometry,
-//! mode, scale, name, description, done). Output destruction removes the
-//! global and frees the module state. Mode/geometry changes are not
-//! re-broadcast in M3 (the server runs a single fixed mode).
+//! mode, scale, name, description, done). Committed mode/scale/transform
+//! changes are re-broadcast to every bound resource with a coalesced
+//! done (wlroots output_apply_state + schedule_done). Output destruction
+//! removes the global and frees the module state.
 //!
 //! Imports: utils/*, core/wire.zig, core/display.zig, output/output.zig
 //! (sibling modules).
@@ -33,6 +34,12 @@ pub const WlOutput = struct {
     /// protocols that take a wl_output argument (screencopy).
     resources: std.ArrayList(*server.wl.Output) = .empty,
     destroy_listener: wire.Listener(*Output),
+    /// Re-broadcast changed state (mode/scale/transform) to every bound
+    /// resource and coalesce the trailing done into one idle callback
+    /// (wlroots schedule_done, output.c:169-176).
+    commit_listener: wire.Listener(*Output.CommitEvent),
+    /// The pending coalesced done idle source; null when none scheduled.
+    done_source: ?*wire.EventSource = null,
     /// wl_output.name.
     name: [:0]const u8,
     /// wl_output.description.
@@ -57,12 +64,14 @@ pub const WlOutput = struct {
             .display = display,
             .resources = .empty,
             .destroy_listener = wire.Listener(*Output).init(onOutputDestroy),
+            .commit_listener = wire.Listener(*Output.CommitEvent).init(onOutputCommit),
             .name = name,
             .description = description,
         };
         errdefer self.resources.deinit(allocator);
         self.global = try display.addGlobal(server.wl.Output, *WlOutput, bindOutput, output_version, self);
         output.events.destroy.add(&self.destroy_listener);
+        output.events.commit.add(&self.commit_listener);
         log.debug("wl_output global for {d}x{d}", io, log_cfg, "wl_output", .{
             output.mode.width, output.mode.height,
         });
@@ -75,11 +84,23 @@ pub const WlOutput = struct {
         return std.mem.indexOfScalar(*server.wl.Output, self.resources.items, resource) != null;
     }
 
+    /// Bind-time state dump. Order matches wlroots output_bind
+    /// (output.c:100-106): geometry, current mode, scale, name,
+    /// description, done.
     fn sendState(self: *WlOutput, resource: *server.wl.Output) void {
-        const out = self.output;
-        const version = resource.getVersion();
-        // v1 events first; version-gated events follow (a v1 client
-        // aborts on any newer opcode).
+        sendGeometry(self, resource);
+        sendMode(self, resource);
+        sendScale(self, resource);
+        sendName(self, resource);
+        sendDescription(self, resource);
+        sendDone(self, resource);
+    }
+
+    /// Physical geometry + transform. This server has no physical size
+    /// data, so the mm dims are 0 (wlroots sends real dims when the
+    /// backend provides them); the transform is the output's real one,
+    /// converted to the wire enum (same values as utils/geom.Transform).
+    fn sendGeometry(self: *WlOutput, resource: *server.wl.Output) void {
         resource.sendGeometry(
             0,
             0,
@@ -88,18 +109,78 @@ pub const WlOutput = struct {
             .unknown,
             "wayland",
             "wayland-m2",
-            .normal,
+            @enumFromInt(@as(c_int, @intCast(@intFromEnum(self.output.transform)))),
         );
+    }
+
+    /// The current mode. wlroots sends only the CURRENT flag at bind
+    /// (output.c:24-35); the preferred flag is not fabricated.
+    fn sendMode(self: *WlOutput, resource: *server.wl.Output) void {
+        const out = self.output;
         resource.sendMode(
-            .{ .current = true, .preferred = true },
+            .{ .current = true },
             out.mode.width,
             out.mode.height,
             @divTrunc(1_000_000, out.mode.refresh_msec), // mHz
         );
-        if (version >= 2) resource.sendScale(1);
-        if (version >= 4) resource.sendName(self.name);
-        if (version >= 4) resource.sendDescription(self.description);
-        if (version >= 2) resource.sendDone();
+    }
+
+    /// Scale as an integer: ceil(scale), the value clients must draw at
+    /// (wlroots send_scale, output.c:37-42). The protocol scale event is
+    /// since 2.
+    fn sendScale(self: *WlOutput, resource: *server.wl.Output) void {
+        if (resource.getVersion() >= 2) {
+            resource.sendScale(@intFromFloat(@ceil(self.output.scale)));
+        }
+    }
+
+    fn sendName(self: *WlOutput, resource: *server.wl.Output) void {
+        if (resource.getVersion() >= 4) resource.sendName(self.name);
+    }
+
+    fn sendDescription(self: *WlOutput, resource: *server.wl.Output) void {
+        if (resource.getVersion() >= 4) resource.sendDescription(self.description);
+    }
+
+    fn sendDone(_: *WlOutput, resource: *server.wl.Output) void {
+        if (resource.getVersion() >= 2) resource.sendDone();
+    }
+
+    /// A committed state changed mode/scale/transform: re-send the
+    /// affected events to every bound resource and coalesce the done
+    /// (wlroots output_apply_state, output.c:329-339 + schedule_done
+    /// output.c:169-176). Unchanged fields are stripped by
+    /// Output.commitState, so a bit present here means a real change.
+    fn onOutputCommit(listener: *wire.Listener(*Output.CommitEvent), event: *Output.CommitEvent) void {
+        const self: *WlOutput = @fieldParentPtr("commit_listener", listener);
+        const committed = event.state.committed;
+        const mode_updated = committed & Output.State.committed_mode != 0;
+        const geometry_updated = mode_updated or (committed & Output.State.committed_transform != 0);
+        const scale_updated = committed & Output.State.committed_scale != 0;
+        if (!geometry_updated and !scale_updated) return;
+        for (self.resources.items) |res| {
+            if (mode_updated) sendMode(self, res);
+            if (geometry_updated) sendGeometry(self, res);
+            if (scale_updated) sendScale(self, res);
+        }
+        scheduleDone(self);
+    }
+
+    /// Coalesce done: one idle callback covers any burst of state
+    /// changes in a single dispatch (wlroots schedule_done). Falls back
+    /// to sending immediately when the idle source cannot be allocated.
+    fn scheduleDone(self: *WlOutput) void {
+        if (self.done_source != null) return; // already scheduled
+        const loop = self.display.getServer().getEventLoop();
+        self.done_source = loop.addIdle(*WlOutput, sendDoneIdle, self) catch null;
+        if (self.done_source == null) {
+            for (self.resources.items) |res| sendDone(self, res);
+        }
+    }
+
+    fn sendDoneIdle(wl_output: *WlOutput) void {
+        wl_output.done_source = null;
+        for (wl_output.resources.items) |res| sendDone(wl_output, res);
     }
 
     fn bindOutput(cli: *wire.Client, wl_output: *WlOutput, version: u32, id: u32) void {
@@ -117,6 +198,7 @@ pub const WlOutput = struct {
 
     fn onOutputDestroy(listener: *wire.Listener(*Output), _: *Output) void {
         const self: *WlOutput = @fieldParentPtr("destroy_listener", listener);
+        if (self.done_source) |src| src.remove();
         if (self.global) |g| g.remove();
         const allocator = self.allocator;
         self.resources.deinit(allocator);
@@ -343,4 +425,48 @@ test "wl_output v2 client receives geometry/mode/scale/done but never name/descr
     try std.testing.expectEqual(@as(usize, 1), events.done_count);
     try std.testing.expectEqual(@as(usize, 0), events.name_count);
     try std.testing.expectEqual(@as(usize, 0), events.description_count);
+}
+
+test "mode/scale commit rebroadcasts to bound resources with a coalesced done" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator, 4);
+    defer ts.deinit();
+
+    var events: OutputEvents = .{};
+    ts.wl_output_proxy.?.setListener(*OutputEvents, OutputEvents.listener, &events);
+    try ts.pump(); // bind-time state send
+    try std.testing.expectEqual(@as(usize, 1), events.mode_count);
+    try std.testing.expectEqual(@as(usize, 1), events.done_count);
+
+    // Commit a mode + scale change: the bound resource gets the new
+    // mode, geometry and scale, and one done (idle-coalesced).
+    var state = Output.State.init(allocator);
+    defer state.deinit();
+    state.committed = Output.State.committed_mode | Output.State.committed_scale;
+    state.mode = .{ .width = 800, .height = 600, .refresh_msec = 8 };
+    state.scale = 2.0;
+    try ts.output.?.commitState(&state);
+
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), events.mode_count);
+    try std.testing.expectEqual(@as(i32, 800), events.mode_width);
+    try std.testing.expectEqual(@as(i32, 600), events.mode_height);
+    try std.testing.expectEqual(@as(usize, 2), events.geometry_count);
+    try std.testing.expectEqual(@as(usize, 2), events.scale_count);
+    try std.testing.expectEqual(@as(i32, 2), events.scale_factor);
+    try std.testing.expectEqual(@as(usize, 2), events.done_count);
+
+    // A commit whose fields are unchanged (a repeated frame) is stripped
+    // by Output.commitState and rebroadcasts nothing.
+    var frame = Output.State.init(allocator);
+    defer frame.deinit();
+    frame.committed = Output.State.committed_mode | Output.State.committed_scale;
+    frame.mode = .{ .width = 800, .height = 600, .refresh_msec = 8 };
+    frame.scale = 2.0;
+    try ts.output.?.commitState(&frame);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), events.mode_count);
+    try std.testing.expectEqual(@as(usize, 2), events.geometry_count);
+    try std.testing.expectEqual(@as(usize, 2), events.scale_count);
+    try std.testing.expectEqual(@as(usize, 2), events.done_count);
 }

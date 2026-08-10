@@ -111,6 +111,13 @@ pub const Buffer = struct {
     /// across its lifetime. The release signal fires when no consumer lock
     /// remains (n_locks == 0) — at most once per buffer lifetime (the
     /// `released` guard).
+    ///
+    /// F53: this is deliberately more lenient than wlroots, where
+    /// wlr_buffer_drop asserts !dropped and the refcount freeing at zero
+    /// makes a double drop a bug (types/buffer/buffer.c:45-56). Our
+    /// once-only release guard keeps the repeated drop harmless, and the
+    /// commit path relies on it (a replaced buffer is re-dropped at the
+    /// next commit). Keep the leniency; do not add the assert.
     pub fn drop(buf: *Buffer) void {
         buf.dropped = true;
         buf.maybeRelease();

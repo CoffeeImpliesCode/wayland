@@ -44,7 +44,7 @@ const std = @import("std");
 const wire = @import("../core/wire.zig");
 const log = @import("../utils/log.zig");
 const display_mod = @import("../core/display.zig");
-const Buffer = @import("buffer.zig").Buffer;
+pub const Buffer = @import("buffer.zig").Buffer;
 const Impl = @import("buffer.zig").Impl;
 const DataAccessError = @import("buffer.zig").DataAccessError;
 
@@ -66,6 +66,12 @@ pub const ShmState = struct {
     /// referenced by surfaces until teardown, so ownership moves here and
     /// deinit frees them.
     dead_buffers: std.ArrayList(*Buffer) = .empty,
+    /// Fixed-size overflow for the graveyard when its append OOMs (F52):
+    /// wrappers with outstanding consumer locks cannot be freed inside the
+    /// resource-destroy signal, so they park here (no allocation) until
+    /// deinit frees them. A full stash leaks (bounded, OOM-only).
+    dead_stash: [8]?*Buffer = [_]?*Buffer{null} ** 8,
+    dead_stash_len: usize = 0,
 
     /// Enable the wl_shm protocol (internal libwayland global + formats)
     /// and allocate the shm state. Safe to call once per display.
@@ -92,8 +98,10 @@ pub const ShmState = struct {
     /// gone; the wrappers themselves outlive them). Destroying a wrapper
     /// removes it from the map, so re-iterate until empty. Dead wrappers
     /// (resource destroyed, still surface-referenced) live in the
-    /// graveyard list and are freed here too.
+    /// graveyard list and are freed here too, plus the F52 overflow stash.
     pub fn deinit(state: *ShmState) void {
+        for (state.dead_stash[0..state.dead_stash_len]) |buf| Buffer.destroy(buf.?);
+        state.dead_stash_len = 0;
         for (state.dead_buffers.items) |buf| Buffer.destroy(buf);
         state.dead_buffers.deinit(state.allocator);
         while (state.buffers.count() > 0) {
@@ -223,7 +231,25 @@ fn resourceDestroy(listener: *wire.Listener(*wire.Resource), resource: *wire.Res
     d.shm = null;
     if (!d.buf.dropped) d.buf.drop();
     if (d.state) |state| {
-        state.dead_buffers.append(state.allocator, d.buf) catch return;
+        state.dead_buffers.append(state.allocator, d.buf) catch {
+            // F52: the graveyard could not take the wrapper. Free it now
+            // when no consumer holds a lock — safe inside the destroy
+            // signal: signal emission tolerates freeing the current
+            // listener, and the surface-side F42 listeners that run later
+            // in this emission only compare resource pointers, never
+            // dereference the wrapper. With outstanding locks the wrapper
+            // parks in the fixed-size stash for deinit.
+            if (d.buf.n_locks == 0) {
+                Buffer.destroy(d.buf);
+            } else {
+                if (state.dead_stash_len < state.dead_stash.len) {
+                    state.dead_stash[state.dead_stash_len] = d.buf;
+                    state.dead_stash_len += 1;
+                }
+                // Stash full: the wrapper leaks at deinit (bounded,
+                // OOM-only).
+            }
+        };
     }
 }
 
@@ -330,4 +356,101 @@ test "shm state init deinit" {
     // The internal wl_shm global is advertised; initShm was called.
     try std.testing.expect(display.shm_initialized);
     try std.testing.expectEqual(@as(usize, 0), state.buffers.count());
+}
+
+test "graveyard append OOM frees unlocked wrappers and stashes locked ones" {
+    // F52: dead_buffers.append OOM used to leak the wrapper (it was
+    // removed from the map and never reclaimed). Now an unlocked wrapper
+    // is freed immediately (safe: signal emission tolerates freeing the
+    // current listener, and the surface-side F42 listeners that run later
+    // only compare resource pointers), and a locked one parks in the
+    // fixed-size stash for deinit.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var io = threaded.io();
+    var cfg: log.Config = .{};
+
+    const display = try display_mod.CompositorDisplay.init(allocator, &io, &cfg);
+    defer display.deinit();
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    const state = try ShmState.init(failing.allocator(), &io, &cfg, display);
+    defer state.deinit();
+
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &fds) != 0) {
+        return error.TestSetupFailed;
+    }
+    const client = wire.Client.create(display.server, fds[0]) orelse return error.TestSetupFailed;
+    fds[0] = -1; // owned by the client now
+    defer {
+        _ = std.c.close(fds[1]);
+    }
+    defer client.destroy();
+
+    // Fabricate a wrapper for a (never-real) client wl_buffer: the
+    // internal shm pipeline is unreachable in unit tests, so build the
+    // ShmBufferData + Buffer pair the resource-destroy path expects.
+    const resource = try wire.Resource.create(client, wire.wl.Buffer, 1, 2);
+    const wl_buf_view: *wire.wl.Buffer = @ptrCast(resource);
+    const d = try allocator.create(ShmBufferData);
+    d.* = .{
+        .allocator = allocator,
+        .resource_key = resource,
+        .resource = wl_buf_view,
+        .shm = null,
+        .state = state,
+        .buf = undefined,
+        .resource_destroy = undefined,
+        .release = undefined,
+    };
+    const buf = try Buffer.init(allocator, &shm_impl, d, 16, 16);
+    d.buf = buf;
+    d.resource_destroy = wire.Listener(*wire.Resource).init(resourceDestroy);
+    d.release = wire.Listener(*Buffer).init(releaseNotify);
+    // Never added to a signal; shmDestroy removes it unconditionally, so
+    // put the link in the removable detached state.
+    d.release.link.init();
+    resource.addDestroyListener(&d.resource_destroy);
+    try state.buffers.put(resource, buf);
+
+    // The client destroys the wl_buffer with the graveyard append failing:
+    // no consumer lock -> the wrapper is freed immediately, not leaked.
+    failing.fail_index = failing.alloc_index;
+    resource.destroy();
+    try std.testing.expectEqual(@as(usize, 0), state.buffers.count());
+    try std.testing.expectEqual(@as(usize, 0), state.dead_buffers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.dead_stash_len);
+
+    // Second wrapper with an outstanding consumer lock: cannot free it
+    // mid-emission, so the fixed-size stash takes it (freed by deinit).
+    const resource2 = try wire.Resource.create(client, wire.wl.Buffer, 1, 3);
+    const wl_buf_view2: *wire.wl.Buffer = @ptrCast(resource2);
+    const d2 = try allocator.create(ShmBufferData);
+    d2.* = .{
+        .allocator = allocator,
+        .resource_key = resource2,
+        .resource = wl_buf_view2,
+        .shm = null,
+        .state = state,
+        .buf = undefined,
+        .resource_destroy = undefined,
+        .release = undefined,
+    };
+    const buf2 = try Buffer.init(allocator, &shm_impl, d2, 8, 8);
+    d2.buf = buf2;
+    d2.resource_destroy = wire.Listener(*wire.Resource).init(resourceDestroy);
+    d2.release = wire.Listener(*Buffer).init(releaseNotify);
+    d2.release.link.init();
+    resource2.addDestroyListener(&d2.resource_destroy);
+    try state.buffers.put(resource2, buf2);
+    try buf2.lock(); // a consumer is reading
+
+    failing.fail_index = failing.alloc_index;
+    resource2.destroy();
+    try std.testing.expectEqual(@as(usize, 0), state.buffers.count());
+    try std.testing.expectEqual(@as(usize, 0), state.dead_buffers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.dead_stash_len);
+    // state.deinit (defer) frees the stashed wrapper.
 }

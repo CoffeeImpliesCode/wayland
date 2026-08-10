@@ -289,7 +289,7 @@ pub fn main(init: std.process.Init) !void {
         });
         return error.OutputModeBad;
     }
-    step("input verified: pointer enter+motion, button, key 38, keymap, output {d}x{d}", .{
+    step("input verified: pointer enter+motion, button, key 30, keymap, output {d}x{d}", .{
         mode.width, mode.height,
     });
 
@@ -391,9 +391,11 @@ fn onKeyboardEvent(keyboard: *wl.Keyboard, event: wl.Keyboard.Event, state: *Cli
         },
         .leave => {},
         .key => |k| {
-            if (k.key == 38) {
+            // The wire keycode is the evdev scancode (F1, note 132): the
+            // server sends keycode-8, so 'a' (xkb 38) arrives as 30.
+            if (k.key == 30) {
                 if (@intFromEnum(k.state) == 1) state.got_key_press = true else state.got_key_release = true;
-                step("key 38 state={d} time={d}", .{ @intFromEnum(k.state), k.time });
+                step("key 30 state={d} time={d}", .{ @intFromEnum(k.state), k.time });
             }
         },
         .modifiers => |m| step("modifiers dep=0x{x} lat=0x{x} lock=0x{x}", .{

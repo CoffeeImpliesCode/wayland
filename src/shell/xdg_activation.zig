@@ -11,18 +11,35 @@
 //! protocols/wayland-protocols/staging/xdg-activation/xdg-activation-v1.xml):
 //! - (a) commit is one-shot: any set_serial/set_app_id/set_surface/commit
 //!   after commit posts already_used=0.
-//! - (b) validation at commit: a set serial must equal the seat's last
-//!   serial (data_device.zig model; wlroots keeps a per-client serial ring)
+//! - (b) validation at commit: a set serial must have been given to the
+//!   token's client (the seat's per-client serial ring,
+//!   seat.validateEventSerial; wlroots wlr_seat_client_validate_event_serial)
 //!   and a set surface must be the seat's current keyboard- or
-//!   pointer-focused surface. On failure the done() event still fires, but
-//!   with a random token the compositor will never accept, and the token is
-//!   dropped from the activation registry (the client cannot distinguish).
+//!   pointer-focused surface — unless the surface was destroyed before
+//!   commit, in which case the constraint is dropped (XA-2, wlroots
+//!   surface-destroy listener). On failure the done() event still fires,
+//!   but with a random token the compositor will never accept, and the
+//!   token is dropped from the activation registry (the client cannot
+//!   distinguish).
 //! - (c) activate() with an unknown token is silently ignored (never an
 //!   error).
 //! - (d) single use: a used token is destroyed (wlroots model); a second
 //!   activate() with the same token is ignored.
 //! - (e) expiry: a 30s one-shot event-loop timer per token (wire loop
 //!   timers, cf. backend/headless.zig re-arming).
+//! - (f) a successfully committed token fires `events.new_token` before
+//!   done() (wlroots events.new_token, XA:141): the compositor can observe
+//!   token creation (app_id allowlists, telemetry). Failed commits do not
+//!   fire it.
+//! - (g) compositor-side external tokens (XA-3): createToken()/addToken()
+//!   make tokens with no wire resource (wlroots
+//!   wlr_xdg_activation_token_v1_create / wlr_xdg_activation_v1_add_token)
+//!   for portal-style activation; they register immediately and are
+//!   consumed by activateToken() or findToken(). createToken() starts the
+//!   30s expiry; addToken() does not (wlroots parity).
+//! - (h) set_serial's seat argument is validated (XA-5): an inert or
+//!   foreign seat resource rejects the set_serial (wlroots XA:186-199) —
+//!   the serial is not stored, so commit validates nothing.
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
@@ -67,11 +84,12 @@ pub const XdgActivation = struct {
     global: ?*wire.Global = null,
     /// Committed, valid, unused tokens, in creation order.
     tokens: std.ArrayList(*ActivationToken),
-    /// PRNG seed counter (mixed into the clock seed so rapid commits get
-    /// distinct token strings).
-    seed_counter: u64 = 0,
     events: struct {
         request_activate: wire.Signal(*ActivateRequest),
+        /// A token was created and committed successfully (before done()).
+        /// The token is already in the registry; the compositor may read
+        /// its name/app_id/surface (wlroots events.new_token, XA:141).
+        new_token: wire.Signal(*ActivationToken),
     },
 
     pub fn init(
@@ -97,6 +115,7 @@ pub const XdgActivation = struct {
         };
         errdefer activation.tokens.deinit(allocator);
         activation.events.request_activate.init();
+        activation.events.new_token.init();
 
         // Register xdg_activation_v1 at the maximum version we implement.
         activation.global = try display.addGlobal(
@@ -114,11 +133,102 @@ pub const XdgActivation = struct {
         if (self.global) |global| global.remove();
         // Destroying the wire resources cascades through their destroy
         // handlers, which remove entries from the list and free the objects
-        // (and cancel their expiry timers).
-        while (self.tokens.items.len > 0) self.tokens.items[0].resource.destroy();
+        // (and cancel their expiry timers). Compositor-created tokens (no
+        // wire resource) are freed directly.
+        while (self.tokens.items.len > 0) {
+            const token = self.tokens.items[0];
+            if (token.resource) |res| {
+                res.destroy();
+            } else {
+                destroyToken(token);
+            }
+        }
         self.tokens.deinit(allocator);
         // The activation global itself is owned by the display's registry.
         allocator.destroy(self);
+    }
+
+    /// Compositor-side token creation (wlroots
+    /// wlr_xdg_activation_token_v1_create): a token with a fresh CSPRNG
+    /// name and the 30s expiry, no wire resource (model decision (g)).
+    pub fn createToken(self: *XdgActivation) !*ActivationToken {
+        const token = try self.allocator.create(ActivationToken);
+        errdefer self.allocator.destroy(token);
+        token.* = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .log_cfg = self.log_cfg,
+            .activation = self,
+            .resource = null,
+            .surface_listener = wire.Listener(*surface_mod.Surface).init(onTokenSurfaceDestroy),
+        };
+        const token_str = generateToken(token) orelse return error.RandomUnavailable;
+        token.token_buf = token_str;
+        try self.registerToken(token);
+        return token;
+    }
+
+    /// Compositor-side external token with a known name (wlroots
+    /// wlr_xdg_activation_v1_add_token, XA:422-435): portal-style tokens
+    /// arrive out of band. The name must be the 32-hex format; unlike
+    /// createToken no expiry timer is started (wlroots parity).
+    pub fn addToken(self: *XdgActivation, token_str: []const u8) !*ActivationToken {
+        if (token_str.len != 32) return error.InvalidTokenName;
+        const token = try self.allocator.create(ActivationToken);
+        errdefer self.allocator.destroy(token);
+        token.* = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .log_cfg = self.log_cfg,
+            .activation = self,
+            .resource = null,
+            .surface_listener = wire.Listener(*surface_mod.Surface).init(onTokenSurfaceDestroy),
+        };
+        @memcpy(token.token_buf[0..32], token_str[0..32]);
+        self.tokens.append(self.allocator, token) catch return error.OutOfMemory;
+        return token;
+    }
+
+    /// Registry lookup by token name (wlroots wlr_xdg_activation_v1_find_token).
+    pub fn findToken(self: *XdgActivation, token_str: []const u8) ?*ActivationToken {
+        for (self.tokens.items) |token| {
+            if (std.mem.eql(u8, token_str, token.token_buf[0..32])) return token;
+        }
+        return null;
+    }
+
+    /// Compositor-side activate (wlroots wlr_xdg_activation_v1_activate):
+    /// deliver the token's activation request and consume the token
+    /// (single-use, model decision (d)).
+    pub fn activateToken(self: *XdgActivation, token: *ActivationToken, surface: *surface_mod.Surface) void {
+        var req: ActivateRequest = .{
+            .token = token.token_buf[0..32],
+            .surface = surface,
+        };
+        self.events.request_activate.emit(&req);
+        if (token.resource) |res| {
+            res.destroy();
+        } else {
+            destroyToken(token);
+        }
+    }
+
+    /// Register a token in the registry and start its 30s expiry timer
+    /// (wlroots token_init, XA:63-91). On failure the timer is cancelled.
+    fn registerToken(self: *XdgActivation, token: *ActivationToken) !void {
+        const timer = self.display.getServer().getEventLoop().addTimer(*ActivationToken, tokenTimeout, token) catch {
+            return error.AddTimerFailed;
+        };
+        timer.timerUpdate(token_timeout_ms) catch {
+            timer.remove();
+            return error.AddTimerFailed;
+        };
+        token.timer = timer;
+        self.tokens.append(self.allocator, token) catch {
+            timer.remove();
+            token.timer = null;
+            return error.OutOfMemory;
+        };
     }
 };
 
@@ -158,6 +268,7 @@ fn activationRequest(
                 .log_cfg = activation.log_cfg,
                 .activation = activation,
                 .resource = res,
+                .surface_listener = wire.Listener(*surface_mod.Surface).init(onTokenSurfaceDestroy),
             };
             res.setHandler(*ActivationToken, tokenRequest, tokenDestroy, token);
         },
@@ -169,7 +280,7 @@ fn activationRequest(
 /// Unknown tokens are silently ignored; a used token is destroyed after its
 /// single delivery (model decisions (c) and (d)).
 fn activationActivate(activation: *XdgActivation, token_str: []const u8, surface_res: *server.wl.Surface) void {
-    const token = findToken(activation, token_str) orelse {
+    const token = activation.findToken(token_str) orelse {
         log.debug("activate: unknown token ignored", activation.io, activation.log_cfg, log_tag, .{});
         return;
     };
@@ -177,7 +288,7 @@ fn activationActivate(activation: *XdgActivation, token_str: []const u8, surface
     // surface the compositor no longer knows is treated like an unknown
     // token (the client cannot legitimately produce one).
     const surface = surfaceForResource(activation, surface_res) orelse {
-        token.resource.destroy();
+        if (token.resource) |res| res.destroy() else destroyToken(token);
         return;
     };
     var req: ActivateRequest = .{
@@ -186,34 +297,62 @@ fn activationActivate(activation: *XdgActivation, token_str: []const u8, surface
     };
     activation.events.request_activate.emit(&req);
     // Single use: the token is destroyed after the delivery (wlroots model).
-    token.resource.destroy();
+    if (token.resource) |res| res.destroy() else destroyToken(token);
 }
 
 // ---------------------------------------------------------------------------
-// ActivationToken: xdg_activation_token_v1.
+// ActivationToken: xdg_activation_token_v1 (+ compositor-created tokens).
 // ---------------------------------------------------------------------------
 
-const ActivationToken = struct {
+pub const ActivationToken = struct {
     allocator: std.mem.Allocator,
     io: *std.Io,
     log_cfg: *const log.Config,
     activation: *XdgActivation,
-    resource: *server.xdg.ActivationTokenV1,
-    /// Whether commit already ran: further set_*/commit posts already_used.
+    /// The wire resource, or null for compositor-created tokens (XA-3,
+    /// model decision (g)).
+    resource: ?*server.xdg.ActivationTokenV1 = null,
+    /// Whether commit already ran: further set_*/commit posts already_used
+    /// (internal tokens only).
     committed: bool = false,
-    /// The token string (32 hex chars + NUL), set at commit.
+    /// The token string (32 hex chars + NUL), set at commit / creation.
     token_buf: [32:0]u8 = undefined,
     /// Validation failed at commit: done() was sent with this random token
     /// but the token was dropped from the registry (model decision (b)).
     invalid: bool = false,
     /// Pending (pre-commit) fields.
     serial: ?u32 = null,
-    surface_res: ?*server.wl.Surface = null,
+    /// The seat from set_serial's seat argument (XA-5); null = not set
+    /// (or the seat was inert/foreign and the set_serial was rejected).
+    seat: ?*seat_mod.Seat = null,
+    /// The surface the token is bound to, if set and alive (XA-2); the
+    /// surface-destroy listener nulls it, dropping the focus constraint
+    /// (wlroots XA:202-208).
+    surface: ?*surface_mod.Surface = null,
+    /// The surface's destroy listener (attached while `surface` != null).
+    surface_listener: wire.Listener(*surface_mod.Surface),
     /// Pending app_id (owned; set_app_id before commit).
     app_id: ?[]const u8 = null,
-    /// The 30s expiry timer (created at commit, model decision (e)).
+    /// The 30s expiry timer (created at commit / createToken, model
+    /// decision (e)).
     timer: ?*wire.EventSource = null,
+
+    /// The token's name (32 hex chars) (wlroots
+    /// wlr_xdg_activation_token_v1_get_name, XA:417-420).
+    pub fn getName(token: *const ActivationToken) []const u8 {
+        return token.token_buf[0..32];
+    }
 };
+
+/// The surface the token was bound to was destroyed before commit: drop the
+/// constraint (XA-2, wlroots token_handle_surface_destroy XA:202-208) — the
+/// token stays valid.
+fn onTokenSurfaceDestroy(listener: *wire.Listener(*surface_mod.Surface), surface: *surface_mod.Surface) void {
+    _ = surface;
+    const token: *ActivationToken = @fieldParentPtr("surface_listener", listener);
+    token.surface_listener.link.remove();
+    token.surface = null;
+}
 
 fn tokenRequest(
     token_res: *server.xdg.ActivationTokenV1,
@@ -224,18 +363,31 @@ fn tokenRequest(
         .set_serial => |r| {
             // Model decision (a): commit is one-shot.
             if (token.committed) {
-                token.resource.postError(.already_used, "set_serial after commit");
+                token.resource.?.postError(.already_used, "set_serial after commit");
                 return;
             }
+            // XA-5: the seat argument must map to a live seat (wlroots
+            // XA:186-199). An inert or foreign seat rejects the set_serial:
+            // no serial is stored, so commit validates nothing.
+            const seat_ud = r.seat.getUserData() orelse {
+                log.debug("set_serial: seat is inert, ignoring", token.io, token.log_cfg, log_tag, .{});
+                return;
+            };
+            const seat: *seat_mod.Seat = @ptrCast(@alignCast(seat_ud));
+            if (seat != token.activation.seat) {
+                log.debug("set_serial: seat is not the server seat, ignoring", token.io, token.log_cfg, log_tag, .{});
+                return;
+            }
+            token.seat = seat;
             token.serial = r.serial;
         },
         .set_app_id => |r| {
             if (token.committed) {
-                token.resource.postError(.already_used, "set_app_id after commit");
+                token.resource.?.postError(.already_used, "set_app_id after commit");
                 return;
             }
             const copy = token.allocator.dupe(u8, std.mem.span(r.app_id)) catch {
-                token.resource.postNoMemory();
+                token.resource.?.postNoMemory();
                 return;
             };
             if (token.app_id) |old| token.allocator.free(old);
@@ -243,10 +395,23 @@ fn tokenRequest(
         },
         .set_surface => |r| {
             if (token.committed) {
-                token.resource.postError(.already_used, "set_surface after commit");
+                token.resource.?.postError(.already_used, "set_surface after commit");
                 return;
             }
-            token.surface_res = r.surface;
+            // XA-2: track the surface's lifetime (wlroots XA:202-208); a
+            // surface destroyed before commit drops the constraint instead
+            // of failing it. The resource is live at dispatch, so the
+            // compositor Surface exists.
+            const surface = surfaceForResource(token.activation, r.surface) orelse {
+                token.surface = null;
+                return;
+            };
+            if (token.surface) |old| {
+                if (old == surface) return;
+                token.surface_listener.link.remove();
+            }
+            token.surface = surface;
+            surface.events.destroy.add(&token.surface_listener);
         },
         .commit => tokenCommit(token),
         // Destructor: libwayland does not auto-destroy; we do.
@@ -254,74 +419,86 @@ fn tokenRequest(
     }
 }
 
-fn tokenDestroy(token_res: *server.xdg.ActivationTokenV1, token: *ActivationToken) void {
-    _ = token_res;
+/// Free a token: unlink from the registry, detach the surface listener,
+/// cancel the timer, free owned strings and the object. Only valid when the
+/// wire resource is already destroyed (internal tokens, invoked from the
+/// resource destroy handler) or absent (external tokens).
+fn destroyToken(token: *ActivationToken) void {
     const activation = token.activation;
     if (std.mem.findScalar(*ActivationToken, activation.tokens.items, token)) |i| {
         _ = activation.tokens.swapRemove(i);
     }
     if (token.timer) |timer| timer.remove();
+    if (token.surface != null) {
+        token.surface_listener.link.remove();
+        token.surface = null;
+    }
     if (token.app_id) |app_id| token.allocator.free(app_id);
     token.allocator.destroy(token);
+}
+
+/// Resource destroy handler (internal tokens): the resource is already
+/// being destroyed; only the object needs cleanup.
+fn tokenDestroy(token_res: *server.xdg.ActivationTokenV1, token: *ActivationToken) void {
+    _ = token_res;
+    destroyToken(token);
 }
 
 /// xdg_activation_token_v1.commit: generate the token, validate the pending
 /// parameters, register the token and send done() (model decisions (a)/(b)).
 fn tokenCommit(token: *ActivationToken) void {
     if (token.committed) {
-        token.resource.postError(.already_used, "commit after commit");
+        token.resource.?.postError(.already_used, "commit after commit");
         return;
     }
     token.committed = true;
+    const res = token.resource orelse return; // external tokens never commit
 
     // A random-looking token is always generated; on validation failure the
     // done() event still carries one, but the token is not registered, so
     // activate() of it is silently ignored (model decision (b)).
-    const token_str = generateToken(token);
+    const token_str = generateToken(token) orelse {
+        res.postNoMemory();
+        return;
+    };
     if (!tokenValid(token)) {
         token.invalid = true;
         log.debug("commit: invalid token parameters, dropping token", token.io, token.log_cfg, log_tag, .{});
-        token.resource.sendDone(&token_str);
+        res.sendDone(&token_str);
         return;
     }
     token.token_buf = token_str;
     const activation = token.activation;
 
-    // 30s expiry timer (model decision (e)): a one-shot source; the
-    // callback removes it and drops the token.
-    const timer = activation.display.getServer().getEventLoop().addTimer(*ActivationToken, tokenTimeout, token) catch {
-        token.resource.postNoMemory();
-        return;
-    };
-    timer.timerUpdate(token_timeout_ms) catch {
-        timer.remove();
-        token.resource.postNoMemory();
-        return;
-    };
-    token.timer = timer;
-
-    activation.tokens.append(activation.allocator, token) catch {
-        timer.remove();
-        token.timer = null;
-        token.resource.postNoMemory();
+    // 30s expiry timer + registry insert (model decision (e)).
+    activation.registerToken(token) catch {
+        res.postNoMemory();
         return;
     };
     log.info("commit: token registered, app_id={s}", token.io, token.log_cfg, log_tag, .{
         token.app_id orelse "(none)",
     });
-    token.resource.sendDone(&token.token_buf);
+    // XA-1: compositor-visible token-creation hook (wlroots
+    // events.new_token, XA:141), emitted before done() and only for
+    // successful commits.
+    activation.events.new_token.emit(token);
+    res.sendDone(&token.token_buf);
 }
 
-/// Model decision (b): a set serial must be the seat's most recent serial
-/// (data_device.zig equality rule), and a set surface must be the seat's
-/// current keyboard- or pointer-focused surface.
+/// Model decision (b): a set serial must have been given to the token's
+/// client (the seat's per-client serial ring, seat.validateEventSerial —
+/// wlroots wlr_seat_client_validate_event_serial), and a set surface must
+/// be the seat's current keyboard- or pointer-focused surface. A surface
+/// destroyed before commit drops the constraint (XA-2, wlroots XA:202-208,
+/// XA:109-114).
 fn tokenValid(token: *ActivationToken) bool {
     const activation = token.activation;
     if (token.serial) |serial| {
-        if (serial != activation.seat.last_serial) return false;
+        // The seat is the one from set_serial's seat argument (XA-5).
+        const seat = token.seat orelse return false;
+        if (!seat.validateEventSerial(token.resource.?.getClient(), serial)) return false;
     }
-    if (token.surface_res) |surface_res| {
-        const surface = surfaceForResource(activation, surface_res) orelse return false;
+    if (token.surface) |surface| {
         const seat = activation.seat;
         if (seat.keyboard_focus != surface and seat.pointer_focus != surface) return false;
     }
@@ -335,15 +512,12 @@ fn tokenValid(token: *ActivationToken) bool {
 fn tokenTimeout(token: *ActivationToken) c_int {
     if (token.timer) |timer| timer.remove();
     token.timer = null;
-    token.resource.destroy();
-    return 1;
-}
-
-fn findToken(activation: *XdgActivation, token_str: []const u8) ?*ActivationToken {
-    for (activation.tokens.items) |token| {
-        if (std.mem.eql(u8, token_str, token.token_buf[0..32])) return token;
+    if (token.resource) |res| {
+        res.destroy();
+    } else {
+        destroyToken(token);
     }
-    return null;
+    return 1;
 }
 
 /// Resolve a wl_surface wire resource to the compositor's Surface wrapper.
@@ -354,16 +528,13 @@ fn surfaceForResource(activation: *XdgActivation, surface_res: *server.wl.Surfac
     return null;
 }
 
-/// Generate a 32-lowercase-hex token string (16 random bytes). [INFERENCE:
-/// wlroots uses getrandom(2); this server has no direct CSPRNG access in
-/// zig 0.16 std (std.crypto.random removed), so Xoshiro256 seeded from the
-/// monotonic clock + a counter stands in.]
-fn generateToken(token: *ActivationToken) [32:0]u8 {
-    token.activation.seed_counter +%= 1;
-    const now_ns: u64 = @intCast(std.Io.Clock.now(.awake, token.io.*).nanoseconds);
-    var prng = std.Random.DefaultPrng.init(now_ns ^ (token.activation.seed_counter *% 0x9E3779B97F4A7C15));
+/// Generate a 32-lowercase-hex token string (16 random bytes). XA-4:
+/// wlroots uses getrandom(2) (util/token.c); zig 0.16 removed
+/// std.crypto.random, so std.Io.randomSecure (getrandom under the hood)
+/// stands in. Returns null if the CSPRNG fails.
+fn generateToken(token: *ActivationToken) ?[32:0]u8 {
     var bytes: [16]u8 = undefined;
-    prng.fill(&bytes);
+    std.Io.randomSecure(token.io.*, &bytes) catch return null;
     var out: [32:0]u8 = undefined;
     const hex = "0123456789abcdef";
     for (bytes, 0..) |b, i| {
@@ -440,6 +611,22 @@ const ActivateCapture = struct {
         @memcpy(cap.token[0..n], req.token[0..n]);
         cap.token[n] = 0;
         cap.surface = req.surface;
+    }
+};
+
+const NewTokenCapture = struct {
+    count: usize = 0,
+    /// The last new_token's name (NUL-terminated copy).
+    token: [33]u8 = undefined,
+    listener: wire.Listener(*ActivationToken),
+
+    fn notify(listener: *wire.Listener(*ActivationToken), token: *ActivationToken) void {
+        const cap: *NewTokenCapture = @fieldParentPtr("listener", listener);
+        cap.count += 1;
+        const name = token.getName();
+        const n = @min(name.len, cap.token.len - 1);
+        @memcpy(cap.token[0..n], name[0..n]);
+        cap.token[n] = 0;
     }
 };
 
@@ -606,8 +793,9 @@ test "activation bogus serial -> invalid done token, activate ignored" {
     const token = try ts.activation_client.?.getActivationToken();
     token.setListener(*TokenEvents, TokenEvents.listener, &token_events);
 
-    // No input has ever occurred, so the seat's last serial is 0; a serial
-    // the seat never issued fails validation at commit.
+    // No input has ever occurred, so the seat's per-client serial ring is
+    // empty; a serial the seat never gave this client fails validation at
+    // commit.
     token.setSerial(1, ts.wl_seat.?);
     token.commit();
     try ts.pump();
@@ -657,4 +845,180 @@ test "activation unknown token -> no error, no event" {
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 0), capture.count);
     try std.testing.expectEqual(@as(usize, 0), ts.activation.?.tokens.items.len);
+}
+
+test "activation new_token hook fires on successful commit only (XA-1)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var new_capture: NewTokenCapture = .{
+        .listener = wire.Listener(*ActivationToken).init(NewTokenCapture.notify),
+    };
+    ts.activation.?.events.new_token.add(&new_capture.listener);
+
+    var token_events: TokenEvents = .{};
+    const token = try ts.activation_client.?.getActivationToken();
+    token.setListener(*TokenEvents, TokenEvents.listener, &token_events);
+
+    // Successful commit: new_token fired with the same name done() carries,
+    // and before done().
+    token.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), new_capture.count);
+    try std.testing.expectEqualStrings(
+        std.mem.sliceTo(&token_events.token, 0),
+        std.mem.sliceTo(&new_capture.token, 0),
+    );
+
+    // A failed commit (bogus serial) must not fire new_token.
+    var bad_events: TokenEvents = .{};
+    const bad = try ts.activation_client.?.getActivationToken();
+    bad.setListener(*TokenEvents, TokenEvents.listener, &bad_events);
+    bad.setSerial(1, ts.wl_seat.?);
+    bad.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), bad_events.done_count);
+    try std.testing.expectEqual(@as(usize, 1), new_capture.count);
+}
+
+test "activation surface destroyed before commit keeps the token valid (XA-2)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var capture: ActivateCapture = .{
+        .listener = wire.Listener(*ActivateRequest).init(ActivateCapture.notify),
+    };
+    ts.activation.?.events.request_activate.add(&capture.listener);
+
+    const doomed = try ts.wl_compositor.?.createSurface();
+    var token_events: TokenEvents = .{};
+    const token = try ts.activation_client.?.getActivationToken();
+    token.setListener(*TokenEvents, TokenEvents.listener, &token_events);
+
+    // Bind the token to a surface, then destroy the surface before commit.
+    // wlroots drops the surface constraint (XA:202-208); the token must
+    // still commit valid.
+    token.setSurface(doomed);
+    doomed.destroy();
+    try ts.pump();
+    token.commit();
+    try ts.pump();
+
+    try std.testing.expectEqual(@as(usize, 1), token_events.done_count);
+    try std.testing.expectEqual(@as(usize, 1), ts.activation.?.tokens.items.len);
+
+    // ...and the token activates normally.
+    const surface = try ts.wl_compositor.?.createSurface();
+    ts.activation_client.?.activate(@ptrCast(&token_events.token), surface);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+}
+
+test "activation external tokens: create/activate and add/find (XA-3)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var capture: ActivateCapture = .{
+        .listener = wire.Listener(*ActivateRequest).init(ActivateCapture.notify),
+    };
+    ts.activation.?.events.request_activate.add(&capture.listener);
+
+    const surface = try ts.wl_compositor.?.createSurface();
+    // The server must process the create_surface request before the
+    // compositor-side Surface exists (surfaceForClient resolves it).
+    try ts.pump();
+    const srv_surface = ts.surfaceForClient(surface);
+
+    // Compositor-created token: no client object, immediate validity.
+    const ext = try ts.activation.?.createToken();
+    try std.testing.expectEqual(@as(usize, 1), ts.activation.?.tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 32), ext.getName().len);
+    try std.testing.expect(ext.resource == null);
+
+    ts.activation.?.activateToken(ext, srv_surface);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings(ext.getName(), std.mem.sliceTo(&capture.token, 0));
+    try std.testing.expectEqual(@as(usize, 0), ts.activation.?.tokens.items.len);
+
+    // addToken: a known out-of-band name, findable and activatable.
+    const name = "aabbccddeeff00112233445566778899";
+    const ext2 = try ts.activation.?.addToken(name);
+    try std.testing.expectEqual(@as(usize, 1), ts.activation.?.tokens.items.len);
+    try std.testing.expectEqual(@as(?*ActivationToken, ext2), ts.activation.?.findToken(name));
+    try std.testing.expectEqual(
+        @as(?*ActivationToken, null),
+        ts.activation.?.findToken("00000000000000000000000000000000"),
+    );
+    ts.activation.?.activateToken(ext2, srv_surface);
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqualStrings(name, std.mem.sliceTo(&capture.token, 0));
+    try std.testing.expectEqual(@as(usize, 0), ts.activation.?.tokens.items.len);
+
+    // A non-32-hex external name is rejected.
+    try std.testing.expectError(error.InvalidTokenName, ts.activation.?.addToken("short"));
+}
+
+test "activation tokens are 32 lowercase hex and distinct (XA-4)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var seen: [4][32]u8 = undefined;
+    var n: usize = 0;
+    while (n < seen.len) : (n += 1) {
+        var token_events: TokenEvents = .{};
+        const token = try ts.activation_client.?.getActivationToken();
+        token.setListener(*TokenEvents, TokenEvents.listener, &token_events);
+        token.commit();
+        try ts.pump();
+
+        const s = std.mem.sliceTo(&token_events.token, 0);
+        try std.testing.expectEqual(@as(usize, 32), s.len);
+        // Every character is a lowercase hex digit.
+        for (s) |c| {
+            try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+        }
+        // No repeated token across commits.
+        for (seen[0..n]) |prev| {
+            try std.testing.expect(!std.mem.eql(u8, &prev, s));
+        }
+        @memcpy(seen[n][0..32], s[0..32]);
+    }
+}
+
+test "activation set_serial with an inert seat is ignored (XA-5)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var capture: ActivateCapture = .{
+        .listener = wire.Listener(*ActivateRequest).init(ActivateCapture.notify),
+    };
+    ts.activation.?.events.request_activate.add(&capture.listener);
+
+    // Inert the server-side wl_seat resource (same effect as wlroots'
+    // wlr_seat_client_from_resource returning NULL, XA:186-199).
+    const seat_res = ts.client.?.getObject(ts.wl_seat.?.getId()).?;
+    seat_res.setDispatcher(null, null, null, null);
+
+    const surface = try ts.wl_compositor.?.createSurface();
+    var token_events: TokenEvents = .{};
+    const token = try ts.activation_client.?.getActivationToken();
+    token.setListener(*TokenEvents, TokenEvents.listener, &token_events);
+
+    // The inert seat rejects the set_serial: no serial is stored, so commit
+    // validates nothing and the token is valid. Contrast the live-seat
+    // bogus-serial test, where the token is dropped.
+    token.setSerial(1, ts.wl_seat.?);
+    token.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), token_events.done_count);
+    try std.testing.expectEqual(@as(usize, 1), ts.activation.?.tokens.items.len);
+
+    ts.activation_client.?.activate(@ptrCast(&token_events.token), surface);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
 }

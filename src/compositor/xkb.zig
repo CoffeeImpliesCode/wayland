@@ -46,7 +46,8 @@ const c = struct {
     extern fn xkb_state_unref(state: ?*xkb_state) void;
     extern fn xkb_state_update_key(state: ?*xkb_state, keycode: u32, direction: xkb_key_direction) c_int;
     extern fn xkb_state_key_get_one_sym(state: ?*const xkb_state, keycode: u32) u32;
-    extern fn xkb_state_serialize_mods(state: ?*const xkb_state, components: xkb_state_component) u32;
+    extern fn xkb_state_serialize_mods(state: ?*const c.xkb_state, components: xkb_state_component) u32;
+    extern fn xkb_state_serialize_layout(state: ?*const c.xkb_state, components: c_int) u32;
 
     /// xkbcommon does not provide a free function for the keymap string;
     /// it is malloc'd and released with the libc free.
@@ -59,9 +60,13 @@ const xkb_key_down: c.xkb_key_direction = 1;
 const xkb_state_mods_depressed: c.xkb_state_component = 1;
 const xkb_state_mods_latched: c.xkb_state_component = 2;
 const xkb_state_mods_locked: c.xkb_state_component = 4;
+/// XKB_STATE_LAYOUT_EFFECTIVE (xkbcommon enum xkb_state_component).
+const xkb_state_layout_effective: c_int = 1 << 16;
 
-/// xkbcommon keycode (X11 evdev scancode + 8); the same codes sent in
-/// wl_keyboard.key events.
+/// xkbcommon keycode (X11 evdev scancode + 8). The seat's keyEvent API
+/// operates in this space; the WIRE keycode is the scancode (keycode
+/// minus 8) — the protocol requires clients to add 8 (wayland.xml:2597),
+/// so the seat converts at the send sites (note 132 F1).
 pub const Keycode = u32;
 
 /// Owned xkbcommon context + keymap + state. Not thread-safe (used from
@@ -175,13 +180,77 @@ pub const Xkb = struct {
     }
 
     /// Current modifier mask (wl_keyboard.modifiers layout: bit 0 Shift,
-    /// 1 Lock, 2 Control, 3 Mod1, 4 Mod2, 5 Mod3, 6 Mod4, 7 Mod5).
-    pub fn mods(self: *Xkb) struct { depressed: u32, latched: u32, locked: u32 } {
+    /// 1 Lock, 2 Control, 3 Mod1, 4 Mod2, 5 Mod3, 6 Mod4, 7 Mod5) plus
+    /// the effective layout group (wl_keyboard.modifiers.group; wlroots
+    /// sends it, wlr_seat_keyboard.c:215-217; smithay layout_effective,
+    /// keyboard.rs:84-93).
+    pub fn mods(self: *Xkb) struct { depressed: u32, latched: u32, locked: u32, group: u32 } {
         return .{
             .depressed = c.xkb_state_serialize_mods(self.state, xkb_state_mods_depressed),
             .latched = c.xkb_state_serialize_mods(self.state, xkb_state_mods_latched),
             .locked = c.xkb_state_serialize_mods(self.state, xkb_state_mods_locked),
+            .group = c.xkb_state_serialize_layout(self.state, xkb_state_layout_effective),
         };
+    }
+
+    /// Replace the keymap (and state) with a new layout, e.g. for a
+    /// runtime layout switch (F10; wlroots wlr_keyboard_set_keymap,
+    /// wlr_keyboard.c:204-283). The keymap text, memfd and state are
+    /// rebuilt; callers must re-broadcast the keymap to clients and
+    /// re-send the modifiers (the group may have changed).
+    pub fn setLayout(
+        self: *Xkb,
+        layout: []const u8,
+    ) error{ KeymapBuildFailed, KeymapMemfdFailed, OutOfMemory }!void {
+        // xkb_rule_names.layout is a C string; callers may hand an
+        // unterminated slice (environ values), so build a sentinel copy.
+        const layout_z = self.allocator.dupeZ(u8, layout) catch return error.OutOfMemory;
+        defer self.allocator.free(layout_z);
+        var names: c.xkb_rule_names = .{
+            .rules = null,
+            .model = null,
+            .layout = layout_z.ptr,
+            .variant = null,
+            .options = null,
+        };
+        const keymap = c.xkb_keymap_new_from_names(self.ctx, &names, 0) orelse return error.KeymapBuildFailed;
+        errdefer c.xkb_keymap_unref(keymap);
+        const state = c.xkb_state_new(keymap) orelse return error.KeymapBuildFailed;
+        errdefer c.xkb_state_unref(state);
+        const keymap_text = c.xkb_keymap_get_as_string(keymap, 1) orelse return error.KeymapBuildFailed;
+        errdefer c.free(@constCast(keymap_text));
+        const text_len = std.mem.len(keymap_text);
+        const keymap_fd = std.posix.memfd_create("wayland-keymap", std.os.linux.MFD.CLOEXEC) catch
+            return error.KeymapMemfdFailed;
+        errdefer _ = std.os.linux.close(keymap_fd);
+        {
+            var written: usize = 0;
+            while (written < text_len) {
+                const n = std.os.linux.write(keymap_fd, keymap_text[written..text_len].ptr, text_len - written);
+                if (n == 0) return error.KeymapMemfdFailed;
+                if (n > std.math.maxInt(usize) / 2) return error.KeymapMemfdFailed; // negated errno
+                written += n;
+            }
+        }
+        _ = std.os.linux.lseek(keymap_fd, 0, std.os.linux.SEEK.SET);
+
+        // Swap in the new keymap; the old one dies after the swap.
+        const old_keymap = self.keymap;
+        const old_state = self.state;
+        const old_text = self.keymap_text;
+        const old_fd = self.keymap_fd;
+        self.keymap = keymap;
+        self.state = state;
+        self.keymap_text = keymap_text;
+        self.keymap_fd = keymap_fd;
+        self.keymap_size = @intCast(text_len);
+        _ = std.os.linux.close(old_fd);
+        c.free(@constCast(old_text));
+        c.xkb_state_unref(old_state);
+        c.xkb_keymap_unref(old_keymap);
+        log.debug("xkb keymap rebuilt (layout {s}, {d} bytes)", self.io, self.log_cfg, "xkb", .{
+            layout, text_len,
+        });
     }
 };
 
@@ -224,4 +293,21 @@ test "xkb builds the us keymap and resolves keysyms" {
     const fd = xkb.dupKeymapFd();
     defer _ = std.os.linux.close(fd);
     try testing.expect(fd >= 0);
+
+    // F10: modifiers carry the effective layout group (0 for one layout).
+    try testing.expectEqual(@as(u32, 0), xkb.mods().group);
+
+    // setLayout rebuilds the keymap/state/memfd (F10): the new keymap
+    // resolves keysyms and the fd is fresh.
+    try xkb.setLayout("us");
+    try testing.expectEqual(@as(u32, 0x61), xkb.updateKey(38, true)); // 'a'
+    try testing.expectEqual(@as(u32, 0), xkb.mods().group);
+    const fd2 = xkb.dupKeymapFd();
+    defer _ = std.os.linux.close(fd2);
+    try testing.expect(fd2 >= 0);
+    try testing.expect(fd2 != fd);
+
+    // A multi-layout keymap reports the effective group (0 initially).
+    try xkb.setLayout("us,de");
+    try testing.expectEqual(@as(u32, 0), xkb.mods().group);
 }

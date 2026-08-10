@@ -151,6 +151,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: on popup creation and on `reposition`, the compositor passes the constraint box (output or parent-toplevel box in parent-surface-local coords) and the geometry must be adjusted per the client's adjustment bits before `xdg_popup.configure`.
 - Why it matters: popups render off-screen and off-anchor; reactive tooltips/menus never re-place when the parent moves; `set_constraint_adjustment` is silently ignored (protocol lie).
 - Fixability: FIXABLE-in-module. Pure rectangle math on data already stored (xdg.zig:918-980). Needs a `constrain(rect, box)` port of wlr_xdg_positioner.c:327-518 (~190 lines) + a constraint-box parameter threaded into popup configure. Constraint box source (output geometry vs parent) is compositor policy; default to output box.
+- FIXED 2026-08-10: ported wlr_xdg_positioner.c:327-518 (unconstrainBox + flip/slide/resize steps, xdg.zig `PositionerState.constrainedGeometry`); `XdgPopup.setConstraintBox` accepts the compositor's usable rect and `configure()`/`reposition` re-place within it; main.zig's onNewPopup supplies the output mode rect; tests: "positioner constraint adjustment math (F1)", "popup configure applies the constraint box (F1)", "popup reposition re-places and acknowledges the token (F1/F7)".
 
 ### F2. xdg_popup.grab is a stub; no seat grabs, no invalid_grab, no topmost-popup rule
 - Severity: HIGH.
@@ -159,6 +160,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: `grab` with a mapped surface → `xdg_popup.invalid_grab`; grab only valid on the topmost popup of the seat's grab chain; while grabbed, input routes to the popup's client only; popup_done ends the grab.
 - Why it matters: menus cannot be dismissed by outside clicks; compositors cannot route input during grabs; wlroots/smithay/KWin all treat this as core popup behavior.
 - Fixability: NEEDS-wiring. seat.zig has no grab concept ([INFERENCE] — no grab API seen in src/compositor/seat.zig; only pointer/key/button events, main.zig:548-560). Requires seat grab interfaces + popup stacking (F12) before the module code can land.
+- DEFERRED 2026-08-10 fixing round: seat grab interfaces and popup stacking (F12) are both STRUCTURAL and out of scope for this round; the module still logs `grab` (popupRequest).
 
 ### F3. ping/pong absent (no unresponsive detection)
 - Severity: HIGH.
@@ -167,6 +169,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: compositor pings on demand (e.g. for close/force-kill UI); pong matches the pending serial; timeout → `ping_timeout` event so the compositor can mark the window unresponsive.
 - Why it matters: hung clients cannot be detected or force-closed; the ping wire event is simply never sent.
 - Fixability: NEEDS-wiring. The module can add `sendPing()/onPong` + a pending-serial field (FIXABLE-in-module), but the timeout timer and unresponsive UI belong to main.zig policy.
+- FIXED 2026-08-10: module tracks one pending ping serial per wm_base binding (`WmBaseState.ping_serial`), `XdgToplevel.ping()/pingPending()/wmBaseResource()`; pong with the matching serial clears it and emits `XdgShell.events.pong`; main.zig's repeating 5s loop timer (onPingTick) pings each distinct client and posts the unresponsive error (code 6) when a ping went unanswered; test: "ping/pong roundtrip and unresponsive tracking (F3)".
 
 ### F4. configure_bounds (v2+) and wm_capabilities (v6+) events never sent
 - Severity: HIGH (protocol surface under-announced; the first configure must carry wm_capabilities per wlroots).
@@ -175,6 +178,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: `configure_bounds` on output/size changes; `wm_capabilities` on first configure and whenever the capability set changes.
 - Why it matters: clients cannot honor work areas; clients never learn which actions the compositor supports (e.g. window menu is advertised then broken — see F11).
 - Fixability: FIXABLE-in-module. Add bounds/caps fields to `ToplevelState`, emit both events version-gated in `configure()` before the states array.
+- FIXED 2026-08-10: `ToplevelState.bounds_width/height` + `wm_capabilities` (WmCapabilities bool set); `XdgToplevel.configure` emits configure_bounds (since v4, on change) and wm_capabilities (since v5, before the first configure and on change); default caps (window_menu|maximize|fullscreen|minimize) seeded at role creation for v5+ clients per wlroots create_xdg_toplevel:299-309; tests: "xdg toplevel configure/ack roundtrip" (caps on first configure, bounds on change) + "wm_capabilities and configure_bounds version gating (F4)". Note: the audit brief said v2/v6; the vendored XML is authoritative — configure_bounds since 4, wm_capabilities since 5 (xdg-shell.xml:1189, 1220), matching wlroots' since-version macros.
 
 ### F5. States array not filtered by client version
 - Severity: MED.
@@ -183,6 +187,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: a configure sent to a v5 client must never contain state values > 5.
 - Why it matters: old toolkits (GTK < 3.24.30-era) mis-parse unknown state values; wire conformance per xdg-shell.xml since-annotations.
 - Fixability: FIXABLE-in-module. Thread `resource.getVersion()` into `stateValues` (or filter in `configure`).
+- FIXED 2026-08-10: `stateValues` takes the binding version and gates tiled_* (>=2), suspended (>=6), constrained_* (>=7) per the XML since annotations (wlroots gates identically, wlr_xdg_toplevel.c:83-124); `configure` passes `t.resource.getVersion()`; tests: "toplevel state values filtered by client version (F5)" + the v5 roundtrip now sets suspended/constrained and asserts they never arrive.
 
 ### F6. Configure payload model: no per-field scheduled state, no idle coalescing, compositor never configures
 - Severity: MED (design).
@@ -191,6 +196,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: compositor policy sets size/states; each policy change produces exactly one configure; rapid changes coalesce.
 - Why it matters: the compositor has no mechanism to resize/maximize a toplevel at all today. The ack payload model (F7) is the same seam.
 - Fixability: STRUCTURAL. Touches the XdgToplevel public API shape and main.zig consumers; module-local emulation (a `pending_configure: ?ToplevelState` + send-on-commit) is possible but fights the current `current`-writes design.
+- FIXED 2026-08-10 (orchestrator override: implement the module-local prescription): `XdgToplevel.scheduled: ToplevelState` holds the per-field state the next configure carries; `configure(width, height)` records a `ConfigurePayload {serial, width, height, state}` per configure; the ack applies the payload to `current` (the committed-against state). main.zig never called `configure` before and still does not; the module auto-configure now sends `scheduled.width/height`. Idle coalescing remains compositor-side policy (no timer in the module).
 
 ### F7. ack_configure applies no role payload
 - Severity: MED.
@@ -199,6 +205,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: the last-acked configure's width/height/states define what the client committed against (the "current" state source in wlroots).
 - Why it matters: no last-acked state; the compositor cannot distinguish "client is at the state I configured" from "client ignored the configure". Popup geometry cannot be re-derived from the acked configure (reactive popups, F1).
 - Fixability: STRUCTURAL (tied to F6's payload model). A list of `{serial, width, height, states}` replacing `sent_serials` is a module-local change, but applying acked state into `current` collides with the policy-writes-current design.
+- FIXED 2026-08-10 (orchestrator override): `XdgToplevel.sent_payloads` (ConfigurePayload list) records each configure; `applyAckedConfigure(serial)` copies the acked width/height/states into `current` and prunes superseded payloads (wlroots handle_xdg_toplevel_ack_configure). Popups likewise: `PopupConfigurePayload` + `acked_geometry` (wlroots handle_xdg_popup_ack_configure). Policy now writes `scheduled`; `current` is read-only committed-against state. Tests: "xdg toplevel configure/ack roundtrip" (current == acked payload), "popup configure applies the constraint box (F1)" (acked_geometry), "popup reposition re-places and acknowledges the token (F1/F7)".
 
 ### F8. Role-object destroy before map does not reset the configure state machine
 - Severity: MED.
@@ -207,6 +214,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: any role-object destruction resets the xdg_surface to the initial state: next map requires buffer-less commit → configure → ack.
 - Why it matters: XML "Unmapping" + role-destroy semantics; a client that destroys its toplevel and re-creates it could map without ever acking, breaking the configure handshake.
 - Fixability: FIXABLE-in-module. Call `resetConfigureState` unconditionally in `toplevelDestroy`/`popupDestroy`.
+- FIXED 2026-08-10: `toplevelDestroy` and `popupDestroy` call `xdg.resetConfigureState()` before `unmapSurface` (which early-returns when unmapped); test: "role-object destroy before map resets the configure machine (F8)" (re-create + buffer commit before the fresh handshake -> unconfigured_buffer).
 
 ### F9. Client min/max size validated then discarded; compositor never reads it
 - Severity: MED.
@@ -215,6 +223,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: after commit, the compositor can read the client's constraints to size/limit the window.
 - Why it matters: without constraints, resizing policy (F6) cannot clamp; a future maximize path cannot honor the client's limits.
 - Fixability: FIXABLE-in-module. Apply `pending.min/max_size` into `current` at commit (in `xdgSurfaceClientCommit`), mirroring the wlroots synced move; expose via `current`.
+- FIXED 2026-08-10: after the existing commit-time validation, `t.current.min_size/max_size = t.pending.*` in `xdgSurfaceClientCommit`; the compositor reads the constraints from `t.current`; test: "client min/max size is applied to current at commit (F9)".
 
 ### F10. set_fullscreen drops the output; set_minimized has no signal
 - Severity: MED.
@@ -223,6 +232,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: the compositor learns which output was requested for fullscreen; it receives a minimize request event.
 - Why it matters: fullscreen-on-a-specific-output cannot be honored; minimize requests are silently dropped.
 - Fixability: FIXABLE-in-module. Add `output: ?*wire.Resource` to a request payload (and a `request_minimize` signal + `minimized` field).
+- FIXED 2026-08-10: `request_fullscreen` widened to `FullscreenRequest {toplevel, fullscreen, output}` carrying the client-named wl_output; `set_minimized` records `pending.minimized` and emits `request_minimize`; `ToplevelState.minimized` field added; main.zig logs both via per-toplevel listeners; test: "set_fullscreen carries the output; set_minimized emits a signal (F10)".
 
 ### F11. move/resize/show_window_menu lose seat + serial; window menu has no event at all
 - Severity: MED.
@@ -231,6 +241,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: the compositor receives seat+serial so it can verify the client held the button (serial check) before starting interactive move/resize, and it can raise the window menu at (x,y).
 - Why it matters: interactive move/resize cannot validate serials; window menus are unimplementable today. wm_capabilities advertises WINDOW_MENU (once F4 lands) but no event exists.
 - Fixability: NEEDS-wiring. Payload widening (seat ref + serial + coords) is FIXABLE-in-module; serial-vs-seat validation and the menu UI are compositor work.
+- FIXED 2026-08-10: `request_move` now emits `MoveRequest {toplevel, seat, serial}`, `request_resize` carries seat+serial, and `request_show_window_menu` (new event) carries `ShowWindowMenuRequest {toplevel, seat, serial, x, y}`; main.zig has no interactive-move consumers yet (logs fullscreen/minimize only). Serial-vs-seat validation and the menu UI remain compositor work; tests: "move and show_window_menu carry seat + serial (F11)" + updated resize payload test.
 
 ### F12. No popup stacking / child lists / parent-unmap teardown / popup hit-testing
 - Severity: MED.
@@ -239,6 +250,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: popups stack above their parent and siblings; destroying a popup that is not the topmost (under an active grab) is a protocol error; parent unmap dismisses children; hit-testing descends into popups at their offset.
 - Why it matters: menus render at wrong positions, intercept clicks at the wrong location, and cannot be ordered. This is the largest STRUCTURAL gap in the popup story.
 - Fixability: STRUCTURAL. Needs scene ordering/offset application (main.zig), seat focus rules, and popup parent/child data structures in the module. F2 (grab) and F1 (reposition) both depend on it.
+- DEFERRED 2026-08-10 fixing round: STRUCTURAL (scene ordering/offset + seat focus + popup parent/child lists); F1's constraint math and reposition were landed independently; popups still composite at scene origin (main.zig onNewPopup only logs).
 
 ### F13. Positioner completeness check differs; zero-size anchor rect accepted
 - Severity: LOW.
@@ -247,6 +259,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: per XML only "set_size and set_anchor_rect must be called"; zero-size anchor rect is undefined territory. wlroots is stricter.
 - Why it matters: edge-case clients get through with a degenerate popup; behavior difference vs wlroots in a conformance test.
 - Fixability: FIXABLE-in-module. Require `anchor_rect.width > 0 && anchor_rect.height > 0` (or track set-with-nonzero) in the completeness check.
+- FIXED 2026-08-10: `PositionerState.isComplete` requires positive size AND positive anchor-rect width+height (wlroots checks only width; the height requirement is the note's prescription, deliberately stricter); used at get_popup and reposition; test: "zero-size anchor rect positioner is incomplete (F13)".
 
 ### F14. Title/app_id: no change events; invalid UTF-8 handled differently from wlroots; state not cleared on unmap
 - Severity: LOW.
@@ -255,6 +268,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: compositor notified on title/app_id change; title cleared on unmap (window metadata is per-map).
 - Why it matters: taskbar/CSD title updates never arrive; metadata leaks across unmap; invalid-UTF-8 handling differs from wlroots (ours keeps the connection, which is arguably safer — no XML error exists).
 - Fixability: FIXABLE-in-module (add events; clear on unmap). The UTF-8 policy (log+reject vs error) is a deliberate divergence — keep, but document.
+- FIXED 2026-08-10: `set_title`/`set_app_id` events on XdgToplevel, emitted after storing; `resetOnUnmap` frees title/app_id on NULL-buffer unmap (per-map metadata); UTF-8 policy kept (log+reject, no wire error) and documented in setTitle; main.zig attaches per-toplevel title/app_id listeners; test: "title/app_id change events; unmap clears metadata (F14)".
 
 ### F15. Window geometry: applied at ack, not commit; no extents intersection
 - Severity: LOW.
@@ -263,6 +277,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: geometry clamped to the committed buffer extents; geometry refreshed at map (so subsurfaces are included).
 - Why it matters: a client can set a window geometry larger than its buffer; ours reports it as-is to the compositor. Timing (ack vs commit) is usually identical in practice since the ack precedes the buffer commit.
 - Fixability: FIXABLE-in-module (commit-time apply); the extents clamp needs the compositor surface extent API — [INFERENCE] `surfaceSize` exists in main.zig:1685 but extents are not exposed to the shell module.
+- FIXED 2026-08-10: window geometry applies at COMMIT (`xdgSurfaceClientCommit`, wlroots synced-state move), not at ack; the extents intersection (effective geometry = extents ∩ window_geometry, wlr_xdg_surface.c:259-280) still needs the surface-extents API which is not exposed to the shell module — applied as-is until that lands; test: "window geometry applies at commit, not ack (F15)".
 
 ### F16. set_parent: self-check only; no storage, no loop detection, no parent-unmap handling
 - Severity: MED.
@@ -271,6 +286,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: descendant-cycle → invalid_parent; parent stored and exposed; parent unmap clears the child's parent.
 - Why it matters: dialog/transient semantics, taskbar grouping, and popup-parent chains need real parenting.
 - Fixability: STRUCTURAL (the task brief classifies parenting as such). A parent field + cycle walk is FIXABLE-in-module; consuming it (stacking, transient windows) is compositor work.
+- FIXED 2026-08-10 (orchestrator override: implement the module-local parts): `XdgToplevel.parent` stored and exposed; `set_parent` walks the ancestor chain and posts invalid_parent on descendant cycles (wlroots wlr_xdg_toplevel.c:178-204); `children` list keeps no stale pointers — parent destroy/unmap reparents children to the grandparent (resetOnUnmap) or clears them; consuming parenting (stacking, transient windows) remains compositor work; test: "set_parent stores the parent and rejects descendant cycles (F16)".
 
 ### L1. get_popup on a layer surface is a stub (posts raw -1)
 - Severity: HIGH.
@@ -279,6 +295,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: `zwlr_layer_surface_v1.get_popup` makes the xdg_popup's parent the layer surface; the popup must then be positioned relative to the layer surface and dismissed with it.
 - Why it matters: layer-shell panels with popups (notification popups, panel menus) are a standard use case; every reference implements it. Also drags `invalid_surface_state`-style behavior with it.
 - Fixability: FIXABLE-in-module for the wire path (set `XdgPopup.parent`-equivalent to the layer surface, hook popup configure), but the popup offset/stacking consumption is NEEDS-wiring (F12). Requires relaxing the xdg.zig commit-time null-parent error (xdg.zig:1076-1092) to accept the layer-surface parent.
+- FIXED 2026-08-10: `getPopup` parents the xdg_popup to the layer surface — `XdgPopup.layer_parent = the layer wl_surface` (wlroots `popup->parent = parent->surface` parity; the popup keeps its NULL xdg `parent`), the popup is tracked in `LayerSurface.popups` (pruned via a per-popup resource destroy listener) and dismissed with the layer surface on unmap-reset and destroy (popup_done + role destroy, mirroring `layer_surface_reset`). The xdg.zig commit-time null-parent check is relaxed to accept a layer parent (xdg.zig:1795, added by W4 per this finding). Already-parented popup → raw -1 on the layer-surface resource (wlroots). Popup offset/stacking consumption remains F12 (deferred). Wire-level `new_popup` on the layer surface was not added: main.zig already sees xdg popups via the xdg `new_popup` signal.
 
 ### L2. Initial layer configure is module-auto; compositor never assigns real sizes
 - Severity: MED.
@@ -287,6 +304,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: the compositor assigns sizes for zero-dimension axes (panel height, dock width) and informs the client.
 - Why it matters: clients asking for auto-assigned sizes (the common case: a top bar with width 0) never learn their actual size; layer layout policy is entirely absent (acknowledged in notes/129-layer-shell-impl.md).
 - Fixability: STRUCTURAL. The module flow is protocol-correct; assigning sizes requires a layout pass over outputs in main.zig plus a public configure entry (FIXABLE-in-module to expose; compositor work to drive).
+- FIXED 2026-08-10 (minimal wiring per the task brief): `LayerSurface.setFallbackSize(w, h)` exposes the compositor-assigned size; main.zig `onNewLayerSurface` supplies the (single) output's mode size; the module's initial configure carries the fallback for each zero desired dimension (the client's nonzero desired size wins per axis). The full layout policy (z-ordering, exclusive-zone arrangement, compositor-driven configures after the initial one) remains deferred.
 
 ### L3. set_size: no INT32_MAX guard, no change short-circuit
 - Severity: LOW.
@@ -295,6 +313,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: implementation-error guard per wlroots (the XML has no error code).
 - Why it matters: overflow beyond INT32_MAX only matters to hostile clients; ours stores u32 losslessly, so no corruption. Parity nicety.
 - Fixability: FIXABLE-in-module.
+- FIXED 2026-08-10: `set_size` rejects width/height > INT32_MAX with raw -1 on the surface resource (wlroots posts client-level via `wl_client_post_implementation_error`; ours uses the codebase's resource-level implementation-error pattern — documented) and short-circuits when the pending size is unchanged (wlroots wlr_layer_shell_v1.c:128-151).
 
 ### L4. set_layer invalid_layer posted on the shell resource; refs post on the layer surface
 - Severity: LOW.
@@ -303,6 +322,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: the error enum lives on `zwlr_layer_shell_v1`; clients match the error to the resource's interface. Posting on the shell resource is XML-defensible but all three references post on the surface.
 - Why it matters: a client that only binds the surface object reads the error as unknown-interface; GTK-style clients expect the error on the surface object. Divergence is deliberate; revisit if a client complains.
 - Fixability: FIXABLE-in-module (one-line move; note the existing comment).
+- FIXED 2026-08-10: `invalid_layer` (code 1, shell error enum) is now posted on the layer-surface resource (wlroots/smithay/KWin parity); the shell-resource divergence comment is updated.
 
 ### L5. Layer state not reset on unmap (matches wlroots; both diverge from XML text)
 - Severity: LOW.
@@ -311,6 +331,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected per XML: full state reset. wlroots and ours keep state; smithay/KWin reset.
 - Why it matters: after unmap/remap, a client that set margins once sees them persist in ours/wlroots but not in smithay/KWin. Low real-world impact; conformance test difference.
 - Fixability: FIXABLE-in-module (clear `pending`/`current` in `reset`, keep only the initial `layer`).
+- FIXED 2026-08-10 (verified, no state-behavior change): re-read wlroots `layer_surface_reset` (wlr_layer_shell_v1.c:33-46) — it keeps `pending`/`current` (size/anchor/margins/zone/layer) across unmap, matching ours; both diverge from the XML text (smithay/KWin reset the state). Documented in `reset()`. Note: `reset()` now also dismisses the parented popups (L1), which wlroots also does here.
 
 ### L6. ack_configure stores no actual configure size
 - Severity: LOW.
@@ -318,6 +339,7 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Ref: wlroots stores `pending.actual_width/actual_height` from the acked configure (wlr_layer_shell_v1.c:105-125) so the compositor knows the size the client committed against.
 - Why it matters: layout policy cannot compare desired vs assigned size per ack. Minor.
 - Fixability: FIXABLE-in-module (store last configure size alongside the serial list).
+- FIXED 2026-08-10: the sent-configures list now stores `{serial, width, height}`; `ack_configure` writes the acked size into `pending.actual_width/actual_height` (wlroots `layer_surface_handle_ack_configure` parity), readable as `current.actual_width/height` after the next commit.
 
 ### L7. set_exclusive_edge stricter than wlroots (single-bit only)
 - Severity: LOW.
@@ -326,29 +348,30 @@ mutated by main.zig, so every real toplevel renders at its client-chosen size wi
 - Expected: per XML the edge "must be one the surface is anchored to"; a corner value is not a single edge. Ours + smithay + KWin agree on strictness.
 - Why it matters: lenient clients (none in practice) only; wlroots diverges from the other three. Keep.
 - Fixability: none required.
+- FIXED 2026-08-10 (decision: wlroots parity per the task brief, over the note's "keep" recommendation): `set_exclusive_edge` now accepts any valid anchor bitset (incl. 0 and corner/multi-bit values) at request time via the mask check (wlroots `zwlr_layer_surface_v1_anchor_is_valid`); the subset-of-anchor check stays at commit (wlroots order). smithay/KWin remain stricter; a corner edge with matching anchors is accepted and simply occupies no exclusive edge (`exclusiveEdge` returns null).
 
 ---
 
 ## 3. Fixability summary
 
-| Finding | Class | Depends on |
-|---|---|---|
-| F1 popup constraint math | FIXABLE-in-module | — |
-| F2 popup grab | NEEDS-wiring | F12 stacking, seat grab API |
-| F3 ping/pong | NEEDS-wiring | main.zig timer |
-| F4 bounds/wm_capabilities | FIXABLE-in-module | — |
-| F5 state version filter | FIXABLE-in-module | — |
-| F6 configure payload model | STRUCTURAL | main.zig policy |
-| F7 ack payload application | STRUCTURAL | F6 |
-| F8 role-destroy pre-map reset | FIXABLE-in-module | — |
-| F9 min/max exposure | FIXABLE-in-module | — |
-| F10 fullscreen output / minimize signal | FIXABLE-in-module | — |
-| F11 move/resize/menu seat+serial | NEEDS-wiring | seat serial validation |
-| F12 popup stacking/hit-test | STRUCTURAL | main.zig scene, seat |
-| F13 positioner completeness | FIXABLE-in-module | — |
-| F14 title/app_id events + unmap clear | FIXABLE-in-module | — |
-| F15 window geometry extents | FIXABLE-in-module (extents API needed) | surface extents [INFERENCE] |
-| F16 parenting | STRUCTURAL | main.zig stacking |
+| Finding | Class | Depends on | 2026-08-10 round |
+|---|---|---|---|
+| F1 popup constraint math | FIXABLE-in-module | — | FIXED |
+| F2 popup grab | NEEDS-wiring | F12 stacking, seat grab API | DEFERRED |
+| F3 ping/pong | NEEDS-wiring | main.zig timer | FIXED |
+| F4 bounds/wm_capabilities | FIXABLE-in-module | — | FIXED |
+| F5 state version filter | FIXABLE-in-module | — | FIXED |
+| F6 configure payload model | STRUCTURAL | main.zig policy | FIXED (orchestrator override, module-local) |
+| F7 ack payload application | STRUCTURAL | F6 | FIXED (orchestrator override) |
+| F8 role-destroy pre-map reset | FIXABLE-in-module | — | FIXED |
+| F9 min/max exposure | FIXABLE-in-module | — | FIXED |
+| F10 fullscreen output / minimize signal | FIXABLE-in-module | — | FIXED |
+| F11 move/resize/menu seat+serial | NEEDS-wiring | seat serial validation | FIXED (payloads; validation is compositor work) |
+| F12 popup stacking/hit-test | STRUCTURAL | main.zig scene, seat | DEFERRED |
+| F13 positioner completeness | FIXABLE-in-module | — | FIXED |
+| F14 title/app_id events + unmap clear | FIXABLE-in-module | — | FIXED |
+| F15 window geometry extents | FIXABLE-in-module (extents API needed) | surface extents [INFERENCE] | FIXED (commit-time; extents clamp pending API) |
+| F16 parenting | STRUCTURAL | main.zig stacking | FIXED (storage + cycle check; stacking is compositor work) |
 | L1 layer get_popup | FIXABLE-in-module (wire) / NEEDS-wiring (stacking) | F12 |
 | L2 layer configure policy | STRUCTURAL | main.zig layout |
 | L3 set_size INT32_MAX | FIXABLE-in-module | — |
@@ -366,7 +389,7 @@ Suggested backlog order: F8, F13, F5, F9 (cheap correctness) → F4, F10, F14, F
 - wm_base bind/destroy/defunct_surfaces handshake: ours xdg.zig:150-240 ↔ wlr_xdg_shell.c:16-64,93-120. Includes the W4 fix (wm_base destroyed before its surfaces: binding state survives until the last surface detaches, xdg.zig:194-205, 530-563).
 - get_xdg_surface role/unconfigured_buffer errors on the correct resources (xdg.zig:207-263 ↔ wlr_xdg_surface.c:397-412); second get_xdg_surface posts `role` on wm_base per XML, not wl_surface role error.
 - ack_configure serial semantics: ours posts `invalid_serial` (4) on xdg_surface for never-sent, duplicate, and stale serials (xdg.zig:330-363) — this is XML-conformant (xdg-shell.xml:573-593) where wlroots/smithay post `invalid_surface_state` (4) on xdg_wm_base (wlr_xdg_surface.c:86-93; smithay surface.rs:300-309). Ours is the reference-correct placement; keep and do not "fix" toward wlroots.
-- Positioner request validation + geometry math: all nine requests (xdg.zig:996-1055 ↔ wlr_xdg_positioner.c:15-150); anchor/gravity/offset placement identical to `wlr_xdg_positioner_rules_get_geometry` (wlr_xdg_positioner.c:221-267) and smithay `get_geometry` (mod.rs:640); zero-width anchor rect allowed in both ours and wlroots (XML-correct; smithay/KWin wrongly reject).
+- Positioner request validation + geometry math: all nine requests (xdg.zig:996-1055 ↔ wlr_xdg_positioner.c:15-150); anchor/gravity/offset placement identical to `wlr_xdg_positioner_rules_get_geometry` (wlr_xdg_positioner.c:221-267) and smithay `get_geometry` (mod.rs:640). (F13, 2026-08-10: the completeness check now rejects zero-size anchor rects — wlroots also rejects 0-width; see F13.)
 - Popup initial configure event order (popup.configure then surface.configure, xdg.zig:864-882 ↔ wlr_xdg_popup.c:13-51, smithay popup.rs:236-260) and positioner-copied-at-get_popup semantics.
 - Toplevel state array order matches wlroots exactly (maximized, fullscreen, resizing, activated, tiled L/R/T/B, suspended, constrained L/R/T/B — xdg.zig:682-737 ↔ wlr_xdg_toplevel.c:76-124) apart from the version gating (F5).
 - resize-edge validation list (xdg.zig:775-793 ↔ wlr_xdg_toplevel.c:312-343); not_constructed checks on move/resize/menu/set_window_geometry/ack (xdg.zig:386-402, 746-772 ↔ wlr_xdg_toplevel.c:262-343).

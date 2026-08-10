@@ -33,6 +33,11 @@ pub const Output = struct {
     /// Current framebuffer size in pixels (mode size after transform).
     width: i32,
     height: i32,
+    /// True while a committed frame is awaiting its frame event (wlroots
+    /// frame_pending, output.c:771-780). Set by commitState on an enabled
+    /// buffer commit; cleared by sendFrame. Callers check it before
+    /// starting a new frame so two frames are never in flight.
+    frame_pending: bool = false,
 
     impl: *const Impl,
     data: *anyopaque,
@@ -44,11 +49,22 @@ pub const Output = struct {
     events: struct {
         /// The backend is ready for the next frame.
         frame: wire.Signal(*Output),
-        /// A committed state has been applied.
-        commit: wire.Signal(*Output),
+        /// A committed state has been applied (payload: CommitEvent).
+        commit: wire.Signal(*CommitEvent),
         /// The output is being destroyed.
         destroy: wire.Signal(*Output),
     },
+
+    /// Payload of the commit signal: what was applied and when.
+    pub const CommitEvent = struct {
+        output: *Output,
+        /// The applied state (unchanged fields stripped). Valid only for
+        /// the duration of the emit — it points at a stack copy inside
+        /// commitState; listeners must not retain it.
+        state: *const State,
+        /// Monotonic commit timestamp (ns), for present/ready events.
+        when_ns: u64,
+    };
 
     /// A pending output state update. Fields are only meaningful when their
     /// bit is set in `committed`; `damage` rides along for the impl to
@@ -84,7 +100,10 @@ pub const Output = struct {
 
     pub const Impl = struct {
         /// Validate a prospective state; reject with error.InvalidState.
-        @"test": *const fn (output: *Output, state: *const State) error{InvalidState}!void,
+        /// Optional (wlroots output.c:731-734): commitState skips the
+        /// probe when no impl is set, or when the state carries no
+        /// changed fields.
+        @"test": ?*const fn (output: *Output, state: *const State) error{InvalidState}!void,
         /// Apply a validated state at the backend level.
         commit: *const fn (output: *Output, state: *const State) error{CommitFailed}!void,
         /// Tear down backend resources owned by this output.
@@ -135,34 +154,102 @@ pub const Output = struct {
         allocator.destroy(output);
     }
 
-    /// Validate, commit, then apply a state update atomically. On error
-    /// nothing is applied and no commit signal fires.
-    pub fn commitState(output: *Output, state: *Output.State) error{ InvalidState, CommitFailed }!void {
-        try output.impl.@"test"(output, state);
-        try output.impl.commit(output, state);
+    /// Probe a prospective state without applying it: strip unchanged
+    /// fields, then run the impl's test hook (when present). Nothing is
+    /// committed and no commit signal fires (wlroots wlr_output_test_state,
+    /// output.c:718-745).
+    pub fn testState(output: *Output, state: *const State) error{InvalidState}!void {
+        var pending = state.*;
+        const unchanged = unchangedFields(output, &pending);
+        pending.committed &= ~unchanged;
+        if (pending.committed == 0) return; // nothing to validate
+        if (output.impl.@"test") |t| try t(output, &pending);
+    }
 
-        if (state.committed & State.committed_enabled != 0) output.enabled = state.enabled;
-        if (state.committed & State.committed_scale != 0) output.scale = state.scale;
-        if (state.committed & State.committed_transform != 0) {
-            output.transform = state.transform;
+    /// Validate, commit, then apply a state update atomically. Fields
+    /// whose value already matches the output are stripped first (wlroots
+    /// output_compare_state, output.c:535-583) so repeated identical
+    /// frames only carry their buffer + damage. On error nothing is
+    /// applied and no commit signal fires.
+    pub fn commitState(output: *Output, state: *Output.State) error{ InvalidState, CommitFailed }!void {
+        var pending = state.*;
+        const unchanged = unchangedFields(output, &pending);
+        pending.committed &= ~unchanged;
+
+        // The test hook is optional and skipped for an empty state
+        // (wlroots output.c:731-734); the backend commit always runs —
+        // a buffer may carry new content even when the mode/enabled/etc.
+        // fields are unchanged.
+        if (output.impl.@"test") |t| {
+            if (pending.committed != 0) try t(output, &pending);
+        }
+        try output.impl.commit(output, &pending);
+
+        // Apply only the changed fields.
+        if (pending.committed & State.committed_enabled != 0) output.enabled = pending.enabled;
+        if (pending.committed & State.committed_scale != 0) output.scale = pending.scale;
+        if (pending.committed & State.committed_transform != 0) {
+            output.transform = pending.transform;
             updateSize(output);
         }
-        if (state.committed & State.committed_mode != 0) {
-            if (state.mode) |m| {
+        if (pending.committed & State.committed_mode != 0) {
+            if (pending.mode) |m| {
                 output.mode = m;
                 updateSize(output);
             }
         }
         // State.committed_buffer: the handle was handed to impl.commit; Output
         // keeps no current-buffer slot in M1.
-        output.events.commit.emit(output);
+
+        // A presented frame is now in flight: the backend owes a frame
+        // event for it, and callers must not start another until then
+        // (wlroots output_apply_commit, output.c:771-780). Enable-only
+        // commits (setup) do not set the flag — no frame event is owed.
+        if (output.enabled and (pending.committed & State.committed_buffer != 0)) {
+            output.frame_pending = true;
+        }
+
+        const now_ns: u64 = @intCast(std.Io.Clock.now(.awake, output.io.*).nanoseconds);
+        var ev: CommitEvent = .{ .output = output, .state = &pending, .when_ns = now_ns };
+        output.events.commit.emit(&ev);
     }
 
-    /// The backend is ready for the next frame.
+    /// The backend is ready for the next frame. Clears the in-flight
+    /// guard; the emit itself is gated on the output being enabled
+    /// (wlroots wlr_output_send_frame, output.c:833-837).
     pub fn sendFrame(output: *Output) void {
-        output.events.frame.emit(output);
+        output.frame_pending = false;
+        if (output.enabled) output.events.frame.emit(output);
     }
 };
+
+/// Mask of committed fields whose value already equals the output's
+/// current value (wlroots output_compare_state, output.c:535-583). The
+/// buffer and damage are never compared: a repeated frame still carries
+/// them.
+fn unchangedFields(output: *Output, state: *const Output.State) u32 {
+    var fields: u32 = 0;
+    if (state.committed & Output.State.committed_mode != 0) {
+        if (state.mode) |m| {
+            if (m.width == output.mode.width and
+                m.height == output.mode.height and
+                m.refresh_msec == output.mode.refresh_msec)
+            {
+                fields |= Output.State.committed_mode;
+            }
+        }
+    }
+    if (state.committed & Output.State.committed_enabled != 0 and output.enabled == state.enabled) {
+        fields |= Output.State.committed_enabled;
+    }
+    if (state.committed & Output.State.committed_scale != 0 and output.scale == state.scale) {
+        fields |= Output.State.committed_scale;
+    }
+    if (state.committed & Output.State.committed_transform != 0 and output.transform == state.transform) {
+        fields |= Output.State.committed_transform;
+    }
+    return fields;
+}
 
 fn updateSize(output: *Output) void {
     const size = output.transform.transformedSize(output.mode.width, output.mode.height);
@@ -225,11 +312,11 @@ const SignalRecorder = struct {
     commits: usize = 0,
     frames: usize = 0,
     destroys: usize = 0,
-    commit_listener: wire.Listener(*Output),
+    commit_listener: wire.Listener(*Output.CommitEvent),
     frame_listener: wire.Listener(*Output),
     destroy_listener: wire.Listener(*Output),
 
-    fn onCommit(listener: *wire.Listener(*Output), _: *Output) void {
+    fn onCommit(listener: *wire.Listener(*Output.CommitEvent), _: *Output.CommitEvent) void {
         const self: *SignalRecorder = @fieldParentPtr("commit_listener", listener);
         self.commits += 1;
     }
@@ -271,7 +358,7 @@ test "state apply and signals" {
     defer backend.destroy();
 
     var rec: SignalRecorder = .{
-        .commit_listener = wire.Listener(*Output).init(SignalRecorder.onCommit),
+        .commit_listener = wire.Listener(*Output.CommitEvent).init(SignalRecorder.onCommit),
         .frame_listener = wire.Listener(*Output).init(SignalRecorder.onFrame),
         .destroy_listener = wire.Listener(*Output).init(SignalRecorder.onDestroy),
     };
@@ -312,6 +399,8 @@ test "state apply and signals" {
     try std.testing.expect(fake.last_enabled);
     try std.testing.expectEqual(@as(usize, 1), rec.commits);
     try std.testing.expectEqual(@as(usize, 0), rec.frames);
+    // No buffer was committed: no frame is in flight.
+    try std.testing.expect(!out.frame_pending);
 
     // Mode-only commit updates mode and size without touching the others.
     var state2 = Output.State.init(allocator);
@@ -328,10 +417,140 @@ test "state apply and signals" {
     out.sendFrame();
     try std.testing.expectEqual(@as(usize, 1), rec.frames);
 
+    // A buffer commit puts a frame in flight; sendFrame clears the guard.
+    var state3 = Output.State.init(allocator);
+    defer state3.deinit();
+    state3.committed = Output.State.committed_buffer;
+    const dummy: u8 = 0;
+    state3.buffer = @ptrCast(@constCast(&dummy));
+    try out.commitState(&state3);
+    try std.testing.expect(out.frame_pending);
+    out.sendFrame();
+    try std.testing.expect(!out.frame_pending);
+    try std.testing.expectEqual(@as(usize, 2), rec.frames);
+
     // Destroy: impl destroy runs and the destroy signal fires.
     out.destroy();
     try std.testing.expect(fake.destroyed);
     try std.testing.expectEqual(@as(usize, 1), rec.destroys);
+}
+
+test "frame_pending: no emit while disabled, guard on buffer commits" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+
+    var fake: FakeImpl = .{};
+    const created = try makeOutput(allocator, &io, &log_cfg, &fake);
+    const out = created[0];
+    defer created[1].destroy();
+
+    var rec: SignalRecorder = .{
+        .commit_listener = wire.Listener(*Output.CommitEvent).init(SignalRecorder.onCommit),
+        .frame_listener = wire.Listener(*Output).init(SignalRecorder.onFrame),
+        .destroy_listener = wire.Listener(*Output).init(SignalRecorder.onDestroy),
+    };
+    out.events.frame.add(&rec.frame_listener);
+
+    // The output starts disabled: sendFrame must not emit.
+    out.sendFrame();
+    try std.testing.expectEqual(@as(usize, 0), rec.frames);
+    try std.testing.expect(!out.frame_pending);
+
+    // An enable-only commit (setup) owes no frame event: no guard.
+    var enable = Output.State.init(allocator);
+    defer enable.deinit();
+    enable.committed = Output.State.committed_enabled;
+    enable.enabled = true;
+    try out.commitState(&enable);
+    try std.testing.expect(!out.frame_pending);
+
+    // A buffer commit puts the guard up; sendFrame clears it and emits.
+    var state = Output.State.init(allocator);
+    defer state.deinit();
+    state.committed = Output.State.committed_buffer;
+    const dummy: u8 = 0;
+    state.buffer = @ptrCast(@constCast(&dummy));
+    try out.commitState(&state);
+    try std.testing.expect(out.frame_pending);
+    out.sendFrame();
+    try std.testing.expect(!out.frame_pending);
+    try std.testing.expectEqual(@as(usize, 1), rec.frames);
+
+    out.destroy();
+}
+
+test "unchanged state skips the impl test but still commits" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+
+    var fake: FakeImpl = .{};
+    const created = try makeOutput(allocator, &io, &log_cfg, &fake);
+    const out = created[0];
+    defer created[1].destroy();
+
+    var rec: SignalRecorder = .{
+        .commit_listener = wire.Listener(*Output.CommitEvent).init(SignalRecorder.onCommit),
+        .frame_listener = wire.Listener(*Output).init(SignalRecorder.onFrame),
+        .destroy_listener = wire.Listener(*Output).init(SignalRecorder.onDestroy),
+    };
+    out.events.commit.add(&rec.commit_listener);
+
+    var state = Output.State.init(allocator);
+    defer state.deinit();
+    state.committed = Output.State.committed_enabled;
+    state.enabled = true;
+
+    // First commit: enabled actually changes, so the impl test runs.
+    try out.commitState(&state);
+    try std.testing.expectEqual(@as(usize, 1), fake.tests);
+    try std.testing.expectEqual(@as(usize, 1), fake.commits);
+
+    // Identical state again: the enabled field is stripped, the probe is
+    // skipped, but the backend commit still runs (a repeated frame may
+    // carry new buffer content).
+    try out.commitState(&state);
+    try std.testing.expectEqual(@as(usize, 1), fake.tests);
+    try std.testing.expectEqual(@as(usize, 2), fake.commits);
+    try std.testing.expectEqual(@as(usize, 2), rec.commits);
+    try std.testing.expect(out.enabled);
+
+    out.destroy();
+}
+
+test "test_state probes without committing" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+
+    var fake: FakeImpl = .{};
+    const created = try makeOutput(allocator, &io, &log_cfg, &fake);
+    const out = created[0];
+    defer created[1].destroy();
+
+    var rec: SignalRecorder = .{
+        .commit_listener = wire.Listener(*Output.CommitEvent).init(SignalRecorder.onCommit),
+        .frame_listener = wire.Listener(*Output).init(SignalRecorder.onFrame),
+        .destroy_listener = wire.Listener(*Output).init(SignalRecorder.onDestroy),
+    };
+    out.events.commit.add(&rec.commit_listener);
+
+    var state = Output.State.init(allocator);
+    defer state.deinit();
+    state.committed = Output.State.committed_enabled;
+    state.enabled = true;
+
+    try out.testState(&state);
+    try std.testing.expectEqual(@as(usize, 1), fake.tests);
+    try std.testing.expectEqual(@as(usize, 0), fake.commits);
+    try std.testing.expectEqual(@as(usize, 0), rec.commits);
+    try std.testing.expect(!out.enabled); // nothing applied
+
+    out.destroy();
 }
 
 test "rejected state is not applied" {
@@ -346,7 +565,7 @@ test "rejected state is not applied" {
     defer created[1].destroy();
 
     var rec: SignalRecorder = .{
-        .commit_listener = wire.Listener(*Output).init(SignalRecorder.onCommit),
+        .commit_listener = wire.Listener(*Output.CommitEvent).init(SignalRecorder.onCommit),
         .frame_listener = wire.Listener(*Output).init(SignalRecorder.onFrame),
         .destroy_listener = wire.Listener(*Output).init(SignalRecorder.onDestroy),
     };
@@ -377,7 +596,7 @@ test "failed commit is not applied" {
     defer created[1].destroy();
 
     var rec: SignalRecorder = .{
-        .commit_listener = wire.Listener(*Output).init(SignalRecorder.onCommit),
+        .commit_listener = wire.Listener(*Output.CommitEvent).init(SignalRecorder.onCommit),
         .frame_listener = wire.Listener(*Output).init(SignalRecorder.onFrame),
         .destroy_listener = wire.Listener(*Output).init(SignalRecorder.onDestroy),
     };

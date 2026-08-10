@@ -1,9 +1,11 @@
 //! xdg-shell: the xdg_wm_base global plus the XdgSurface / XdgToplevel /
 //! XdgPopup state machines (stable/xdg-shell protocol).
 //!
-//! M1 scope: xdg_wm_base global, XdgSurface (toplevel + popup roles),
-//! configure / ack_configure, map/unmap. No seat interaction, no popup grabs
-//! (M3), no constraint adjustment / reactive repositioning (M4).
+//! Scope: xdg_wm_base global, XdgSurface (toplevel + popup roles),
+//! configure / ack_configure with a payload model (F6/F7), map/unmap,
+//! popup constraint adjustment (F1), ping/pong tracking (F3),
+//! parenting (F16). Popup grabs (F2) and popup stacking/hit-testing
+//! (F12) are structural and tracked in notes/133.
 //!
 //! Mapping semantics: an xdg surface maps when the client commits a buffer
 //! after acking a configure. The compositor's commit pipeline performs the
@@ -72,6 +74,10 @@ pub const XdgShell = struct {
         new_toplevel: wire.Signal(*XdgToplevel),
         /// A new xdg_popup role object was created.
         new_popup: wire.Signal(*XdgPopup),
+        /// A client answered a pending ping (xdg_wm_base.pong matched the
+        /// pending serial). Emitted like wlroots' shell events.pong; the
+        /// compositor uses it to clear per-client "unresponsive" markers.
+        pong: wire.Signal(*XdgShell),
     },
 
     pub fn init(
@@ -100,6 +106,7 @@ pub const XdgShell = struct {
         }
         shell.events.new_toplevel.init();
         shell.events.new_popup.init();
+        shell.events.pong.init();
 
         // Register xdg_wm_base at the maximum version we implement.
         shell.global = try display.addGlobal(
@@ -145,6 +152,25 @@ const WmBaseState = struct {
     /// until the last xdg_surface detaches and frees it (see
     /// xdgSurfaceDestroy).
     dead: bool = false,
+    /// Serial of the ping currently awaiting a pong, if any. One
+    /// outstanding ping per client (wlroots: wlr_xdg_shell.c:81-96); the
+    /// timeout policy (timer, unresponsive error) belongs to the
+    /// compositor, which checks `pingPending` and posts the error.
+    ping_serial: ?u32 = null,
+
+    /// Send a ping on this binding if none is outstanding (wlroots
+    /// wlr_xdg_surface_ping, wlr_xdg_surface.c:553-562).
+    fn ping(self: *WmBaseState) void {
+        if (self.ping_serial != null) return;
+        const serial = self.shell.display.nextSerial();
+        self.ping_serial = serial;
+        self.res.sendPing(serial);
+        log.debug("ping sent serial={d}", self.shell.io, self.shell.log_cfg, log_tag, .{serial});
+    }
+
+    fn pingPending(self: *WmBaseState) bool {
+        return self.ping_serial != null;
+    }
 };
 
 fn wmBaseBind(client_wire: *wire.Client, shell: *XdgShell, version: u32, id: u32) void {
@@ -187,7 +213,16 @@ fn wmBaseRequest(wm_base: *server.xdg.WmBase, request: server.xdg.WmBase.Request
             res.setHandler(*PositionerState, positionerRequest, positionerDestroy, pos_state);
         },
         .get_xdg_surface => |r| wmBaseGetXdgSurface(wm_base, state, r),
-        .pong => |r| log.debug("xdg_wm_base.pong serial={d}", shell.io, shell.log_cfg, log_tag, .{r.serial}),
+        .pong => |r| {
+            // A pong only matters when it matches the pending ping serial
+            // (wlroots xdg_shell_handle_pong, wlr_xdg_shell.c:32-39); a
+            // stale/unknown serial is ignored.
+            if (state.ping_serial == r.serial) {
+                state.ping_serial = null;
+                shell.events.pong.emit(shell);
+            }
+            log.debug("xdg_wm_base.pong serial={d}", shell.io, shell.log_cfg, log_tag, .{r.serial});
+        },
     }
 }
 
@@ -246,6 +281,8 @@ fn wmBaseGetXdgSurface(wm_base: *server.xdg.WmBase, state: *WmBaseState, r: anyt
         .events = undefined,
     };
     xdg.events.destroy.init();
+    xdg.events.configure.init();
+    xdg.events.ack_configure.init();
     res.setHandler(*XdgSurface, xdgSurfaceRequest, xdgSurfaceDestroy, xdg);
     role_mod.assignRole(surface, &xdg_surface_role, @as(?*wire.Resource, @ptrCast(res))) catch {
         res.destroy();
@@ -299,6 +336,17 @@ pub const XdgSurface = struct {
     popup: ?*XdgPopup = null,
     events: struct {
         destroy: wire.Signal(*XdgSurface),
+        /// A configure event was just sent on this xdg_surface; the serial
+        /// is `configure_serial`. Emitted after the wire configure is
+        /// queued, so listeners (xdg_decoration's mode configure, XD-1)
+        /// can send their own accompanying event in the same roundtrip
+        /// (wlroots wlr_xdg_surface events.configure, fired from
+        /// wlr_xdg_surface_send_configure).
+        configure: wire.Signal(*XdgSurface),
+        /// The client acked a configure; `acked_serial` is the acked
+        /// serial. Emitted at the end of ack processing (wlroots
+        /// wlr_xdg_surface events.ack_configure).
+        ack_configure: wire.Signal(*XdgSurface),
     },
 
     /// Send the xdg_surface.configure event and record the serial.
@@ -309,6 +357,9 @@ pub const XdgSurface = struct {
         xdg.sent_serials.append(xdg.allocator, serial) catch {
             xdg.resource.postNoMemory();
         };
+        // Listeners (xdg_decoration, XD-1) send their accompanying
+        // configure here, after the xdg_surface.configure on the wire.
+        xdg.events.configure.emit(xdg);
     }
 
     /// Reset the configure state machine: after an unmap (role object
@@ -349,11 +400,19 @@ pub const XdgSurface = struct {
         while (xdg.sent_serials.items.len > 0 and xdg.sent_serials.items[0] <= serial) {
             _ = xdg.sent_serials.orderedRemove(0);
         }
-        if (xdg.geometry_set) xdg.current_geometry = xdg.pending_geometry;
+        // The ack defines what the client committed against: apply the
+        // acked configure's payload (width/height/states for toplevels,
+        // geometry for popups) to the role's current state (wlroots
+        // handle_xdg_toplevel_ack_configure / handle_xdg_popup_ack_configure).
+        if (xdg.toplevel) |t| t.applyAckedConfigure(serial);
+        if (xdg.popup) |p| p.applyAckedConfigure(serial);
         log.info("surface configured serial={d} role={s}", xdg.io, xdg.log_cfg, log_tag, .{
             serial,
             @tagName(xdg.role),
         });
+        // Listeners (xdg_decoration, XD-1) apply their acked state here;
+        // `acked_serial` carries the serial that was just acked.
+        xdg.events.ack_configure.emit(xdg);
         // Mapping happens on the next commit with a buffer: the compositor's
         // commit pipeline performs the map transition and fires the map hook
         // and signal (see the file header).
@@ -439,8 +498,23 @@ fn xdgSurfaceGetToplevel(xdg: *XdgSurface, id: u32) void {
     t.events.request_resize.init();
     t.events.request_maximize.init();
     t.events.request_fullscreen.init();
+    t.events.request_minimize.init();
+    t.events.request_show_window_menu.init();
+    t.events.set_title.init();
+    t.events.set_app_id.init();
     t.events.destroy.init();
     res.setHandler(*XdgToplevel, toplevelRequest, toplevelDestroy, t);
+    // F4: the first configure must carry wm_capabilities (wlroots seeds
+    // the default set at role creation, create_xdg_toplevel:299-309); the
+    // configure() gate on the client version decides whether it is sent.
+    if (res.getVersion() >= 5) {
+        t.scheduled.wm_capabilities = .{
+            .window_menu = true,
+            .maximize = true,
+            .fullscreen = true,
+            .minimize = true,
+        };
+    }
     xdg.toplevel = t;
     xdg.role = .toplevel;
     shell.toplevels.append(shell.allocator, t) catch {
@@ -472,7 +546,10 @@ fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
         }
     }
     const positioner: *PositionerState = @ptrCast(@alignCast(r.positioner.getUserData()));
-    if (!positioner.size_set or !positioner.anchor_rect_set) {
+    // F13: completeness requires positive size AND a positive anchor rect
+    // (a zero-size anchor rect is degenerate; wlroots
+    // wlr_xdg_positioner_is_complete, wlr_xdg_positioner.c:216).
+    if (!positioner.isComplete()) {
         // invalid_positioner belongs to the xdg_wm_base interface; posting
         // its code on the xdg_surface resource would make the client read
         // xdg_surface.invalid_size (code 5 collides).
@@ -497,6 +574,7 @@ fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
         .xdg_surface = xdg,
         .resource = res,
         .geometry = positioner.geometry(),
+        .positioner_rules = positioner.*,
         .parent = if (r.parent) |p|
             @as(*XdgSurface, @ptrCast(@alignCast(p.getUserData())))
         else
@@ -562,6 +640,91 @@ fn xdgSurfaceDestroy(res: *server.xdg.Surface, xdg: *XdgSurface) void {
 // XdgToplevel.
 // ---------------------------------------------------------------------------
 
+/// Compositor-advertised wm_capabilities (xdg_toplevel.wm_capabilities,
+/// since v5; XML enum values 1..4). A bool struct rather than the wire
+/// enum: the generated enum is non-exhaustive, so a set is cleaner.
+pub const WmCapabilities = struct {
+    window_menu: bool = false,
+    maximize: bool = false,
+    fullscreen: bool = false,
+    minimize: bool = false,
+
+    pub fn isEmpty(c: WmCapabilities) bool {
+        return !c.window_menu and !c.maximize and !c.fullscreen and !c.minimize;
+    }
+
+    pub fn eql(a: WmCapabilities, b: WmCapabilities) bool {
+        return a.window_menu == b.window_menu and a.maximize == b.maximize and
+            a.fullscreen == b.fullscreen and a.minimize == b.minimize;
+    }
+
+    /// Serialize into the wire array, in enum value order (window_menu=1,
+    /// maximize=2, fullscreen=3, minimize=4; at most 4 entries).
+    pub fn toArray(c: WmCapabilities, out: *[4]u32) []u32 {
+        var n: usize = 0;
+        if (c.window_menu) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.WmCapabilities.window_menu);
+            n += 1;
+        }
+        if (c.maximize) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.WmCapabilities.maximize);
+            n += 1;
+        }
+        if (c.fullscreen) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.WmCapabilities.fullscreen);
+            n += 1;
+        }
+        if (c.minimize) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.WmCapabilities.minimize);
+            n += 1;
+        }
+        return out[0..n];
+    }
+};
+
+/// One xdg_toplevel.configure that was sent and not yet superseded: the
+/// payload the client acks against (F6/F7). The state is the scheduled
+/// state the configure carried.
+pub const ConfigurePayload = struct {
+    serial: u32,
+    width: i32,
+    height: i32,
+    state: ToplevelState,
+};
+
+/// One xdg_popup.configure that was sent: the geometry the client acks
+/// against (F7).
+pub const PopupConfigurePayload = struct {
+    serial: u32,
+    geometry: geom.Rect,
+};
+
+/// Payload of the XdgToplevel request_move signal: the seat whose serial
+/// the client echoed (F11).
+pub const MoveRequest = struct {
+    toplevel: *XdgToplevel,
+    seat: *seat_mod.Seat,
+    serial: u32,
+};
+
+/// Payload of the XdgToplevel request_fullscreen signal: the client's
+/// requested fullscreen state plus the output it named, if any (F10).
+pub const FullscreenRequest = struct {
+    toplevel: *XdgToplevel,
+    fullscreen: bool,
+    output: ?*server.wl.Output,
+};
+
+/// Payload of the XdgToplevel request_show_window_menu signal: the seat,
+/// serial and surface-local coordinates for the menu (F11).
+pub const ShowWindowMenuRequest = struct {
+    toplevel: *XdgToplevel,
+    seat: *seat_mod.Seat,
+    serial: u32,
+    x: i32,
+    y: i32,
+};
+
 pub const ToplevelState = struct {
     maximized: bool = false,
     fullscreen: bool = false,
@@ -581,12 +744,26 @@ pub const ToplevelState = struct {
     height: i32 = 0,
     min_size: geom.Size = .{ .w = 0, .h = 0 },
     max_size: geom.Size = .{ .w = 0, .h = 0 },
+    /// Recommended window-geometry bounds (xdg_toplevel.configure_bounds,
+    /// since v4); 0 = unknown (equivalent to never sent).
+    bounds_width: i32 = 0,
+    bounds_height: i32 = 0,
+    /// Compositor-advertised wm_capabilities (since v5): which interactive
+    /// requests the compositor supports. Sent on the first configure and
+    /// whenever the set changes; empty = never announced.
+    wm_capabilities: WmCapabilities = .{},
+    /// Client requested minimization (xdg_toplevel.set_minimized). Not a
+    /// wire state; recorded for the compositor's minimize policy.
+    minimized: bool = false,
 };
 
-/// Payload of the XdgToplevel request_resize signal: the validated
-/// resize_edge value the client asked to resize from (none is legal).
+/// Payload of the XdgToplevel request_resize signal: the seat whose
+/// serial the client echoed plus the validated resize_edge value (none is
+/// legal) (F11).
 pub const ResizeRequest = struct {
     toplevel: *XdgToplevel,
+    seat: *seat_mod.Seat,
+    serial: u32,
     edges: server.xdg.Toplevel.ResizeEdge,
 };
 
@@ -600,36 +777,99 @@ pub const XdgToplevel = struct {
     title: ?[]const u8 = null,
     /// Last app_id sent by the client (owned; UTF-8).
     app_id: ?[]const u8 = null,
-    /// Applied state. The compositor author reads this and updates it
-    /// (e.g. `current.maximized = true`) before calling `configure`.
+    /// Last-acked state: what the client committed against (wlroots
+    /// toplevel->pending after handle_xdg_toplevel_ack_configure). The
+    /// compositor reads min/max size and the acked geometry here.
     current: ToplevelState = .{},
-    /// Double-buffered client-requested state; applied by policy on commit.
+    /// Double-buffered client-requested state; applied to `current` by
+    /// policy on commit.
     pending: ToplevelState = .{},
+    /// Per-field state the NEXT configure will carry (F6): the compositor
+    /// writes fields here (size, maximized, ...) and calls `configure`;
+    /// the ack then applies the payload to `current`.
+    scheduled: ToplevelState = .{},
     /// Size from the last configure event sent.
     configured_size: geom.Size = .{ .w = 0, .h = 0 },
+    /// Configure payloads sent since the last (re)map, in send order; the
+    /// acked payload is applied to `current` (F7).
+    sent_payloads: std.ArrayList(ConfigurePayload) = .empty,
+    /// The parent toplevel (xdg_toplevel.set_parent, F16); null = no
+    /// parent. Only toplevels (no children) may be parented.
+    parent: ?*XdgToplevel = null,
+    /// Toplevels whose `parent` is this toplevel, in set order. Kept so
+    /// parent destruction/unmap can reparent or clear the children's
+    /// pointers (no dangling references).
+    children: std.ArrayList(*XdgToplevel) = .empty,
+    /// Whether wm_capabilities has been sent at least once (the protocol
+    /// requires it before the first xdg_surface.configure).
+    wm_capabilities_sent: bool = false,
+    /// The last wm_capabilities set announced; a changed set is re-sent
+    /// before the next configure.
+    last_wm_capabilities: WmCapabilities = .{},
+    /// The last configure_bounds announced; a change is re-sent before
+    /// the next configure.
+    sent_bounds: geom.Size = .{ .w = 0, .h = 0 },
     events: struct {
-        /// Client requested an interactive move (seat serials land in M3).
-        request_move: wire.Signal(*XdgToplevel),
+        /// Client requested an interactive move; the payload carries the
+        /// seat + serial the client echoed (F11).
+        request_move: wire.Signal(*MoveRequest),
         /// Client requested an interactive resize; the payload carries the
-        /// validated resize_edge.
+        /// seat + serial + validated resize_edge (F11).
         request_resize: wire.Signal(*ResizeRequest),
         /// Client requested maximize/unmaximize.
         request_maximize: wire.Signal(*XdgToplevel),
-        /// Client requested fullscreen/unfullscreen.
-        request_fullscreen: wire.Signal(*XdgToplevel),
+        /// Client requested fullscreen/unfullscreen; the payload carries
+        /// the state and the output the client named (F10).
+        request_fullscreen: wire.Signal(*FullscreenRequest),
+        /// Client requested minimization (F10).
+        request_minimize: wire.Signal(*XdgToplevel),
+        /// Client asked the compositor to show a window menu at (x, y)
+        /// with a seat + serial (F11).
+        request_show_window_menu: wire.Signal(*ShowWindowMenuRequest),
+        /// The client changed the title (F14).
+        set_title: wire.Signal(*XdgToplevel),
+        /// The client changed the app_id (F14).
+        set_app_id: wire.Signal(*XdgToplevel),
         /// The role object was destroyed.
         destroy: wire.Signal(*XdgToplevel),
     },
 
-    /// Send a configure event for this toplevel: xdg_toplevel.configure with
-    /// the states derived from `current`, followed by xdg_surface.configure
+    /// Send a configure event for this toplevel: optional configure_bounds
+    /// and wm_capabilities (version-gated, F4), then xdg_toplevel.configure
+    /// with the states derived from `scheduled`, then xdg_surface.configure
     /// with the serial. `width`/`height` are window-geometry hints; 0 means
     /// "client decides".
     pub fn configure(t: *XdgToplevel, width: i32, height: i32) !void {
         const xdg = t.xdg_surface;
         const serial = xdg.shell.display.nextSerial();
+        const version = t.resource.getVersion();
+        // configure_bounds (since v4): sent when the recommended bounds
+        // changed; 0,0 = unknown (equivalent to never sent).
+        if (version >= 4 and (t.scheduled.bounds_width != 0 or t.scheduled.bounds_height != 0) and
+            (t.scheduled.bounds_width != t.sent_bounds.w or t.scheduled.bounds_height != t.sent_bounds.h))
+        {
+            t.resource.sendConfigureBounds(t.scheduled.bounds_width, t.scheduled.bounds_height);
+            t.sent_bounds = .{ .w = t.scheduled.bounds_width, .h = t.scheduled.bounds_height };
+        }
+        // wm_capabilities (since v5): the protocol requires the event
+        // before the first xdg_surface.configure and on every change.
+        const caps = t.scheduled.wm_capabilities;
+        if (version >= 5 and !caps.isEmpty() and
+            (!t.wm_capabilities_sent or !caps.eql(t.last_wm_capabilities)))
+        {
+            var cap_buf: [4]u32 = undefined;
+            const cap_values = caps.toArray(&cap_buf);
+            var cap_array: server.wl.Array = .{
+                .size = cap_values.len * @sizeOf(u32),
+                .alloc = cap_buf.len * @sizeOf(u32),
+                .data = &cap_buf,
+            };
+            t.resource.sendWmCapabilities(&cap_array);
+            t.wm_capabilities_sent = true;
+            t.last_wm_capabilities = caps;
+        }
         var buf: [13]u32 = undefined;
-        const states = stateValues(&t.current, &buf);
+        const states = stateValues(&t.scheduled, &buf, version);
         // libwayland marshals the array synchronously; a stack buffer is safe.
         var array: server.wl.Array = .{
             .size = states.len * @sizeOf(u32),
@@ -639,9 +879,68 @@ pub const XdgToplevel = struct {
         t.resource.sendConfigure(width, height, &array);
         xdg.sendConfigureEvent(serial);
         t.configured_size = .{ .w = width, .h = height };
+        // Record the payload the client will ack against (F7).
+        t.sent_payloads.append(t.allocator, .{
+            .serial = serial,
+            .width = width,
+            .height = height,
+            .state = t.scheduled,
+        }) catch {
+            t.resource.postNoMemory();
+        };
         log.info("toplevel configure serial={d} {d}x{d} states={d}", xdg.io, xdg.log_cfg, log_tag, .{
             serial, width, height, states.len,
         });
+    }
+
+    /// Apply the acked configure payload to `current` (wlroots
+    /// handle_xdg_toplevel_ack_configure): the acked size/states are what
+    /// the client committed against. Payloads up to and including the
+    /// acked serial are dropped (they can never be acked again).
+    fn applyAckedConfigure(t: *XdgToplevel, serial: u32) void {
+        var i: usize = 0;
+        while (i < t.sent_payloads.items.len) {
+            const payload = t.sent_payloads.items[i];
+            if (payload.serial == serial) {
+                t.current.width = payload.width;
+                t.current.height = payload.height;
+                t.current.maximized = payload.state.maximized;
+                t.current.fullscreen = payload.state.fullscreen;
+                t.current.resizing = payload.state.resizing;
+                t.current.activated = payload.state.activated;
+                t.current.tiled_left = payload.state.tiled_left;
+                t.current.tiled_right = payload.state.tiled_right;
+                t.current.tiled_top = payload.state.tiled_top;
+                t.current.tiled_bottom = payload.state.tiled_bottom;
+                t.current.suspended = payload.state.suspended;
+                t.current.constrained_left = payload.state.constrained_left;
+                t.current.constrained_right = payload.state.constrained_right;
+                t.current.constrained_top = payload.state.constrained_top;
+                t.current.constrained_bottom = payload.state.constrained_bottom;
+            }
+            if (payload.serial <= serial) {
+                _ = t.sent_payloads.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Ping this toplevel's client (xdg_wm_base.ping). No-op when a ping
+    /// is already outstanding on the binding (wlroots wlr_xdg_surface_ping).
+    pub fn ping(t: *XdgToplevel) void {
+        t.xdg_surface.wm_base.ping();
+    }
+
+    /// Whether a ping on this toplevel's client is awaiting a pong.
+    pub fn pingPending(t: *XdgToplevel) bool {
+        return t.xdg_surface.wm_base.pingPending();
+    }
+
+    /// The xdg_wm_base resource owning this toplevel's surface, for
+    /// posting the unresponsive error from compositor policy.
+    pub fn wmBaseResource(t: *XdgToplevel) *server.xdg.WmBase {
+        return t.xdg_surface.wm_base.res;
     }
 
     /// Ask the client to close the window (xdg_toplevel.close).
@@ -653,7 +952,8 @@ pub const XdgToplevel = struct {
         // The XML requires UTF-8 ("The string must be encoded in UTF-8")
         // but defines no error code for a violation; reject the value with a
         // log instead of storing garbage (wlroots posts error -1, which has
-        // no XML backing).
+        // no XML backing; ours keeps the connection — deliberate
+        // divergence, documented in notes/133).
         const span = std.mem.span(title);
         if (!std.unicode.utf8ValidateSlice(span)) {
             log.warn("xdg_toplevel.set_title: title is not valid UTF-8; rejected", t.io, t.log_cfg, log_tag, .{});
@@ -665,6 +965,7 @@ pub const XdgToplevel = struct {
         };
         if (t.title) |old| t.allocator.free(old);
         t.title = copy;
+        t.events.set_title.emit(t);
     }
 
     fn setAppId(t: *XdgToplevel, app_id: [*:0]const u8) void {
@@ -674,12 +975,47 @@ pub const XdgToplevel = struct {
         };
         if (t.app_id) |old| t.allocator.free(old);
         t.app_id = copy;
+        t.events.set_app_id.emit(t);
+    }
+
+    /// Reset the per-map toplevel metadata on unmap (wlroots
+    /// reset_xdg_toplevel, wlr_xdg_toplevel.c:523-541): title/app_id are
+    /// per-map, and the parent link dies with the map (the XML: "If a
+    /// surface becomes unmapped, its children's parent is set to the
+    /// parent of the now-unmapped surface"). Children are reparented to
+    /// this toplevel's parent (the grandparent) so no child ever holds a
+    /// stale pointer.
+    fn resetOnUnmap(t: *XdgToplevel) void {
+        if (t.title) |title| t.allocator.free(title);
+        t.title = null;
+        if (t.app_id) |app_id| t.allocator.free(app_id);
+        t.app_id = null;
+        const grandparent = t.parent;
+        if (grandparent) |parent| {
+            if (std.mem.findScalar(*XdgToplevel, parent.children.items, t)) |i| {
+                _ = parent.children.swapRemove(i);
+            }
+        }
+        t.parent = null;
+        for (t.children.items) |child| {
+            child.parent = grandparent;
+            if (grandparent) |gp| gp.children.append(t.allocator, child) catch |err| {
+                // OOM: the child keeps a valid parent pointer but is not
+                // tracked; acceptable degradation.
+                log.debug("reparent on unmap: {s}", t.io, t.log_cfg, log_tag, .{@errorName(err)});
+            };
+        }
+        t.children.clearRetainingCapacity();
     }
 };
 
 /// Serialize the states set in `st` into `out`, in protocol enum value
-/// order (maximized=1 .. constrained_bottom=13; at most 13 entries).
-fn stateValues(st: *const ToplevelState, out: *[13]u32) []u32 {
+/// order (maximized=1 .. constrained_bottom=13; at most 13 entries),
+/// filtering out states the client's binding version does not know
+/// (F5): tiled_* since v2, suspended since v6, constrained_* since v7
+/// (xdg-shell.xml since annotations; wlroots gates per state in
+/// send_xdg_toplevel_configure, wlr_xdg_toplevel.c:83-124).
+fn stateValues(st: *const ToplevelState, out: *[13]u32, version: u32) []u32 {
     var n: usize = 0;
     if (st.maximized) {
         out[n] = @intFromEnum(server.xdg.Toplevel.State.maximized);
@@ -697,43 +1033,55 @@ fn stateValues(st: *const ToplevelState, out: *[13]u32) []u32 {
         out[n] = @intFromEnum(server.xdg.Toplevel.State.activated);
         n += 1;
     }
-    if (st.tiled_left) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_left);
-        n += 1;
+    if (version >= 2) {
+        if (st.tiled_left) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_left);
+            n += 1;
+        }
+        if (st.tiled_right) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_right);
+            n += 1;
+        }
+        if (st.tiled_top) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_top);
+            n += 1;
+        }
+        if (st.tiled_bottom) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_bottom);
+            n += 1;
+        }
     }
-    if (st.tiled_right) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_right);
-        n += 1;
+    if (version >= 6) {
+        if (st.suspended) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.State.suspended);
+            n += 1;
+        }
     }
-    if (st.tiled_top) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_top);
-        n += 1;
-    }
-    if (st.tiled_bottom) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_bottom);
-        n += 1;
-    }
-    if (st.suspended) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.suspended);
-        n += 1;
-    }
-    if (st.constrained_left) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_left);
-        n += 1;
-    }
-    if (st.constrained_right) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_right);
-        n += 1;
-    }
-    if (st.constrained_top) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_top);
-        n += 1;
-    }
-    if (st.constrained_bottom) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_bottom);
-        n += 1;
+    if (version >= 7) {
+        if (st.constrained_left) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_left);
+            n += 1;
+        }
+        if (st.constrained_right) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_right);
+            n += 1;
+        }
+        if (st.constrained_top) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_top);
+            n += 1;
+        }
+        if (st.constrained_bottom) {
+            out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_bottom);
+            n += 1;
+        }
     }
     return out[0..n];
+}
+
+/// Recover the compositor Seat from a wl_seat wire resource (the seat
+/// module stores the *Seat as the resource user data, seat.zig:494).
+fn seatFromResource(res: *server.wl.Seat) *seat_mod.Seat {
+    return @ptrCast(@alignCast(res.getUserData()));
 }
 
 fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Toplevel.Request, t: *XdgToplevel) void {
@@ -741,40 +1089,31 @@ fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Tople
     switch (request) {
         // Destructor: libwayland does not auto-destroy; we do (runs toplevelDestroy).
         .destroy => t.resource.destroy(),
-        .set_parent => |r| {
-            // The parent must not be the toplevel itself (invalid_parent);
-            // descendant-cycle detection needs real parenting/stacking and
-            // is deferred. Parenting itself is not implemented in M1.
-            if (r.parent) |parent_res| {
-                if (parent_res == t.resource) {
-                    toplevel_res.postError(.invalid_parent, "xdg_toplevel cannot be its own parent");
-                    return;
-                }
-            }
-            log.debug("xdg_toplevel.set_parent ignored (parenting deferred)", t.io, t.log_cfg, log_tag, .{});
-        },
+        .set_parent => |r| setToplevelParent(t, toplevel_res, r.parent),
         .set_title => |r| t.setTitle(r.title),
         .set_app_id => |r| t.setAppId(r.app_id),
-        .show_window_menu => {
+        .show_window_menu => |r| {
             // Interactive requests need a configured (constructed) surface.
             if (!xdg.configured) {
                 xdg.resource.postError(.not_constructed, "show_window_menu before the surface is configured");
                 return;
             }
-            log.debug(
-                "xdg_toplevel.show_window_menu ignored (seat interaction deferred)",
-                t.io,
-                t.log_cfg,
-                log_tag,
-                .{},
-            );
+            var req: ShowWindowMenuRequest = .{
+                .toplevel = t,
+                .seat = seatFromResource(r.seat),
+                .serial = r.serial,
+                .x = r.x,
+                .y = r.y,
+            };
+            t.events.request_show_window_menu.emit(&req);
         },
-        .move => {
+        .move => |r| {
             if (!xdg.configured) {
                 xdg.resource.postError(.not_constructed, "move before the surface is configured");
                 return;
             }
-            t.events.request_move.emit(t);
+            var req: MoveRequest = .{ .toplevel = t, .seat = seatFromResource(r.seat), .serial = r.serial };
+            t.events.request_move.emit(&req);
         },
         .resize => |r| {
             if (!xdg.configured) {
@@ -793,7 +1132,12 @@ fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Tople
                     return;
                 },
             }
-            var req: ResizeRequest = .{ .toplevel = t, .edges = r.edges };
+            var req: ResizeRequest = .{
+                .toplevel = t,
+                .seat = seatFromResource(r.seat),
+                .serial = r.serial,
+                .edges = r.edges,
+            };
             t.events.request_resize.emit(&req);
         },
         .set_max_size => |r| {
@@ -811,16 +1155,72 @@ fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Tople
             t.pending.maximized = false;
             t.events.request_maximize.emit(t);
         },
-        .set_fullscreen => {
+        .set_fullscreen => |r| {
             t.pending.fullscreen = true;
-            t.events.request_fullscreen.emit(t);
+            var req: FullscreenRequest = .{ .toplevel = t, .fullscreen = true, .output = r.output };
+            t.events.request_fullscreen.emit(&req);
         },
+        // unset_fullscreen carries no output argument (xdg-shell.xml;
+        // only set_fullscreen names an output).
         .unset_fullscreen => {
             t.pending.fullscreen = false;
-            t.events.request_fullscreen.emit(t);
+            var req: FullscreenRequest = .{ .toplevel = t, .fullscreen = false, .output = null };
+            t.events.request_fullscreen.emit(&req);
         },
-        .set_minimized => log.debug("xdg_toplevel.set_minimized ignored in M1", t.io, t.log_cfg, log_tag, .{}),
+        .set_minimized => {
+            t.pending.minimized = true;
+            t.events.request_minimize.emit(t);
+        },
     }
+}
+
+/// xdg_toplevel.set_parent: store the parent and reject cycles (F16).
+/// Only the toplevel itself (invalid_parent) and descendant cycles are
+/// invalid; the parent's unmap reparents children (see resetOnUnmap).
+fn setToplevelParent(t: *XdgToplevel, toplevel_res: *server.xdg.Toplevel, parent: ?*server.xdg.Toplevel) void {
+    // Resolve the requested parent to its XdgToplevel, if any.
+    const new_parent: ?*XdgToplevel = if (parent) |res|
+        @ptrCast(@alignCast(res.getUserData()))
+    else
+        null;
+    if (new_parent) |np| {
+        if (np == t) {
+            toplevel_res.postError(.invalid_parent, "xdg_toplevel cannot be its own parent");
+            return;
+        }
+        // Cycle check: walking up from the requested parent must never
+        // reach `t` (the XML: "The parent toplevel must not be one of the
+        // child toplevel's descendants"). wlroots walks the parent chain
+        // the same way (wlr_xdg_toplevel.c:178-204).
+        var cursor: ?*XdgToplevel = np.parent;
+        while (cursor) |c| {
+            if (c == t) {
+                toplevel_res.postError(.invalid_parent, "xdg_toplevel parent would create a cycle");
+                return;
+            }
+            cursor = c.parent;
+        }
+    }
+    // Drop the old link before installing the new one.
+    if (t.parent) |old| {
+        if (std.mem.findScalar(*XdgToplevel, old.children.items, t)) |i| {
+            _ = old.children.swapRemove(i);
+        }
+    }
+    if (new_parent) |np| {
+        np.children.append(t.allocator, t) catch {
+            toplevel_res.postNoMemory();
+            return;
+        };
+    }
+    t.parent = new_parent;
+    log.debug(
+        "xdg_toplevel.set_parent -> {s}",
+        t.io,
+        t.log_cfg,
+        log_tag,
+        .{if (new_parent) |_| "set" else "cleared"},
+    );
 }
 
 fn toplevelDestroy(toplevel_res: *server.xdg.Toplevel, t: *XdgToplevel) void {
@@ -833,7 +1233,23 @@ fn toplevelDestroy(toplevel_res: *server.xdg.Toplevel, t: *XdgToplevel) void {
     const xdg = t.xdg_surface;
     xdg.toplevel = null;
     xdg.role = .none;
+    // F8: role-object destruction resets the configure state machine even
+    // when the surface never mapped (unmapSurface early-returns on
+    // !mapped, so the reset must run explicitly).
+    xdg.resetConfigureState();
     xdg.unmapSurface();
+    // Parent-link cleanup. On the mapped path, resetOnUnmap (via the unmap
+    // hook) already reparented the children to the grandparent and cleared
+    // the child list; the unmapped path needs the manual detach here.
+    if (t.parent) |parent| {
+        if (std.mem.findScalar(*XdgToplevel, parent.children.items, t)) |i| {
+            _ = parent.children.swapRemove(i);
+        }
+        t.parent = null;
+    }
+    for (t.children.items) |child| child.parent = null;
+    t.children.deinit(t.allocator);
+    t.sent_payloads.deinit(t.allocator);
     if (t.title) |title| t.allocator.free(title);
     if (t.app_id) |app_id| t.allocator.free(app_id);
     shell.allocator.destroy(t);
@@ -850,22 +1266,58 @@ pub const XdgPopup = struct {
     xdg_surface: *XdgSurface,
     resource: *server.xdg.Popup,
     /// Position relative to the top-left of the parent's window geometry,
-    /// derived from the xdg_positioner at get_popup time.
+    /// derived from the xdg_positioner at get_popup time and re-derived
+    /// on configure/reposition (F1).
     geometry: geom.Rect = geom.Rect.empty(),
-    /// The xdg_surface this popup is attached to (null = layer-shell parent,
-    /// M4).
+    /// The xdg_surface this popup is attached to (null = layer-shell parent).
     parent: ?*XdgSurface = null,
+    /// The layer surface this popup is attached to when the parent is a
+    /// zwlr_layer_surface_v1 (L1; set by layer_shell.zig's get_popup).
+    layer_parent: ?*surface_mod.Surface = null,
+    /// The positioner rules copied at get_popup/reposition time; the
+    /// constraint adjustment and reactive re-placement read these (F1).
+    positioner_rules: PositionerState = undefined,
+    /// The compositor-supplied usable area the popup must stay within
+    /// (output or parent-toplevel box, in parent-surface-local coords).
+    /// Null = no constraint adjustment (F1). Applied at configure time.
+    constraint_box: ?geom.Rect = null,
+    /// Popup configure payloads sent since the last (re)map; the acked
+    /// one records the geometry the client committed against (F7).
+    sent_payloads: std.ArrayList(PopupConfigurePayload) = .empty,
+    /// Geometry of the last acked configure, if any (F7).
+    acked_geometry: ?geom.Rect = null,
     events: struct {
         destroy: wire.Signal(*XdgPopup),
     },
 
+    /// Recompute `geometry` from the positioner rules, applying the
+    /// constraint adjustment when a constraint box is set (F1).
+    fn recomputeGeometry(p: *XdgPopup) void {
+        p.geometry = if (p.constraint_box) |box|
+            p.positioner_rules.constrainedGeometry(box)
+        else
+            p.positioner_rules.geometry();
+    }
+
+    /// Set the compositor-side usable area for this popup. When a box is
+    /// set, the next configure (and any reposition) places the popup
+    /// within it per the positioner's constraint_adjustment bits.
+    pub fn setConstraintBox(p: *XdgPopup, box: geom.Rect) void {
+        p.constraint_box = box;
+    }
+
     /// Send the initial/popup configure: xdg_popup.configure with the
-    /// positioner-derived geometry, then xdg_surface.configure with the serial.
+    /// positioner-derived (and constraint-adjusted) geometry, then
+    /// xdg_surface.configure with the serial.
     pub fn configure(p: *XdgPopup) !void {
         const xdg = p.xdg_surface;
+        p.recomputeGeometry();
         const serial = xdg.shell.display.nextSerial();
         p.resource.sendConfigure(p.geometry.x, p.geometry.y, p.geometry.width, p.geometry.height);
         xdg.sendConfigureEvent(serial);
+        p.sent_payloads.append(p.allocator, .{ .serial = serial, .geometry = p.geometry }) catch {
+            p.resource.postNoMemory();
+        };
         log.info("popup configure serial={d} at ({d},{d}) {d}x{d}", xdg.io, xdg.log_cfg, log_tag, .{
             serial,
             p.geometry.x,
@@ -873,6 +1325,23 @@ pub const XdgPopup = struct {
             p.geometry.width,
             p.geometry.height,
         });
+    }
+
+    /// Apply the acked configure's geometry (wlroots
+    /// handle_xdg_popup_ack_configure): the acked geometry is what the
+    /// client committed against. Payloads up to the acked serial are
+    /// dropped.
+    fn applyAckedConfigure(p: *XdgPopup, serial: u32) void {
+        var i: usize = 0;
+        while (i < p.sent_payloads.items.len) {
+            const payload = p.sent_payloads.items[i];
+            if (payload.serial == serial) p.acked_geometry = payload.geometry;
+            if (payload.serial <= serial) {
+                _ = p.sent_payloads.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Dismiss the popup from the compositor side (xdg_popup.popup_done).
@@ -886,14 +1355,34 @@ fn popupRequest(popup_res: *server.xdg.Popup, request: server.xdg.Popup.Request,
     switch (request) {
         // Destructor: libwayland does not auto-destroy; we do (runs popupDestroy).
         .destroy => popup.resource.destroy(),
-        .grab => log.debug("xdg_popup.grab ignored (popup grabs are M3)", popup.io, popup.log_cfg, log_tag, .{}),
-        .reposition => log.debug(
-            "xdg_popup.reposition ignored (constraint adjustment is M4)",
+        // F2 (popup grabs) is STRUCTURAL (needs seat grabs + popup
+        // stacking); tracked in notes/133.
+        .grab => log.debug(
+            "xdg_popup.grab ignored (popup grabs are F2, structural)",
             popup.io,
             popup.log_cfg,
             log_tag,
             .{},
         ),
+        .reposition => |r| {
+            // Per the XML, the positioner must be complete; an incomplete
+            // one is invalid_positioner on the wm_base (wlroots
+            // xdg_popup_handle_reposition, wlr_xdg_popup.c:317-343).
+            const positioner: *PositionerState = @ptrCast(@alignCast(r.positioner.getUserData()));
+            if (!positioner.isComplete()) {
+                popup.xdg_surface.wm_base.res.postError(
+                    .invalid_positioner,
+                    "xdg_popup.reposition: positioner object is not complete",
+                );
+                return;
+            }
+            // Copy the new rules and re-place (wlroots: rules + geometry
+            // into scheduled, then configure; ours is synchronous).
+            popup.positioner_rules = positioner.*;
+            popup.recomputeGeometry();
+            popup.resource.sendRepositioned(r.token);
+            popup.configure() catch popup.resource.postNoMemory();
+        },
     }
 }
 
@@ -907,7 +1396,12 @@ fn popupDestroy(popup_res: *server.xdg.Popup, popup: *XdgPopup) void {
     const xdg = popup.xdg_surface;
     xdg.popup = null;
     xdg.role = .none;
+    // F8: role-object destruction resets the configure state machine even
+    // when the surface never mapped (unmapSurface early-returns on
+    // !mapped, so the reset must run explicitly).
+    xdg.resetConfigureState();
     xdg.unmapSurface();
+    popup.sent_payloads.deinit(shell.allocator);
     shell.allocator.destroy(popup);
 }
 
@@ -931,7 +1425,7 @@ const PositionerState = struct {
 
     /// Compute the popup geometry from the positioner rules: the anchor point
     /// of the anchor rect, the gravity offset, then the surface offset.
-    /// (M1: no constraint adjustment; matches xdg-shell's placement rules.)
+    /// Matches wlr_xdg_positioner_rules_get_geometry (wlr_xdg_positioner.c:221).
     pub fn geometry(self: *const PositionerState) geom.Rect {
         var box: geom.Rect = .{
             .x = self.offset.x,
@@ -967,7 +1461,272 @@ const PositionerState = struct {
         }
         return box;
     }
+
+    /// The positioner is complete when set_size and set_anchor_rect were
+    /// called with positive values (F13). wlroots requires
+    /// `size.width > 0 && anchor_rect.width > 0`
+    /// (wlr_xdg_positioner_is_complete, wlr_xdg_positioner.c:216); we
+    /// additionally require a positive anchor-rect height so a degenerate
+    /// 0-height anchor rect cannot produce a zero-area popup. The XML
+    /// only says "set_size and set_anchor_rect must be called"; the
+    /// zero-size anchor rect is undefined territory and wlroots is
+    /// stricter than the XML text.
+    pub fn isComplete(self: *const PositionerState) bool {
+        return self.size_set and self.anchor_rect_set and
+            self.size.w > 0 and self.size.h > 0 and
+            self.anchor_rect.width > 0 and self.anchor_rect.height > 0;
+    }
+
+    /// Raw placement geometry constrained to `constraint`: applies the
+    /// client's constraint_adjustment bits in the wlroots order — flip,
+    /// then slide, then resize; a step that fully unconstrains wins (F1,
+    /// wlr_xdg_positioner.c:500-518).
+    pub fn constrainedGeometry(self: *const PositionerState, constraint: geom.Rect) geom.Rect {
+        var box = self.geometry();
+        unconstrainBox(self, constraint, &box);
+        return box;
+    }
 };
+
+/// Distances from each edge of `box` to the corresponding edge of
+/// `constraint`. Positive = the box edge is outside the constraint;
+/// negative = inside (wlroots constraint_offsets,
+/// wlr_xdg_positioner.c:327-340).
+const ConstraintOffsets = struct {
+    top: i32,
+    bottom: i32,
+    left: i32,
+    right: i32,
+};
+
+fn constrainedBoxOffsets(constraint: geom.Rect, box: geom.Rect) ConstraintOffsets {
+    return .{
+        .left = constraint.x - box.x,
+        .right = box.x + box.width - constraint.x - constraint.width,
+        .top = constraint.y - box.y,
+        .bottom = box.y + box.height - constraint.y - constraint.height,
+    };
+}
+
+fn isUnconstrained(offsets: ConstraintOffsets) bool {
+    return offsets.top <= 0 and offsets.bottom <= 0 and
+        offsets.left <= 0 and offsets.right <= 0;
+}
+
+/// The flip step (F1): flip the anchor/gravity on an axis when exactly one
+/// edge of that axis is constrained and the client requested flip_*;
+/// only apply a flip that actually helps (wlroots
+/// xdg_positioner_rules_unconstrain_by_flip, wlr_xdg_positioner.c:340-385).
+fn unconstrainByFlip(
+    rules: *const PositionerState,
+    constraint: geom.Rect,
+    box: *geom.Rect,
+    offsets: *ConstraintOffsets,
+) bool {
+    const adj = adjustmentBits(rules.constraint_adjustment);
+    const flip_x = ((offsets.left > 0) != (offsets.right > 0)) and (adj & flip_x_bit) != 0;
+    const flip_y = ((offsets.top > 0) != (offsets.bottom > 0)) and (adj & flip_y_bit) != 0;
+    if (!flip_x and !flip_y) return false;
+
+    var flipped = rules.*;
+    if (flip_x) {
+        flipped.anchor = anchorInvertX(flipped.anchor);
+        flipped.gravity = gravityInvertX(flipped.gravity);
+    }
+    if (flip_y) {
+        flipped.anchor = anchorInvertY(flipped.anchor);
+        flipped.gravity = gravityInvertY(flipped.gravity);
+    }
+    const flipped_box = flipped.geometry();
+    const flipped_offsets = constrainedBoxOffsets(constraint, flipped_box);
+    // Only apply a flip that helps on the axis (wlroots comment: "Only
+    // apply flipping if it helps").
+    if (flipped_offsets.left <= 0 and flipped_offsets.right <= 0) {
+        box.x = flipped_box.x;
+        offsets.left = flipped_offsets.left;
+        offsets.right = flipped_offsets.right;
+    }
+    if (flipped_offsets.top <= 0 and flipped_offsets.bottom <= 0) {
+        box.y = flipped_box.y;
+        offsets.top = flipped_offsets.top;
+        offsets.bottom = flipped_offsets.bottom;
+    }
+    return isUnconstrained(offsets.*);
+}
+
+/// The slide step (F1): shift the box the minimum distance that
+/// unconstrains one edge or constrains another; when the box fully
+/// contains the anchor rect, slide toward the gravity (falling back to
+/// right/bottom, GTK-compatible) (wlroots
+/// xdg_positioner_rules_unconstrain_by_slide, wlr_xdg_positioner.c:386-453).
+fn unconstrainBySlide(
+    rules: *const PositionerState,
+    constraint: geom.Rect,
+    box: *geom.Rect,
+    offsets: *ConstraintOffsets,
+) bool {
+    const adj = adjustmentBits(rules.constraint_adjustment);
+    const ge = positionerEdges(@intFromEnum(rules.gravity));
+    const slide_x = (offsets.left > 0 or offsets.right > 0) and (adj & slide_x_bit) != 0;
+    const slide_y = (offsets.top > 0 or offsets.bottom > 0) and (adj & slide_y_bit) != 0;
+    if (!slide_x and !slide_y) return false;
+
+    if (slide_x) {
+        if (offsets.left > 0 and offsets.right > 0) {
+            // The box is bigger than the anchor rect and completely
+            // includes it: slide toward the gravity (wlroots: the second
+            // slide would fail immediately).
+            if (ge.left) {
+                box.x -= offsets.right;
+            } else {
+                box.x += offsets.left;
+            }
+        } else {
+            // Slide the minimal distance that satisfies one edge.
+            const abs_left = if (offsets.left > 0) offsets.left else -offsets.left;
+            const abs_right = if (offsets.right > 0) offsets.right else -offsets.right;
+            if (abs_left < abs_right) {
+                box.x += offsets.left;
+            } else {
+                box.x -= offsets.right;
+            }
+        }
+    }
+    if (slide_y) {
+        if (offsets.top > 0 and offsets.bottom > 0) {
+            if (ge.top) {
+                box.y -= offsets.bottom;
+            } else {
+                box.y += offsets.top;
+            }
+        } else {
+            const abs_top = if (offsets.top > 0) offsets.top else -offsets.top;
+            const abs_bottom = if (offsets.bottom > 0) offsets.bottom else -offsets.bottom;
+            if (abs_top < abs_bottom) {
+                box.y += offsets.top;
+            } else {
+                box.y -= offsets.bottom;
+            }
+        }
+    }
+    offsets.* = constrainedBoxOffsets(constraint, box.*);
+    return isUnconstrained(offsets.*);
+}
+
+/// The resize step (F1): clip the box to the constraint on the requested
+/// axes; give up when the result would be empty (wlroots
+/// xdg_positioner_rules_unconstrain_by_resize, wlr_xdg_positioner.c:454-498).
+fn unconstrainByResize(
+    rules: *const PositionerState,
+    constraint: geom.Rect,
+    box: *geom.Rect,
+    offsets: *ConstraintOffsets,
+) bool {
+    const adj = adjustmentBits(rules.constraint_adjustment);
+    const resize_x = (offsets.left > 0 or offsets.right > 0) and (adj & resize_x_bit) != 0;
+    const resize_y = (offsets.top > 0 or offsets.bottom > 0) and (adj & resize_y_bit) != 0;
+    if (!resize_x and !resize_y) return false;
+
+    var clamped = offsets.*;
+    if (clamped.left < 0) clamped.left = 0;
+    if (clamped.right < 0) clamped.right = 0;
+    if (clamped.top < 0) clamped.top = 0;
+    if (clamped.bottom < 0) clamped.bottom = 0;
+
+    var resized = box.*;
+    if (resize_x) {
+        resized.x += clamped.left;
+        resized.width -= clamped.left + clamped.right;
+    }
+    if (resize_y) {
+        resized.y += clamped.top;
+        resized.height -= clamped.top + clamped.bottom;
+    }
+    if (resized.isEmpty()) return false;
+
+    box.* = resized;
+    offsets.* = constrainedBoxOffsets(constraint, box.*);
+    return isUnconstrained(offsets.*);
+}
+
+/// Constraint-adjustment bit positions (wlroots uses a bitmask; the wire
+/// values are the same as the XML bitfield).
+const slide_x_bit: u32 = 1;
+const slide_y_bit: u32 = 2;
+const flip_x_bit: u32 = 4;
+const flip_y_bit: u32 = 8;
+const resize_x_bit: u32 = 16;
+const resize_y_bit: u32 = 32;
+
+fn adjustmentBits(adj: server.xdg.Positioner.ConstraintAdjustment) u32 {
+    return @bitCast(adj);
+}
+
+/// Apply the client's constraint adjustment to `box` in the wlroots order
+/// (flip → slide → resize; the first step that unconstrains wins) (F1,
+/// wlr_xdg_positioner_rules_unconstrain_box, wlr_xdg_positioner.c:500-518).
+fn unconstrainBox(rules: *const PositionerState, constraint: geom.Rect, box: *geom.Rect) void {
+    var offsets = constrainedBoxOffsets(constraint, box.*);
+    if (isUnconstrained(offsets)) return;
+    if (unconstrainByFlip(rules, constraint, box, &offsets)) return;
+    if (unconstrainBySlide(rules, constraint, box, &offsets)) return;
+    if (unconstrainByResize(rules, constraint, box, &offsets)) return;
+}
+
+/// Invert an anchor value across the X axis (wlroots
+/// xdg_positioner_anchor_invert_x, wlr_xdg_positioner.c:182-201).
+fn anchorInvertX(anchor: server.xdg.Positioner.Anchor) server.xdg.Positioner.Anchor {
+    return switch (anchor) {
+        .left => .right,
+        .right => .left,
+        .top_left => .top_right,
+        .top_right => .top_left,
+        .bottom_left => .bottom_right,
+        .bottom_right => .bottom_left,
+        else => anchor,
+    };
+}
+
+/// Invert a gravity value across the X axis (gravity and anchor share
+/// their value layout).
+fn gravityInvertX(gravity: server.xdg.Positioner.Gravity) server.xdg.Positioner.Gravity {
+    return switch (gravity) {
+        .left => .right,
+        .right => .left,
+        .top_left => .top_right,
+        .top_right => .top_left,
+        .bottom_left => .bottom_right,
+        .bottom_right => .bottom_left,
+        else => gravity,
+    };
+}
+
+/// Invert an anchor value across the Y axis (wlroots
+/// xdg_positioner_anchor_invert_y).
+fn anchorInvertY(anchor: server.xdg.Positioner.Anchor) server.xdg.Positioner.Anchor {
+    return switch (anchor) {
+        .top => .bottom,
+        .bottom => .top,
+        .top_left => .bottom_left,
+        .bottom_left => .top_left,
+        .top_right => .bottom_right,
+        .bottom_right => .top_right,
+        else => anchor,
+    };
+}
+
+/// Invert a gravity value across the Y axis.
+fn gravityInvertY(gravity: server.xdg.Positioner.Gravity) server.xdg.Positioner.Gravity {
+    return switch (gravity) {
+        .top => .bottom,
+        .bottom => .top,
+        .top_left => .bottom_left,
+        .bottom_left => .top_left,
+        .top_right => .bottom_right,
+        .bottom_right => .top_right,
+        else => gravity,
+    };
+}
 
 const EdgeSet = struct {
     top: bool = false,
@@ -1077,15 +1836,17 @@ fn xdgSurfaceClientCommit(surface: *surface_mod.Surface) void {
     const xdg = xdgFromSurface(surface) orelse return;
     // A popup created with a NULL parent must be given one through another
     // protocol before its initial commit (XML get_popup: "before committing
-    // the initial state"); layer-shell parenting is M4.
+    // the initial state"); a layer-shell parent counts (L1).
     if (xdg.role == .popup) if (xdg.popup) |p| {
-        if (p.parent == null) {
+        if (p.parent == null and p.layer_parent == null) {
             xdg.resource.postError(.not_constructed, "xdg_popup committed without a parent");
             return;
         }
     };
-    // Protocol: attaching a buffer before the surface is configured is an error.
-    if (!xdg.configured and surface.current.buffer != null) {
+    // Protocol: attaching a buffer before the surface is configured is an
+    // error. This hook runs pre-swap (wlroots moves client_commit before
+    // the state swap), so the buffer being committed is `pending`'s.
+    if (!xdg.configured and surface.pending.buffer != null) {
         xdg.resource.postError(.unconfigured_buffer, "xdg_surface committed a buffer before ack_configure");
         return;
     }
@@ -1100,7 +1861,20 @@ fn xdgSurfaceClientCommit(surface: *surface_mod.Surface) void {
             t.resource.postError(.invalid_size, "xdg_toplevel: invalid min or max size");
             return;
         }
+        // F9: the validated constraints become the compositor-readable
+        // current state (wlroots synced move pending -> current).
+        t.current.min_size = min;
+        t.current.max_size = max;
     };
+    // F15: window geometry applies at COMMIT (wlroots synced state), not
+    // at ack. The extents clamp (effective geometry =
+    // surface extents ∩ window geometry, wlr_xdg_surface.c:259-280) needs
+    // the compositor surface-extent API; without it we apply the client's
+    // window geometry as-is (the ack-before-commit order makes the timing
+    // identical in practice).
+    if (xdg.geometry_set) {
+        xdg.current_geometry = xdg.pending_geometry;
+    }
 }
 
 /// Runs after the pending state has been applied, on every commit.
@@ -1112,7 +1886,7 @@ fn xdgSurfaceCommit(surface: *surface_mod.Surface) void {
             // Protocol: the initial configure is sent in reply to the client's
             // first (buffer-less) commit after the role object exists.
             if (!xdg.configure_sent) {
-                t.configure(t.current.width, t.current.height) catch {
+                t.configure(t.scheduled.width, t.scheduled.height) catch {
                     t.resource.postNoMemory();
                 };
             }
@@ -1142,6 +1916,9 @@ fn xdgSurfaceMap(surface: *surface_mod.Surface) void {
 fn xdgSurfaceUnmap(surface: *surface_mod.Surface) void {
     const xdg = xdgFromSurface(surface) orelse return;
     xdg.resetConfigureState();
+    // F14/F16: title/app_id are per-map and the parent link dies with the
+    // map (wlroots reset_xdg_toplevel on unmap).
+    if (xdg.role == .toplevel) if (xdg.toplevel) |t| t.resetOnUnmap();
     log.info("surface unmapped via NULL buffer role={s}", xdg.io, xdg.log_cfg, log_tag, .{@tagName(xdg.role)});
 }
 
@@ -1216,16 +1993,16 @@ test "positioner edge mapping" {
 
 test "toplevel state values" {
     var buf: [13]u32 = undefined;
-    const empty = stateValues(&.{}, &buf);
+    const empty = stateValues(&.{}, &buf, 7);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
     const st: ToplevelState = .{ .maximized = true, .activated = true };
-    const vals = stateValues(&st, &buf);
+    const vals = stateValues(&st, &buf, 7);
     try std.testing.expectEqual(@as(usize, 2), vals.len);
     try std.testing.expectEqual(@as(u32, 1), vals[0]); // maximized
     try std.testing.expectEqual(@as(u32, 4), vals[1]); // activated
 
-    // Full state set: 13 entries in XML enum value order (1..13).
+    // Full state set at v7: 13 entries in XML enum value order (1..13).
     const all: ToplevelState = .{
         .maximized = true,
         .fullscreen = true,
@@ -1241,9 +2018,44 @@ test "toplevel state values" {
         .constrained_top = true,
         .constrained_bottom = true,
     };
-    const all_vals = stateValues(&all, &buf);
+    const all_vals = stateValues(&all, &buf, 7);
     try std.testing.expectEqual(@as(usize, 13), all_vals.len);
     for (all_vals, 1..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(i)), v);
+}
+
+test "toplevel state values filtered by client version (F5)" {
+    var buf: [13]u32 = undefined;
+    const all: ToplevelState = .{
+        .maximized = true,
+        .tiled_left = true,
+        .suspended = true,
+        .constrained_top = true,
+        .constrained_bottom = true,
+    };
+
+    // v1: only maximized (since 1); tiled (2), suspended (6) and
+    // constrained (7) are filtered out.
+    const v1 = stateValues(&all, &buf, 1);
+    try std.testing.expectEqual(@as(usize, 1), v1.len);
+    try std.testing.expectEqual(@as(u32, 1), v1[0]);
+
+    // v2: tiled appears (since 2), suspended/constrained still filtered.
+    const v2 = stateValues(&all, &buf, 2);
+    try std.testing.expectEqual(@as(usize, 2), v2.len);
+    try std.testing.expectEqual(@as(u32, 5), v2[1]); // tiled_left
+
+    // v6: suspended appears (since 6), constrained filtered (since 7).
+    const v6 = stateValues(&all, &buf, 6);
+    try std.testing.expectEqual(@as(usize, 3), v6.len);
+    try std.testing.expectEqual(@as(u32, 9), v6[2]); // suspended
+
+    // v7: everything. constrained enum values (xdg-shell.xml):
+    // constrained_left=10, constrained_right=11, constrained_top=12,
+    // constrained_bottom=13 — emitted left, right, top, bottom.
+    const v7 = stateValues(&all, &buf, 7);
+    try std.testing.expectEqual(@as(usize, 5), v7.len);
+    try std.testing.expectEqual(@as(u32, 12), v7[3]); // constrained_top
+    try std.testing.expectEqual(@as(u32, 13), v7[4]); // constrained_bottom
 }
 
 // --- socketpair roundtrip harness (no filesystem server socket) ------------
@@ -1297,6 +2109,12 @@ const ToplevelEvents = struct {
     height: i32 = 0,
     states_len: usize = 0,
     states: [13]u32 = [_]u32{0} ** 13,
+    bounds_count: usize = 0,
+    bounds_width: i32 = 0,
+    bounds_height: i32 = 0,
+    caps_count: usize = 0,
+    caps_len: usize = 0,
+    caps: [4]u32 = [_]u32{0} ** 4,
 
     fn listener(toplevel: *client.xdg.Toplevel, event: client.xdg.Toplevel.Event, data: *ToplevelEvents) void {
         _ = toplevel;
@@ -1311,8 +2129,18 @@ const ToplevelEvents = struct {
                 @memcpy(data.states[0..n], s[0..n]);
             },
             .close => {},
-            .configure_bounds => {},
-            .wm_capabilities => {},
+            .configure_bounds => |c| {
+                data.bounds_count += 1;
+                data.bounds_width = c.width;
+                data.bounds_height = c.height;
+            },
+            .wm_capabilities => |c| {
+                data.caps_count += 1;
+                const s = c.capabilities.slice(u32);
+                const n = @min(s.len, data.caps.len);
+                data.caps_len = s.len;
+                @memcpy(data.caps[0..n], s[0..n]);
+            },
         }
     }
 };
@@ -1532,13 +2360,20 @@ test "xdg toplevel configure/ack roundtrip" {
     try std.testing.expect(!t.xdg_surface.configured);
 
     // Initial buffer-less commit: the compositor replies with the first
-    // configure (0x0 = client decides, no states).
+    // configure (0x0 = client decides, no states). F4: the first configure
+    // carries wm_capabilities (seeded at role creation for v5+ clients).
     wl_surface.commit();
     try ts.pump();
 
     try std.testing.expectEqual(@as(usize, 1), tl_events.configure_count);
     try std.testing.expectEqual(@as(usize, 1), xs_events.configure_count);
     try std.testing.expectEqual(@as(usize, 0), tl_events.states_len);
+    try std.testing.expectEqual(@as(usize, 1), tl_events.caps_count);
+    try std.testing.expectEqual(@as(usize, 4), tl_events.caps_len);
+    try std.testing.expectEqual(@as(u32, 1), tl_events.caps[0]); // window_menu
+    try std.testing.expectEqual(@as(u32, 2), tl_events.caps[1]); // maximize
+    try std.testing.expectEqual(@as(u32, 3), tl_events.caps[2]); // fullscreen
+    try std.testing.expectEqual(@as(u32, 4), tl_events.caps[3]); // minimize
     const xdg = t.xdg_surface;
     const serial1 = xs_events.serial;
     try std.testing.expectEqual(serial1, xdg.configure_serial);
@@ -1553,8 +2388,11 @@ test "xdg toplevel configure/ack roundtrip" {
     try std.testing.expect(xdg.configured);
     try std.testing.expectEqual(serial1, xdg.acked_serial.?);
 
-    // Compositor side: configure a new size with the maximized state.
-    t.current.maximized = true;
+    // Compositor side: schedule a new size with the maximized state (F6:
+    // policy writes the scheduled state) and announce new bounds (F4).
+    t.scheduled.maximized = true;
+    t.scheduled.bounds_width = 1000;
+    t.scheduled.bounds_height = 700;
     try t.configure(800, 600);
     try ts.pump();
 
@@ -1564,6 +2402,13 @@ test "xdg toplevel configure/ack roundtrip" {
     try std.testing.expectEqual(@as(usize, 1), tl_events.states_len);
     try std.testing.expectEqual(@as(u32, 1), tl_events.states[0]); // maximized
     try std.testing.expectEqual(geom.Size{ .w = 800, .h = 600 }, t.configured_size);
+    // configure_bounds arrives before this configure (and is not re-sent
+    // for an unchanged value).
+    try std.testing.expectEqual(@as(usize, 1), tl_events.bounds_count);
+    try std.testing.expectEqual(@as(i32, 1000), tl_events.bounds_width);
+    try std.testing.expectEqual(@as(i32, 700), tl_events.bounds_height);
+    // wm_capabilities is not re-sent when unchanged.
+    try std.testing.expectEqual(@as(usize, 1), tl_events.caps_count);
     const serial2 = xs_events.serial;
     try std.testing.expect(serial2 != serial1);
 
@@ -1572,6 +2417,10 @@ test "xdg toplevel configure/ack roundtrip" {
     wl_surface.commit();
     try ts.pump();
     try std.testing.expectEqual(serial2, xdg.acked_serial.?);
+    // F7: the acked payload defines what the client committed against.
+    try std.testing.expect(t.current.maximized);
+    try std.testing.expectEqual(@as(i32, 800), t.current.width);
+    try std.testing.expectEqual(@as(i32, 600), t.current.height);
 
     // Acking an unknown serial is a protocol error (invalid_serial = 4); the
     // server destroys the client, so pump fails with ClientDispatchFailed.
@@ -1840,12 +2689,16 @@ test "toplevel move before configured posts not_constructed" {
 const ResizeCapture = struct {
     count: usize = 0,
     edges: server.xdg.Toplevel.ResizeEdge = .none,
+    seat: ?*seat_mod.Seat = null,
+    serial: u32 = 0,
     listener: wire.Listener(*ResizeRequest),
 
     fn notify(listener: *wire.Listener(*ResizeRequest), req: *ResizeRequest) void {
         const self: *ResizeCapture = @fieldParentPtr("listener", listener);
         self.count += 1;
         self.edges = req.edges;
+        self.seat = req.seat;
+        self.serial = req.serial;
     }
 };
 
@@ -1880,6 +2733,9 @@ test "resize carries the validated edges in the signal payload" {
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqual(server.xdg.Toplevel.ResizeEdge.top_left, capture.edges);
+    // F11: the payload carries the seat + serial the client echoed.
+    try std.testing.expect(capture.seat == ts.seat);
+    try std.testing.expectEqual(@as(u32, 2), capture.serial);
 }
 
 test "positioner rejects invalid anchor, gravity and constraint adjustments" {
@@ -2093,9 +2949,11 @@ test "xdg_wm_base v5 client: legacy toplevel roundtrip with since<=5 states only
     // Compositor-side configure carrying states valid at v5: maximized (1,
     // since 1) and tiled_left (5, since 2). States newer than v5
     // (suspended=9 since 6, constrained_*=10..13 since 7) must not appear
-    // in a configure sent to this client.
-    t.current.maximized = true;
-    t.current.tiled_left = true;
+    // in a configure sent to this client (F5).
+    t.scheduled.maximized = true;
+    t.scheduled.tiled_left = true;
+    t.scheduled.suspended = true;
+    t.scheduled.constrained_top = true;
     try t.configure(800, 600);
     try ts.pump();
 
@@ -2130,4 +2988,710 @@ test "xdg_wm_base v5 client: legacy toplevel roundtrip with since<=5 states only
     try ts.pump();
     try std.testing.expectEqual(serial2, t.xdg_surface.acked_serial.?);
     try std.testing.expect(t.xdg_surface.surface.mapped);
+}
+
+// ---------------------------------------------------------------------------
+// F1-F16 regression tests (2026-08-10 fixing round).
+// ---------------------------------------------------------------------------
+
+test "positioner constraint adjustment math (F1)" {
+    var pos: PositionerState = .{ .shell = undefined };
+    const constraint: geom.Rect = .{ .x = 0, .y = 0, .width = 200, .height = 200 };
+
+    // Slide: a popup placed left of the anchor rect is inside the parent
+    // rect; the raw geometry hangs off the left edge (-100). slide_x moves
+    // it the minimal distance (100) into the constraint.
+    pos.size = .{ .w = 100, .h = 50 };
+    pos.anchor_rect = .{ .x = 0, .y = 100, .width = 100, .height = 100 };
+    pos.anchor = .top_left;
+    pos.gravity = .top_left;
+    pos.constraint_adjustment = @bitCast(@as(u32, 1)); // slide_x
+    try std.testing.expectEqual(
+        geom.Rect{ .x = -100, .y = 50, .width = 100, .height = 50 },
+        pos.geometry(),
+    );
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 0, .y = 50, .width = 100, .height = 50 },
+        pos.constrainedGeometry(constraint),
+    );
+
+    // Flip: a popup with anchor/gravity top placed at the top edge extends
+    // above it (y = -50). flip_y inverts both to bottom, placing it below
+    // the anchor point (y = 100) — inside the constraint.
+    pos = .{ .shell = undefined };
+    pos.size = .{ .w = 100, .h = 50 };
+    pos.anchor_rect = .{ .x = 0, .y = 0, .width = 200, .height = 100 };
+    pos.anchor = .top;
+    pos.gravity = .top;
+    pos.constraint_adjustment = @bitCast(@as(u32, 8)); // flip_y
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 50, .y = -50, .width = 100, .height = 50 },
+        pos.geometry(),
+    );
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 50, .y = 100, .width = 100, .height = 50 },
+        pos.constrainedGeometry(constraint),
+    );
+
+    // Resize: a popup larger than the constraint on both axes is clipped
+    // (resize_x|resize_y), shifting and shrinking to fit.
+    pos = .{ .shell = undefined };
+    pos.size = .{ .w = 250, .h = 250 };
+    pos.anchor_rect = .{ .x = 0, .y = 0, .width = 100, .height = 100 };
+    pos.anchor = .bottom_right;
+    pos.gravity = .bottom_right;
+    pos.constraint_adjustment = @bitCast(@as(u32, 16 | 32)); // resize_x | resize_y
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 100, .y = 100, .width = 250, .height = 250 },
+        pos.geometry(),
+    );
+    // The box spans 100..350; the constraint is 0..200, so the clip keeps
+    // the visible 100..200 slice: x stays 100, width shrinks to 100
+    // (wlroots: x += clamped left offset, width -= left + right offsets).
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 100, .y = 100, .width = 100, .height = 100 },
+        pos.constrainedGeometry(constraint),
+    );
+
+    // No adjustment bits: the raw (off-screen) geometry is unchanged.
+    pos.constraint_adjustment = .{};
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 100, .y = 100, .width = 250, .height = 250 },
+        pos.constrainedGeometry(constraint),
+    );
+}
+
+test "popup configure applies the constraint box (F1)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    var popup_events: PopupEvents = .{};
+
+    // slide_x popup that would hang off the left edge of the constraint.
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(0, 100, 100, 100);
+    positioner.setAnchor(.top_left);
+    positioner.setGravity(.top_left);
+    positioner.setConstraintAdjustment(@bitCast(@as(u32, 1))); // slide_x
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    positioner.destroy();
+    try ts.pump();
+
+    // Raw geometry before the constraint is applied.
+    const p = ts.shell.?.popups.items[0];
+    try std.testing.expectEqual(
+        geom.Rect{ .x = -100, .y = 50, .width = 100, .height = 50 },
+        p.geometry,
+    );
+
+    // The compositor supplies the usable area; the configure then carries
+    // the constraint-adjusted placement.
+    p.setConstraintBox(.{ .x = 0, .y = 0, .width = 200, .height = 200 });
+    wl_surface.commit();
+    try ts.pump();
+
+    try std.testing.expectEqual(@as(usize, 1), popup_events.configure_count);
+    try std.testing.expectEqual(@as(i32, 0), popup_events.x);
+    try std.testing.expectEqual(@as(i32, 50), popup_events.y);
+    try std.testing.expectEqual(@as(i32, 100), popup_events.width);
+    try std.testing.expectEqual(@as(i32, 50), popup_events.height);
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 0, .y = 50, .width = 100, .height = 50 },
+        p.geometry,
+    );
+    const serial = xs_events.serial;
+    xdg_surface.ackConfigure(serial);
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(p.xdg_surface.configured);
+    // F7: the acked popup payload records the geometry it was configured at.
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 0, .y = 50, .width = 100, .height = 50 },
+        p.acked_geometry.?,
+    );
+}
+
+const WmBasePingEvents = struct {
+    ping_count: usize = 0,
+    serial: u32 = 0,
+
+    fn listener(wm_base: *client.xdg.WmBase, event: client.xdg.WmBase.Event, data: *WmBasePingEvents) void {
+        _ = wm_base;
+        switch (event) {
+            .ping => |p| {
+                data.ping_count += 1;
+                data.serial = p.serial;
+            },
+        }
+    }
+};
+
+const PongCapture = struct {
+    count: usize = 0,
+    listener: wire.Listener(*XdgShell),
+
+    fn notify(listener: *wire.Listener(*XdgShell), _: *XdgShell) void {
+        @as(*PongCapture, @fieldParentPtr("listener", listener)).count += 1;
+    }
+};
+
+test "ping/pong roundtrip and unresponsive tracking (F3)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var ping_events: WmBasePingEvents = .{};
+    ts.wm_base.?.setListener(*WmBasePingEvents, WmBasePingEvents.listener, &ping_events);
+    var pong_cap: PongCapture = .{ .listener = wire.Listener(*XdgShell).init(PongCapture.notify) };
+    ts.shell.?.events.pong.add(&pong_cap.listener);
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+    const t = ts.shell.?.toplevels.items[0];
+
+    // Compositor pings: the client receives xdg_wm_base.ping.
+    t.ping();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ping_events.ping_count);
+    try std.testing.expectEqual(ping_events.serial, t.xdg_surface.wm_base.ping_serial.?);
+    try std.testing.expect(t.pingPending());
+
+    // A second ping while one is outstanding is a no-op (wlroots: one
+    // pending ping per client).
+    t.ping();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ping_events.ping_count);
+
+    // A pong with the wrong serial does not clear the pending ping.
+    ts.wm_base.?.pong(ping_events.serial + 1);
+    try ts.pump();
+    try std.testing.expect(t.pingPending());
+    try std.testing.expectEqual(@as(usize, 0), pong_cap.count);
+
+    // The matching pong clears it and emits the shell pong signal.
+    ts.wm_base.?.pong(ping_events.serial);
+    try ts.pump();
+    try std.testing.expect(!t.pingPending());
+    try std.testing.expectEqual(@as(usize, 1), pong_cap.count);
+
+    // Ping again: fresh serial, pending again (the compositor's timer then
+    // decides the timeout and posts the unresponsive error, error code 6 —
+    // exercised in main.zig policy, not here).
+    t.ping();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), ping_events.ping_count);
+    try std.testing.expect(t.pingPending());
+}
+
+test "wm_capabilities and configure_bounds version gating (F4)" {
+    const allocator = std.testing.allocator;
+    // A v4 client: configure_bounds exists (since 4) but wm_capabilities
+    // (since 5) must never be sent.
+    var ts = try TestServer.initAtVersion(allocator, 4);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const toplevel = try xdg_surface.getToplevel();
+    var tl_events: ToplevelEvents = .{};
+    toplevel.setListener(*ToplevelEvents, ToplevelEvents.listener, &tl_events);
+    try ts.pump();
+
+    wl_surface.commit();
+    try ts.pump();
+    // First configure: no wm_capabilities at v4.
+    try std.testing.expectEqual(@as(usize, 1), tl_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 0), tl_events.caps_count);
+    // configure_bounds still works at v4.
+    const t = ts.shell.?.toplevels.items[0];
+    t.scheduled.bounds_width = 640;
+    t.scheduled.bounds_height = 480;
+    try t.configure(0, 0);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), tl_events.bounds_count);
+    try std.testing.expectEqual(@as(i32, 640), tl_events.bounds_width);
+    try std.testing.expectEqual(@as(i32, 480), tl_events.bounds_height);
+}
+
+test "role-object destroy before map resets the configure machine (F8)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    var tl_events: ToplevelEvents = .{};
+    const toplevel = try xdg_surface.getToplevel();
+    toplevel.setListener(*ToplevelEvents, ToplevelEvents.listener, &tl_events);
+    try ts.pump();
+
+    // First role: commit (configure sent), ack it — the surface is
+    // configured but never maps (no buffer ever attached).
+    wl_surface.commit();
+    try ts.pump();
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    const srv = ts.shell.?.toplevels.items[0].xdg_surface;
+    try std.testing.expect(srv.configured);
+
+    // Destroy the role object while the surface is unmapped: the configure
+    // state machine must reset (F8) — the old acked state must not survive
+    // into the next role.
+    toplevel.destroy();
+    try ts.pump();
+    try std.testing.expect(ts.shell.?.toplevels.items.len == 0);
+    try std.testing.expect(!srv.configured);
+    try std.testing.expect(srv.acked_serial == null);
+
+    // A fresh role on the same wl_surface: attaching a buffer before the
+    // new configure handshake is an error (would have mapped silently
+    // without the F8 reset).
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+    const buffer = try ts.createBuffer();
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 3), err.code); // unconfigured_buffer
+    try std.testing.expectEqualStrings("xdg_surface", err.interface);
+}
+
+test "client min/max size is applied to current at commit (F9)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    const toplevel = try xdg_surface.getToplevel();
+    try ts.pump();
+    wl_surface.commit();
+    try ts.pump();
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+
+    toplevel.setMinSize(100, 50);
+    toplevel.setMaxSize(500, 400);
+    const t = ts.shell.?.toplevels.items[0];
+    try std.testing.expectEqual(geom.Size{ .w = 0, .h = 0 }, t.current.min_size);
+    try std.testing.expectEqual(geom.Size{ .w = 0, .h = 0 }, t.current.max_size);
+
+    // Double-buffered: nothing applies until the commit.
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(geom.Size{ .w = 100, .h = 50 }, t.current.min_size);
+    try std.testing.expectEqual(geom.Size{ .w = 500, .h = 400 }, t.current.max_size);
+
+    // Invalid constraints still error at commit (existing check).
+    toplevel.setMinSize(600, 50); // > max width
+    wl_surface.commit();
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 2), err.code); // invalid_size
+    try std.testing.expectEqualStrings("xdg_toplevel", err.interface);
+}
+
+const MinimizeCapture = struct {
+    count: usize = 0,
+    listener: wire.Listener(*XdgToplevel),
+
+    fn notify(listener: *wire.Listener(*XdgToplevel), _: *XdgToplevel) void {
+        @as(*MinimizeCapture, @fieldParentPtr("listener", listener)).count += 1;
+    }
+};
+
+const FullscreenCapture = struct {
+    count: usize = 0,
+    fullscreen: bool = false,
+    output: ?*server.wl.Output = null,
+    listener: wire.Listener(*FullscreenRequest),
+
+    fn notify(listener: *wire.Listener(*FullscreenRequest), req: *FullscreenRequest) void {
+        const self: *FullscreenCapture = @fieldParentPtr("listener", listener);
+        self.count += 1;
+        self.fullscreen = req.fullscreen;
+        self.output = req.output;
+    }
+};
+
+test "set_fullscreen carries the output; set_minimized emits a signal (F10)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var xs_events: XdgSurfaceEvents = .{};
+    const toplevel = try setupConfiguredToplevel(ts, &xs_events);
+    const t = ts.shell.?.toplevels.items[0];
+
+    var fs_capture: FullscreenCapture = .{
+        .listener = wire.Listener(*FullscreenRequest).init(FullscreenCapture.notify),
+    };
+    var min_capture: MinimizeCapture = .{ .listener = wire.Listener(*XdgToplevel).init(MinimizeCapture.notify) };
+    t.events.request_fullscreen.add(&fs_capture.listener);
+    t.events.request_minimize.add(&min_capture.listener);
+
+    // No wl_output object in the test harness: null output is legal and
+    // must reach the payload.
+    toplevel.setFullscreen(null);
+    toplevel.setMinimized();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), fs_capture.count);
+    try std.testing.expect(fs_capture.fullscreen);
+    try std.testing.expect(fs_capture.output == null);
+    try std.testing.expectEqual(@as(usize, 1), min_capture.count);
+
+    toplevel.unsetFullscreen();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), fs_capture.count);
+    try std.testing.expect(!fs_capture.fullscreen);
+}
+
+const MoveCapture = struct {
+    count: usize = 0,
+    seat: ?*seat_mod.Seat = null,
+    serial: u32 = 0,
+    listener: wire.Listener(*MoveRequest),
+
+    fn notify(listener: *wire.Listener(*MoveRequest), req: *MoveRequest) void {
+        const self: *MoveCapture = @fieldParentPtr("listener", listener);
+        self.count += 1;
+        self.seat = req.seat;
+        self.serial = req.serial;
+    }
+};
+
+const WindowMenuCapture = struct {
+    count: usize = 0,
+    seat: ?*seat_mod.Seat = null,
+    serial: u32 = 0,
+    x: i32 = 0,
+    y: i32 = 0,
+    listener: wire.Listener(*ShowWindowMenuRequest),
+
+    fn notify(listener: *wire.Listener(*ShowWindowMenuRequest), req: *ShowWindowMenuRequest) void {
+        const self: *WindowMenuCapture = @fieldParentPtr("listener", listener);
+        self.count += 1;
+        self.seat = req.seat;
+        self.serial = req.serial;
+        self.x = req.x;
+        self.y = req.y;
+    }
+};
+
+test "move and show_window_menu carry seat + serial (F11)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var xs_events: XdgSurfaceEvents = .{};
+    const toplevel = try setupConfiguredToplevel(ts, &xs_events);
+    const t = ts.shell.?.toplevels.items[0];
+
+    var move_capture: MoveCapture = .{ .listener = wire.Listener(*MoveRequest).init(MoveCapture.notify) };
+    var menu_capture: WindowMenuCapture = .{
+        .listener = wire.Listener(*ShowWindowMenuRequest).init(WindowMenuCapture.notify),
+    };
+    t.events.request_move.add(&move_capture.listener);
+    t.events.request_show_window_menu.add(&menu_capture.listener);
+
+    toplevel.move(ts.wl_seat.?, 7);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), move_capture.count);
+    try std.testing.expect(move_capture.seat == ts.seat);
+    try std.testing.expectEqual(@as(u32, 7), move_capture.serial);
+
+    toplevel.showWindowMenu(ts.wl_seat.?, 9, 12, 34);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), menu_capture.count);
+    try std.testing.expect(menu_capture.seat == ts.seat);
+    try std.testing.expectEqual(@as(u32, 9), menu_capture.serial);
+    try std.testing.expectEqual(@as(i32, 12), menu_capture.x);
+    try std.testing.expectEqual(@as(i32, 34), menu_capture.y);
+}
+
+test "zero-size anchor rect positioner is incomplete (F13)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    try ts.pump();
+
+    // 0x0 anchor rect: size set, anchor rect set, but degenerate — the
+    // completeness check must reject it (wlroots checks width > 0; we also
+    // require a positive height).
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(0, 0, 0, 0);
+    _ = try xdg_surface.getPopup(null, positioner);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 5), err.code); // invalid_positioner
+    try std.testing.expectEqualStrings("xdg_wm_base", err.interface);
+
+    // 10x0 anchor rect: width positive, height zero — still incomplete.
+    var ts2 = try TestServer.init(allocator);
+    defer ts2.deinit();
+    const wl_surface2 = try ts2.wl_compositor.?.createSurface();
+    const xdg_surface2 = try ts2.wm_base.?.getXdgSurface(wl_surface2);
+    try ts2.pump();
+    const positioner2 = try ts2.wm_base.?.createPositioner();
+    positioner2.setSize(100, 50);
+    positioner2.setAnchorRect(0, 0, 10, 0);
+    _ = try xdg_surface2.getPopup(null, positioner2);
+    try std.testing.expectError(error.ClientDispatchFailed, ts2.pump());
+    const err2 = protocolError(ts2);
+    try std.testing.expectEqual(@as(c_int, 5), err2.code);
+    try std.testing.expectEqualStrings("xdg_wm_base", err2.interface);
+}
+
+const TitleCapture = struct {
+    count: usize = 0,
+    listener: wire.Listener(*XdgToplevel),
+
+    fn notify(listener: *wire.Listener(*XdgToplevel), _: *XdgToplevel) void {
+        @as(*TitleCapture, @fieldParentPtr("listener", listener)).count += 1;
+    }
+};
+
+test "title/app_id change events; unmap clears metadata (F14)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    const toplevel = try xdg_surface.getToplevel();
+    try ts.pump();
+    const t = ts.shell.?.toplevels.items[0];
+
+    var title_capture: TitleCapture = .{ .listener = wire.Listener(*XdgToplevel).init(TitleCapture.notify) };
+    var appid_capture: TitleCapture = .{ .listener = wire.Listener(*XdgToplevel).init(TitleCapture.notify) };
+    t.events.set_title.add(&title_capture.listener);
+    t.events.set_app_id.add(&appid_capture.listener);
+
+    toplevel.setTitle("hello");
+    toplevel.setAppId("org.example.Foo");
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), title_capture.count);
+    try std.testing.expectEqual(@as(usize, 1), appid_capture.count);
+    try std.testing.expectEqualStrings("hello", t.title.?);
+
+    // Invalid UTF-8: rejected, no event, connection survives.
+    toplevel.setTitle("\xff\xfe");
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), title_capture.count);
+    try std.testing.expectEqualStrings("hello", t.title.?);
+
+    // Map, then unmap via NULL buffer: title/app_id are per-map.
+    wl_surface.commit();
+    try ts.pump();
+    xdg_surface.ackConfigure(xs_events.serial);
+    const buffer = try ts.createBuffer();
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(t.xdg_surface.surface.mapped);
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(!t.xdg_surface.surface.mapped);
+    try std.testing.expect(t.title == null);
+    try std.testing.expect(t.app_id == null);
+}
+
+test "window geometry applies at commit, not ack (F15)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+
+    wl_surface.commit();
+    try ts.pump();
+    const srv = ts.shell.?.toplevels.items[0].xdg_surface;
+
+    // set_window_geometry is double-buffered: the ack alone must not apply
+    // it (F15 — applied at commit).
+    xdg_surface.setWindowGeometry(5, 7, 100, 100);
+    xdg_surface.ackConfigure(xs_events.serial);
+    try ts.pump();
+    try std.testing.expectEqual(geom.Rect.empty(), srv.current_geometry);
+    try std.testing.expectEqual(geom.Rect{ .x = 5, .y = 7, .width = 100, .height = 100 }, srv.pending_geometry);
+
+    // The commit applies the pending window geometry.
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(geom.Rect{ .x = 5, .y = 7, .width = 100, .height = 100 }, srv.current_geometry);
+}
+
+test "set_parent stores the parent and rejects descendant cycles (F16)" {
+    const allocator = std.testing.allocator;
+
+    // Direct cycle: A.parent = B, then B.parent = A closes A -> B -> A.
+    {
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const wl_surface_a = try ts.wl_compositor.?.createSurface();
+        const xdg_surface_a = try ts.wm_base.?.getXdgSurface(wl_surface_a);
+        const a = try xdg_surface_a.getToplevel();
+        const wl_surface_b = try ts.wl_compositor.?.createSurface();
+        const xdg_surface_b = try ts.wm_base.?.getXdgSurface(wl_surface_b);
+        const b = try xdg_surface_b.getToplevel();
+        try ts.pump();
+        const t_a = ts.shell.?.toplevels.items[0];
+        const t_b = ts.shell.?.toplevels.items[1];
+
+        // A.parent = B: stored and exposed; B tracks A as a child.
+        a.setParent(b);
+        try ts.pump();
+        try std.testing.expect(t_a.parent == t_b);
+        try std.testing.expect(t_b.children.items.len == 1);
+        try std.testing.expect(t_b.children.items[0] == t_a);
+
+        // B.parent = A closes the cycle: invalid_parent on the toplevel.
+        b.setParent(a);
+        try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+        const err = protocolError(ts);
+        try std.testing.expectEqual(@as(c_int, 1), err.code); // invalid_parent
+        try std.testing.expectEqualStrings("xdg_toplevel", err.interface);
+    }
+
+    // Deeper cycle: C.parent = A (chain C -> A -> B), then A.parent = C
+    // closes C -> A -> C.
+    {
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const wl_surface_a = try ts.wl_compositor.?.createSurface();
+        const xdg_surface_a = try ts.wm_base.?.getXdgSurface(wl_surface_a);
+        const a = try xdg_surface_a.getToplevel();
+        const wl_surface_b = try ts.wl_compositor.?.createSurface();
+        const xdg_surface_b = try ts.wm_base.?.getXdgSurface(wl_surface_b);
+        const b = try xdg_surface_b.getToplevel();
+        const wl_surface_c = try ts.wl_compositor.?.createSurface();
+        const xdg_surface_c = try ts.wm_base.?.getXdgSurface(wl_surface_c);
+        const c = try xdg_surface_c.getToplevel();
+        try ts.pump();
+        const t_a = ts.shell.?.toplevels.items[0];
+        const t_c = ts.shell.?.toplevels.items[2];
+
+        a.setParent(b);
+        c.setParent(a);
+        try ts.pump();
+        try std.testing.expect(t_c.parent == t_a);
+        try std.testing.expect(t_a.children.items.len == 1);
+
+        a.setParent(c);
+        try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+        const err = protocolError(ts);
+        try std.testing.expectEqual(@as(c_int, 1), err.code); // invalid_parent
+        try std.testing.expectEqualStrings("xdg_toplevel", err.interface);
+    }
+}
+
+test "popup reposition re-places and acknowledges the token (F1/F7)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    var popup_events: PopupEvents = .{};
+
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    positioner.destroy();
+    try ts.pump();
+    const p = ts.shell.?.popups.items[0];
+
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), popup_events.configure_count);
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(p.xdg_surface.configured);
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 210, .y = 120, .width = 100, .height = 50 },
+        p.acked_geometry.?,
+    );
+
+    // Reposition with a new positioner: repositioned(token) then a fresh
+    // configure with the new placement.
+    const positioner2 = try ts.wm_base.?.createPositioner();
+    positioner2.setSize(100, 50);
+    positioner2.setAnchorRect(0, 0, 50, 50);
+    positioner2.setAnchor(.bottom_right);
+    positioner2.setGravity(.bottom_right);
+    popup.reposition(positioner2, 42);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), popup_events.configure_count);
+    try std.testing.expectEqual(@as(i32, 50), popup_events.x);
+    try std.testing.expectEqual(@as(i32, 50), popup_events.y);
+
+    // Acking the reposition configure updates the acked geometry (F7).
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 50, .y = 50, .width = 100, .height = 50 },
+        p.acked_geometry.?,
+    );
+
+    // An incomplete positioner on reposition is invalid_positioner (size
+    // set but no anchor rect: complete-set but incomplete).
+    const bad_positioner = try ts.wm_base.?.createPositioner();
+    bad_positioner.setSize(100, 50);
+    popup.reposition(bad_positioner, 43);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 5), err.code); // invalid_positioner
+    try std.testing.expectEqualStrings("xdg_wm_base", err.interface);
 }

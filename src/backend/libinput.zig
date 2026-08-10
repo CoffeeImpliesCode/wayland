@@ -59,17 +59,20 @@
 //!     to the output size by `scaleToOutput`;
 //!   - buttons pass through as-is (libinput button codes are the linux
 //!     BTN_* codes the seat already expects);
-//!   - axis: only the legacy LIBINPUT_EVENT_POINTER_AXIS is consumed. Since
-//!     libinput 1.19 the new SCROLL_WHEEL/FINGER/CONTINUOUS events are sent
-//!     *in addition* to it; consuming both would double every wheel click.
-//!     The axis value's units depend on the source (libinput.h:1598-1617):
-//!     WHEEL is degrees (15.0 per notch) and `axisValueToPixels` converts to
-//!     the seat's 10 px per notch convention; FINGER and CONTINUOUS are
-//!     cursor-equivalent units (1.0 = 1 px) passed through as-is, matching
-//!     wlroots (backend/libinput/pointer.c:146). `axisDiscreteToNotches`
-//!     rounds the physical click count (WHEEL only; FINGER/CONTINUOUS
-//!     discrete is always 0, libinput.h:1653-1657). The source rides along
-//!     to the seat as wl_pointer.axis_source.
+//!   - axis: wheel scrolls come from LIBINPUT_EVENT_POINTER_SCROLL_WHEEL,
+//!     the libinput 1.19+ event that carries v120-normalized deltas
+//!     (libinput_event_pointer_get_scroll_value_v120, ±120 per logical
+//!     click — the wlroots choice, backend/libinput/events.c:169-183).
+//!     `v120ToNotches` normalizes the v120 delta to the seat's legacy
+//!     click convention; the value (degrees, 15.0 per notch) converts via
+//!     `axisValueToPixels` to the seat's 10 px per notch. The legacy
+//!     LIBINPUT_EVENT_POINTER_AXIS event is consumed only for the
+//!     FINGER/CONTINUOUS sources (touchpad/trackpoint): those are
+//!     cursor-equivalent units (1.0 = 1 px, passed through as-is,
+//!     matching wlroots backend/libinput/pointer.c:146) and their
+//!     SCROLL_FINGER/CONTINUOUS twins are ignored to avoid double
+//!     delivery (libinput posts both families; libinput.h:811-826). The
+//!     source rides along to the seat as wl_pointer.axis_source.
 //!
 //! Test path: no real devices exist on the dev host, so the pure logic
 //! (offset, scaling, axis conversion, event-type mapping, capability
@@ -130,6 +133,14 @@ pub const log_priority_error: c_int = 30;
 pub const device_cap_keyboard: c_int = 0;
 pub const device_cap_pointer: c_int = 1;
 pub const device_cap_touch: c_int = 2;
+
+/// enum libinput_led (libinput.h:232-238): the bitmask
+/// libinput_device_led_update accepts. The values match the wlroots
+/// WLR_LED_* layout (wlr_keyboard.h:22-24), which derives them from the
+/// xkb_state led indexes (numlock=0, capslock=1) — see ledsFromModsLocked.
+pub const led_num_lock: c_int = 1 << 0;
+pub const led_caps_lock: c_int = 1 << 1;
+pub const led_scroll_lock: c_int = 1 << 2;
 
 /// linux/input-event-codes.h:357-359 (BTN_*). The seat exports the same
 /// values (seat.btn_left == 272); these exist for the registry mapping and
@@ -212,10 +223,18 @@ const c = struct {
     extern fn libinput_event_pointer_get_axis_value(event: ?*libinput_event_pointer, axis: c_int) f64;
     extern fn libinput_event_pointer_get_axis_value_discrete(event: ?*libinput_event_pointer, axis: c_int) f64;
     extern fn libinput_event_pointer_get_axis_source(event: ?*libinput_event_pointer) c_int;
+    // SCROLL_* accessors (libinput.h:1667-1760, @since 1.19): the wheel
+    // event's value in degrees and its v120-normalized delta.
+    extern fn libinput_event_pointer_get_scroll_value(event: ?*libinput_event_pointer, axis: c_int) f64;
+    extern fn libinput_event_pointer_get_scroll_value_v120(event: ?*libinput_event_pointer, axis: c_int) f64;
 
     // Device accessors (libinput.h:4338, 4490).
     extern fn libinput_device_get_name(device: ?*libinput_device) [*:0]const u8;
     extern fn libinput_device_has_capability(device: ?*libinput_device, capability: c_int) c_int;
+    // LED sync (libinput.h:4481): push the keyboard LED state
+    // (numlock/capslock) to the device's LEDs (wlroots
+    // backend/libinput/keyboard.c keyboard_set_leds).
+    extern fn libinput_device_led_update(device: ?*libinput_device, leds: c_int) void;
 
     // libudev: a plain context for device enumeration (libinput needs an
     // initialized udev; wlroots passes its session's).
@@ -292,6 +311,45 @@ pub fn axisDiscreteForSource(source: server.wl.Pointer.AxisSource, raw: f64) i32
     };
 }
 
+/// v120 scroll delta -> legacy notch count. libinput normalizes
+/// high-resolution wheel deltas to ±120 per logical click
+/// (libinput_event_pointer_get_scroll_value_v120, libinput.h:1712-1760:
+/// "a value that is a fraction of ±120 indicates a wheel movement less
+/// than one logical click"); one logical click is one legacy notch, so
+/// dividing by 120 converts the v120 delta to the seat's legacy click
+/// convention (10 px per notch, see axisValueToPixels). wlroots instead
+/// forwards the raw v120 as delta_discrete (pointer.c:172-179); the seat
+/// contract here is legacy clicks, so the normalization happens in the
+/// backend.
+pub fn v120ToNotches(v120: f64) i32 {
+    return @intFromFloat(@round(v120 / 120.0));
+}
+
+/// Whether the zero-device startup check is enabled. Mirrors wlroots
+/// env_parse_bool (util/env.c): only the literal "1" is truthy — any
+/// other value (or an unset variable) leaves the check on.
+pub fn zeroDeviceCheckEnabled(env_value: ?[*:0]const u8) bool {
+    const v = env_value orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// Keyboard LED bitmask from the seat's locked-modifier state. The seat
+/// stores mods_locked in the wl_keyboard.modifiers layout (bit 1 = Lock
+/// = Caps Lock, bit 4 = Mod2 = Num Lock; xkb.zig mods() doc). Mirrors
+/// wlroots keyboard_led_update (types/wlr_keyboard.c:20-35), which
+/// derives the WLR_LED_* bits from the xkb_state led indexes — the
+/// standard evdev keymap indexes numlock=0 and capslock=1, so the
+/// produced bits align with libinput's enum libinput_led
+/// (LIBINPUT_LED_NUM_LOCK=1, LIBINPUT_LED_CAPS_LOCK=2).
+pub fn ledsFromModsLocked(mods_locked: u32) c_int {
+    var leds: c_int = 0;
+    // Lock (bit 1) -> Caps Lock.
+    if (mods_locked & (1 << 1) != 0) leds |= led_caps_lock;
+    // Mod2 (bit 4) -> Num Lock.
+    if (mods_locked & (1 << 4) != 0) leds |= led_num_lock;
+    return leds;
+}
+
 /// Map a libinput device to the backend's InputDevice kind. libinput's
 /// has_capability takes ONE capability and returns a bool; devices are
 /// classified by priority (keyboard > pointer). Devices with only
@@ -355,6 +413,11 @@ const Libinput = struct {
     /// deltas do not get lost per event).
     cursor_x: f64 = 0,
     cursor_y: f64 = 0,
+    /// Last LED bitmask pushed to devices (libinput_device_led_update).
+    /// The seat's LED state is global to the keyboard, so one cache
+    /// serves all devices; -1 forces the first key event to sync
+    /// (wlroots caches kb->leds the same way, wlr_keyboard.c:188-196).
+    last_leds: c_int = -1,
 
     /// The libinput fd to poll (libinput_get_fd). Only valid after start().
     pub fn pollFd(self: *Libinput) c_int {
@@ -386,9 +449,16 @@ const Libinput = struct {
             event_pointer_motion_absolute => self.onPointerMotionAbsolute(event),
             event_pointer_button => self.onPointerButton(event),
             event_pointer_axis => self.onPointerAxis(event),
-            // libinput >= 1.19 sends these *in addition* to POINTER_AXIS;
-            // consuming both would double every wheel click.
-            event_pointer_scroll_wheel, event_pointer_scroll_finger, event_pointer_scroll_continuous => {},
+            // Wheel scrolls arrive here with v120-normalized deltas
+            // (libinput >= 1.19; wlroots consumes exactly this event,
+            // events.c:169-183). The legacy POINTER_AXIS twin of a wheel
+            // event is skipped in onPointerAxis, so no double delivery.
+            event_pointer_scroll_wheel => self.onPointerScrollWheel(event),
+            // SCROLL_FINGER/CONTINUOUS carry the same data as their
+            // POINTER_AXIS twins (libinput posts both families,
+            // libinput.h:811-826); the AXIS handler consumes those, so
+            // these stay ignored to avoid double delivery.
+            event_pointer_scroll_finger, event_pointer_scroll_continuous => {},
             // Touch, gestures, tablets, switches: not implemented in M3.
             else => log_mod.debug(
                 "unhandled libinput event {s} ({d})",
@@ -403,6 +473,13 @@ const Libinput = struct {
     fn onDeviceAdded(self: *Libinput, event: *c.libinput_event) void {
         const dev = c.libinput_event_get_device(event) orelse return;
         const kind = kindForDevice(dev) orelse return;
+        // Fresh keyboard: LEDs start off (wlroots init_device_keyboard
+        // calls libinput_device_led_update(handle, 0),
+        // backend/libinput/keyboard.c:38-44). libinput no-ops for
+        // devices without LED support.
+        if (kind == .keyboard) {
+            _ = c.libinput_device_led_update(dev, 0);
+        }
 
         const name_slice = std.mem.span(c.libinput_device_get_name(dev));
         const name = if (name_slice.len == 0) "unknown" else name_slice;
@@ -444,6 +521,18 @@ const Libinput = struct {
         const pressed = c.libinput_event_keyboard_get_key_state(kevent) == key_state_pressed;
         // libinput reports evdev scancodes; the seat expects xkb keycodes.
         self.seat.keyEvent(evdevToXkb(key), pressed);
+        // Push the seat's LED state (numlock/capslock, updated by
+        // keyEvent) to the device's LEDs — wlroots keyboard_set_leds
+        // (backend/libinput/keyboard.c:31-35) + keyboard_led_update
+        // (types/wlr_keyboard.c:20-35), with the same skip-when-unchanged
+        // cache (wlr_keyboard.c:188-196).
+        const leds = ledsFromModsLocked(self.seat.mods_locked);
+        if (leds != self.last_leds) {
+            self.last_leds = leds;
+            if (c.libinput_event_get_device(event)) |dev| {
+                _ = c.libinput_device_led_update(dev, leds);
+            }
+        }
     }
 
     fn onPointerMotion(self: *Libinput, event: *c.libinput_event) void {
@@ -483,6 +572,13 @@ const Libinput = struct {
         // The axis value's units depend on the source
         // (libinput.h:1598-1617); the source is required to interpret it.
         const source = axisSourceFromLibinput(c.libinput_event_pointer_get_axis_source(pevent)) orelse return;
+        // Wheel data now arrives via LIBINPUT_EVENT_POINTER_SCROLL_WHEEL
+        // (v120-normalized, libinput 1.19+). The legacy AXIS event is
+        // still posted alongside SCROLL_WHEEL for hi-res devices, so
+        // consuming it here would double every wheel click — wheel
+        // sources are handled in onPointerScrollWheel only (wlroots
+        // events.c:167-169 ignores the AXIS event for the same reason).
+        if (source == .wheel or source == .wheel_tilt) return;
         // wlroots iterates both scroll axes (handle_pointer_axis,
         // backend/libinput/pointer.c:114-148).
         if (c.libinput_event_pointer_has_axis(pevent, pointer_axis_scroll_vertical) != 0) {
@@ -491,6 +587,46 @@ const Libinput = struct {
         if (c.libinput_event_pointer_has_axis(pevent, pointer_axis_scroll_horizontal) != 0) {
             self.sendAxis(pevent, source, .horizontal_scroll);
         }
+    }
+
+    /// A LIBINPUT_EVENT_POINTER_SCROLL_WHEEL event: wheel scroll with a
+    /// v120-normalized delta (libinput 1.19+; wlroots
+    /// handle_pointer_axis_value120, pointer.c:149-186). The value is in
+    /// degrees (15.0 per logical click) and converts via
+    /// axisValueToPixels; the discrete is the v120 delta normalized to
+    /// legacy clicks via v120ToNotches.
+    fn onPointerScrollWheel(self: *Libinput, event: *c.libinput_event) void {
+        const pevent = c.libinput_event_get_pointer_event(event) orelse return;
+        // wlroots iterates both scroll axes.
+        if (c.libinput_event_pointer_has_axis(pevent, pointer_axis_scroll_vertical) != 0) {
+            self.sendAxisV120(pevent, .vertical_scroll);
+        }
+        if (c.libinput_event_pointer_has_axis(pevent, pointer_axis_scroll_horizontal) != 0) {
+            self.sendAxisV120(pevent, .horizontal_scroll);
+        }
+    }
+
+    /// Forward one SCROLL_WHEEL axis to the seat: value in degrees -> the
+    /// seat's 10 px per notch convention, discrete v120-normalized to
+    /// legacy clicks.
+    fn sendAxisV120(
+        self: *Libinput,
+        pevent: *c.libinput_event_pointer,
+        axis: server.wl.Pointer.Axis,
+    ) void {
+        const libinput_axis: c_int = switch (axis) {
+            .vertical_scroll => pointer_axis_scroll_vertical,
+            .horizontal_scroll => pointer_axis_scroll_horizontal,
+            else => return, // unknown wire axis: nothing to forward
+        };
+        const value = c.libinput_event_pointer_get_scroll_value(pevent, libinput_axis);
+        const v120 = c.libinput_event_pointer_get_scroll_value_v120(pevent, libinput_axis);
+        self.seat.pointerAxis(
+            axis,
+            .wheel,
+            axisValueToPixels(value),
+            v120ToNotches(v120),
+        );
     }
 
     /// Forward one scroll axis to the seat, scaled per source (see
@@ -620,16 +756,33 @@ fn start(base: *backend.Backend) error{BackendFailed}!void {
         return error.BackendFailed;
     }
 
-    log_mod.info("libinput backend started (seat {s}, output {d}x{d})", self.io, self.log_cfg, "libinput", .{
-        self.seat_name, self.output_width, self.output_height,
-    });
-
     // Assigning the seat queues DEVICE_ADDED for every device on it; they
     // arrive on the first dispatch (wlroots drains in backend_start too).
     self.dispatch() catch {
         log_mod.err("libinput initial dispatch failed", self.io, self.log_cfg, "libinput", .{});
         return error.BackendFailed;
     };
+
+    // Zero-device check (wlroots backend.c:112-116): an empty registry
+    // usually means a broken udev/seat config, and a healthy-looking
+    // backend with no devices is worse than a failed start.
+    // WLR_LIBINPUT_NO_DEVICES=1 suppresses the check.
+    if (zeroDeviceCheckEnabled(std.c.getenv("WLR_LIBINPUT_NO_DEVICES")) and
+        self.devices.items.len == 0)
+    {
+        log_mod.err(
+            "libinput: no input devices found; set WLR_LIBINPUT_NO_DEVICES=1 to suppress this check",
+            self.io,
+            self.log_cfg,
+            "libinput",
+            .{},
+        );
+        return error.BackendFailed;
+    }
+
+    log_mod.info("libinput backend started (seat {s}, output {d}x{d})", self.io, self.log_cfg, "libinput", .{
+        self.seat_name, self.output_width, self.output_height,
+    });
 }
 
 fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
@@ -751,6 +904,44 @@ test "axis source mapping and per-source scaling" {
     try testing.expectEqual(@as(i32, 0), axisDiscreteForSource(.continuous, 1.6));
 }
 
+test "v120 deltas normalize to legacy clicks" {
+    // B28: libinput high-resolution wheel deltas are ±120 per logical
+    // click; the seat contract is legacy clicks (10 px per notch).
+    try testing.expectEqual(@as(i32, 1), v120ToNotches(120.0));
+    try testing.expectEqual(@as(i32, 2), v120ToNotches(240.0));
+    try testing.expectEqual(@as(i32, -1), v120ToNotches(-120.0));
+    try testing.expectEqual(@as(i32, -3), v120ToNotches(-360.0));
+    // Fractional deltas (hi-res sub-notch, e.g. one third of a click):
+    // the value carries the fraction; the discrete rounds to whole
+    // notches (round-half-away-from-zero).
+    try testing.expectEqual(@as(i32, 1), v120ToNotches(60.0));
+    try testing.expectEqual(@as(i32, 0), v120ToNotches(40.0));
+    try testing.expectEqual(@as(i32, 0), v120ToNotches(-40.0));
+    try testing.expectEqual(@as(i32, 0), v120ToNotches(0.0));
+}
+
+test "zero-device check honors WLR_LIBINPUT_NO_DEVICES" {
+    // B29: the startup check stays on unless the env var is exactly "1"
+    // (wlroots env_parse_bool, util/env.c).
+    try testing.expect(zeroDeviceCheckEnabled(null));
+    try testing.expect(zeroDeviceCheckEnabled(""));
+    try testing.expect(zeroDeviceCheckEnabled("0"));
+    try testing.expect(zeroDeviceCheckEnabled("true"));
+    try testing.expect(!zeroDeviceCheckEnabled("1"));
+}
+
+test "LED state derives from locked modifiers" {
+    // B30: wl_keyboard.modifiers layout — Lock (bit 1) -> Caps Lock,
+    // Mod2 (bit 4) -> Num Lock; bits match libinput's enum libinput_led.
+    try testing.expectEqual(@as(c_int, 0), ledsFromModsLocked(0));
+    try testing.expectEqual(@as(c_int, led_caps_lock), ledsFromModsLocked(1 << 1));
+    try testing.expectEqual(@as(c_int, led_num_lock), ledsFromModsLocked(1 << 4));
+    try testing.expectEqual(@as(c_int, led_caps_lock | led_num_lock), ledsFromModsLocked((1 << 1) | (1 << 4)));
+    // Non-LED locked modifiers (Shift = bit 0, Mod4 = bit 6) contribute
+    // nothing.
+    try testing.expectEqual(@as(c_int, 0), ledsFromModsLocked((1 << 0) | (1 << 6)));
+}
+
 test "capability to kind mapping" {
     // kindForDevice queries the real libinput per capability (bool per
     // cap), so the unit level covers the classification PRIORITY order
@@ -768,10 +959,11 @@ test "event type dispatch mapping" {
     try testing.expectEqualStrings("pointer motion absolute", eventTypeName(event_pointer_motion_absolute));
     try testing.expectEqualStrings("pointer button", eventTypeName(event_pointer_button));
     try testing.expectEqualStrings("pointer axis", eventTypeName(event_pointer_axis));
-    // libinput 1.19+ scroll events: recognized, consumed by the "ignore"
-    // prongs of the dispatch switch (they duplicate POINTER_AXIS).
+    // libinput 1.19+ scroll events: SCROLL_WHEEL is consumed (v120 wheel
+    // path); SCROLL_FINGER/CONTINUOUS are ignored (their POINTER_AXIS
+    // twins carry the data).
     try testing.expectEqualStrings("pointer scroll wheel", eventTypeName(event_pointer_scroll_wheel));
-    try testing.expectEqualStrings("other", eventTypeName(500)); // touch down
+    try testing.expectEqualStrings("other", eventTypeName(500)); // touch down)
 }
 
 test "button constants match the seat" {

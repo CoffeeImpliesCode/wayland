@@ -162,6 +162,13 @@ const DrmBackendData = struct {
     device_path: []const u8,
     fd: ?std.posix.fd_t = null,
     is_master: bool = false,
+    /// KMS interface in use: true = atomic (DRM_CLIENT_CAP_ATOMIC set),
+    /// false = legacy (drmModeSetCrtc modeset + drmModePageFlip flips).
+    /// Set in startInner from the atomic capability (wlroots
+    /// check_drm_features drm.c:106-110 falls back to the legacy
+    /// interface when the driver lacks ATOMIC; smithay the same,
+    /// device/mod.rs:252-256). Read by commit() to pick the flip path.
+    atomic: bool = true,
     drm_output: ?*DrmOutput = null,
 };
 
@@ -178,10 +185,12 @@ const output_impl: output_mod.Output.Impl = .{
 
 pub const DrmBackend = struct {
     /// Create a DRM/KMS backend. All device work happens in start():
-    /// open + master, connector/mode/crtc/plane enumeration, dumb buffer,
-    /// atomic modeset, then `new_output` (plus the first frame kick).
-    /// `device_path` selects the card node (default "/dev/dri/card0";
-    /// the server passes WAYLAND_DRM_DEVICE).
+    /// open + master, connector/mode/crtc (plane) enumeration, dumb
+    /// buffers, modeset — atomic when the driver supports it
+    /// (DRM_CLIENT_CAP_ATOMIC), else the legacy interface
+    /// (drmModeSetCrtc/drmModePageFlip) — then `new_output` (plus the
+    /// first frame kick). `device_path` selects the card node (default
+    /// "/dev/dri/card0"; the server passes WAYLAND_DRM_DEVICE).
     pub fn create(
         allocator: std.mem.Allocator,
         io: *std.Io,
@@ -260,9 +269,26 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
 
     // Atomic modesetting must be requested before any KMS ioctl
     // (wlroots drm.c drm_open: drmSetClientCap(DRM_CLIENT_CAP_ATOMIC, 1)).
-    if (c.drmSetClientCap(fd, @intCast(c.DRM_CLIENT_CAP_ATOMIC), 1) != 0) {
-        log_mod.err("drm: DRM_CLIENT_CAP_ATOMIC unsupported on {s}", self.io, self.log_cfg, "drm", .{self.device_path});
-        return error.BackendFailed;
+    // When the driver lacks ATOMIC, fall back to the legacy KMS
+    // interface (drmModeSetCrtc modeset + drmModePageFlip flips) instead
+    // of failing — wlroots check_drm_features drm.c:106-110, smithay
+    // LegacyDrmDevice (device/mod.rs:252-256). WLR_DRM_NO_ATOMIC forces
+    // the legacy path (wlroots parity; lets the fallback be exercised on
+    // atomic hardware). The legacy path needs no planes or property
+    // blobs; the connector/mode/CRTC enumeration below is shared.
+    const force_legacy = std.c.getenv("WLR_DRM_NO_ATOMIC") != null;
+    if (force_legacy) {
+        log_mod.info("drm: WLR_DRM_NO_ATOMIC set; using legacy KMS interface", self.io, self.log_cfg, "drm", .{});
+        self.atomic = false;
+    } else if (c.drmSetClientCap(fd, @intCast(c.DRM_CLIENT_CAP_ATOMIC), 1) != 0) {
+        log_mod.warn(
+            "drm: DRM_CLIENT_CAP_ATOMIC unsupported on {s}; using legacy KMS interface",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{self.device_path},
+        );
+        self.atomic = false;
     }
 
     // Become DRM master (required for modeset). The first opener is
@@ -274,8 +300,11 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
     }
 
     // --- find a connected connector with a mode, its encoder and a CRTC
-    // (wlroots drm.c init_drm_resources + drm_connector_alloc_crtc).
-    const found = findConnectorMode(self) orelse {
+    // (wlroots drm.c init_drm_resources + drm_connector_alloc_crtc). `var`
+    // (not const): the legacy drmModeSetCrtc path below passes
+    // &found.connector_id / &found.mode to C, which wants mutable
+    // [*c] pointers.
+    var found = findConnectorMode(self) orelse {
         log_mod.err("drm: no connected connector with a mode on {s}", self.io, self.log_cfg, "drm", .{
             self.device_path,
         });
@@ -291,11 +320,16 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
 
     // --- primary plane for the CRTC, with all commit property ids
     // (wlroots drm.c init_plane: possible_crtcs + type == PRIMARY).
+    // Atomic-only: the legacy interface has no planes — modeset and
+    // flips target the CRTC directly (drmModeSetCrtc/drmModePageFlip).
     var plane: PlanePropIds = .{};
-    const plane_id = findPrimaryPlane(self, found.crtc_index, &plane) orelse {
-        log_mod.err("drm: no primary plane for crtc={d}", self.io, self.log_cfg, "drm", .{found.crtc_id});
-        return error.BackendFailed;
-    };
+    const plane_id: u32 = if (self.atomic) blk: {
+        const id = findPrimaryPlane(self, found.crtc_index, &plane) orelse {
+            log_mod.err("drm: no primary plane for crtc={d}", self.io, self.log_cfg, "drm", .{found.crtc_id});
+            return error.BackendFailed;
+        };
+        break :blk id;
+    } else 0;
 
     const allocator = self.allocator;
     const drm_out = try allocator.create(DrmOutput);
@@ -312,7 +346,9 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
     self.drm_output = drm_out;
 
     // --- connector + crtc property ids (wlroots properties.c tables).
-    {
+    // Atomic-only: the legacy modeset binds the connector to the CRTC
+    // implicitly via drmModeSetCrtc, so no property ids are needed.
+    if (self.atomic) {
         var conn_props: [1]u32 = undefined;
         if (!scanPropIds(fd, found.connector_id, c.DRM_MODE_OBJECT_CONNECTOR, &[_][]const u8{"CRTC_ID"}, &conn_props)) {
             log_mod.err("drm: connector CRTC_ID property missing", self.io, self.log_cfg, "drm", .{});
@@ -393,8 +429,10 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
         }
     }
 
-    // --- mode blob (wlroots atomic.c create_mode_blob).
-    {
+    // --- mode blob (wlroots atomic.c create_mode_blob). Atomic-only:
+    // the legacy modeset passes the drmModeModeInfo directly to
+    // drmModeSetCrtc.
+    if (self.atomic) {
         var blob_id: u32 = 0;
         if (c.drmModeCreatePropertyBlob(fd, &found.mode, @sizeOf(c.drmModeModeInfo), &blob_id) != 0) {
             log_mod.err("drm: drmModeCreatePropertyBlob failed", self.io, self.log_cfg, "drm", .{});
@@ -403,12 +441,15 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
         drm_out.mode_blob = blob_id;
     }
 
-    // --- atomic modeset: connector->crtc binding, crtc active+mode,
-    // plane fb + full source/dest rect + full-fb damage clip. Blocking
+    // --- modeset. Atomic: connector->crtc binding, crtc active+mode,
+    // plane fb + full source/dest rect + full-fb damage clip, blocking
     // (no flip event; the first frame's page flip sends the event).
     // (wlroots atomic.c atomic_connector_add + set_plane_props; smithay
-    // surface/atomic.rs set_connector/set_crtc/set_plane).
-    {
+    // surface/atomic.rs set_connector/set_crtc/set_plane). Legacy: one
+    // drmModeSetCrtc call binds the connector to the CRTC and applies
+    // the mode with buffers[0] as the initial scanout fb (wlroots
+    // legacy.c:121-126).
+    if (self.atomic) {
         // FB_DAMAGE_CLIPS (full-fb rect) must ride every commit touching
         // the plane: virtio-gpu's plane update is gated on merged damage
         // clips — drivers/gpu/drm/virtio/virtgpu_plane.c
@@ -505,6 +546,26 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
             );
             return error.BackendFailed;
         }
+    } else {
+        // --- legacy modeset: bind the connector to the CRTC and apply
+        // the mode in one call (wlroots legacy.c:121-126 drmModeSetCrtc
+        // with the connector array + mode). buffers[0] is the A side of
+        // the swapchain; the first commit flips to buffers[1]. The call
+        // is synchronous (no flip event), same as the blocking atomic
+        // modeset above.
+        if (c.drmModeSetCrtc(
+            fd,
+            found.crtc_id,
+            drm_out.buffers[0].fb_id,
+            0,
+            0,
+            &found.connector_id,
+            1,
+            &found.mode,
+        ) != 0) {
+            log_mod.err("drm: drmModeSetCrtc failed", self.io, self.log_cfg, "drm", .{});
+            return error.BackendFailed;
+        }
     }
 
     // --- announce the output, then kick the first frame. The compositor
@@ -544,11 +605,15 @@ fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
 
 fn testState(out: *output_mod.Output, state: *const output_mod.Output.State) error{InvalidState}!void {
     const self: *DrmOutput = @ptrCast(@alignCast(out.data));
-    // Transform and scale are not applied by this backend: the modeset
-    // pinned the plane's source/dest rect at init and commits only
-    // change FB_ID, so any such state would be silently ignored.
-    if (state.committed & output_mod.Output.State.committed_transform != 0) return error.InvalidState;
-    if (state.committed & output_mod.Output.State.committed_scale != 0) return error.InvalidState;
+    // Unsupported-state mask (wlroots drm_connector_prepare,
+    // drm.c:838-840): scale and transform are not applied by this
+    // backend — the modeset pinned the plane's source/dest rect at init
+    // and commits only change FB_ID, so any such state would be silently
+    // ignored.
+    const supported = output_mod.Output.State.committed_enabled |
+        output_mod.Output.State.committed_mode |
+        output_mod.Output.State.committed_buffer;
+    if (state.committed & ~supported != 0) return error.InvalidState;
     // Mode changes are rejected: the dumb buffer and modeset are fixed
     // at init (single-mode backend for now). The refresh value is
     // advisory (pacing comes from the flip event, not the refresh
@@ -600,6 +665,21 @@ fn commit(out: *output_mod.Output, state: *const output_mod.Output.State) error{
     // whole-buffer memcpy would skew every row past the first.
     // (smithay dumb.rs scans out the same pitch-padded ARGB buffer.)
     copyRows(fb.data, @intCast(fb.stride), buf.map, buf.pitch, fb.width, fb.height);
+
+    // Legacy interface (no atomic): drmModePageFlip on the CRTC
+    // (wlroots legacy.c:206-209). Asynchronous, like the atomic
+    // non-blocking flip — completion arrives as DRM_EVENT_FLIP_COMPLETE
+    // through dispatch() and pageFlipHandler clears flip_pending. No
+    // damage property exists on this path (damage is a plane property).
+    if (!self.backend.atomic) {
+        if (c.drmModePageFlip(self.backend.fd.?, self.crtc_id, buf.fb_id, c.DRM_MODE_PAGE_FLIP_EVENT, self) != 0) {
+            log_mod.err("drm: drmModePageFlip failed", self.backend.io, self.backend.log_cfg, "drm", .{});
+            return error.CommitFailed;
+        }
+        self.flip_pending = true;
+        self.flip_index = 1 - self.flip_index;
+        return;
+    }
 
     // Page flip: FB_ID changes on the plane (the modeset bound the rest)
     // plus a full-fb FB_DAMAGE_CLIPS clip; PAGE_FLIP_EVENT + NONBLOCK
@@ -667,10 +747,28 @@ const FoundConnector = struct {
     mode: c.drmModeModeInfo,
 };
 
+/// Index of the first CRTC a possible_crtcs mask allows (bit i = CRTC
+/// i) within [0, count) — the encoder-fallback CRTC pick: the union mask
+/// comes from drmModeConnectorGetPossibleCrtcs, and the lowest set bit
+/// is the first CRTC a sibling encoder can drive (wlroots realloc_crtcs
+/// matches connectors against every CRTC in possible_crtcs; we take the
+/// first such CRTC, kernels expose <= 32). Null when the mask allows no
+/// CRTC in range.
+fn firstCrtcIndex(possible_crtcs: u32, count: usize) ?usize {
+    var i: usize = 0;
+    while (i < count and i < 32) : (i += 1) {
+        if (possible_crtcs & (@as(u32, 1) << @as(u5, @intCast(i))) != 0) return i;
+    }
+    return null;
+}
+
 /// Find the first connected connector with a mode; prefer the preferred
 /// mode (mode.type & DRM_MODE_TYPE_PREFERRED), else the first mode
-/// (wlroots drm.c drm_connector_get_current_mode). Resolves the encoder
-/// and a free CRTC via possible_crtcs (wlroots drm_connector_alloc_crtc).
+/// (wlroots drm.c drm_connector_get_current_mode). Resolves a free CRTC
+/// from the union of possible_crtcs over ALL encoders the connector can
+/// use (wlroots drm.c:1579 drmModeConnectorGetPossibleCrtcs; F24: the
+/// connector's own encoder may report possible_crtcs == 0 while a
+/// sibling encoder can drive it).
 fn findConnectorMode(self: *DrmBackendData) ?FoundConnector {
     const fd = self.fd.?;
     const res = c.drmModeGetResources(fd) orelse {
@@ -695,43 +793,23 @@ fn findConnectorMode(self: *DrmBackendData) ?FoundConnector {
             }
         }
 
-        // Encoder: the connector's own when set, else the first encoder
-        // that can drive any CRTC.
-        var encoder_id = conn.*.encoder_id;
-        var possible_crtcs: u32 = 0;
-        if (encoder_id != 0) {
-            const enc = c.drmModeGetEncoder(fd, encoder_id) orelse continue;
-            possible_crtcs = enc.*.possible_crtcs;
-            c.drmModeFreeEncoder(enc);
-        } else {
-            var e: c_int = 0;
-            while (e < res.*.count_encoders) : (e += 1) {
-                const enc = c.drmModeGetEncoder(fd, res.*.encoders[@intCast(e)]) orelse continue;
-                const enc_possible = enc.*.possible_crtcs;
-                c.drmModeFreeEncoder(enc);
-                if (enc_possible != 0) {
-                    encoder_id = res.*.encoders[@intCast(e)];
-                    possible_crtcs = enc_possible;
-                    break;
-                }
-            }
-        }
+        // Possible CRTCs: the union over ALL encoders the connector can
+        // use. drmModeConnectorGetPossibleCrtcs iterates the connector's
+        // encoder list and ORs their possible_crtcs (libdrm
+        // xf86drmMode.c) — the same match wlroots uses for connector
+        // CRTC allocation (drm.c:1579, realloc_crtcs drm.c:1399-1453).
+        // Using only the connector's currently-bound encoder would skip
+        // the connector when that encoder can drive no CRTC even though
+        // a sibling encoder could (the F24 gap); single-encoder
+        // virtio-gpu is unaffected, but the union is the correct KMS
+        // behavior.
+        const possible_crtcs = c.drmModeConnectorGetPossibleCrtcs(fd, conn);
         if (possible_crtcs == 0) continue;
 
-        // First free CRTC the encoder can drive (kernels expose <= 32
-        // CRTCs; wlroots asserts the same bound).
-        var j: c_int = 0;
-        var crtc_index: usize = 0;
-        var crtc_id: u32 = 0;
-        while (j < res.*.count_crtcs and j < 32) : (j += 1) {
-            const bit = @as(u32, 1) << @as(u5, @intCast(j));
-            if (possible_crtcs & bit != 0) {
-                crtc_index = @intCast(j);
-                crtc_id = res.*.crtcs[@intCast(j)];
-                break;
-            }
-        }
-        if (crtc_id == 0) continue;
+        // First free CRTC the encoder union can drive (kernels expose
+        // <= 32 CRTCs; wlroots asserts the same bound).
+        const crtc_index = firstCrtcIndex(possible_crtcs, @intCast(res.*.count_crtcs)) orelse continue;
+        const crtc_id = res.*.crtcs[crtc_index];
 
         return .{
             .connector_id = connector_id,
@@ -1074,6 +1152,26 @@ test "mode to output conversion" {
     mode.htotal = 0;
     mode.vtotal = 0;
     try testing.expectEqual(@as(i32, 16), modeToOutput(mode).refresh_msec);
+}
+
+test "encoder fallback picks the first CRTC in the possible_crtcs union" {
+    // F24: a connector's CRTC set is the union over ALL its encoders
+    // (drmModeConnectorGetPossibleCrtcs); the lowest set bit wins.
+    // Single-encoder mask: bit 0 -> CRTC 0.
+    try testing.expectEqual(@as(?usize, 0), firstCrtcIndex(0b1, 4));
+    // Union of two encoders' masks (bits 0 and 2): first is CRTC 0.
+    try testing.expectEqual(@as(?usize, 0), firstCrtcIndex(0b101, 4));
+    // Only the sibling encoder drives CRTC 2 (the connector's own
+    // encoder reported 0): fallback must still find it.
+    try testing.expectEqual(@as(?usize, 2), firstCrtcIndex(0b100, 4));
+    // Bit 3 is within a 4-CRTC device: index 3 is valid.
+    try testing.expectEqual(@as(?usize, 3), firstCrtcIndex(0b1000, 4));
+    // Mask allows CRTCs past the resources' count: out of range -> null.
+    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0b10000, 4));
+    // No CRTC reachable at all.
+    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0, 4));
+    // Zero resources -> null even with a full mask.
+    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0xFFFFFFFF, 0));
 }
 
 test "plane property name table" {

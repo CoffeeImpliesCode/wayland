@@ -25,9 +25,11 @@
 //! `pending`, wl_surface.commit applies it to `current`.
 //!
 //! Out of scope (compositor policy, decided by main.zig consumers):
-//! z-ordering/layout of layers against an output, keyboard-focus policy,
-//! xdg_popup parenting (get_popup is rejected with wlroots' raw -1 error;
-//! parenting is M4 for the popup module).
+//! z-ordering/layout of layers against an output (incl. the popup offset
+//! application), keyboard-focus policy. get_popup parenting is implemented
+//! (L1): the xdg_popup keeps its NULL xdg parent and is parented to this
+//! layer surface (XdgPopup.layer_parent = the layer wl_surface, wlroots
+//! parity), tracked here so unmap/destroy dismiss it with popup_done.
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
@@ -40,6 +42,9 @@ const role_mod = @import("../compositor/role.zig");
 const surface_mod = @import("../compositor/surface.zig");
 const compositor_mod = @import("../compositor/compositor.zig");
 const display_mod = @import("../core/display.zig");
+// Imported for get_popup: the xdg_popup role object the client created with
+// a NULL parent. xdg.zig does not import this module (no cycle).
+const xdg_mod = @import("xdg.zig");
 
 const log_tag = "layer";
 
@@ -164,7 +169,6 @@ fn layerShellGetLayerSurface(layer_shell: *server.zwlr.LayerShellV1, shell: *Lay
         .log_cfg = shell.log_cfg,
         .shell = shell,
         .resource = res,
-        .shell_resource = layer_shell,
         .surface = surface,
         .output = r.output,
         .namespace = null,
@@ -221,6 +225,12 @@ const LayerState = struct {
     /// Desired size from set_size (0 = the compositor assigns that axis).
     desired_width: u32 = 0,
     desired_height: u32 = 0,
+    /// Size of the last acked configure (wlroots pending.actual_width/height,
+    /// set at ack_configure from the configure list entry, applied to
+    /// `current` at the next commit). Lets the compositor compare what it
+    /// assigned vs what the client committed against (L6).
+    actual_width: u32 = 0,
+    actual_height: u32 = 0,
     /// Anchor bitfield (top=1, bottom=2, left=4, right=8).
     anchor: u32 = 0,
     /// Exclusive zone from set_exclusive_zone.
@@ -235,15 +245,38 @@ const LayerState = struct {
     layer: Layer = .background,
 };
 
+/// One sent configure: the serial plus the size it carried, so ack_configure
+/// can store the acked size (wlroots wlr_layer_surface_v1_configure).
+const Configure = struct {
+    serial: u32,
+    width: u32,
+    height: u32,
+};
+
+/// Per-popup destroy hook: prunes the popup from the layer surface's list
+/// when the client destroys the popup (or it dies with its wl_surface), so
+/// the list never holds a freed XdgPopup.
+const PopupLink = struct {
+    popup: *xdg_mod.XdgPopup,
+    ls: *LayerSurface,
+    destroy_listener: wire.Listener(*wire.Resource),
+
+    fn onDestroy(listener: *wire.Listener(*wire.Resource), res: *wire.Resource) void {
+        _ = res;
+        const link: *PopupLink = @fieldParentPtr("destroy_listener", listener);
+        if (std.mem.findScalar(*xdg_mod.XdgPopup, link.ls.popups.items, link.popup)) |i| {
+            _ = link.ls.popups.swapRemove(i);
+        }
+        link.ls.allocator.destroy(link);
+    }
+};
+
 pub const LayerSurface = struct {
     allocator: std.mem.Allocator,
     io: *std.Io,
     log_cfg: *const log.Config,
     shell: *LayerShell,
     resource: *server.zwlr.LayerSurfaceV1,
-    /// The zwlr_layer_shell_v1 resource of the creating client (same
-    /// client); hosts the shell error enum's invalid_layer error.
-    shell_resource: *server.zwlr.LayerShellV1,
     surface: *surface_mod.Surface,
     /// The output the client named (null = the compositor decides).
     output: ?*server.wl.Output = null,
@@ -256,54 +289,108 @@ pub const LayerSurface = struct {
     configure_sent: bool = false,
     /// Serial of the last configure event sent.
     configure_serial: u32 = 0,
-    /// Every configure serial sent since the last (re)map, in order, for
-    /// ack_configure validation (wlroots configure-list semantics).
-    sent_serials: std.ArrayList(u32) = .empty,
+    /// Every configure sent since the last (re)map, in order (serial + size),
+    /// for ack_configure validation and the acked-size storage (wlroots
+    /// configure-list semantics).
+    sent_serials: std.ArrayList(Configure) = .empty,
     /// Double-buffered layer state; requests write `pending`,
     /// wl_surface.commit applies it to `current`.
     pending: LayerState = .{},
     current: LayerState = .{},
+    /// The xdg_popups parented to this layer surface via get_popup, in
+    /// creation order. Dismissed (popup_done + role destroy) when the layer
+    /// surface resets or is destroyed (wlroots layer_surface_reset parity).
+    popups: std.ArrayList(*xdg_mod.XdgPopup) = .empty,
+    /// Compositor-assigned fallback for the zero desired dimensions,
+    /// supplied by main.zig (the output size) via setFallbackSize; the
+    /// initial configure carries it so clients asking for an auto-assigned
+    /// size learn their real size (L2; the protocol: "the compositor will
+    /// assign it and inform you of the assignment in the configure event").
+    fallback_width: u32 = 0,
+    fallback_height: u32 = 0,
     /// `closed` was sent; the object is inert.
     closed: bool = false,
     events: struct {
         destroy: wire.Signal(*LayerSurface),
     },
 
-    /// Send layer_surface.configure with the desired size (0,0 = client
-    /// decides) and record the serial for ack_configure validation.
+    /// Send layer_surface.configure with the size the compositor assigns:
+    /// the desired size per axis, or the compositor-supplied fallback (the
+    /// output size from main.zig) where the client left the dimension 0.
+    /// The serial + size are recorded for ack_configure validation (L6).
     fn sendConfigure(ls: *LayerSurface) void {
         const serial = ls.shell.display.nextSerial();
-        ls.resource.sendConfigure(serial, ls.current.desired_width, ls.current.desired_height);
+        const width: u32 = if (ls.current.desired_width == 0) ls.fallback_width else ls.current.desired_width;
+        const height: u32 = if (ls.current.desired_height == 0) ls.fallback_height else ls.current.desired_height;
+        ls.resource.sendConfigure(serial, width, height);
         ls.configure_serial = serial;
         ls.configure_sent = true;
-        ls.sent_serials.append(ls.allocator, serial) catch {
+        ls.sent_serials.append(ls.allocator, .{ .serial = serial, .width = width, .height = height }) catch {
             ls.resource.postNoMemory();
         };
         log.info("layer surface configure serial={d} {d}x{d}", ls.io, ls.log_cfg, log_tag, .{
             serial,
-            ls.current.desired_width,
-            ls.current.desired_height,
+            width,
+            height,
         });
     }
 
     /// Handle layer_surface.ack_configure. The serial must be one we sent
     /// (present in the sent list); acking removes it and every older serial
-    /// (wlroots configure-list semantics: only the last configure matters).
+    /// (wlroots configure-list semantics: only the last configure matters)
+    /// and stores the acked configure's size so the compositor can read the
+    /// size the client committed against (L6, wlroots
+    /// layer_surface_handle_ack_configure: pending.actual_width/height).
     fn ackConfigure(ls: *LayerSurface, serial: u32) void {
-        if (std.mem.indexOfScalar(u32, ls.sent_serials.items, serial) == null) {
+        var acked: ?Configure = null;
+        for (ls.sent_serials.items) |c| {
+            if (c.serial == serial) {
+                acked = c;
+                break;
+            }
+        }
+        if (acked == null) {
             ls.resource.postError(.invalid_surface_state, "wrong configure serial");
             return;
         }
-        while (ls.sent_serials.items.len > 0 and ls.sent_serials.items[0] <= serial) {
+        while (ls.sent_serials.items.len > 0 and ls.sent_serials.items[0].serial <= serial) {
             _ = ls.sent_serials.orderedRemove(0);
         }
+        ls.pending.actual_width = acked.?.width;
+        ls.pending.actual_height = acked.?.height;
         ls.configured = true;
-        log.info("layer surface configured serial={d}", ls.io, ls.log_cfg, log_tag, .{serial});
+        log.info("layer surface configured serial={d} {d}x{d}", ls.io, ls.log_cfg, log_tag, .{
+            serial,
+            acked.?.width,
+            acked.?.height,
+        });
+    }
+
+    /// Supply the compositor-assigned fallback size (the output size in
+    /// main.zig); zero desired dimensions in the configure are replaced with
+    /// it (L2). Replaced by the client's desired size once set.
+    pub fn setFallbackSize(ls: *LayerSurface, width: u32, height: u32) void {
+        ls.fallback_width = width;
+        ls.fallback_height = height;
     }
 
     /// Reset to the initial (post-get_layer_surface) state: a fresh
     /// buffer-less commit + configure + ack are required to map again.
+    /// The layer state (size/anchor/margins/zone/layer) is deliberately KEPT:
+    /// wlroots layer_surface_reset (wlr_layer_shell_v1.c:33-46) also keeps
+    /// it, both diverging from the XML's "returns to the state it had right
+    /// after get_layer_surface" (L5, verified 2026-08-10; smithay/KWin do
+    /// reset the state, which is the divergence).
     fn reset(ls: *LayerSurface) void {
+        // The parented popups die with the layer surface: popup_done, then
+        // destroy the role object (wlroots layer_surface_reset destroys the
+        // popups the same way). The per-popup destroy listener prunes the
+        // list as each resource goes away.
+        while (ls.popups.items.len > 0) {
+            const popup = ls.popups.items[0];
+            popup.sendPopupDone();
+            popup.resource.destroy();
+        }
         ls.configured = false;
         ls.configure_sent = false;
         ls.sent_serials.clearRetainingCapacity();
@@ -355,14 +442,44 @@ pub const LayerSurface = struct {
         ls.pending.keyboard_interactive = @intCast(v);
     }
 
-    /// Handle get_popup. xdg_popup parenting from layer surfaces is out of
-    /// scope (M4 for the popup module); the XML requires a popup with a NULL
-    /// parent and get_popup before its initial commit. Reject with wlroots'
-    /// raw -1 implementation error and do not create anything.
-    fn getPopup(ls: *LayerSurface, popup: *server.xdg.Popup) void {
-        _ = popup;
-        const raw: *wire.Resource = @ptrCast(ls.resource);
-        raw.postError(@bitCast(@as(i32, -1)), "xdg_popup on a layer surface is not supported");
+    /// Handle get_popup. The client created the xdg_popup via
+    /// xdg_surface.get_popup with a NULL parent (xdg-shell.xml: "If null is
+    /// passed as a parent, a parent surface must be specified using some
+    /// other protocol, before committing the initial state"); this request
+    /// makes the layer surface that parent (wlroots
+    /// layer_surface_handle_get_popup sets popup->parent to the layer
+    /// surface's wl_surface, inserts it into the layer surface's popups list
+    /// and emits new_popup). The popup is dismissed with the layer surface
+    /// (see reset). An already-parented popup is an implementation error
+    /// (raw -1 on the layer surface resource, wlroots).
+    fn getPopup(ls: *LayerSurface, popup_res: *server.xdg.Popup) void {
+        const popup: *xdg_mod.XdgPopup = @ptrCast(@alignCast(popup_res.getUserData() orelse return));
+        if (popup.parent != null or popup.layer_parent != null) {
+            const raw: *wire.Resource = @ptrCast(ls.resource);
+            raw.postError(@bitCast(@as(i32, -1)), "xdg_popup already has a parent");
+            return;
+        }
+        popup.layer_parent = ls.surface;
+        const link = ls.allocator.create(PopupLink) catch {
+            ls.resource.postNoMemory();
+            return;
+        };
+        link.* = .{
+            .popup = popup,
+            .ls = ls,
+            .destroy_listener = wire.Listener(*wire.Resource).init(PopupLink.onDestroy),
+        };
+        ls.popups.append(ls.allocator, popup) catch {
+            ls.allocator.destroy(link);
+            ls.resource.postNoMemory();
+            return;
+        };
+        const raw_popup: *wire.Resource = @ptrCast(popup_res);
+        raw_popup.addDestroyListener(&link.destroy_listener);
+        log.info("xdg_popup {*} parented to layer surface on wl_surface {*}", ls.io, ls.log_cfg, log_tag, .{
+            popup,
+            ls.surface,
+        });
     }
 };
 
@@ -392,6 +509,17 @@ fn layerSurfaceRequest(
     switch (request) {
         .destroy => ls.close(),
         .set_size => |r| {
+            // wlroots rejects sizes beyond INT32_MAX with an implementation
+            // error (wlr_layer_shell_v1.c:128-151; the XML defines no error
+            // code for it) and skips the state write when nothing changed.
+            // wlroots posts client-level; ours posts raw -1 on the surface
+            // resource (the codebase's implementation-error pattern).
+            if (r.width > std.math.maxInt(i32) or r.height > std.math.maxInt(i32)) {
+                const raw: *wire.Resource = @ptrCast(ls.resource);
+                raw.postError(@bitCast(@as(i32, -1)), "size out of bounds");
+                return;
+            }
+            if (ls.pending.desired_width == r.width and ls.pending.desired_height == r.height) return;
             ls.pending.desired_width = r.width;
             ls.pending.desired_height = r.height;
         },
@@ -412,19 +540,26 @@ fn layerSurfaceRequest(
         .ack_configure => |r| ls.ackConfigure(r.serial),
         .set_layer => |r| {
             if (!layerIsValid(@intFromEnum(r.layer))) {
-                // invalid_layer lives on the shell error enum; post it on the
-                // shell resource (its XML home). wlroots posts on the surface
-                // resource instead (types/wlr_layer_shell_v1.c XXX comment).
-                ls.shell_resource.postError(.invalid_layer, "invalid layer value");
+                // invalid_layer lives on the shell error enum, but wlroots,
+                // smithay and KWin all post it on the layer-surface resource
+                // ("XXX: this sends a zwlr_layer_shell_v1 error to a
+                // zwlr_layer_surface_v1 object", wlr_layer_shell_v1.c:260);
+                // GTK-style clients expect it there. L4, 2026-08-10.
+                const raw: *wire.Resource = @ptrCast(ls.resource);
+                raw.postError(@intFromEnum(server.zwlr.LayerShellV1.Error.invalid_layer), "invalid layer value");
                 return;
             }
             ls.pending.layer = r.layer;
         },
         .set_exclusive_edge => |r| {
             const bits: u32 = @bitCast(r.edge);
-            // The edge must be a single anchor bit: an edge "the surface is
-            // anchored to" (XML) — one bit disambiguates a corner.
-            if (bits == 0 or (bits & (bits - 1)) != 0 or (bits & ~anchor_mask) != 0) {
+            // wlroots accepts any valid anchor bitset here
+            // (zwlr_layer_surface_v1_anchor_is_valid, wlr_layer_shell_v1.c:284)
+            // and defers the subset-of-anchor check to commit (L7, 2026-08-10:
+            // matched to wlroots per the task brief; smithay/KWin keep the
+            // stricter single-bit rule). A corner value with matching anchors
+            // is accepted and simply occupies no exclusive edge.
+            if ((bits & ~anchor_mask) != 0) {
                 ls.resource.postError(.invalid_exclusive_edge, "invalid exclusive edge");
                 return;
             }
@@ -446,11 +581,15 @@ fn layerSurfaceDestroy(res: *server.zwlr.LayerSurfaceV1, ls: *LayerSurface) void
         surface.role_resource = null;
     }
     ls.unmapSurface();
+    // The parented popups are dismissed with the layer surface (popup_done +
+    // role destroy, same as the unmap reset).
+    ls.reset();
     ls.events.destroy.emit(ls);
     if (std.mem.findScalar(*LayerSurface, shell.layer_surfaces.items, ls)) |i| {
         _ = shell.layer_surfaces.swapRemove(i);
     }
     ls.sent_serials.deinit(shell.allocator);
+    ls.popups.deinit(shell.allocator);
     if (ls.namespace) |ns| shell.allocator.free(ns);
     shell.allocator.destroy(ls);
 }
@@ -477,7 +616,10 @@ fn layerSurfaceClientCommit(surface: *surface_mod.Surface) void {
     // Protocol: attaching a buffer before the surface is ever configured is
     // an error. already_constructed is in the shell error enum (the surface
     // enum has no code for it); wlroots posts it on the layer surface.
-    if (!ls.configured and surface.current.buffer != null) {
+    // The check reads the PENDING buffer: the client_commit hook runs before
+    // the pending->current swap (wlroots layer_surface_role_client_commit
+    // checks wlr_surface->pending; W2 F36 moved the hook pre-swap).
+    if (!ls.configured and surface.pending.buffer != null) {
         const raw: *wire.Resource = @ptrCast(ls.resource);
         raw.postError(
             @intFromEnum(server.zwlr.LayerShellV1.Error.already_constructed),
@@ -570,6 +712,7 @@ const RegistryCapture = struct {
     compositor_name: ?u32 = null,
     layer_shell_name: ?u32 = null,
     shm_name: ?u32 = null,
+    wm_base_name: ?u32 = null,
 
     fn listener(registry: *client.wl.Registry, event: client.wl.Registry.Event, data: *RegistryCapture) void {
         _ = registry;
@@ -582,6 +725,8 @@ const RegistryCapture = struct {
                     data.layer_shell_name = g.name;
                 } else if (std.mem.eql(u8, name, "wl_shm")) {
                     data.shm_name = g.name;
+                } else if (std.mem.eql(u8, name, "xdg_wm_base")) {
+                    data.wm_base_name = g.name;
                 }
             },
             .global_remove => {},
@@ -624,6 +769,56 @@ const NewLayerSurfaceCapture = struct {
     }
 };
 
+const ProtocolError = struct { code: c_int, interface: []const u8, id: u32 };
+
+/// The client-side record of the last protocol error (interface + code),
+/// for asserting which resource an error was posted on.
+fn protocolError(ts: *TestServer) ProtocolError {
+    var interface: ?*client.wl.Interface = null;
+    var id: u32 = 0;
+    const code = wl_display_get_protocol_error(ts.c_display.?, @ptrCast(&interface), &id);
+    const name = if (interface) |i| std.mem.span(i.name) else "";
+    return .{ .code = code, .interface = name, .id = id };
+}
+
+/// xdg_surface.configure capture (the popup's xdg_surface), for acking the
+/// popup configure in the layer-popup roundtrip.
+const XdgSurfaceEvents = struct {
+    configure_count: usize = 0,
+    serial: u32 = 0,
+
+    fn listener(xdg_surface: *client.xdg.Surface, event: client.xdg.Surface.Event, data: *XdgSurfaceEvents) void {
+        _ = xdg_surface;
+        switch (event) {
+            .configure => |c| {
+                data.configure_count += 1;
+                data.serial = c.serial;
+            },
+        }
+    }
+};
+
+/// xdg_popup.configure/popup_done capture for the layer-popup roundtrip.
+const PopupEvents = struct {
+    configure_count: usize = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    done_count: usize = 0,
+
+    fn listener(popup: *client.xdg.Popup, event: client.xdg.Popup.Event, data: *PopupEvents) void {
+        _ = popup;
+        switch (event) {
+            .configure => |c| {
+                data.configure_count += 1;
+                data.width = c.width;
+                data.height = c.height;
+            },
+            .popup_done => data.done_count += 1,
+            .repositioned => {},
+        }
+    }
+};
+
 /// A full compositor + layer shell + in-memory client, for wire roundtrips.
 const TestServer = struct {
     allocator: std.mem.Allocator,
@@ -632,11 +827,14 @@ const TestServer = struct {
     display: ?*display_mod.CompositorDisplay = null,
     compositor: ?*compositor_mod.Compositor = null,
     shell: ?*LayerShell = null,
+    /// xdg_wm_base (for the get_popup layer-popup tests).
+    xdg_shell: ?*xdg_mod.XdgShell = null,
     client: ?*wire.Client = null,
     c_display: ?*client.wl.Display = null,
     wl_compositor: ?*client.wl.Compositor = null,
     wl_shm: ?*client.wl.Shm = null,
     layer_shell: ?*client.zwlr.LayerShellV1 = null,
+    wm_base: ?*client.xdg.WmBase = null,
 
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, compositor and shell all store it).
@@ -663,6 +861,9 @@ const TestServer = struct {
         try ts.display.?.initShm();
         ts.shell = try LayerShell.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, ts.compositor.?);
         errdefer if (ts.shell) |s| s.deinit();
+        // xdg_wm_base: only the layer-popup (get_popup) tests use it.
+        ts.xdg_shell = try xdg_mod.XdgShell.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, ts.compositor.?);
+        errdefer if (ts.xdg_shell) |s| s.deinit();
 
         // In-memory client connection: one socketpair end for the server, the
         // other for the client library.
@@ -677,14 +878,20 @@ const TestServer = struct {
         var capture: RegistryCapture = .{};
         registry.setListener(*RegistryCapture, RegistryCapture.listener, &capture);
         try ts.pump();
-        if (capture.compositor_name == null or capture.layer_shell_name == null or capture.shm_name == null) {
+        if (capture.compositor_name == null or
+            capture.layer_shell_name == null or
+            capture.shm_name == null or
+            capture.wm_base_name == null)
+        {
             return error.GlobalMissing;
         }
 
-        // Round 2: bind wl_compositor, wl_shm and zwlr_layer_shell_v1.
+        // Round 2: bind wl_compositor, wl_shm, zwlr_layer_shell_v1 and
+        // xdg_wm_base.
         ts.wl_compositor = try registry.bind(capture.compositor_name.?, client.wl.Compositor, 7);
         ts.wl_shm = try registry.bind(capture.shm_name.?, client.wl.Shm, 1);
         ts.layer_shell = try registry.bind(capture.layer_shell_name.?, client.zwlr.LayerShellV1, layer_shell_version);
+        ts.wm_base = try registry.bind(capture.wm_base_name.?, client.xdg.WmBase, 7);
         try ts.pump();
         return ts;
     }
@@ -693,6 +900,7 @@ const TestServer = struct {
         if (ts.c_display) |d| d.disconnect();
         if (ts.client) |c| c.destroy();
         if (ts.shell) |s| s.deinit();
+        if (ts.xdg_shell) |s| s.deinit();
         if (ts.compositor) |c| c.deinit();
         if (ts.display) |d| d.deinit();
         const allocator = ts.allocator;
@@ -992,4 +1200,285 @@ test "layer surface v3 client: legacy flow, set_layer, keyboard interactivity co
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), ls_events.closed_count);
     try std.testing.expectEqual(@as(usize, 1), ls_events.configure_count);
+}
+
+test "layer surface: get_popup parents a NULL-parent xdg_popup; layer unmap dismisses it" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // Map the layer surface normally first (unmap-reset only runs once a
+    // configure was sent).
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+    layer_surface.setAnchor(@bitCast(anchor_top | anchor_bottom | anchor_left | anchor_right));
+    try ts.pump();
+    const ls = ts.shell.?.layer_surfaces.items[0];
+    wl_surface.commit();
+    try ts.pump();
+    const layer_serial = ls.configure_serial;
+    layer_surface.ackConfigure(layer_serial);
+    const layer_buffer = try createShmBuffer(ts);
+    wl_surface.attach(layer_buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(ls.surface.mapped);
+
+    // The popup: its own wl_surface + xdg_surface, get_popup with NULL
+    // parent, then layer_surface.get_popup before the popup's first commit.
+    const popup_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(popup_surface);
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 10, 20, 20);
+    const popup = try xdg_surface.getPopup(null, positioner);
+    var popup_events: PopupEvents = .{};
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    var xdg_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xdg_events);
+    try ts.pump();
+
+    layer_surface.getPopup(popup);
+    try ts.pump();
+
+    // The layer surface is now the popup's parent: the popup keeps its NULL
+    // xdg parent and is tracked for dismissal.
+    try std.testing.expectEqual(@as(usize, 1), ls.popups.items.len);
+    const server_popup = ls.popups.items[0];
+    try std.testing.expect(server_popup.parent == null);
+    try std.testing.expect(server_popup.layer_parent != null);
+    try std.testing.expectEqual(ls.surface, server_popup.layer_parent.?);
+
+    // The popup's first buffer-less commit triggers popup.configure (with the
+    // positioner geometry) + xdg_surface.configure.
+    popup_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), popup_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 1), xdg_events.configure_count);
+    try std.testing.expectEqual(@as(i32, 100), popup_events.width);
+    try std.testing.expectEqual(@as(i32, 50), popup_events.height);
+
+    // Ack + buffer commit maps the popup.
+    xdg_surface.ackConfigure(xdg_events.serial);
+    const popup_buffer = try createShmBuffer(ts);
+    popup_surface.attach(popup_buffer, 0, 0);
+    popup_surface.commit();
+    try ts.pump();
+    try std.testing.expect(server_popup.xdg_surface.surface.mapped);
+
+    // Unmapping the layer surface dismisses the popup with it: popup_done,
+    // then the popup role object goes away (wlroots layer_surface_reset).
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
+    try std.testing.expectEqual(@as(usize, 0), ls.popups.items.len);
+    try std.testing.expect(!server_popup.xdg_surface.surface.mapped);
+}
+
+test "layer surface: get_popup on an already-parented xdg_popup posts -1" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // A toplevel to serve as the popup's xdg parent.
+    const parent_wl = try ts.wl_compositor.?.createSurface();
+    const parent_xdg = try ts.wm_base.?.getXdgSurface(parent_wl);
+    _ = try parent_xdg.getToplevel();
+    try ts.pump();
+
+    const popup_wl = try ts.wl_compositor.?.createSurface();
+    const popup_xdg = try ts.wm_base.?.getXdgSurface(popup_wl);
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(0, 0, 10, 10);
+    const popup = try popup_xdg.getPopup(parent_xdg, positioner);
+    try ts.pump();
+
+    // The popup already has an xdg parent: wlroots posts raw -1 on the
+    // layer-surface resource ("xdg_popup already has a parent").
+    const layer_wl = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell.?.getLayerSurface(layer_wl, null, .top, "test");
+    try ts.pump();
+    layer_surface.getPopup(popup);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, -1), err.code);
+    try std.testing.expectEqualStrings("zwlr_layer_surface_v1", err.interface);
+}
+
+test "layer surface: initial configure carries the assigned fallback size" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+    var ls_events: LayerSurfaceEvents = .{};
+    layer_surface.setListener(*LayerSurfaceEvents, LayerSurfaceEvents.listener, &ls_events);
+    layer_surface.setAnchor(@bitCast(anchor_top | anchor_bottom | anchor_left | anchor_right));
+    // Width 0 = compositor assigns (the output width from main.zig); height
+    // 100 stays the client's desired size.
+    layer_surface.setSize(0, 100);
+    try ts.pump();
+    const ls = ts.shell.?.layer_surfaces.items[0];
+    ls.setFallbackSize(640, 30);
+
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ls_events.configure_count);
+    try std.testing.expectEqual(@as(u32, 640), ls_events.width);
+    try std.testing.expectEqual(@as(u32, 100), ls_events.height);
+}
+
+test "layer surface: set_size beyond INT32_MAX is an implementation error" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+    try ts.pump();
+
+    const too_big: u32 = @as(u32, @intCast(std.math.maxInt(i32))) + 1;
+    layer_surface.setSize(too_big, 0);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, -1), err.code);
+    try std.testing.expectEqualStrings("zwlr_layer_surface_v1", err.interface);
+    // The error fires before any state write (the guard returns first), and
+    // posting it destroys the client (libwayland-server tears down errored
+    // clients after the dispatch), so no server-side state survives to read.
+}
+
+test "layer surface: repeated identical set_size is a no-op" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+    try ts.pump();
+    const ls = ts.shell.?.layer_surfaces.items[0];
+
+    // The second identical set_size is a no-op (no error, state unchanged);
+    // the surface stays usable and the commit goes through.
+    layer_surface.setSize(100, 50);
+    layer_surface.setSize(100, 50);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 100), ls.pending.desired_width);
+    try std.testing.expectEqual(@as(u32, 50), ls.pending.desired_height);
+
+    layer_surface.setAnchor(@bitCast(anchor_top | anchor_bottom | anchor_left | anchor_right));
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 100), ls.current.desired_width);
+    try std.testing.expectEqual(@as(u32, 50), ls.current.desired_height);
+}
+
+test "layer surface: invalid set_layer posts invalid_layer on the surface resource" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+    try ts.pump();
+
+    // 99 is outside {background..overlay}: invalid_layer (1), posted on the
+    // LAYER SURFACE resource (wlroots/smithay/KWin parity, L4).
+    layer_surface.setLayer(@enumFromInt(99));
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 1), err.code);
+    try std.testing.expectEqualStrings("zwlr_layer_surface_v1", err.interface);
+}
+
+test "layer surface: ack_configure stores the actual configure size" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+    var ls_events: LayerSurfaceEvents = .{};
+    layer_surface.setListener(*LayerSurfaceEvents, LayerSurfaceEvents.listener, &ls_events);
+    layer_surface.setAnchor(@bitCast(anchor_top | anchor_bottom | anchor_left | anchor_right));
+    try ts.pump();
+    const ls = ts.shell.?.layer_surfaces.items[0];
+    ls.setFallbackSize(640, 30);
+
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 640), ls_events.width);
+    try std.testing.expectEqual(@as(u32, 30), ls_events.height);
+    const serial = ls_events.serial;
+
+    layer_surface.ackConfigure(serial);
+    try ts.pump();
+    // The acked configure's size lands in pending at ack (wlroots parity)...
+    try std.testing.expectEqual(@as(u32, 640), ls.pending.actual_width);
+    try std.testing.expectEqual(@as(u32, 30), ls.pending.actual_height);
+
+    // ...and in current once the buffer commit applies the double-buffered
+    // state, so the compositor can read the size the client committed
+    // against.
+    const buffer = try createShmBuffer(ts);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 640), ls.current.actual_width);
+    try std.testing.expectEqual(@as(u32, 30), ls.current.actual_height);
+    try std.testing.expect(ls.surface.mapped);
+}
+
+test "layer surface: set_exclusive_edge accepts valid anchor subsets (wlroots parity)" {
+    const allocator = std.testing.allocator;
+    {
+        // A corner (multi-bit) value is accepted at request time; with
+        // matching anchors the commit goes through.
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const wl_surface = try ts.wl_compositor.?.createSurface();
+        const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+        layer_surface.setAnchor(@bitCast(anchor_top | anchor_bottom | anchor_left | anchor_right));
+        layer_surface.setExclusiveEdge(@bitCast(anchor_top | anchor_left));
+        try ts.pump();
+        const ls = ts.shell.?.layer_surfaces.items[0];
+        try std.testing.expectEqual(@as(u32, anchor_top | anchor_left), ls.pending.exclusive_edge);
+        wl_surface.commit();
+        try ts.pump();
+        try std.testing.expectEqual(@as(u32, anchor_top | anchor_left), ls.current.exclusive_edge);
+    }
+    {
+        // An out-of-mask bit is still invalid_exclusive_edge (4).
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const wl_surface = try ts.wl_compositor.?.createSurface();
+        const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+        try ts.pump();
+        layer_surface.setExclusiveEdge(@bitCast(@as(u32, 0x10)));
+        try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+        const err = protocolError(ts);
+        try std.testing.expectEqual(@as(c_int, 4), err.code);
+        try std.testing.expectEqualStrings("zwlr_layer_surface_v1", err.interface);
+    }
+    {
+        // A valid edge not covered by the anchors still errors at commit
+        // (the subset check stayed at commit time, wlroots order).
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const wl_surface = try ts.wl_compositor.?.createSurface();
+        const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+        // left|right only: a top edge is not part of the anchor.
+        layer_surface.setAnchor(@bitCast(anchor_left | anchor_right));
+        layer_surface.setSize(100, 100);
+        layer_surface.setExclusiveEdge(@bitCast(anchor_top));
+        try ts.pump();
+        wl_surface.commit();
+        try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+        const err = protocolError(ts);
+        try std.testing.expectEqual(@as(c_int, 4), err.code);
+        try std.testing.expectEqualStrings("zwlr_layer_surface_v1", err.interface);
+    }
 }

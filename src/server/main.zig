@@ -94,6 +94,10 @@ const output_width: i32 = 1280;
 const output_height: i32 = 720;
 const output_refresh_msec: i32 = 16;
 const watchdog_timeout_ms: u64 = 5000;
+/// xdg_wm_base ping policy (F3): ping every live client every 5s; a ping
+/// still unanswered 5s later (the next tick) posts the unresponsive error
+/// (error code 6), which disconnects the client.
+const xdg_ping_interval_ms: u64 = 5000;
 /// Background color (straight alpha RGBA).
 const background_color = [4]f32{ 0.1, 0.1, 0.12, 1.0 };
 /// Fallback cursor: a small light rect when no client cursor surface.
@@ -127,6 +131,12 @@ const SurfaceEntry = struct {
     node: ?*wayland.scene.SceneNode = null,
     commit_listener: wire.Listener(*Surface),
     destroy_listener: wire.Listener(*Surface),
+    /// wl_surface.unmap signal listener: drops the scene node when the
+    /// surface stops being mapped. Covers the forced-unmap path (a
+    /// destroyed wl_subsurface unmaps its child, note 132 F6) that has
+    /// no commit to carry it; idempotent with onSurfaceCommit's
+    /// updateSurfaceNode (removeSurfaceNode nulls the node/tree slots).
+    unmap_listener: wire.Listener(*Surface),
     /// wl_surface.enter/leave signal listeners (the surface module emits
     /// the signals on output enter/leave; these send the wire events).
     enter_listener: wire.Listener(*wayland.output.Output),
@@ -210,6 +220,9 @@ const ServerState = struct {
     loop: ?*zio.ev.Loop = null,
     /// One-shot watchdog timer, re-armed on every render.
     watchdog: ?*zio.ev.Timer = null,
+    /// Repeating xdg_wm_base ping timer (F3): pings every live client;
+    /// an unanswered ping on the next tick posts the unresponsive error.
+    ping_timer: ?*zio.ev.Timer = null,
     /// Whether the watchdog is active (WAYLAND_WATCHDOG_DISABLE unset).
     /// Guards BOTH the initial loop.add and the renderFrame re-arm: zio's
     /// setTimer arms an un-armed timer, so a re-arm on a disabled watchdog
@@ -300,6 +313,7 @@ const ServerState = struct {
     frame_listener: wire.Listener(*wayland.output.Output),
     new_toplevel_listener: wire.Listener(*wayland.shell.XdgToplevel),
     new_popup_listener: wire.Listener(*wayland.shell.XdgPopup),
+    new_activation_token_listener: wire.Listener(*wayland.xdg_activation.ActivationToken),
     new_layer_surface_listener: wire.Listener(*wayland.layer_shell.LayerSurface),
     request_activate_listener: wire.Listener(*wayland.xdg_activation.ActivateRequest),
     request_mode_listener: wire.Listener(*wayland.xdg_decoration.RequestMode),
@@ -373,6 +387,12 @@ pub fn main(init: std.process.Init) !void {
     // M3: the seat (keyboard + pointer) with the xkbcommon us keymap.
     const seat = try wayland.seat.Seat.init(allocator, io, &log_cfg, display);
     defer seat.deinit();
+    // F10: runtime layout selection (WAYLAND_KEYBOARD_LAYOUT, default
+    // "us" compiled by Seat.init) — recompiles the keymap and
+    // re-broadcasts it before any client binds.
+    if (init.environ_map.get("WAYLAND_KEYBOARD_LAYOUT")) |layout| {
+        seat.setKeyboardLayout(layout);
+    }
     // xdg_activation_v1 (staging): activation tokens for focus requests
     // (needs the seat for serial/focus validation).
     const xdg_activation = try wayland.xdg_activation.XdgActivation.init(
@@ -534,6 +554,8 @@ pub fn main(init: std.process.Init) !void {
         .new_layer_surface_listener = wire.Listener(*wayland.layer_shell.LayerSurface).init(onNewLayerSurface),
         .request_activate_listener = wire.Listener(*wayland.xdg_activation.ActivateRequest).init(onRequestActivate),
         .request_mode_listener = wire.Listener(*wayland.xdg_decoration.RequestMode).init(onDecorationMode),
+        .new_activation_token_listener = wire.Listener(*wayland.xdg_activation.ActivationToken)
+            .init(onNewActivationToken),
         .seat_key_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKey),
         .seat_button_listener = wire.Listener(*wayland.seat.Seat).init(onSeatButton),
         .seat_pointer_move_listener = wire.Listener(*wayland.seat.Seat).init(onSeatPointerMove),
@@ -568,8 +590,11 @@ pub fn main(init: std.process.Init) !void {
     seat.events.pointer_move.add(&state.seat_pointer_move_listener);
     seat.events.axis.add(&state.seat_axis_listener);
     // xdg_activation_v1: activation requests with known tokens (focus
-    // policy is out of scope — the handler logs and accepts).
+    // policy is out of scope — the handler logs and accepts) and the
+    // token-creation hook (XA-1; the compositor can observe allowlists /
+    // telemetry).
     xdg_activation.events.request_activate.add(&state.request_activate_listener);
+    xdg_activation.events.new_token.add(&state.new_activation_token_listener);
     // zxdg_decoration_manager_v1: mode requests; the handler replies with
     // the effective mode via sendConfigure.
     xdg_decoration.events.request_mode.add(&state.request_mode_listener);
@@ -578,6 +603,8 @@ pub fn main(init: std.process.Init) !void {
     seat.setPick(pickSurface, &state);
 
     // zwlr_screencopy_v1: captures the compositor framebuffer (shm only).
+    // The copy is deferred to the next output commit; requestFrame wakes
+    // the renderer so a pending copy gets its commit.
     state.screencopy = try wayland.screencopy.Screencopy.init(
         allocator,
         io,
@@ -586,9 +613,9 @@ pub fn main(init: std.process.Init) !void {
         shm_state,
         getFramebuffer,
         &state,
-        ownsOutput,
+        outputFromResource,
         &state,
-        captureClock,
+        requestFrame,
         &state,
     );
     defer if (state.screencopy) |sc| sc.deinit();
@@ -666,6 +693,15 @@ pub fn main(init: std.process.Init) !void {
     const watchdog_disabled = init.environ_map.get("WAYLAND_WATCHDOG_DISABLE") != null;
     state.watchdog_enabled = !watchdog_disabled;
     if (!watchdog_disabled) loop.add(&watchdog.c);
+
+    // xdg_wm_base ping policy (F3): a repeating timer re-arms itself in
+    // onPingTick; each tick pings every live client and declares clients
+    // unresponsive (error 6) when the previous ping went unanswered.
+    var ping_timer = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(xdg_ping_interval_ms) });
+    ping_timer.c.userdata = &state;
+    ping_timer.c.callback = onPingTick;
+    state.ping_timer = &ping_timer;
+    loop.add(&ping_timer.c);
 
     try backend.start(); // fires new_output; the headless timer paces frames
     if (input_backend) |ib| try ib.start();
@@ -817,6 +853,72 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
     cursor_buf.pickable = false;
     cursor_buf.enable(false);
     self.cursor_buf_node = cursor_buf;
+
+    // Enable the output up front: sendFrame gates the frame signal on
+    // enabled (wlroots output.c:833-837), so the first requestRender
+    // would otherwise never emit and the first frame would never render.
+    // This enable-only commit sets no frame_pending (no frame event is
+    // owed); the first buffer commit starts the frame chain.
+    var init_state = wayland.output.Output.State.init(self.allocator);
+    defer init_state.deinit();
+    init_state.committed = wayland.output.Output.State.committed_enabled |
+        wayland.output.Output.State.committed_mode;
+    init_state.enabled = true;
+    init_state.mode = .{ .width = out.mode.width, .height = out.mode.height, .refresh_msec = out.mode.refresh_msec };
+    out.commitState(&init_state) catch |err| {
+        log.err("output enable commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+}
+
+/// Per-toplevel listeners owned by main.zig (F10/F14): title/app_id change
+/// events, the minimize request, and the destroy event that frees this
+/// struct. Freed from the destroy handler (the module emits it before the
+/// role object is freed). `state` back-references the ServerState for the
+/// log config.
+const ToplevelListeners = struct {
+    state: *ServerState,
+    set_title: wire.Listener(*wayland.shell.XdgToplevel),
+    set_app_id: wire.Listener(*wayland.shell.XdgToplevel),
+    request_minimize: wire.Listener(*wayland.shell.XdgToplevel),
+    request_fullscreen: wire.Listener(*wayland.shell.FullscreenRequest),
+    destroy: wire.Listener(*wayland.shell.XdgToplevel),
+};
+
+fn onToplevelTitle(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
+    const tl: *ToplevelListeners = @fieldParentPtr("set_title", listener);
+    log.info("toplevel title changed: {s}", tl.state.io, tl.state.log_cfg, "server", .{t.title orelse "(none)"});
+}
+
+fn onToplevelAppId(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
+    const tl: *ToplevelListeners = @fieldParentPtr("set_app_id", listener);
+    log.info("toplevel app_id changed: {s}", tl.state.io, tl.state.log_cfg, "server", .{t.app_id orelse "(none)"});
+}
+
+fn onToplevelMinimize(listener: *wire.Listener(*wayland.shell.XdgToplevel), _: *wayland.shell.XdgToplevel) void {
+    const tl: *ToplevelListeners = @fieldParentPtr("request_minimize", listener);
+    log.info("toplevel minimize requested", tl.state.io, tl.state.log_cfg, "server", .{});
+}
+
+fn onToplevelFullscreen(
+    listener: *wire.Listener(*wayland.shell.FullscreenRequest),
+    req: *wayland.shell.FullscreenRequest,
+) void {
+    const tl: *ToplevelListeners = @fieldParentPtr("request_fullscreen", listener);
+    // F10: the client-named fullscreen output reaches the compositor.
+    log.info(
+        "toplevel fullscreen requested: {s}",
+        tl.state.io,
+        tl.state.log_cfg,
+        "server",
+        .{if (req.fullscreen) "on" else "off"},
+    );
+    _ = req.output;
+}
+
+fn onToplevelDestroy(listener: *wire.Listener(*wayland.shell.XdgToplevel), _: *wayland.shell.XdgToplevel) void {
+    const tl: *ToplevelListeners = @fieldParentPtr("destroy", listener);
+    tl.state.allocator.destroy(tl);
 }
 
 fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
@@ -824,6 +926,25 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
     self.toplevels.append(self.allocator, t) catch |err| {
         log.warn("failed to track toplevel: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
     };
+    // F10/F14: wire the per-toplevel change events; the listeners live in a
+    // heap struct freed by onToplevelDestroy.
+    const tl = self.allocator.create(ToplevelListeners) catch |err| {
+        log.warn("failed to allocate toplevel listeners: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    tl.* = .{
+        .state = self,
+        .set_title = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelTitle),
+        .set_app_id = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelAppId),
+        .request_minimize = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelMinimize),
+        .request_fullscreen = wire.Listener(*wayland.shell.FullscreenRequest).init(onToplevelFullscreen),
+        .destroy = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelDestroy),
+    };
+    t.events.set_title.add(&tl.set_title);
+    t.events.set_app_id.add(&tl.set_app_id);
+    t.events.request_minimize.add(&tl.request_minimize);
+    t.events.request_fullscreen.add(&tl.request_fullscreen);
+    t.events.destroy.add(&tl.destroy);
     log.info("new toplevel (title={s} app_id={s}) total={d}", self.io, self.log_cfg, "server", .{
         t.title orelse "(none)",
         t.app_id orelse "(none)",
@@ -838,8 +959,10 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
 /// module in reply to the client's first buffer-less commit (per the
 /// protocol: "the client must perform an initial commit without any buffer
 /// attached. The compositor will reply with a layer_surface.configure
-/// event"). Layer z-ordering and layout are compositor policy and are not
-/// implemented yet (see notes/129-layer-shell-impl.md).
+/// event"); the module carries the output size as the assigned size for the
+/// dimensions the client left at 0 (L2). Layer z-ordering and layout are
+/// compositor policy and are not implemented yet (see
+/// notes/129-layer-shell-impl.md).
 fn onNewLayerSurface(
     listener: *wire.Listener(*wayland.layer_shell.LayerSurface),
     ls: *wayland.layer_shell.LayerSurface,
@@ -848,6 +971,12 @@ fn onNewLayerSurface(
     self.layer_surfaces.append(self.allocator, ls) catch |err| {
         log.warn("failed to track layer surface: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
     };
+    // L2: the compositor assigns the real size for the zero desired
+    // dimensions — the (single) output's mode size is the fallback the
+    // module uses in the initial configure.
+    if (self.output) |out| {
+        ls.setFallbackSize(@intCast(out.mode.width), @intCast(out.mode.height));
+    }
     log.info("new layer surface (namespace={s} layer={d}) total={d}", self.io, self.log_cfg, "server", .{
         ls.namespace orelse "(none)",
         @intFromEnum(ls.current.layer),
@@ -857,6 +986,18 @@ fn onNewLayerSurface(
 
 fn onNewPopup(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.shell.XdgPopup) void {
     const self: *ServerState = @fieldParentPtr("new_popup_listener", listener);
+    // F1: the compositor supplies the usable area for popup placement —
+    // the (single) output's mode rect in parent-surface-local coords. The
+    // popup configure then applies the client's constraint_adjustment bits
+    // (flip/slide/resize) to stay inside it.
+    if (self.output) |out| {
+        p.setConstraintBox(.{
+            .x = 0,
+            .y = 0,
+            .width = out.mode.width,
+            .height = out.mode.height,
+        });
+    }
     log.info("new popup at {d},{d} {d}x{d}", self.io, self.log_cfg, "server", .{
         p.geometry.x, p.geometry.y, p.geometry.width, p.geometry.height,
     });
@@ -876,6 +1017,20 @@ fn onRequestActivate(
     });
 }
 
+/// xdg_activation_v1 events.new_token (XA-1): a client token was created
+/// and committed successfully. Informational — the compositor can enforce
+/// app_id allowlists or collect telemetry here (the token is already in
+/// the registry and will be consumed by a matching activate()).
+fn onNewActivationToken(
+    listener: *wire.Listener(*wayland.xdg_activation.ActivationToken),
+    token: *wayland.xdg_activation.ActivationToken,
+) void {
+    const self: *ServerState = @fieldParentPtr("new_activation_token_listener", listener);
+    log.info("xdg_activation: new token committed app_id={s}", self.io, self.log_cfg, "server", .{
+        token.app_id orelse "(none)",
+    });
+}
+
 fn onDecorationMode(
     listener: *wire.Listener(*wayland.xdg_decoration.RequestMode),
     req: *wayland.xdg_decoration.RequestMode,
@@ -884,6 +1039,10 @@ fn onDecorationMode(
     // Placeholder policy (the compositor has no real decorations):
     // server-side for the focused toplevel, client-side otherwise. See
     // notes/129-shell-protocols-impl.md.
+    // XD-1: sendConfigure schedules a toplevel configure; the
+    // zxdg_toplevel_decoration_v1.configure event rides that
+    // xdg_surface.configure/ack_configure cycle (the client applies the
+    // mode when it acks).
     const mode: wayland.server.zxdg.ToplevelDecorationV1.Mode = blk: {
         const toplevel = req.decoration.toplevel orelse break :blk .client_side;
         break :blk if (self.seat.keyboard_focus == toplevel.xdg_surface.surface)
@@ -996,6 +1155,39 @@ fn onWatchdog(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     loop.stop();
 }
 
+/// Repeating xdg_wm_base ping tick (F3): for each distinct client (wm_base
+/// binding), ping it when idle; declare it unresponsive (unresponsive
+/// error, code 6 — disconnects the client) when the previous ping went
+/// unanswered. Re-arms itself for the next tick.
+fn onPingTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
+    const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
+    defer loop.setTimer(self.ping_timer.?, .{ .duration = zio.Duration.fromMilliseconds(xdg_ping_interval_ms) });
+    // Posting the error destroys the client and mutates the toplevel list,
+    // so iterate a snapshot.
+    var snapshot = std.ArrayList(*wayland.shell.XdgToplevel).empty;
+    defer snapshot.deinit(self.allocator);
+    snapshot.appendSlice(self.allocator, self.shell.toplevels.items) catch return;
+    for (snapshot.items, 0..) |t, i| {
+        // One ping per wm_base binding: skip toplevels sharing a client
+        // already handled earlier in this tick.
+        const res = t.wmBaseResource();
+        var seen = false;
+        for (snapshot.items[0..i]) |prev| {
+            if (prev.wmBaseResource() == res) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (t.pingPending()) {
+            log.warn("xdg client unresponsive: posting unresponsive error", self.io, self.log_cfg, "server", .{});
+            res.postError(.unresponsive, "client did not respond to xdg_wm_base.ping");
+        } else {
+            t.ping();
+        }
+    }
+}
+
 /// M3 + M4 synth input for the headless/DRM E2Es. Runs per dispatch (not
 /// per render — see onDisplayReady).
 /// - M3: one pointer click + key press once the first surface is mapped.
@@ -1048,11 +1240,16 @@ fn onOutputFrame(listener: *wire.Listener(*wayland.output.Output), out: *wayland
 /// renderer via output.sendFrame(). The DRM frame chain is driven by the
 /// flip event (sendFrame -> renderFrame -> commit -> flip -> event), so a
 /// change while idle needs this kick to start a frame; subsequent frames
-/// then pace off the flips until the change is consumed.
+/// then pace off the flips until the change is consumed. While a frame is
+/// in flight (frame_pending, set by the last commit) the kick is skipped:
+/// the backend's next frame event renders it — starting a second frame
+/// now would duplicate the frame signal (note 135 F2).
 fn requestRender(self: *ServerState) void {
     self.repaint_pending = true;
     if (!self.in_render) {
-        if (self.output) |out| out.sendFrame();
+        if (self.output) |out| {
+            if (!out.frame_pending) out.sendFrame();
+        }
     }
 }
 
@@ -1067,6 +1264,9 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // requestRender while this render is on the stack.
     self.in_render = true;
     defer self.in_render = false;
+    // Close the seat's input batch: everything the backends fed since
+    // the last frame forms one wl_pointer.frame group (F7, note 132).
+    self.seat.pointerFrame();
     // Idle-frame skip: nothing changed since the last render, so skip the
     // full composite + flip. Without this the flip chain runs a full
     // 1280x800 bilinear composite + fb copy at every vsync (~60fps) even
@@ -1221,8 +1421,10 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         });
     }
 
-    // wp_presentation: every surface drawn this frame was presented.
-    self.presentation.present(self.presented.items, @intCast(output_refresh_msec), 0);
+    // wp_presentation: every surface drawn this frame was presented. The
+    // output's wl_output global names the output for sync_output, and the
+    // output's own refresh drives the protocol refresh value.
+    self.presentation.present(self.presented.items, self.wl_output, @intCast(out.mode.refresh_msec), 0);
 
     self.frames_rendered += 1;
     // The frame was rendered + committed (the flip is in flight): clear
@@ -1520,6 +1722,7 @@ fn syncSurfaces(self: *ServerState) void {
             .node = null,
             .commit_listener = wire.Listener(*Surface).init(onSurfaceCommit),
             .destroy_listener = wire.Listener(*Surface).init(onSurfaceDestroy),
+            .unmap_listener = wire.Listener(*Surface).init(onSurfaceUnmap),
             .enter_listener = wire.Listener(*wayland.output.Output).init(onSurfaceEnter),
             .leave_listener = wire.Listener(*wayland.output.Output).init(onSurfaceLeave),
         };
@@ -1530,6 +1733,7 @@ fn syncSurfaces(self: *ServerState) void {
         };
         s.events.commit.add(&entry.commit_listener);
         s.events.destroy.add(&entry.destroy_listener);
+        s.events.unmap.add(&entry.unmap_listener);
         s.events.enter.add(&entry.enter_listener);
         s.events.leave.add(&entry.leave_listener);
         // updateSurfaceNode drives the enter/leave signals (setEntered at
@@ -1582,6 +1786,17 @@ fn onSurfaceEnter(listener: *wire.Listener(*wayland.output.Output), _: *wayland.
     if (entry.entered) return;
     entry.entered = true;
     sendSurfaceEnter(entry.state, entry.surface, true);
+}
+
+/// wl_surface.unmap signal: the surface stopped being mapped — a
+/// null-buffer commit, destroy, or the forced unmap of a destroyed
+/// wl_subsurface's child (note 132 F6). Drop the scene node so the
+/// surface disappears; the entry stays (a later buffer commit remaps it
+/// as a plain surface via updateSurfaceNode). Idempotent with the
+/// commit path (removeSurfaceNode nulls node/tree after destroying).
+fn onSurfaceUnmap(listener: *wire.Listener(*Surface), _: *Surface) void {
+    const entry: *SurfaceEntry = @fieldParentPtr("unmap_listener", listener);
+    removeSurfaceNode(entry.state, entry);
 }
 
 /// wl_surface.leave signal (surface lost the output; fired at unmap):
@@ -1871,6 +2086,7 @@ fn cleanupSurfaceEntries(self: *ServerState) void {
         const entry = entry_ptr.*;
         entry.commit_listener.link.remove();
         entry.destroy_listener.link.remove();
+        entry.unmap_listener.link.remove();
         entry.enter_listener.link.remove();
         entry.leave_listener.link.remove();
         removeSurfaceNode(self, entry);
@@ -1930,28 +2146,32 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     return null;
 }
 
-fn getFramebuffer(ctx: *anyopaque) ?*pixman.Framebuffer {
+/// Capture source for zwlr_screencopy: the display framebuffer (cursor
+/// composited in) for overlay_cursor=1; the base framebuffer (canvas
+/// without the cursor, current because it is recomposited before the
+/// cursor draw in the same render) for overlay_cursor=0. Falls back to
+/// the display framebuffer when no base exists yet.
+fn getFramebuffer(ctx: *anyopaque, overlay_cursor: bool) ?*pixman.Framebuffer {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
+    if (!overlay_cursor) {
+        if (self.base_framebuffer) |base| return base;
+    }
     return self.framebuffer;
 }
 
-fn ownsOutput(ctx: *anyopaque, resource: *wayland.server.wl.Output) bool {
+/// Resolve a client's wl_output resource to the output it belongs to.
+fn outputFromResource(ctx: *anyopaque, resource: *wayland.server.wl.Output) ?*wayland.output.Output {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
-    const wl_output = self.wl_output orelse return false;
-    return wl_output.owns(resource);
+    const wl_output = self.wl_output orelse return null;
+    if (!wl_output.owns(resource)) return null;
+    return wl_output.output;
 }
 
-/// Capture timestamp: monotonic nanoseconds split into the protocol's
-/// tv_sec_hi / tv_sec_lo / tv_nsec triple.
-fn captureClock(ctx: *anyopaque, out: *[3]u32) void {
+/// A screencopy frame is waiting for its next commit: wake the renderer
+/// (the idle-frame skip would otherwise never render the copy).
+fn requestFrame(ctx: *anyopaque) void {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
-    const ms: i64 = std.Io.Clock.now(.awake, self.io.*).toMilliseconds();
-    const sec: u64 = @intCast(@max(ms, 0) / 1000);
-    const ms_rem: u64 = @intCast(@max(@rem(ms, @as(i64, 1000)), 0));
-    const nsec: u64 = ms_rem * std.time.ns_per_ms;
-    out[0] = @truncate(sec >> 32);
-    out[1] = @truncate(sec);
-    out[2] = @truncate(nsec);
+    requestRender(self);
 }
 
 /// Seat key signal: Mod4+Escape quits the server (keysym binding).
@@ -2144,8 +2364,16 @@ fn syncSubsurfaceNodes(self: *ServerState) void {
                     continue;
                 };
             }
-            if (ss.restack_sibling_id != 0) {
-                applyRestack(self, ss, child_tree, parent_tree);
+            // A pending restack becomes effective only after the parent
+            // committed (F5: z-order is double-buffered on the parent,
+            // wayland.xml:3336-3337; the parent-commit listener sets
+            // restack_committed). Applied here (the scene reorder) and
+            // reset — the next place_above needs a fresh commit.
+            if (ss.restack_committed) {
+                if (ss.restack_sibling_id != 0) {
+                    applyRestack(self, ss, child_tree, parent_tree);
+                }
+                ss.restack_committed = false;
                 ss.restack_sibling_id = 0;
             }
             // Offset relative to the parent tree (which sits at the

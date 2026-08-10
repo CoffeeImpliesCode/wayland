@@ -21,9 +21,19 @@
 //!   per the XML. See notes/129.]
 //! - (e) set_mode/unset_mode are forwarded to the compositor as
 //!   `events.request_mode`; the compositor replies by calling
-//!   Decoration.sendConfigure (re-sent on every set_mode/unset_mode).
-//!   No initial configure is sent: a client that never sets a mode draws
-//!   client-side (the XML's default).
+//!   Decoration.sendConfigure(mode), which SCHEDULES a toplevel configure
+//!   (XD-1; wlroots wlr_xdg_toplevel_decoration_v1_set_mode, XD:52-58):
+//!   the zxdg_toplevel_decoration_v1.configure event rides the same
+//!   xdg_surface.configure/ack_configure cycle (sent during the configure
+//!   emission, applied when the client acks the matching xdg configure;
+//!   wlroots XD:93-146). No initial configure is sent: a client that never
+//!   sets a mode draws client-side (the XML's default; wlroots' pending ==
+//!   scheduled initially).
+//! - (f) creation errors (unconfigured_buffer, already_constructed) are
+//!   posted on the MANAGER resource (XD-2; wlroots XD:181, XD:190,
+//!   smithay smXD:229-243, KWin KWXD:54-65), not on the new decoration.
+//! - (g) an orphaned decoration (toplevel destroyed first) posts orphaned
+//!   AND destroys the decoration resource (XD-4; wlroots XD:81-91).
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
@@ -38,11 +48,20 @@ const xdg_mod = @import("xdg.zig");
 
 const log_tag = "xdg_decoration";
 
+pub const Mode = server.zxdg.ToplevelDecorationV1.Mode;
+
 /// set_mode/unset_mode arrived; the compositor replies with
 /// Decoration.sendConfigure. mode == null for unset_mode.
 pub const RequestMode = struct {
     decoration: *Decoration,
-    mode: ?server.zxdg.ToplevelDecorationV1.Mode,
+    mode: ?Mode,
+};
+
+/// A configure sent but not yet acked (wlroots configure_list entry,
+/// XD:96-113): the mode the client must draw once it acks serial.
+const ConfigureEntry = struct {
+    serial: u32,
+    mode: Mode,
 };
 
 pub const Decoration = struct {
@@ -52,16 +71,41 @@ pub const Decoration = struct {
     manager: *XdgDecoration,
     resource: *server.zxdg.ToplevelDecorationV1,
     /// The decorated toplevel. Null once the toplevel died (orphaned path)
-    /// — invariant: toplevel == null implies the destroy listener is no
-    /// longer attached, so the destroy handler never touches freed memory.
+    /// — invariant: toplevel == null implies all three toplevel listeners
+    /// are detached, so the destroy handler never touches freed memory.
     toplevel: ?*xdg_mod.XdgToplevel,
     /// The toplevel's destroy listener (orphaned detection).
     destroy_listener: wire.Listener(*xdg_mod.XdgToplevel),
+    /// The toplevel's xdg_surface configure listener (XD-1): sends the
+    /// zxdg decoration configure with the scheduled mode during the xdg
+    /// configure emission.
+    configure_listener: wire.Listener(*xdg_mod.XdgSurface),
+    /// The toplevel's xdg_surface ack_configure listener (XD-1): applies
+    /// the acked configure's mode.
+    ack_listener: wire.Listener(*xdg_mod.XdgSurface),
+    /// The mode the compositor last scheduled via sendConfigure (wlroots
+    /// scheduled_mode); null = no mode established (client-side default).
+    scheduled_mode: ?Mode = null,
+    /// The mode of the last configure sent but not yet acked (wlroots
+    /// pending.mode); updated at ack.
+    pending_mode: ?Mode = null,
+    /// The last acked mode (wlroots current.mode): what the client is
+    /// drawing with. null = none established.
+    current_mode: ?Mode = null,
+    /// (serial, mode) pairs for configures sent but not yet acked, in send
+    /// order (wlroots configure_list, XD:96-113).
+    configure_list: std.ArrayList(ConfigureEntry) = .empty,
 
-    /// The compositor's reply to a request_mode: configure the effective
-    /// decoration mode.
-    pub fn sendConfigure(dec: *Decoration, mode: server.zxdg.ToplevelDecorationV1.Mode) void {
-        dec.resource.sendConfigure(mode);
+    /// The compositor's reply to a request_mode: schedule a toplevel
+    /// configure that carries the mode (wlroots
+    /// wlr_xdg_toplevel_decoration_v1_set_mode, XD:52-58). The zxdg
+    /// decoration configure is sent during the xdg_surface.configure
+    /// emission and the mode is applied when the client acks that
+    /// configure (XD-1).
+    pub fn sendConfigure(dec: *Decoration, mode: Mode) void {
+        dec.scheduled_mode = mode;
+        const toplevel = dec.toplevel orelse return;
+        toplevel.configure(0, 0) catch return;
     }
 };
 
@@ -162,9 +206,22 @@ fn managerRequest(
     }
 }
 
-/// zxdg_decoration_manager_v1.get_toplevel_decoration. Validation errors
-/// post on the NEW decoration resource (the error enum lives on
-/// xdg_toplevel_decoration; wlroots posts there too).
+/// Post an xdg_toplevel_decoration error code on the manager resource
+/// (XD-2). The error enum lives on the decoration interface, but wlroots
+/// posts creation errors on the manager (XD:181, XD:190) so the client
+/// attributes them to the object it called.
+fn managerPostError(
+    manager_res: *server.zxdg.DecorationManagerV1,
+    code: server.zxdg.ToplevelDecorationV1.Error,
+    message: [*:0]const u8,
+) void {
+    const res: *server.wl.Resource = @ptrCast(manager_res);
+    res.postError(@intCast(@intFromEnum(code)), message);
+}
+
+/// zxdg_decoration_manager_v1.get_toplevel_decoration. Creation validation
+/// errors post on the MANAGER resource (XD-2); the freshly created
+/// decoration resource is destroyed.
 fn getToplevelDecoration(
     deco: *XdgDecoration,
     manager_res: *server.zxdg.DecorationManagerV1,
@@ -181,16 +238,20 @@ fn getToplevelDecoration(
     const toplevel: *xdg_mod.XdgToplevel = @ptrCast(@alignCast(toplevel_ud));
     // Model decision (a), v1 semantics: a toplevel that already committed a
     // buffer must not be decorated (wlroots posts unconfigured_buffer on
-    // the decoration resource; v2+ allows it).
+    // the manager resource; v2+ allows it).
     if (toplevel.xdg_surface.surface.buffer != null) {
-        res.postError(.unconfigured_buffer, "xdg_toplevel_decoration must not be created after a buffer was committed");
+        managerPostError(
+            manager_res,
+            .unconfigured_buffer,
+            "xdg_toplevel_decoration must not be created after a buffer was committed",
+        );
         res.destroy();
         return;
     }
     // Model decision (b): one decoration per toplevel.
     for (deco.decorations.items) |existing| {
         if (existing.toplevel == toplevel) {
-            res.postError(.already_constructed, "xdg_toplevel already has an xdg_toplevel_decoration");
+            managerPostError(manager_res, .already_constructed, "xdg_toplevel already has an xdg_toplevel_decoration");
             res.destroy();
             return;
         }
@@ -208,14 +269,21 @@ fn getToplevelDecoration(
         .resource = res,
         .toplevel = toplevel,
         .destroy_listener = wire.Listener(*xdg_mod.XdgToplevel).init(onToplevelDestroy),
+        .configure_listener = wire.Listener(*xdg_mod.XdgSurface).init(onSurfaceConfigure),
+        .ack_listener = wire.Listener(*xdg_mod.XdgSurface).init(onAckConfigure),
     };
     res.setHandler(*Decoration, decorationRequest, decorationDestroy, dec);
     // Model decision (c): the module needs the toplevel's lifetime to post
-    // orphaned when the toplevel dies first.
+    // orphaned when the toplevel dies first, and (XD-1) the xdg configure
+    // emission to ride the mode configure on the same cycle.
     toplevel.events.destroy.add(&dec.destroy_listener);
+    toplevel.xdg_surface.events.configure.add(&dec.configure_listener);
+    toplevel.xdg_surface.events.ack_configure.add(&dec.ack_listener);
     deco.decorations.append(deco.allocator, dec) catch {
         dec.destroy_listener.link.remove();
-        dec.toplevel = null; // the listener is detached; decorationDestroy skips it
+        dec.configure_listener.link.remove();
+        dec.ack_listener.link.remove();
+        dec.toplevel = null; // the listeners are detached; decorationDestroy skips them
         res.destroy();
         manager_res.postNoMemory();
         return;
@@ -246,8 +314,8 @@ fn decorationRequest(
 }
 
 /// Forward the mode preference to the compositor; it replies with
-/// sendConfigure (re-sent on every set_mode/unset_mode, model decision (e)).
-fn emitRequestMode(dec: *Decoration, mode: ?server.zxdg.ToplevelDecorationV1.Mode) void {
+/// sendConfigure (which schedules a toplevel configure, model decision (e)).
+fn emitRequestMode(dec: *Decoration, mode: ?Mode) void {
     var req: RequestMode = .{
         .decoration = dec,
         .mode = mode,
@@ -261,24 +329,68 @@ fn decorationDestroy(dec_res: *server.zxdg.ToplevelDecorationV1, dec: *Decoratio
     if (std.mem.findScalar(*Decoration, deco.decorations.items, dec)) |i| {
         _ = deco.decorations.swapRemove(i);
     }
-    // Invariant: toplevel != null means the destroy listener is still
-    // attached (and the toplevel is alive).
+    // Invariant: toplevel != null means all three toplevel listeners are
+    // still attached (and the toplevel is alive).
     if (dec.toplevel != null) {
         dec.destroy_listener.link.remove();
+        dec.configure_listener.link.remove();
+        dec.ack_listener.link.remove();
     }
+    dec.configure_list.deinit(dec.allocator);
     deco.allocator.destroy(dec);
 }
 
-/// The toplevel died before the decoration (model decision (c)): detach and
-/// forget the toplevel first, then post orphaned. The error kills the
-/// client; the decoration resource dies with it, and its destroy handler
-/// runs later with toplevel == null (no touch of the freed toplevel).
+/// The toplevel died before the decoration (model decision (c) + XD-4):
+/// detach and forget the toplevel first, then post orphaned AND destroy
+/// the decoration resource (wlroots XD:81-91). The destroy handler runs
+/// with toplevel == null (no touch of the freed toplevel).
 fn onToplevelDestroy(listener: *wire.Listener(*xdg_mod.XdgToplevel), toplevel: *xdg_mod.XdgToplevel) void {
     const dec: *Decoration = @fieldParentPtr("destroy_listener", listener);
     dec.destroy_listener.link.remove();
+    dec.configure_listener.link.remove();
+    dec.ack_listener.link.remove();
     dec.toplevel = null;
     _ = toplevel;
     dec.resource.postError(.orphaned, "xdg_toplevel_decoration must be destroyed before its xdg_toplevel");
+    dec.resource.destroy();
+}
+
+/// The toplevel's xdg_surface.configure was sent (XD-1): if the compositor
+/// scheduled a mode different from the last acked one, send the
+/// zxdg_toplevel_decoration_v1.configure in the same roundtrip and record
+/// the (serial, mode) pair for the ack (wlroots
+/// toplevel_decoration_handle_surface_configure, XD:93-113).
+fn onSurfaceConfigure(listener: *wire.Listener(*xdg_mod.XdgSurface), xdg: *xdg_mod.XdgSurface) void {
+    const dec: *Decoration = @fieldParentPtr("configure_listener", listener);
+    const mode = dec.scheduled_mode orelse return;
+    if (dec.pending_mode == dec.scheduled_mode) return;
+    dec.configure_list.append(dec.allocator, .{ .serial = xdg.configure_serial, .mode = mode }) catch return;
+    dec.resource.sendConfigure(mode);
+}
+
+/// The client acked an xdg_surface.configure (XD-1): apply the mode that
+/// configure carried and drop entries that can never be acked (wlroots
+/// toplevel_decoration_handle_surface_ack_configure, XD:115-146).
+fn onAckConfigure(listener: *wire.Listener(*xdg_mod.XdgSurface), xdg: *xdg_mod.XdgSurface) void {
+    const dec: *Decoration = @fieldParentPtr("ack_listener", listener);
+    const acked = xdg.acked_serial orelse return;
+    var idx: ?usize = null;
+    for (dec.configure_list.items, 0..) |entry, i| {
+        if (entry.serial == acked) {
+            idx = i;
+            break;
+        }
+    }
+    const i = idx orelse return;
+    const mode = dec.configure_list.items[i].mode;
+    // Serials up to and including the acked one can never be acked again
+    // (xdg-shell enforces strictly increasing acks).
+    var n: usize = 0;
+    while (n <= i) : (n += 1) {
+        _ = dec.configure_list.orderedRemove(0);
+    }
+    dec.pending_mode = mode;
+    dec.current_mode = mode;
 }
 
 // --- socketpair roundtrip harness (pattern: src/shell/xdg.zig) ------------
@@ -325,6 +437,21 @@ const DecorationEvents = struct {
             .configure => |c| {
                 data.configure_count += 1;
                 data.mode = @intFromEnum(c.mode);
+            },
+        }
+    }
+};
+
+const XdgSurfaceEvents = struct {
+    configure_count: usize = 0,
+    serial: u32 = 0,
+
+    fn listener(xdg_surface: *client.xdg.Surface, event: client.xdg.Surface.Event, data: *XdgSurfaceEvents) void {
+        _ = xdg_surface;
+        switch (event) {
+            .configure => |c| {
+                data.configure_count += 1;
+                data.serial = c.serial;
             },
         }
     }
@@ -444,12 +571,16 @@ const TestServer = struct {
     }
 
     /// Create an xdg_toplevel for the test client.
-    fn createToplevel(ts: *TestServer) !struct { surface: *client.wl.Surface, toplevel: *client.xdg.Toplevel } {
+    fn createToplevel(ts: *TestServer) !struct {
+        surface: *client.wl.Surface,
+        xdg_surface: *client.xdg.Surface,
+        toplevel: *client.xdg.Toplevel,
+    } {
         const wl_surface = try ts.wl_compositor.?.createSurface();
         const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
         const toplevel = try xdg_surface.getToplevel();
         try ts.pump();
-        return .{ .surface = wl_surface, .toplevel = toplevel };
+        return .{ .surface = wl_surface, .xdg_surface = xdg_surface, .toplevel = toplevel };
     }
 };
 
@@ -505,10 +636,14 @@ test "decoration second decoration on a toplevel -> already_constructed" {
     try std.testing.expectEqual(@as(usize, 1), ts.decoration.?.decorations.items.len);
 
     // Model decision (b): a second decoration object posts
-    // already_constructed=1 and the client is killed.
+    // already_constructed=1 and the client is killed. XD-2: creation
+    // errors post on the MANAGER resource (wlroots XD:190), not the new
+    // decoration.
     _ = try ts.decoration_client.?.getToplevelDecoration(tl.toplevel);
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
-    try std.testing.expectEqual(@as(c_int, 1), wl_display_get_protocol_error(ts.c_display.?, null, null));
+    var err_id: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, 1), wl_display_get_protocol_error(ts.c_display.?, null, &err_id));
+    try std.testing.expectEqual(ts.decoration_client.?.getId(), err_id);
 }
 
 test "decoration set_mode with invalid mode -> invalid_mode" {
@@ -538,11 +673,14 @@ test "decoration toplevel destroyed first -> orphaned" {
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), ts.decoration.?.decorations.items.len);
 
-    // Model decision (c): the toplevel died before the decoration — the
-    // orphaned=2 error is posted on the decoration resource.
+    // Model decision (c) + XD-4: the toplevel died before the decoration —
+    // the orphaned=2 error is posted on the decoration resource AND the
+    // resource is destroyed (wlroots XD:81-91), so the decorations list is
+    // emptied.
     tl.toplevel.destroy();
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     try std.testing.expectEqual(@as(c_int, 2), wl_display_get_protocol_error(ts.c_display.?, null, null));
+    try std.testing.expectEqual(@as(usize, 0), ts.decoration.?.decorations.items.len);
     _ = dec;
 }
 
@@ -564,5 +702,49 @@ test "decoration on a toplevel with a committed buffer -> unconfigured_buffer" {
 
     _ = try ts.decoration_client.?.getToplevelDecoration(tl.toplevel);
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
-    try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+    var err_id: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, &err_id));
+    // XD-2: the error posts on the manager resource (wlroots XD:181).
+    try std.testing.expectEqual(ts.decoration_client.?.getId(), err_id);
+}
+
+test "decoration mode configure rides the xdg configure/ack cycle (XD-1)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var capture: RequestModeCapture = .{
+        .listener = wire.Listener(*RequestMode).init(RequestModeCapture.notify),
+    };
+    ts.decoration.?.events.request_mode.add(&capture.listener);
+
+    const tl = try ts.createToplevel();
+    var xs_events: XdgSurfaceEvents = .{};
+    tl.xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    const dec = try ts.decoration_client.?.getToplevelDecoration(tl.toplevel);
+    var dec_events: DecorationEvents = .{};
+    dec.setListener(*DecorationEvents, DecorationEvents.listener, &dec_events);
+    try ts.pump();
+
+    // set_mode(server_side) -> the compositor schedules a toplevel
+    // configure; the zxdg decoration configure arrives in the SAME
+    // roundtrip as the xdg_surface.configure (XD-1, wlroots XD:93-113).
+    dec.setMode(.server_side);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), xs_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 1), dec_events.configure_count);
+    try std.testing.expectEqual(@as(i32, 2), dec_events.mode); // server_side
+
+    // The mode is NOT applied until the client acks the xdg configure.
+    const dec_obj = ts.decoration.?.decorations.items[0];
+    try std.testing.expectEqual(@as(?Mode, null), dec_obj.current_mode);
+    try std.testing.expectEqual(@as(usize, 1), dec_obj.configure_list.items.len);
+
+    // Ack the matching xdg configure: the mode is applied (wlroots
+    // XD:115-146).
+    tl.xdg_surface.ackConfigure(xs_events.serial);
+    try ts.pump();
+    try std.testing.expectEqual(@as(?Mode, .server_side), dec_obj.current_mode);
+    try std.testing.expectEqual(@as(?Mode, .server_side), dec_obj.pending_mode);
+    try std.testing.expectEqual(@as(usize, 0), dec_obj.configure_list.items.len);
 }

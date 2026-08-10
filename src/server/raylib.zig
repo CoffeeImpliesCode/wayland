@@ -228,7 +228,15 @@ fn frameMs() i64 {
     return std.Io.Clock.now(.awake, std.Io.Threaded.global_single_threaded.io()).toMilliseconds();
 }
 
-fn testState(_: *output.Output, _: *const output.Output.State) error{InvalidState}!void {}
+/// The raylib window draws the committed framebuffer 1:1: scale and
+/// transform commits are rejected (the headless mask — the window size is
+/// the mode, and the texture upload has no transform/scale path).
+fn testState(_: *output.Output, state: *const output.Output.State) error{InvalidState}!void {
+    const supported = output.Output.State.committed_enabled |
+        output.Output.State.committed_mode |
+        output.Output.State.committed_buffer;
+    if (state.committed & ~supported != 0) return error.InvalidState;
+}
 
 /// Upload the committed framebuffer into the window texture and draw it.
 /// No-op (beyond logging) when the state carries no buffer. When the

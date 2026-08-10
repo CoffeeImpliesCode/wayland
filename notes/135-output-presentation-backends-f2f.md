@@ -156,6 +156,12 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
 ## Findings
 
 1. [HIGH, NEEDS-wiring] No wl_output rebroadcast on state change — open from 109:5.
+- FIXED 2026-08-10: Output.commitState emits a CommitEvent (output, the
+  unchanged-stripped applied state, monotonic when_ns) on the commit signal;
+  WlOutput listens and re-sends mode/geometry/scale to every bound resource
+  for changed bits, with the done coalesced into one idle timer (wlroots
+  schedule_done output.c:169-176; immediate done on idle-source OOM).
+  The unchanged-field strip (F3) makes a present bit mean a real change.
    Ours: wl_output.zig:78-103 sends state only at bind; a committed mode/scale/
    transform change never reaches clients. References: wlroots output_apply_state
    output.c:274-308 re-sends mode/geometry/scale per resource and schedule_done
@@ -167,6 +173,12 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
    fields to WlOutput resources after apply, with a coalesced done.
 
 2. [HIGH, FIXABLE-in-module] No frame_pending guard — open from 109:4.
+- FIXED 2026-08-10: Output.frame_pending is set by commitState on an enabled
+  buffer commit (enable-only setup commits set nothing — no frame event is
+  owed), cleared in sendFrame, and the emit is gated on enabled (wlroots
+  output.c:771-780, 833-837). main.zig requestRender skips sendFrame while
+  pending; the headless timer relies on the sendFrame gate. main.zig enables
+  the output in onNewOutput so the gate cannot stall the first frame.
    Ours: Output.sendFrame (output.zig:162-164) emits unconditionally; callers
    headless frameCb (headless.zig:102-108) and main.zig:1055 can fire while a
    frame is in flight; server re-render guard (main.zig:227-232) is a separate
@@ -179,6 +191,12 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
    sendFrame.
 
 3. [MED, FIXABLE-in-module] Test/commit fused, impl->test mandatory — open from
+- FIXED 2026-08-10: Output.testState is a separate probe (strips unchanged
+  fields, never commits, no commit signal); commitState strips unchanged
+  fields first (wlroots output_compare_state output.c:535-583) and the impl
+  test hook is optional + skipped for empty states (output.c:731-734); the
+  backend commit still runs on every call (a repeated frame carries new
+  buffer content).
    109:1. Ours: commitState (output.zig:140) always runs test then commit;
    Impl.@"test" (output.zig:87) required. wlroots: wlr_output_test_state
    output.c:718-745 separate probe; impl->test optional (output.c:731-734);
@@ -195,8 +213,17 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
    event (:66-72). Why: a committed mode change produces no pacing change; the headless
    output never emits present, starving presentation feedback of per-output
    events (ties to F22).
+   FIXED 2026-08-10: headless commit (headless.zig) now applies
+   state.mode to the backend copy and re-arms the frame timer at the new
+   mode's refresh_msec (wlroots headless/output.c:56-78 frame_delay +
+   timer_update); test added (mode-change pacing).
 
 5. [MED, FIXABLE-in-module] No unsupported-state mask in backends' test hooks —
+- FIXED 2026-08-10: headless and raylib testState reject scale/transform via
+  an unsupported-state mask (enabled|mode|buffer, wlroots SUPPORTED_OUTPUT_STATE
+  headless/output.c:10-14); drm testState uses the same mask shape, replacing
+  the explicit transform/scale rejections (wlroots drm_connector_prepare
+  drm.c:838-840).
    open analog of 109:1/116. Ours: headless testState (headless.zig:110) accepts
    everything; drm testState (drm.zig:545) rejects transform/scale/mode-size only
    [116:5 CLOSED]. wlroots: headless output_test (headless/output.c:35-55) masks
@@ -205,6 +232,10 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
    (updateSize output.zig:168-173) with no backend effect — silent divergence.
 
 6. [MED, FIXABLE-in-module] Bind-time fidelity — open from 109:6. Ours:
+- FIXED 2026-08-10: sendState matches wlroots' bind order (geometry, current
+  mode, scale, name, description, done — output.c:100-106); the mode event no
+  longer fabricates the preferred flag (send_current_mode output.c:24-35);
+  scale is ceil(output.scale) (:37-42); geometry carries output.transform.
    sendState hardcodes geometry 0,0,0,0 / subpixel unknown / make "wayland" /
    model "wayland-m2" / transform normal (wl_output.zig:83-92), scale 1 (:99),
    and fabricates preferred on the single mode (:94). wlroots: real phys dims +
@@ -216,6 +247,10 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
    be wrong the day scale changes.
 
 7. [MED, NEEDS-wiring] sync_output never sent — open from 112:1. Ours:
+- FIXED 2026-08-10: present() takes the compositor's WlOutput; each feedback's
+  client gets a sync_output for its own wl_output resource before presented
+  (wlroots presentation_time.c:27-40). main.zig passes state.wl_output and the
+  output's real refresh (out.mode.refresh_msec).
    presentation.zig:13 documents absence; present() (presentation.zig:186) sends
    no sync_output; test swallows the event :344. wlroots: per-client output
    resources before presented (presentation_time.c:27-40); smithay: per client
@@ -225,6 +260,10 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
    resources already tracked wl_output.zig:34-38).
 
 8. [MED, STRUCTURAL] No per-output present event anywhere — root cause of
+- DEFERRED 2026-08-10 fixing round: STRUCTURAL — a real present signal spans
+  output.zig + drm.zig + presentation.zig association (commit_seq gating);
+  stopgaps landed instead: per-output seq (F11) and commit-time ready
+  timestamps in screencopy (F13).
    112:2/5/6. Ours: drm pageFlipHandler (drm.zig:1014-1024) clears flip_pending
    and sends frame only; Output has no present signal (output.zig:26-44);
    presentation.present (main.zig:1225) synthesizes tv from CLOCK_MONOTONIC at
@@ -239,6 +278,11 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
    presentation.present.
 
 9. [MED, FIXABLE-in-module] No supersede-discard — open from 112:3. Ours:
+- FIXED 2026-08-10: each feedback listens to its surface's commit signal; a
+  feedback already committed is discarded (destroySendDiscarded) when the
+  surface commits again before present, a feedback created since the last
+  commit survives and becomes current (wlroots synced-state move
+  presentation_time.c:73-81; smithay merge_into mod.rs:323-337).
    feedbacks accumulate until present/discard (presentation.zig:75-78); a
    surface committing new content before the old frame presents gets presented
    for content never shown. smithay: merge_into discards superseded callbacks
@@ -248,6 +292,10 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
    present.
 
 10. [MED, FIXABLE-in-module] Manual discard on surface death — open from 112:4.
+- FIXED 2026-08-10: each feedback listens to its surface's destroy signal and
+  discards itself (wlroots addon destroy + synced finish
+  presentation_time.c:58-76); the compositor's manual discard() call is
+  redundant but harmless and kept.
     Ours: main.zig:1573 is the only discard call site; any other destruction
     path leaks a stale feedback that can present for a dead surface. wlroots:
     addon destroy + synced finish (presentation_time.c:58-76); smithay: Drop +
@@ -256,12 +304,20 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     discard when dead (smithay pattern).
 
 11. [LOW, FIXABLE-in-module] No per-output vblank seq — open from 112:5/6.
+- FIXED 2026-08-10 (stopgap): seq comes from a per-output counter
+  (AutoHashMap keyed by the presented Output), advancing once per present on
+  that output; a global fallback covers no-output calls (tests). The hardware
+  vblank seq still awaits F8's present event.
     Ours: seq is a per-presentation counter (presentation.zig:76-79, 190); tv is
     the present() call clock (presentation.zig:187). wlroots seq/tv come from the
     output present event (presentation_time.c:243-252); smithay takes them per
     callback (mod.rs:237-239). Closes automatically with F8.
 
 12. [LOW, FIXABLE-in-module] ZERO_COPY and v1-adaptive-sync refresh handling
+- FIXED 2026-08-10 (partial): present() clears the ZERO_COPY kind flag — the
+  pixman path composites (textured), never scans out (wlroots
+  presentation_time.c:296-298). The v1+VRR refresh=0 branch is DEFERRED with
+  F8: no adaptive-sync state exists in this server.
     absent — open from 112:7/8. Ours: flags always 0 (main.zig:1225); no
     version-dependent refresh. wlroots: clears ZERO_COPY when textured
     (presentation_time.c:296-298), refresh 0 for v1+VRR (:292-295); smithay:
@@ -269,6 +325,12 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     exist (F8).
 
 13. [HIGH, FIXABLE-in-module] Synchronous screencopy copy at request time —
+- FIXED 2026-08-10: the copy is deferred to the next output commit that
+  presents a buffer (frame commit listener armed at the copy request; a
+  request_frame callback wakes the renderer, wlroots :434-440); ready carries
+  the commit timestamp; the output's destroy signal fails pending frames. The
+  client buffer is validated at the copy request and held (lock) until the
+  copy.
     open from 113:1. Ours: copyFrame (screencopy.zig:226) memcpys the CURRENT
     framebuffer inside the copy request. wlroots: copy deferred to the next
     output commit (wlr_screencopy_v1.c:434-435), requests a frame via
@@ -278,6 +340,11 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     copy from the committed state.buffer at commit time.
 
 14. [MED, FIXABLE-in-module] copy_with_damage is a no-op — open from 113:2.
+- FIXED 2026-08-10: per-client damage accumulator armed at the first
+  copy_with_damage (starts whole, wlroots screencopy_damage_create), fed by
+  every output commit (submitted damage clamped to the output; whole on a
+  buffer commit without damage, wlroots :47-66); the ready event carries the
+  accumulated boxes and clears the region (frame_send_damage :156-181).
     Ours: frameRequest (screencopy.zig:208-210) routes it to copyFrame; damage
     semantics ignored; per-box damage never sent (full rect always,
     screencopy.zig:299). wlroots: sets with_damage :456, waits for accumulated
@@ -287,6 +354,10 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     to be real (ours full-rect today — honest but useless).
 
 15. [MED, FIXABLE-in-module] No stride validation — open from 113:4. Ours:
+- FIXED 2026-08-10: the client buffer's real stride (wl_shm_buffer_get_stride)
+  must equal the advertised tight stride, else invalid_buffer (wlroots
+  :418-421); the copy loop uses the validated stride, so padded buffers are
+  rejected instead of mis-copied.
     copyFrame (screencopy.zig:226) recomputes dst_stride = width*4 (:284) and
     never checks the client buffer's real stride; a padded client shm buffer is
     silently mis-copied row-by-row. wlroots: rejects stride != frame->shm_stride
@@ -295,30 +366,52 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     invalid_buffer.
 
 16. [LOW, FIXABLE-in-module] Fixed ARGB8888 vs renderer preferred format; no
+- FIXED 2026-08-10 (cheap part): the advertised format is the source
+  framebuffer's format (pixman ARGB8888 today, wlroots preferred_read_format
+  :543) and the client format check compares against it. The linux_dmabuf
+  path stays absent (shm-only renderer).
     linux_dmabuf path — open from 113:3. Ours: capture sends argb8888 + tight
     stride (screencopy.zig:198), rejects any other format (:254-257). wlroots:
     preferred_read_format :543, linux_dmabuf event for v3 :592-595, dma copy
     :234-281. Fine while the renderer is pixman-only.
 
 17. [LOW, FIXABLE-in-module] Region mapping ignores scale/transform; clamps
+- FIXED 2026-08-10: the capture region maps through invert(transform) + scale
+  into buffer coordinates (wlroots :576-580); boxes are no longer clamped —
+  an out-of-source box fails at copy time (:313-319), non-positive boxes fail
+  at capture.
     instead of failing — open from 113:5. Ours: capture clamps to fb
     (screencopy.zig:148-173). wlroots: transforms box by transform+scale
     :576-580, fails when box exceeds source :313-319. Correct at fixed scale
     1/normal [VERIFIED 113:5]; breaks if scale/transform become dynamic.
 
 18. [LOW, FIXABLE-in-module] overlay_cursor has no effect — open from 113:6.
+- FIXED 2026-08-10 (cheap path): overlay_cursor is recorded per frame and the
+  copy source honors it — main.zig getFramebuffer returns the cursor-less base
+  framebuffer for overlay_cursor=0 and the composited display framebuffer
+  (as before) for 1. The base is current because it is recomposited before
+  the cursor draw in the same render.
     Ours: dropped (screencopy.zig:120-123, doc :5-6). wlroots: locks software
     cursors :443-446. Currently correct because the scene composites the cursor
     into the framebuffer (main.zig drawCursor); the flag should be honored when
     cursor surfaces become separate.
 
 19. [LOW, FIXABLE-in-module] No output-enabled check at capture/copy — open
+- FIXED 2026-08-10: captures of a disabled output fail at capture AND at the
+  copy request (wlroots :508-511, :364-367); the wl_output resource resolves
+  to its Output through a new output_from_resource callback.
     from 113:7. Ours: owns_output verifies identity only (screencopy.zig:43-46);
     framebuffer presence is the only liveness proxy. wlroots: fails disabled
     outputs at capture :508-511 and copy :364-367. Harmless while the server has
     exactly one always-enabled output.
 
 20. [LOW, NEEDS-wiring] No surface enter/leave tracking — open from 109:8.
+- FIXED (pre-existing): surface.setEntered/setLeft + enter/leave signals and
+  the main.zig wire (onSurfaceEnter/onSurfaceLeave -> wl_surface.enter/leave)
+  landed in commit 9209925; re-verified this round (updateSurfaceNode drives
+  setEntered at map, removeSurfaceNode drives setLeft at unmap/destroy;
+  surface.zig "enter/leave signals fire once per output transition" test
+  covers the signal side).
     Ours: no surface sets in the output module. smithay: enter/leave/leave_all
     mod.rs:287-345 + enter replay at bind handlers.rs:80-85. Why: clients never
     learn which output a surface is on (wl_surface.enter); wl_output-based
@@ -326,11 +419,16 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     association.
 
 21. [LOW, NEEDS-wiring] No xdg-output; no fractional/per-client scale — open
+- DEFERRED 2026-08-10 fixing round: new protocol (xdg-output is not in the
+  vendored wayland-protocols scan) — out of scope for this round.
     from 109:9/11. smithay new_with_xdg_output mod.rs:128-139; Scale enum
     output.rs:177-212 with per-client re-send (handlers.rs:44-50, mod.rs:181-186).
     Ours: wl_output only, scale f32 fixed 1 (wl_output.zig:99).
 
 22. [LOW, STRUCTURAL] No weak/user-data model — open from 109:10. smithay:
+- DEFERRED 2026-08-10 fixing round: STRUCTURAL — the owning-pointer model is
+  fine for the current single-owner lifetimes; independent listener ownership
+  is a separate design change.
     WeakOutput output.rs:411-464; wlroots: void* data + addon set (wlr_output.h:270-274).
     Ours: one owning pointer + impl data (output.zig:33-34). Fine for the current
     single-owner lifetime; blocks independent listener ownership.
@@ -340,18 +438,35 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     fallback drm.c:106-110; smithay: LegacyDrmDevice device/mod.rs:252-256.
     Fine on virtio-gpu (ATOMIC+UNIVERSAL_PLANES implied per kernel v6.6
     drm_ioctl.c:341-352 [VERIFIED 116]).
+    FIXED 2026-08-10: drm.zig falls back to the legacy KMS interface when
+    DRM_CLIENT_CAP_ATOMIC fails (or WLR_DRM_NO_ATOMIC is set, wlroots
+    parity): legacy drmModeSetCrtc modeset in startInner + drmModePageFlip
+    in commit, planes/property scans/blob gated on the atomic flag
+    (DrmBackendData.atomic). VM path (atomic) unchanged; legacy path is
+    FFI-bound, not unit-testable here.
 
 24. [LOW, FIXABLE-in-module] DRM: no encoder fallback — open from 116:4.
     Ours: findConnectorMode (drm.zig:674) uses the connector's own encoder; if
     its possible_crtcs == 0 the connector is skipped without trying sibling
     encoders. wlroots: matches across the encoder union (realloc_crtcs
     drm.c:1399-1453). Single-encoder virtio-gpu unaffected.
+    FIXED 2026-08-10: findConnectorMode now takes possible_crtcs from
+    drmModeConnectorGetPossibleCrtcs (libdrm ORs every encoder the
+    connector can use — the wlroots drm.c:1579 match) and picks the first
+    CRTC via the new firstCrtcIndex helper; unit test covers the fallback
+    pick (union mask incl. sibling-encoder-only bits, out-of-range,
+    empty).
 
 25. [LOW, STRUCTURAL] DRM teardown does not restore previous KMS state — open
     from 116 (verdict). Ours: drmTeardown (drm.zig:978) releases everything but
     leaves the fb modeset. smithay: AtomicDrmDevice Drop restores captured
     properties with ALLOW_MODESET (device/atomic.rs:238-275). Moot on a VM, real
     on a session.
+    DEFERRED 2026-08-10 fixing round: STRUCTURAL — KMS-state restore is
+    backend-lifecycle scope (capture connector/crtc property values at
+    start, ALLOW_MODESET restore at teardown); spans drm.zig start/teardown
+    as a whole and is untestable on the atomic VM hardware. Revisit with a
+    session/seat lifecycle phase.
 
 26. [LOW, NEEDS-wiring] Backend.Impl lacks multi-output test/commit and
     get_drm_fd — open analog of 114. Ours: Backend.Impl (backend.zig:36) = start
@@ -360,6 +475,12 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     (backend.c:72-75, 78-93). Why: no atomic multi-output config (test/apply
     across outputs) at the backend level; pollFd-per-backend replaces get_drm_fd.
     Structural only when multi-output arrives.
+    DEFERRED 2026-08-10 fixing round: classified NEEDS-wiring but the note
+    itself deems it structural until multi-output arrives — the fix changes
+    Backend.Impl (backend.zig), adds backend-level drm test/commit over
+    output-state arrays, and needs a multi-output compositor config that
+    does not exist yet (single-output today). Revisit in the multi-output
+    phase.
 
 27. [LOW, NEEDS-wiring] Touch/gesture/tablet/switch events absent — open from
     117:3. Ours: kindForDevice (libinput.zig:302) never announces touch; dispatch
@@ -368,6 +489,11 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     tablet_pad.c, switch.c; smithay forwards all (mod.rs:725-830). The seat has
     no touch protocol support, so wiring is compositor-side. Low until a
     touchscreen target.
+    DEFERRED 2026-08-10 fixing round: the finding itself says the wiring is
+    compositor-side — the seat implements no touch protocol
+    (src/compositor/seat.zig, W3's module), so announcing touch devices
+    would put inert devices in the registry. Revisit when the seat gains
+    touch support.
 
 28. [LOW, FIXABLE-in-module] Wheel v120 normalization absent; legacy
     POINTER_AXIS choice — open from 117 (policy). Ours: legacy event consumed
@@ -375,15 +501,37 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
     SCROLL_* with value120 (events.c:169-183), smithay same (mod.rs:782-805).
     Both legal per libinput.h:811-826 [VERIFIED 117]; hi-res wheel data is
     carried in discrete, just not v120-normalized.
+    FIXED 2026-08-10: wheel scrolls now come from
+    LIBINPUT_EVENT_POINTER_SCROLL_WHEEL (wlroots' event choice) with the
+    v120 delta normalized to legacy clicks via the new v120ToNotches
+    (v120/120, libinput_event_pointer_get_scroll_value_v120 — hi-res-only
+    devices emit ONLY this event family, so the legacy AXIS path lost
+    them); the legacy POINTER_AXIS handler now serves FINGER/CONTINUOUS
+    only, so hi-res devices posting both families cannot double-deliver.
+    Caveat: REL_WHEEL-only (lo-res) mice emit only the legacy AXIS event
+    per libinput 1.31.3 source (evdev-fallback.c fallback_flush_wheels)
+    and are dropped by this choice — the same tradeoff wlroots makes
+    (events.c:167-169). Unit test covers the normalization math.
 
 29. [LOW, FIXABLE-in-module] libinput: no zero-device check at start — open
     from 117:5. Ours: start (libinput.zig:593) succeeds with an empty registry.
     wlroots: fails unless WLR_LIBINPUT_NO_DEVICES=1 (backend.c:112-116). A
     broken udev/seat config looks healthy.
+    FIXED 2026-08-10: start() fails with BackendFailed when the initial
+    dispatch leaves the device registry empty, unless
+    WLR_LIBINPUT_NO_DEVICES=1 (zeroDeviceCheckEnabled mirrors wlroots
+    env_parse_bool; unit test covers the gate).
 
 30. [LOW, FIXABLE-in-module] libinput: no LED sync — open from 117:6. wlroots:
     libinput_device_led_update (keyboard.c:31-35); smithay: LedState mapping
     (mod.rs:674-688). Ours: no LED path. Cosmetic on the VM path.
+    FIXED 2026-08-10: onKey syncs the seat's LED state to the event's
+    device via libinput_device_led_update (wlroots keyboard_set_leds +
+    keyboard_led_update); ledsFromModsLocked derives numlock/capslock from
+    the seat's mods_locked (wl_keyboard.modifiers layout, bits align with
+    enum libinput_led); keyboards start with LEDs cleared at device add
+    (wlroots init_device_keyboard) and a skip-when-unchanged cache avoids
+    redundant EV_LED writes. Unit test covers the bit mapping.
 
 ## Re-audit of previous open items
 
@@ -407,10 +555,13 @@ Reference: wlroots types/wlr_screencopy_v1.c. smithay: no zwlr_screencopy
   117:8 (dispatch failure policy — main.zig:918-923 stops loop), 117:9 (dead
   FFI decls — path_create_context/path_add_device/device_get_seat gone from the
   extern block; get_axis_source now used).
-- Still open from 116: encoder fallback (F24), atomic-only (F23), KMS-state
-  restore (F25). Still open from 117: touch/gesture (F27), zero-device check
-  (F29), LED sync (F30), single-announce policy (117:7 — by design), SCROLL_*
-  vs legacy choice (F28).
+- Closed 2026-08-10 fixing round: encoder fallback (F24), atomic-only
+  (F23), zero-device check (F29), LED sync (F30), SCROLL_* vs legacy choice
+  (F28 — wheel now on SCROLL_WHEEL + v120, legacy AXIS serves
+  finger/continuous). DEFERRED 2026-08-10: KMS-state restore (F25,
+  STRUCTURAL — lifecycle scope, untestable on the atomic VM), multi-output
+  backend impl (F26, structural until multi-output), touch/gesture wiring
+  (F27, seat-side). Still open: single-announce policy (117:7 — by design).
 
 ## Fixability summary
 

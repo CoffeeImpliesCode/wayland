@@ -64,6 +64,10 @@ and their resources leak at shutdown. wlroots explicitly calls `wl_display_destr
 before destroy (tinywl.c:1075), and libwayland documents destroy_clients as the required
 pre-step (wls:1769-1777). Fix: call `server.destroyClients()` (zws wrapper exists) in
 `deinit` before `server.destroy()`. FIXABLE-in-module.
+FIXED 2026-08-10: display.zig deinit now calls `server.destroyClients()` (zws
+`wl.Server.destroyClients` → wl_display_destroy_clients, wayland_server_core.zig:63-64)
+before `server.destroy()`, matching tinywl.c:1075 and libwayland's documented pre-step;
+the existing display deinit test exercises the path.
 
 F12. [LOW] `Global.remove()` (unpublish only) leaves a late-bind UAF window.
 ours: `Compositor.deinit` compositor.zig:89-99 calls `g.remove()` (= wl_global_remove
@@ -75,6 +79,13 @@ and note libwayland's own docs recommend destroy only when no more binds can arr
 In practice the window is process-shutdown-only (no new clients), but a test harness
 connecting after deinit would UAF. Fix: use `g.destroy()`; keep `remove()` only when the
 global must stay bindable for stragglers. FIXABLE-in-module.
+FIXED 2026-08-10: Compositor.deinit uses `g.destroy()` (wl_global_destroy) instead of
+`g.remove()` — the global leaves the display's global_list and is freed, so a late
+registry_bind cannot reach the freed Compositor; `remove()` remains available for
+straggler-safe paths (none currently). Teardown order now matches
+compositor_handle_display_destroy (wlr_compositor.c:1346-1359): destroy signal →
+global destroy → surface destroy. In main.zig, compositor.deinit runs before
+display.deinit's destroyClients, so bound clients still get global_remove before teardown.
 
 ## 2. wl_compositor
 
@@ -101,11 +112,25 @@ wlroots emits `events.new_surface` at create (wlr_compositor.c:1318-1320) and
 `events.destroy` at teardown (:1348-1350); consumers observe creation instead of
 polling the list. ours: consumers poll `c.surfaces` (server/main.zig). No current
 consumer needs the signal; add only when a listener appears. FIXABLE-in-module.
+FIXED 2026-08-10: Compositor now has `events.new_surface: wire.Signal(*Surface)`
+(emitted in createSurface after list append) and `events.destroy: wire.Signal(*Compositor)`
+(emitted at deinit start), mirroring wlr_compositor.c:1318-1320/1348-1350 with the
+xdg.zig signal pattern (init after construction, emit on event). main.zig wiring
+SKIPPED (documented): syncSurfaces already polls `compositor.surfaces.items` for
+surface_entries tracking (main.zig:1509-1530), so the event would be redundant; wiring
+it would change no behavior. Test: compositor.zig "new_surface and destroy signals fire".
 
 F22. [LOW] Version 7 vs 6 — resolved in note 130: vendored wayland.xml declares
 wl_compositor v7 (protocols/wayland/wayland.xml:197); the v7 slot adds only
 wl_surface.get_release, which we implement (see F62). wlroots/KWin cap at 6; smithay's
 protocol crate has v7 but its handler panics on GetRelease (F62). No action.
+VERIFIED 2026-08-10: resolution still consistent. Vendored
+protocols/wayland/wayland.xml:197 declares wl_compositor version 7; build.zig:33
+generates it at 7; `compositor_version = 7` (compositor.zig:45) advertises exactly the
+generated version. The v7-only slot is wl_surface.get_release, implemented
+(surface.zig:626-643, no_buffer error matches the spec). Bind-time version validation
+is conformant per §1.2/note 130 (no clamping; child objects inherit the bind version).
+No code change.
 
 ## 3. wl_surface (the bulk)
 
@@ -219,6 +244,12 @@ current.buffer now points at the new buffer. wlroots: `surface_cache_pending`
 wlr_compositor.c:475-510 — on OOM the pending state stays pending (post_no_memory,
 nothing moved). Fix: move the appendSlice (and its OOM path) BEFORE swapState, or
 roll back the swap. FIXABLE-in-module.
+FIXED 2026-08-10: applyCommit is now transactional — the frame-callback appendSlice
+and the damage translation (translateDamage, pre-swap into pending.buffer_damage) run
+before swapState; an OOM aborts with the state untouched + postNoMemory, and no
+allocation remains after the swap (the post-swap phase is infallible). Damage-union
+OOM posts no_memory but no longer aborts the commit (damage is a hint). Test:
+"OOM in the commit path aborts without applying partial state" (FailingAllocator).
 
 F32. [MED] Buffer lock model: hold-across-commits vs unlock-every-commit.
 ours: `current.buffer` holds a locked reference until replaced or destroyed
@@ -232,6 +263,16 @@ holding `current.buffer` after commit holds an UNLOCKED reference (release alrea
 fired) — future readers must not assume liveness from the lock count. This is the
 root cause behind F42 (dead-wrapper display). STRUCTURAL (changing it rewires
 surface+buffers+subsurface).
+DEFERRED 2026-08-10 fixing round: classified STRUCTURAL — switching to
+unlock-per-commit rewires the attach locking, release_callbacks, the subcompositor
+flush path, and both destroy paths. Cache-impact evidence (checked before deferring):
+the M2 canvas does NOT hold buffer references — main.zig's commit-signal handler
+copies the pixels at upload (updateSurfaceNode → surfacePixels →
+importSurfacePixels/updateMemory, "the scene node owns the copy",
+src/server/main.zig:1618-1703, src/renderer/pixman.zig:137-190), so per-commit unlock
+would not free shm under a live texture. The deferral is about the lock-model rewrite
+scope (F42 was fixed separately on top of the current model), not a cache hazard.
+F51 is tied to this model and deferred with it.
 
 F33. [LOW] No `committed` mask: every commit is a full state copy.
 wlroots `surface_state_move` wlr_compositor.c:321-405 applies fields only when the
@@ -242,6 +283,14 @@ what wlroots would have committed); only damage is affected — wlroots CLEARS
 current damage when the bit is absent (:374-385), ours always transfers pending
 (empty after a swap → same result). No fix needed; note for future viewporter work.
 FIXABLE-in-module (when viewport arrives).
+FIXED 2026-08-10: State.committed mask added (buffer/opaque/input/transform/scale/
+offset bits), set by the request handlers, consumed and cleared by swapState. The
+swap applies only committed fields — behavior-preserving except where wlroots
+explicitly clears on an absent bit: the offset (F34) and opaque/input regions (which
+the old full copy lost on the next commit, because the swap nulls pending — the mask
+now keeps them, matching wlroots). Damage transfers unconditionally (equivalent).
+Tests: "uncommitted fields keep their current value across the swap", "opaque and
+input regions persist until replaced by a commit".
 
 F34. [MED] `wl_surface.offset` (v5) and pre-v5 attach dx/dy are dropped.
 ours: `handleOffset` surface.zig:693-698 is a no-op; State has no dx/dy. All three
@@ -251,6 +300,12 @@ KWin surface.cpp:459-461. Consumers: XWayland positioning, cursor hotspots, popu
 placement. Ours renders such surfaces at the wrong location (no visible consumer yet:
 no XWayland). Add `dx`/`dy` to State, store on handleOffset and pre-v5 attach, expose
 for the compositor. FIXABLE-in-module.
+FIXED 2026-08-10: State.dx/dy added; handleOffset stores them (committed.offset bit),
+handleAttach stores the attach dx/dy at every version (v5+: the mandatory 0, like
+wlroots) and sets the bit; swapState applies them and CLEARS current.dx/dy on a
+commit without the offset bit (wlr_compositor.c:340-346). Exposed on State for
+consumers. Tests: "offset is stored, committed, and cleared by a commit without
+one", "pre-v5 attach stores the offset".
 
 F35. [MED] Deferred commits merge into one slot; post-commit requests are applied at
 flush (wlroots applies only committed states).
@@ -264,6 +319,12 @@ set_buffer_scale(2) without commit; parent commits — ours applies scale 2, wlr
 applies the committed scale and leaves 2 pending. Module comment claims equivalence;
 that is not correct for post-commit requests. STRUCTURAL (needs a cached-state list
 or an explicit "flush applies only last-committed snapshot" rule).
+DEFERRED 2026-08-10 fixing round: classified STRUCTURAL — a faithful fix needs a
+per-commit cached-state list on the surface and the flush path lives in
+subsurface.zig (flushCached, W3's file); the merged-slot approximation is a
+deliberate M1 simplification and observationally equivalent for
+buffer/damage/frame-callback behavior. The commit() doc comment now states the
+divergence explicitly.
 
 F36. [MED] role.client_commit runs on cache flushes.
 ours: `applyCommit` surface.zig:482 runs role.client_commit on EVERY apply, including
@@ -273,6 +334,15 @@ only role->commit (:562-565). The xdg client_commit hook does configure accounti
 running it once at flush (not per cached commit) shifts configure counting for
 sync-subsurface xdg popups. Fix: run role.client_commit in `commit()` (before the
 deferral check) instead of applyCommit, matching wlroots. FIXABLE-in-module.
+FIXED 2026-08-10: role.client_commit moved to commit() (before the client_commit
+signal and the deferral check, mirroring wlroots surface_handle_commit
+wlr_compositor.c:582-584); applyCommit runs only role.commit, so cache flushes no
+longer run client_commit. Consequence for the shell hooks: the xdg/layer
+unconfigured/already_constructed checks in the client_commit hooks read
+`surface.current.buffer` post-swap today; with the pre-swap placement they must read
+`surface.pending.buffer` (wlroots checks pending.buffer_resource) — xdg.zig:1801 and
+layer_shell.zig:623 updated by W4/W5 in coordination. Test: "role client_commit runs
+per client commit, not on cache flushes".
 
 F37. [LOW] Unmap ordering: role.unmap before unmap signal.
 ours: surface.zig:306-311 (destroy path) and :504-510 (commit path) call role.unmap
@@ -280,6 +350,11 @@ then emit events.unmap; wlroots `wlr_surface_unmap` wlr_compositor.c:854-872 emi
 the signal first, then role->unmap, then recursively unmaps subsurfaces. Also ours
 does not recurse into subsurfaces (subsurface module handles orphan re-root in
 main.zig:1629-1645 instead). LOW; listeners see hooks before the signal. FIXABLE-in-module.
+FIXED 2026-08-10: both unmap sites (Surface.destroy and the commit-path transition)
+now emit the unmap signal BEFORE role.unmap, matching wlr_surface_unmap
+(wlr_compositor.c:854-872). No listener depended on the old order (verified: no
+map/unmap signal consumers outside surface.zig). Test: "unmap signal fires before
+the role unmap hook".
 
 F38. [MED] No `previous` state.
 wlroots snapshots `surface->previous.{scale,transform,width,height,buffer_width,buffer_height}`
@@ -289,6 +364,11 @@ previous fields; server recomputes surfaceSize per commit (main.zig:1654-1658) a
 damages old+new cursor footprints manually. Needed for M2 damage-ring correctness on
 transform/scale changes (a scale change currently damages only the new size).
 FIXABLE-in-module (copy in applyCommit before swapState).
+FIXED 2026-08-10: Surface.previous {scale, transform, buffer_width, buffer_height}
+added and snapshotted from the CURRENT state at the top of every applyCommit
+(before the swap, wlroots wlr_compositor.c:523-528). Consumers diff previous vs
+current to damage the old footprint on geometry changes (M2 damage ring). Test:
+"previous state snapshots the pre-commit geometry".
 
 F39. [LOW] `handleDamage`/`handleDamageBuffer` accept negative w/h.
 wlroots ignores negative dims at request time (wlr_compositor.c:91-106, 626-639);
@@ -297,6 +377,16 @@ KWin QRegion clamps. ours stores the rects raw (surface.zig:596-611); they are
 harmless for rendering (isEmpty at union) but grow the rect list and feed F1's
 overflow path at render time. Fix: reject/ignore negative dims like wlroots.
 FIXABLE-in-module.
+FIXED 2026-08-10: handleDamage/handleDamageBuffer (surface.zig) early-return when
+`width < 0 or height < 0` — the rect is ignored, no protocol error. Reference check:
+the wl_surface spec (wayland.xml damage/damage_buffer) defines no error for negative
+extents and says "the compositor ignores the parts of the damage that fall outside of
+the surface"; wlroots ignores (wlr_compositor.c:91-106, 626-639), smithay ignores for
+DamageBuffer (handlers.rs:304-309 — the note's "rejects" means rejects-from-list, the
+code is `if width < 0 || height < 0 { return; }`), KWin QRegion clamps. Decision:
+ignore, per the majority reference and the note's prescription. Zero extents remain
+accepted (harmless empties, isEmpty at consume) matching wlroots. Test:
+surface.zig "negative damage extents are ignored".
 
 F3A. [LOW] `validatePending` posts invalid_size for cursor surfaces.
 wlroots exempts cursor roles from the scale-divisibility error (debug log instead,
@@ -358,6 +448,19 @@ uses checked Rectangle types, KWin QRegion is 64-bit based. Fix: use saturating
 `addSat`/`subSat` (already present surface.zig:805-819) inside Rect.intersect/union,
 or reject rects whose `x + width` overflows at the request handlers (region.zig:43,
 surface.zig:596-611). FIXABLE-in-module.
+FIXED 2026-08-10: geom.zig gained pub `addSat`/`subSat` (i32 saturated add/sub,
+clamp-at-boundary = the pixman int64-in/int32-out model); Rect.intersect, Rect.@"union"
+and Rect.containsPoint now compute every edge via them, so no client-supplied rect can
+trap the compositor. Region.subtract's split arithmetic (inter.x - existing.x,
+existing.x + existing.width, ...) also switched to geom.addSat/subSat — it recomputed
+the same edges outside Rect, so the geom fix alone was not sufficient (verified: the
+fuzz's subtract invariant still holds under saturation because part edges are exact).
+Callers (a) region.zig subtract, (b) main.zig:1124-1134 damage translate →
+out_rect.intersect, (c) Damage.boundingRect union (damage.zig/raylib.zig) are all
+protected through the shared Rect helpers. Tests: geom.zig "rect intersect saturates on
+client-controlled overflow" + "rect containsPoint saturates"; region.zig "region
+extreme coordinates never trap"; region fuzz now mixes in randExtremeRect rects whose
+x + width overflows i32.
 
 F42. [MED] Dead pending/current buffer still displays stale content after commit.
 Client: attach B → destroy B's wl_buffer → commit. Ours: `shm.resourceDestroy`
@@ -374,6 +477,19 @@ surface must observe wrapper death (subscribe to the Buffer destroy signal or ha
 ShmState notify) and clear `pending.buffer`/`pending_locked` (and `current.buffer`
 for the displayed case), so the next commit unmaps. NEEDS-wiring (buffer module →
 surface module contract).
+FIXED 2026-08-10: implemented with the wlroots mechanism (pending_buffer_resource_
+handle_destroy wlr_compositor.c:49-54) instead of a Buffer signal: the surface tracks
+`pending_resource`/`current_resource` (moved at applyCommit) and registers one destroy
+listener on the attached wl_buffer resource at attach. On resource death the handler
+compares resource pointers and clears the matching slot(s) — pending
+(buffer + pending_locked, firing pending get_release callbacks) and/or current
+(buffer + the s.buffer mirror, firing current callbacks) — so the next commit is a
+NULL-buffer commit and unmaps. The handler never dereferences the wrapper: shm's own
+resourceDestroy listener runs first in the emission and may have freed it (F52's OOM
+fallback). The listener self-detaches and is detached in Surface.destroy. The wiring
+stays within surface.zig + the existing Buffer/ShmState API (no Buffer changes).
+Tests: "destroying the attached buffer resource unmaps on the next commit",
+"destroying the displayed buffer's resource clears the current slot".
 
 F43. [LOW] Region rect count grows unboundedly (no normalization).
 Each `add` appends (region.zig:43-51); each `subtract` splits every intersecting rect
@@ -383,6 +499,16 @@ set); KWin QRegion likewise. A client can drive memory growth with overlapping a
 For M1 (opaque/input snapshots) the list is copied wholesale, so accuracy is fine —
 only growth differs. Fix: merge/compact on add when a rect is adjacent/contained, or
 cap the list. FIXABLE-in-module.
+FIXED 2026-08-10: Region.add compacts on insert (the note's merge option): a new rect
+contained in an existing one is dropped; an existing rect contained in the new one is
+absorbed; overlapping or touching rects sharing an edge alignment (same y+height →
+horizontal, same x+width → vertical) merge into their union. Every merge preserves the
+represented set exactly (the merged box equals the union of its inputs — alignment
+guarantees no invented corners), so a client re-adding the same area cannot grow the
+list; repeated overlapping adds of one shape collapse to a single rect. Disjoint
+rects still append (union semantics unchanged). subtract parts are left unmerged
+(growth there is bounded per intersecting rect; the note's 4x observation stands).
+Tests: region.zig "region add compacts overlapping, contained and adjacent rects".
 
 ## 5. Buffers (buffer.zig + shm.zig)
 
@@ -425,18 +551,40 @@ per texture generation, and the guard must move from "per buffer" to "per use".
 Also note: ours fires release at ATTACH-time drops of never-committed buffers
 (surface.zig:386-395) — harmless (compositor never used it) but differs from wlroots
 (no lock at attach). STRUCTURAL (tied to the lock model, F32).
+DEFERRED 2026-08-10 fixing round: classified STRUCTURAL and tied to F32's lock
+model — switching the release guard from "per buffer" to "per use" is exactly the
+unlock-per-commit change deferred with F32 (same rewiring scope). The once-only guard
+remains protocol-safe for M1: the commit-signal upload (main.zig:1553-1555 →
+1618-1703) copies the pixels BEFORE the commit-end unlock, so wl_buffer.release never
+races the copy. Cache evidence for the deferral: the canvas texture cache holds pixel
+copies, not buffer references (importSurfacePixels/updateMemory, "the scene node owns
+the copy"), so neither F32 nor F51 risks freeing shm under a live texture — the
+deferral is purely the lock-model rewrite scope.
 
 F52. [LOW] Graveyard OOM path leaks the wrapper (documented in 119).
 shm.zig:212-216: `dead_buffers.append` OOM → `catch return` — wrapper is nulled and
 dropped but never freed (leak at deinit). Safe (no UAF), valgrind-visible only under
 OOM. wlroots needs no graveyard (refcounts). FIXABLE-in-module (fall back to
 immediate free when n_locks==0, else keep a fixed-size stash).
+FIXED 2026-08-10: resourceDestroy's graveyard append now falls back — an unlocked
+wrapper (n_locks == 0) is freed immediately via Buffer.destroy (safe inside the
+destroy signal: signal emission tolerates freeing the current listener, and the
+surface-side F42 listeners that run later only compare resource pointers); a locked
+wrapper parks in a fixed-size no-allocation stash (ShmState.dead_stash[8]) freed at
+deinit. A full stash still leaks (bounded, OOM-only, documented). Test: "graveyard
+append OOM frees unlocked wrappers and stashes locked ones" (FailingAllocator +
+fabricated wrapper).
 
 F53. [LOW] `Buffer.drop` is idempotent; wlroots asserts `!dropped`.
 buffer.zig:96-101 vs buffer.c:45-56. Ours tolerates re-drops (the commit path re-drops
 replaced buffers, surface.zig:455-469); wlroots' single-shot drop + refcount-free-at-0
 makes double-drop a bug. Ours is more lenient; the `released` guard makes it safe.
 OK/documented.
+FIXED 2026-08-10 (documentation): kept the lenient cycle-idempotent drop (the commit
+path re-drops replaced buffers and the released guard makes it harmless) and added the
+wlroots-assert contrast + "keep the leniency; do not add the assert" note to
+Buffer.drop's doc (buffer.zig). No code change — adding the assert would fire in
+normal operation (re-attach cycles).
 
 F54. [MED] Formats: only ARGB8888+XRGB8888 advertised; no renderer-format integration.
 ours: `initShm` display.zig:61-74 uses libwayland's internal wl_shm (always exactly
@@ -448,6 +596,17 @@ RGB565/YUYV pools here even though the pixman renderer could consume them. Also
 libwayland's internal create_pool/create_buffer DO validate size/stride/format
 (wlshm.c:449-473); wlroots additionally validates stride per pixel format info
 (wlr_shm.c:314-372). Needs a format-query hook on the renderer. NEEDS-wiring.
+FIXED 2026-08-10 (verified no-op, with evidence): the renderer ALREADY exposes the
+format-query hook — `Renderer.formats: []const u32` (renderer.zig:19-21), and the
+pixman renderer creates with `&.{format_argb8888}` (pixman.zig create) — a SINGLE
+format, a8r8g8b8, which is a subset of what libwayland's internal wl_shm already
+advertises (a8r8g8b8 + x8r8g8b8, display.zig initShm:67-68). The note's claim that
+"the pixman renderer could consume RGB565/YUYV" is not true for this renderer:
+importMemory/updateMemory copy the bytes verbatim into an a8r8g8b8 texture
+(PixmanTextureData), so any non-4-bytes-per-pixel format would render garbage.
+There is no renderer-supported format outside the advertised pair, so wiring
+renderer.formats → wl_display_add_shm_format would be a no-op; the seam exists
+(display.addShmFormat, renderer.formats) for a future renderer with more formats.
 
 F55. [LOW] fromResource errors swallowed at attach (no postNoMemory on OOM).
 surface.zig:568-594: `st.fromResource(...) catch null` conflates InvalidBuffer and
@@ -455,6 +614,14 @@ OutOfMemory — an OOM silently keeps the previous pending buffer and the client
 never told (no postNoMemory). wlroots surfaces an OOM at commit via post_no_memory.
 Fix: split the error handling (InvalidBuffer → keep previous + debug log per M1;
 OutOfMemory → postNoMemory). FIXABLE-in-module.
+FIXED 2026-08-10: handleAttach no longer conflates the wrap errors — error.InvalidBuffer
+now takes the F56 reject path (fatal error on the buffer resource + destroy), and
+error.OutOfMemory posts postNoMemory on the surface and returns with the previous
+pending buffer untouched (wlroots surfaces the OOM too). The OutOfMemory branch is
+not reachable in the unit harness (fromResource fails with InvalidBuffer before any
+allocation for fabricated non-shm resources — a real shm buffer is needed to reach
+the allocation sites); the split itself is exercised by the F56 test, and the
+InvalidBuffer arm asserts the previous pending buffer is kept.
 
 F56. [LOW] Unknown buffer type: keep-previous vs kill-client.
 wlroots: attach stores the resource; at commit `wlr_buffer_try_from_resource` fails →
@@ -463,6 +630,14 @@ wlroots: attach stores the resource; at commit `wlr_buffer_try_from_resource` fa
 previous pending buffer with a warn log (surface.zig:579-591). Divergence is
 deliberate M1 leniency; a client attaching a foreign buffer sees a stuck surface
 instead of an error. Document or align. FIXABLE-in-module.
+FIXED 2026-08-10: aligned with wlroots — an unknown buffer type now posts a fatal
+error on the BUFFER resource with code -1 ("unknown buffer type", mirroring
+wlr_surface_reject_pending wlr_compositor.c:874-889) and destroys the resource. The
+error fires at ATTACH here (ours wraps at attach; wlroots resolves at commit) — same
+observable outcome for the client (fatal protocol error + disconnect), and the
+previous pending buffer is untouched (the error path never reaches attachBuffer).
+Test: "attach of an unknown buffer type posts an error and keeps the previous
+pending".
 
 ## 6. role.zig
 

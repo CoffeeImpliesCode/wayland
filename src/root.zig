@@ -87,6 +87,12 @@ pub const screencopy = @import("screencopy.zig");
 comptime {
     _ = wire;
     _ = utils;
+    // `_ = utils` forces the wrapper struct, not the nested modules' tests;
+    // force each member so geom/damage/log/matrix tests are always collected.
+    _ = utils.geom;
+    _ = utils.damage;
+    _ = utils.log;
+    _ = utils.matrix;
     _ = core;
     _ = buffers;
     _ = shm;

@@ -101,6 +101,17 @@ reads every key one row off ('a' → 'l' with our current wire value 38). Latent
 no real client in the gate; tests only count events and never xkb-interpret the wire.
 Class: FIXABLE-in-module (keep the seat API in xkb keycodes; subtract 8 in
 keyEvent's send and in both enter-array constructions).
+FIXED 2026-08-10: `Seat.keyEvent` sends `keycode - 8` (evdev scancode) on
+wl_keyboard.key; both enter-array constructions (setKeyboardFocus +
+get_keyboard late bind) now use `pressedScancodeArray()` (xkb → scancode
+conversion); the API + `pressed` list stay in xkb keycodes (xkb.zig:63-65
+doc updated). Call-site inventory: seat.zig keyEvent/enter arrays (fixed),
+libinput.zig:236-238/446 feeds xkb codes via evdevToXkb (correct, no
+change), raylib_input.zig:131-132 feeds xkb codes (correct), main.zig:1023
+synth feeds xkb 38 (correct), test client client.zig:395 expected wire 38
+→ now expects 30 (fixed). seat.zig test asserts last_key == 30; new test
+"keyboard enter carries evdev scancodes, not xkb keycodes (F1)" asserts
+the enter keys array carries 30.
 
 ### F2 — serial model: single `last_serial` vs per-client ringset (MED)
 Ours: `nextSerial` (seat.zig:200) records only the seat-wide last serial
@@ -124,6 +135,17 @@ today (single focused client per device, no drags) but is a correctness debt for
 and DnD.
 Class: NEEDS-wiring (per-client serial storage + ring; data_device validation moves to
 a seat-provided `validateEventSerial(client, serial)`; pointer grab serial F3).
+FIXED 2026-08-10: per-client serial ringset in the seat (wlroots 0.20.2
+compressed-range model, wlr_seat.h:20-30 + wlr_seat.c:473-524): every
+serial-bearing delivery records via `serialFor(client)` on the RECEIVING
+client (pointerButton, pointerEnter/Leave, keyEvent, setKeyboardFocus
+leave+enter, sendKeyboardModifiers, both late binds). Public
+`Seat.validateEventSerial(client, serial)` validates over the client's
+ring with half-range wrap handling (serial 0 with an empty ring rejects).
+Consumers wired: data_device.zig set_selection + start_drag (W6) and
+xdg_activation tokenValid (W7) now call validateEventSerial; seat's own
+set_cursor uses it (F9). `last_serial` kept for compat. Grab-serial
+prerequisite (start_drag's implicit-grab check) stays with F3.
 
 ### F3 — no grab system (pointer/keyboard) and touch is a dead object (HIGH/STRUCTURAL)
 Ours: no grab state anywhere in `Seat` (seat.zig:55-110); `pointerButton` hardcodes
@@ -147,6 +169,11 @@ compositor (wlroots does NOT move keyboard focus on click).
 Class: STRUCTURAL (grab trait/struct layer + routing seam) — the largest single item;
 the implicit-click-grab serial (grab_serial) is a FIXABLE prerequisite that unlocks
 F2's start_drag check.
+DEFERRED 2026-08-10 fixing round: grab layer (interface + default grab +
+routing seam), touch implementation and the MISSING_CAPABILITY post are a
+structural rework (new trait/struct layer + touch path); the orchestrator
+blocked F3 for this round. F2's start_drag check remains
+validateEventSerial-only (no implicit-grab serial) until the grab layer lands.
 
 ### F4 — version 7 vs 9/10: missing axis_value120, axis_relative_direction, key repeat state (MED)
 Ours: `seat_version = 7` (seat.zig:45); axis path sends source/discrete/axis/stop+frame
@@ -169,6 +196,23 @@ repeat). Version bump is a wire-contract change.
 Class: FIXABLE-in-module (bump seat_version to 9; add value120 accumulation per
 pointer resource — the accumulator state is per client like wlroots'
 `client->value120` wlr_seat.h:58; send relative_direction; make repeat_info configurable).
+FIXED 2026-08-10: seat_version bumped 7 → 10 (KWin parity, seat.cpp:30;
+generated stays 11, build.zig:35). `pointerAxis` rewritten to the wlroots
+shape (wlr_seat_pointer.c:321-392): v8+ resources get axis_value120
+(discrete × 120, replacing axis_discrete per wayland.xml:2481-2482), v9+
+get axis_relative_direction before the axis event; <v8 clients get
+per-client accumulated axis_discrete (Value120 state in the seat-client
+entry, wlroots update_value120_accumulators); axis_stop only on value==0.
+New `pointerAxisDir` carries the relative direction (wheel default
+identical); existing 4-arg pointerAxis delegates (libinput.zig,
+raylib_input.zig, main.zig synth unchanged). repeat_info is now
+configurable via seat.key_repeat_rate/delay (default 0/0 — no server-side
+repeat timer, see F13). Verified against vendored wayland.xml:
+axis_value120 since=8, axis_relative_direction since=9 (the task brief's
+"v6" was wrong — XML is ground truth). Tests: v10 bind in the harness +
+value120/relative_direction counters; new test asserts a v7-bound pointer
+gets axis_discrete while the v10 pointer gets axis_value120. notes/130
+seat decision updated.
 
 ### F5 — subsurface position and z-order are request-time, not double-buffered (MED)
 Ours: `set_position` writes ss.x/ss.y immediately (subsurface.zig:307-310); the server
@@ -191,6 +235,14 @@ application it is a protocol-contract deviation, not just timing.
 Class: FIXABLE-in-module (hold pending x/y/restack on the Subsurface; apply when the
 parent commits — there is already an `onParentCommit` flush seam; or move pending
 into the surface's cached-state slot).
+FIXED 2026-08-10: `set_position` writes pending_x/pending_y; onParentCommit
+applies them to x/y and promotes a pending restack (restack_committed) —
+both position and z-order now effective only on the parent's commit
+(wlroots pending.x/y + surface_synced_move_state, wlr_subcompositor.c:
+65-73, 161-179). main.zig syncSubsurfaceNodes applies the restack only
+when restack_committed (then resets both). Tests: "set_position is
+double-buffered on the parent commit (F5)" + "restack is double-buffered
+on the parent commit (F5)".
 
 ### F6 — wl_subsurface destroy / parent death leaves the child mapped (MED)
 Ours: `.destroy` flushes the cache and clears the role; the surface keeps rendering as
@@ -209,6 +261,15 @@ ghosting in any client that destroys a popup's subsurface while the popup surfac
 lives. Ours is a documented M3 deviation; wlroots semantics are the contract.
 Class: FIXABLE-in-module (call the unmap path — Surface has map/unmap transitions —
 in subsurfaceDestroy and onParentDestroy; keep the cache flush first).
+FIXED 2026-08-10: `unmapChild` (the Surface.destroy unmap transition:
+clear mapped, run the role unmap hook, emit events.unmap) is called on
+wl_subsurface.destroy AND on parent death (after the cache flush), per
+wlroots subsurface_destroy → wlr_surface_unmap (wlr_subcompositor.c:43)
+and wayland.xml:3279-3301. main.zig gained a per-entry surface.unmap
+listener (onSurfaceUnmap → removeSurfaceNode) so the forced unmap drops
+the child's scene node; the entry survives for a later remap as a plain
+surface. Tests: destroy-request unmap test + parent-destroy test now
+assert `!t.child.mapped`.
 
 ### F7 — axis_source sent per call, frame after every event; no batch (LOW)
 Ours: `pointerAxis` sends axis_source unconditionally per call (seat.zig:301) and a
@@ -227,6 +288,16 @@ Why it matters: legal but chatty; clients see N frames for an N-event scroll bur
 and axis_source repeated mid-frame where the protocol expects it once. No functional
 break.
 Class: FIXABLE-in-module.
+FIXED 2026-08-10: pointer events defer their wl_pointer.frame — each
+delivery marks the receiving client's `frame_pending`; the new
+`Seat.pointerFrame()` (called by main.zig renderFrame once per render
+iteration, i.e. once per input batch; the test pump mirrors it) flushes
+one frame per batch and resets the axis-source dedup
+(sent_axis_source/cached_axis_source, wlroots wlr_seat_pointer.c:334-342,
+394-402). axis_source is sent once per batch; a mid-batch source change
+re-sends it (wlroots asserts; we degrade). Tests: "axis events batch into
+one frame with a single axis_source (F7)" (2 notches in one batch → 1
+source, 1 frame; next batch re-sends the source).
 
 ### F8 — pointer motion dedup absent (LOW)
 Ours: every pointerMotion with focus sends motion (seat.zig:225-227).
@@ -236,6 +307,17 @@ smithay does not either — so this is a wlroots nicety, not a cross-reference c
 Why it matters: sub-pixel movement in the same fixed-point cell generates redundant
 events; the raylib backend already avoids same-pixel calls (raylib_input.zig:139).
 Class: FIXABLE-in-module (compare fixed-point of focus_x/focus_y against last sent).
+FIXED 2026-08-10: pointerMotion compares the fixed-point of
+focus_x/focus_y against the last sent value (last_motion_fixed_x/y) and
+skips the motion event when unchanged (wlroots wlr_seat_pointer.c:252-263).
+Refined 2026-08-10 (E2E regression): the dedup base resets to "never
+sent" on every pointer enter, so a motion always follows each enter —
+dedup only suppresses REPEATS of an already-delivered position (the
+headless E2E synth moves to the exact enter position; suppressing that
+first motion starved the client's motion check). The pointer_move signal
+still emits and enter/leave are unaffected. Tests: same-position motion
+after enter delivers once, its repeat is deduped, a new-cell move
+delivers.
 
 ### F9 — set_cursor validation: no role enforcement, allows when unfocused (MED)
 Ours: accepts when `serial == pointer_enter_serial OR pointer_focus == null`
@@ -252,6 +334,17 @@ Why it matters: the `pointer_focus == null` branch lets ANY client set the curso
 image with any serial while the pointer is outside all surfaces — a client can swap
 the cursor remotely. Latent (single-client demo) but a real authority hole.
 Class: FIXABLE-in-module (add focused-client + role checks; keep the enter-serial match).
+FIXED 2026-08-10: set_cursor accepts only when (a) a pointer focus
+exists, (b) the requesting client OWNS the focus surface, (c) the serial
+validates over that client's ring (validateEventSerial — the enter serial
+qualifies; wlroots validates over the ring, smithay last_enter, KWin the
+enter serial), and (d) a non-null surface may carry only the new
+`cursor_role` ("wl_pointer-cursor", wlroots pointer_cursor_surface_role) —
+a conflict posts WL_POINTER_ERROR_ROLE on the pointer resource
+(wlr_seat_pointer.c:85-100). The `pointer_focus == null` allowance is
+gone (it let any client swap the cursor). Test: "set_cursor requires
+focus, a valid serial and the cursor role (F9)" covers unfocused, stale
+serial, foreign client, accept, and the role-conflict error.
 
 ### F10 — no keymap change / layout-group tracking (LOW-MED)
 Ours: keymap compiled once at init (seat.zig:146-153); modifiers always send group 0
@@ -269,6 +362,17 @@ Why it matters: layout switching (both refs and KWin support it) is impossible; 
 2-layout keymap would report group 0 forever. Latent: single "us" layout.
 Class: NEEDS-wiring (keymap-change broadcast channel + group in Xkb.mods + mod-index
 mapping); the broadcast is FIXABLE-in-module.
+FIXED 2026-08-10: `Xkb.mods()` now carries the effective layout group
+(xkb_state_serialize_layout, XKB_STATE_LAYOUT_EFFECTIVE) and
+sendKeyboardModifiers sends it (wlroots wlr_seat_keyboard.c:215-217);
+keyEvent re-sends modifiers on a group change too. `Xkb.setLayout`
+rebuilds the keymap/state/text/memfd; `Seat.setKeyboardLayout` wraps it +
+`Seat.broadcastKeymap()` re-broadcasts the keymap to every client's
+keyboards (wlroots handle_keyboard_keymap, wlr_seat_keyboard.c:87-99) +
+re-sends the modifiers. Wired from main.zig via WAYLAND_KEYBOARD_LAYOUT
+(before any client binds). Tests: xkb.zig group + setLayout (incl. a
+"us,de" multi-layout keymap), seat.zig "keymap change re-broadcasts to
+all clients (F10)".
 
 ### F11 — teardown sends no leave/clear (LOW)
 Ours: `Seat.deinit` (seat.zig:179-188) just frees; focused clients get no
@@ -282,6 +386,12 @@ Why it matters: cosmetic only — the display teardown immediately kills client
 connections; wlroots does it for orderly shutdown of clients that might otherwise
 hang. LOW.
 Class: FIXABLE-in-module.
+FIXED 2026-08-10: Seat.deinit sends keyboard.leave + pointer.leave (with
+frame) to the focused client before freeing, flushes them
+(display.flushClients), then destroys the seat's keyboard/pointer
+resources so their destroy handlers run while the seat is alive (wlroots
+seat_client_destroy, wlr_seat.c:257-260), then frees. Test: "seat
+teardown sends leave to the focused client (F11)".
 
 ### F12 — focused-surface destroy: ours clears silently, refs send leave (LOW)
 Ours: `surfaceDestroyed` (seat.zig:431-434) nulls the focus pointers without events
@@ -294,6 +404,15 @@ Expected: either behavior is defensible; the surface's client is the one destroy
 it. Ours matches wlroots; KWin is stricter. Verified wired: main.zig:1572 calls
 `seat.surfaceDestroyed(s)` before the entry is freed — the note-106 UAF is closed.
 Class: OK (documented divergence vs KWin).
+FIXED 2026-08-10: took the KWin behavior — surfaceDestroyed sends
+keyboard.leave + pointer.leave with fresh serials before clearing (the
+surface is still alive inside the destroy signal). Also implemented
+wlroots' re-armed surface-destroy listeners (keyboard_focus_listener /
+pointer_focus_listener, armed on every focus change and detached on
+focus change + seat deinit) so the focus pointers can never dangle —
+the seat clears itself when its focused surface dies, and the listeners
+route through surfaceDestroyed. Test: "focused-surface destroy sends
+leave before clearing (F12)".
 
 ### F13 — KWin-style Repeated key state (v10) absent (LOW)
 Ours: no repeat generation at all (repeat_info 0,0, seat.zig:515).
@@ -302,6 +421,14 @@ KWin sends it and sets repeat rate 0 for v10+ clients (keyboard.cpp:44-47, 150-1
 Why it matters: only relevant after F4's version bump; server-side repeat would be a
 new feature (timer), not a fix.
 Class: FIXABLE-in-module (after F4) / out of scope for the current gate.
+DEFERRED 2026-08-10 fixing round: server-side key repetition is a new
+feature (a per-key repeat timer), not a fix; the note's own finding text
+puts it out of scope for the gate and the fixing-round task brief says
+"implement if the note prescribes it at v10" — it does not. F4's
+repeat_info is now configurable (seat.key_repeat_rate/delay, still 0/0
+so clients do their own repeat, which is legal; the wire's
+key_state.repeated enum exists at v10 and is reachable once a repeat
+timer lands).
 
 ---
 
@@ -315,6 +442,12 @@ Class: FIXABLE-in-module (after F4) / out of scope for the current gate.
   data_device.zig:327/363), F10 (keymap-change broadcast + group tracking).
 - STRUCTURAL: F3 (grab layer: interface + default grab + routing seam; implicit click
   grab serial; touch either fully implemented or inert-with-error like smithay).
+
+Status after the 2026-08-10 fixing round: F1, F2, F4, F5, F6, F7, F8, F9, F10,
+F11, F12 implemented (FIXED annotations on each finding; F12 took the KWin path the
+task brief prescribed over the note's "OK" verdict). F3 DEFERRED (STRUCTURAL,
+blocked by the orchestrator). F13 DEFERRED (server-side repeat is a new timer
+feature the note explicitly gates out).
 
 Suggested order: F1 (wire correctness, one-line) → F9 (authority hole) → F4 (version)
 → F2's grab_serial prerequisite → F3 (grab system) → F5/F6 (subsurface contract) →

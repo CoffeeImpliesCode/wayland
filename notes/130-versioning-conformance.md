@@ -24,13 +24,25 @@ Ground truth: freedesktop-wayland-wayland/src/wayland-server.c + wayland-client.
 ## Gate inventory (complete, audit-verified)
 
 - wl_output sendState (wl_output.zig:78-103): geometry/mode since 1; scale >=2; name/description >=4; done >=2. Correct.
-- wl_seat: pointer.frame >=5 (seat.zig:232,260,297,456,474,552); seat.name >=2 (seat.zig:496); keyboard.repeat_info >=4 (seat.zig:517); capabilities since 1 (always, seat.zig:495). Correct.
+- wl_seat: pointer.frame >=5 (seat.zig:350,547); seat.name >=2 (seat.zig:1000); keyboard.repeat_info >=4 (seat.zig:1021); capabilities since 1 (always, seat.zig:999). Correct.
 - screencopy: buffer_done >=3 (screencopy.zig:204); damage >=2 (screencopy.zig:313-315, fixed). Correct now.
 - layer_shell keyboard_interactivity v<4 bool coercion (layer_shell.zig:345-352): v<4 maps any nonzero to exclusive (on_demand does not exist there); v>=4 validates the enum range. Correct.
 
 ## Decisions (recorded)
 
-- wl_seat advertises v7 while generated to 11 (seat.zig:45; build.zig:35). Deliberate: touch exists in the generated wire but not in the capability set. A future touch feature must bump BOTH the advertisement (seat_version) AND the touch-capability coupling (sendCapabilities, seat.zig:495) — advertising v11 without the capability would not add touch events, and adding the capability without bumping would leave v7 clients unable to send wl_touch.release (since 3) on resources created at v7.
+- wl_seat advertises v10 (seat.zig:56; build.zig:35 generates to 11) — bumped from
+  v7 on 2026-08-10 (note 132 F4). Deliberate cap at 10, not 11: v10 exposes
+  axis_value120 (wl_pointer v8), axis_relative_direction (v9) and the
+  key_state.repeated pseudo-state (wl_keyboard v10) while keeping the dead-touch
+  protection intact. Touch exists in the generated wire but not in the capability
+  set; the v10 cap means a touch client binding at ≤10 still hits libwayland's
+  request gating on the dead wl_touch (release is since 3, reachable at any
+  advertised version ≥ 3 — the dead-object path at seat.zig:556-567 plus
+  MISSING_CAPABILITY-free inert creation is the protection). A future touch
+  feature must bump BOTH the advertisement (seat_version) AND the touch-capability
+  coupling (sendCapabilities, seat.zig:495). Advertising 11 without the capability
+  would not add touch events; the cap at 10 is the KWin parity point
+  (KWin seat.cpp:30) with no wire surface above it in use.
 - wl_seat.get_touch is since 1 (wayland.xml wl_seat; generated get_touch_since_version=1), so it IS reachable at v1. The seat's dead-object path (seat.zig:556-563: create a wl_touch at the seat's version, no events) plus libwayland's request gating (wl_touch.release is since 3) is the actual protection. The earlier audit's "unreachable at v1" framing was wrong; no code change needed.
 - zxdg_decoration_manager_v1 advertises v1 (xdg_decoration.zig:112-117, generated_version=1) with v1 semantics (unconfigured_buffer at get). A v2-capable client clamps to v1; the generated target version is 1, so no v2 wire exists here at all.
 - xdg_wm_base, wl_compositor, zwlr_layer_shell_v1, zwlr_screencopy_manager_v1, wl_data_device_manager, wl_output advertise exactly their generated versions. presentation_version = generated (presentation.zig:63).

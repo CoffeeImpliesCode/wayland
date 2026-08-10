@@ -15,14 +15,48 @@
 //!     resource left inert) whenever the selection is re-delivered or its
 //!     source dies, so an offer never outlives the source it references
 //!     and receive() can never read freed source memory.
-//!   - set_selection/start_drag validate the serial: it must be the
-//!     seat's most recent serial. Stale serials are ignored — never a
+//!   - set_selection/start_drag validate the serial against the seat's
+//!     per-client serial ring (Seat.validateEventSerial, the wlroots
+//!     model — a serial handed to ANY other client is invalid) plus a
+//!     superseded window against the serial the current selection was
+//!     set with (serial - selection_serial > UINT32_MAX/2 is rejected,
+//!     wlr_data_device.c:148-153). Stale serials are ignored — never a
 //!     protocol error — like wlroots.
+//!   - A data source is used once (wayland.xml wl_data_device.set_selection:
+//!     "The given source may not be used in any further set_selection or
+//!     start_drag requests"): set_selection/start_drag finalize the source
+//!     BEFORE serial validation (wlroots wlr_data_device.c:34-37, :82-85),
+//!     so a rejected request still burns it; set_actions on a finalized
+//!     source — or a second set_actions — raises invalid_action_mask
+//!     (wlr_data_source.c:166-178).
+//!   - set_selection with a source that advertised DnD actions raises
+//!     wl_data_source.error.invalid_source (KWin datadevice.cpp:91-101
+//!     hardening; wlroots has no such check).
+//!   - DnD action state is stored and negotiated per wlroots
+//!     (data_offer_choose_action / data_offer_update_action,
+//!     wlr_data_offer.c:22-76): the source's mask, the offer's
+//!     mask/preferred action, the compositor-forced action and the
+//!     current negotiated action. offer.set_actions stores and re-runs
+//!     the negotiation, and the negotiated wl_data_offer.action /
+//!     wl_data_source.action events go out with v3 guards. No drag offer
+//!     exists while start_drag is a stub (DnD deferred), so the events
+//!     wait for the DnD state machine; the offer action STATE and
+//!     negotiation are live.
+//!   - offer.set_actions on a clipboard (non-drag) offer raises
+//!     wl_data_offer.error.invalid_offer (wayland.xml: "This request can
+//!     only be made on drag-and-drop offers, a protocol error will be
+//!     raised otherwise"; wlroots data_offer_handle_set_actions).
+//!   - offer.receive relays the fd to the source only when the requested
+//!     mime type was actually offered; an unknown mime closes the fd
+//!     without a relay (smithay offer.rs hardening; wlroots relays
+//!     blindly).
 //!   - data_source teardown (destroy/cancel) clears the stored selection
 //!     and destroys the offers that referenced it.
 //!
 //! Drag-and-drop (start_drag) is not implemented in M3: the request is
-//! accepted, the source is cancelled, no drag icon is shown.
+//! accepted, the source is cancelled, no drag icon is shown. The
+//! action-negotiation machinery above is wired for the future drag
+//! state machine (drag offers would be created with offer_type = .drag).
 //!
 //! Imports: utils/*, core/wire.zig, core/display.zig, compositor/seat.zig.
 
@@ -54,6 +88,11 @@ pub const DataDeviceManager = struct {
     /// field holds the selection for the whole seat: a selection set by
     /// one client is delivered to whichever client holds keyboard focus.
     selection_source: ?*DataSource = null,
+    /// The serial the current selection was set with (wlr_seat
+    /// .selection_serial). A set_selection whose serial is older than
+    /// this by more than half the wrap range is superseded and rejected
+    /// (wlroots wlr_seat_request_set_selection, wlr_data_device.c:148-153).
+    selection_serial: u32 = 0,
     /// Every data source created by clients. Clients outlive the manager
     /// at shutdown (main.zig defers the manager before display.deinit
     /// tears down the clients), so deinit destroys these resources while
@@ -144,11 +183,41 @@ const DataSource = struct {
     /// (wl_data_offer.offer takes a C string).
     mime_types: std.ArrayList([:0]const u8),
     /// DnD actions the source supports (wl_data_source.set_actions).
+    /// null = never set — the wlroots -1 sentinel; the negotiation
+    /// treats such a source as copy-only (wlr_data_offer.c:32-37).
     /// Clipboard selection never uses actions, but the mask is validated
     /// and stored so wl_data_offer.set_actions can run its
-    /// invalid_action check against it (wlr_data_offer.c).
-    actions: u32 = 0,
+    /// invalid_action check against it and the future drag negotiation
+    /// can read it.
+    actions: ?u32 = null,
+    /// The source was handed to wl_data_device.set_selection or
+    /// start_drag: it is used once (wlroots finalizes it,
+    /// wlr_data_device.c:34-37, :82-85). After finalize, set_actions
+    /// raises invalid_action_mask (wlr_data_source.c:173-178) and
+    /// offer() only logs.
+    finalized: bool = false,
+    /// The action the compositor forces for a drag (wlroots:
+    /// wlr_data_source.compositor_action). 0 = none. Wins the
+    /// negotiation when the source and destination both support it.
+    /// Set by the compositor before the drag starts.
+    compositor_action: u32 = 0,
+    /// The currently negotiated action for the in-flight drag (wlroots:
+    /// wlr_data_source.current_dnd_action). 0 = none. Read back by the
+    /// drop/finish paths of the future DnD state machine.
+    current_dnd_action: u32 = 0,
+    /// The destination accepted a mime via wl_data_offer.accept: true
+    /// for a non-NULL mime, false on NULL/leave (wlroots:
+    /// wlr_data_source.accepted). Drives the finish validation in the
+    /// future DnD state machine.
+    accepted: bool = false,
 };
+
+/// The kind of offer (wlroots enum wlr_data_offer_type): a selection
+/// (clipboard) offer or a drag-and-drop offer. set_actions and accept
+/// only apply to drag offers; with DnD deferred, every offer created
+/// today is a selection offer and the future drag state machine creates
+/// drag offers.
+const OfferType = enum { selection, drag };
 
 /// A data offer delivered to a target client.
 const DataOffer = struct {
@@ -159,7 +228,20 @@ const DataOffer = struct {
     /// freed source memory (wlroots nulls offer->source in
     /// data_offer_handle_source_destroy, wlr_data_offer.c).
     source: ?*DataSource,
+    offer_type: OfferType = .selection,
+    /// The destination's supported action mask
+    /// (wl_data_offer.set_actions; wlroots data_offer->actions).
+    actions: u32 = 0,
+    /// The destination's preferred action
+    /// (wl_data_offer.set_actions; wlroots data_offer->preferred_action).
+    preferred_action: u32 = 0,
 };
+
+/// wl_data_device_manager.dnd_action bits (wayland.xml).
+const dnd_action_none: u32 = 0;
+const dnd_action_copy: u32 = 1;
+const dnd_action_move: u32 = 2;
+const dnd_action_ask: u32 = 4;
 
 fn bindManager(client_wire: *wire.Client, mgr: *DataDeviceManager, version: u32, id: u32) void {
     const resource = server.wl.DataDeviceManager.create(client_wire, version, id) catch {
@@ -253,26 +335,65 @@ fn managerRequest(
 fn sourceRequest(src_res: *server.wl.DataSource, request: server.wl.DataSource.Request, src: *DataSource) void {
     switch (request) {
         .offer => |r| {
+            const mgr = src.manager;
+            // wlroots logs a debug message when a finalized source offers
+            // more mimes (wlr_data_source.c:199-200); the offer is still
+            // accepted and delivered.
+            if (src.finalized) {
+                log.debug(
+                    "offering additional mime type after wl_data_device.set_selection/start_drag",
+                    mgr.io,
+                    mgr.log_cfg,
+                    "data_device",
+                    .{},
+                );
+            }
             const mime = std.mem.span(r.mime_type);
-            const copy = src.manager.allocator.dupeZ(u8, mime) catch {
+            // Duplicate offers are ignored (wlroots dedups,
+            // wlr_data_source.c:201-204; primary_selection.zig does the
+            // same).
+            for (src.mime_types.items) |m| {
+                if (std.mem.eql(u8, m, mime)) return;
+            }
+            const copy = mgr.allocator.dupeZ(u8, mime) catch {
                 src_res.postNoMemory();
                 return;
             };
-            src.mime_types.append(src.manager.allocator, copy) catch {
-                src.manager.allocator.free(copy);
+            src.mime_types.append(mgr.allocator, copy) catch {
+                mgr.allocator.free(copy);
                 src_res.postNoMemory();
                 return;
             };
         },
         .set_actions => |r| {
-            // wayland.xml wl_data_source.set_actions: the source side may
-            // only offer copy and move (ask is destination-only); any
-            // other bit raises the invalid_action_mask protocol error
-            // (wlroots data_source_handle_set_actions, wlr_data_source.c).
+            // wayland.xml wl_data_source.set_actions, per wlroots
+            // data_source_set_actions (wlr_data_source.c:152-182):
+            //   1. once-only: a second set_actions is invalid_action_mask
+            //      (wlroots: actions >= 0 sentinel);
+            //   2. the source side may only offer copy and move (ask is
+            //      destination-only); any other bit is
+            //      invalid_action_mask;
+            //   3. a finalized source (already handed to set_selection or
+            //      start_drag) cannot change actions:
+            //      invalid_action_mask.
+            if (src.actions != null) {
+                src_res.postError(
+                    .invalid_action_mask,
+                    "wl_data_source.set_actions: cannot set actions more than once",
+                );
+                return;
+            }
             const valid: u32 = 1 | 2; // copy | move
             const dnd_actions: u32 = @bitCast(r.dnd_actions);
             if (dnd_actions & ~valid != 0) {
                 src_res.postError(.invalid_action_mask, "wl_data_source.set_actions: invalid dnd_actions");
+                return;
+            }
+            if (src.finalized) {
+                src_res.postError(
+                    .invalid_action_mask,
+                    "wl_data_source.set_actions: invalid action change after wl_data_device.set_selection/start_drag",
+                );
                 return;
             }
             src.actions = dnd_actions;
@@ -314,23 +435,51 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
     switch (request) {
         .set_selection => |r| {
             const mgr = dev.manager;
-            // Serial validation: the serial must be the seat's most
-            // recent one — the client can only act on the input event it
-            // just received. wlroots validates with
-            // wlr_seat_client_validate_event_serial and silently ignores
-            // a stale serial (never a protocol error),
-            // wlr_seat.c:266-277; the same equality rule gates start_drag
-            // via the pointer grab serial, wlr_seat_pointer.c:603-617.
-            // [Simplification: wlroots accepts any serial recently
-            // delivered to the requesting client; this single-seat
-            // implementation accepts only the seat's last serial.]
-            if (r.serial != mgr.seat.last_serial) {
+            // The source is finalized (used once) BEFORE the serial
+            // validation, per wlroots data_device_set_selection
+            // (wlr_data_device.c:24-45: finalize at :34-37, then
+            // wlr_seat_request_set_selection validates): a request the
+            // gates reject still burns the source.
+            if (r.source) |src_res| {
+                const src: *DataSource = @ptrCast(@alignCast(src_res.getUserData()));
+                // KWin hardening: a source that advertised DnD actions
+                // cannot be a clipboard source — invalid_source on the
+                // source (KWin data_device_set_selection,
+                // datadevice.cpp:91-101; wlroots has no such check).
+                if ((src.actions orelse 0) != 0) {
+                    src_res.postError(
+                        .invalid_source,
+                        "wl_data_source.set_selection: data source is for drag and drop",
+                    );
+                    return;
+                }
+                src.finalized = true;
+            }
+            // Serial validation (wlroots wlr_seat_request_set_selection,
+            // wlr_data_device.c:144-165): the serial must have been
+            // handed to THIS client recently (per-client ring,
+            // Seat.validateEventSerial), and must not be superseded by
+            // the current selection's serial. A stale serial is silently
+            // ignored — never a protocol error — like wlroots.
+            if (!mgr.seat.validateEventSerial(dev_res.getClient(), r.serial)) {
                 log.debug(
-                    "rejecting set_selection: serial {d} is not the seat's last ({d})",
+                    "rejecting set_selection: serial {d} was never given to this client",
                     mgr.io,
                     mgr.log_cfg,
                     "data_device",
-                    .{ r.serial, mgr.seat.last_serial },
+                    .{r.serial},
+                );
+                return;
+            }
+            if (mgr.selection_source != null and
+                r.serial -% mgr.selection_serial > std.math.maxInt(u32) / 2)
+            {
+                log.debug(
+                    "rejecting set_selection: serial {d} indicates superseded (selection at {d})",
+                    mgr.io,
+                    mgr.log_cfg,
+                    "data_device",
+                    .{ r.serial, mgr.selection_serial },
                 );
                 return;
             }
@@ -341,6 +490,7 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
                     if (old != src) old.resource.sendCancelled();
                 }
                 mgr.selection_source = src;
+                mgr.selection_serial = r.serial;
                 log.debug("selection set with {d} mime types", mgr.io, mgr.log_cfg, "data_device", .{
                     src.mime_types.items.len,
                 });
@@ -350,23 +500,33 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
                     old.resource.sendCancelled();
                 }
                 mgr.selection_source = null;
+                mgr.selection_serial = r.serial;
             }
             deliverSelectionToFocus(mgr);
         },
         .start_drag => |r| {
             const mgr = dev.manager;
-            // The drag serial must be the seat's last (wlroots: the
-            // pointer grab serial, wlr_seat_pointer.c:603-617). A denied
-            // drag leaves the source alone — the client keeps it
-            // (smithay logs "denying drag from client without implicit
-            // grab" and returns, data_device/device.rs).
-            if (r.serial != mgr.seat.last_serial) {
+            // The source is finalized before the serial check (wlroots
+            // data_device_start_drag, wlr_data_device.c:47-87:
+            // finalize at :82-85, then wlr_seat_request_start_drag
+            // validates the pointer grab serial): a denied drag still
+            // burns the source, but leaves it alive — the client keeps
+            // it (smithay "denying drag from client without implicit
+            // grab", data_device/device.rs).
+            if (r.source) |src_res| {
+                const src: *DataSource = @ptrCast(@alignCast(src_res.getUserData()));
+                src.finalized = true;
+            }
+            // The drag serial must have been handed to THIS client
+            // (wlroots validates the pointer grab serial via the
+            // per-client ring, wlr_seat_pointer.c:603-617).
+            if (!mgr.seat.validateEventSerial(dev_res.getClient(), r.serial)) {
                 log.debug(
-                    "rejecting start_drag: serial {d} is not the seat's last ({d})",
+                    "rejecting start_drag: serial {d} was never given to this client",
                     mgr.io,
                     mgr.log_cfg,
                     "data_device",
-                    .{ r.serial, mgr.seat.last_serial },
+                    .{r.serial},
                 );
                 return;
             }
@@ -472,11 +632,73 @@ fn deliverSelectionToFocus(mgr: *DataDeviceManager) void {
 // wl_data_offer
 // ---------------------------------------------------------------------------
 
+/// The compositor-chosen action for a drag offer, per wlroots
+/// data_offer_choose_action (wlr_data_offer.c:22-55) on raw state:
+/// the intersection of the destination's mask and the source's actions
+/// (a source that never called set_actions is copy-only); the
+/// compositor-forced action wins when both sides support it, then the
+/// destination's preferred action, then the lowest common action bit.
+fn chooseActionRaw(
+    offer_actions: u32,
+    source_actions: ?u32,
+    compositor_action: u32,
+    preferred_action: u32,
+) u32 {
+    const src_actions = source_actions orelse dnd_action_copy;
+    const available = offer_actions & src_actions;
+    if (available == 0) return dnd_action_none;
+    if (compositor_action & available != 0) return compositor_action;
+    if (preferred_action & available != 0) return preferred_action;
+    // First found action, in bit order (wlroots: 1 << (ffs(available) - 1);
+    // available & -available is the lowest set bit).
+    return available & -%available;
+}
+
+fn chooseAction(offer: *DataOffer) u32 {
+    const src = offer.source orelse return dnd_action_none;
+    // Pre-v3 offers cannot send set_actions; wlroots treats their mask
+    // as copy-only (wlr_data_offer.c:28-31).
+    const offer_actions = if (offer.resource.getVersion() >= 3) offer.actions else dnd_action_copy;
+    return chooseActionRaw(offer_actions, src.actions, src.compositor_action, offer.preferred_action);
+}
+
+/// Recompute the negotiated action for a drag offer and emit it to both
+/// sides when it changed (wlroots data_offer_update_action,
+/// wlr_data_offer.c:57-76). The source's current action is stored so the
+/// drop/finish paths of the future DnD state machine can read it back.
+/// Emission only happens for drag offers; with DnD deferred (DD-1) no
+/// drag offer exists yet, so the wl_data_offer.action /
+/// wl_data_source.action events wait for the drag state machine. wlroots
+/// also suppresses the events during "ask" negotiation (offer->in_ask,
+/// declared in wlr_data_device.h:43 but never set in 0.20.2); not
+/// modeled here.
+fn updateAction(offer: *DataOffer) void {
+    const src = offer.source orelse return;
+    const action = chooseAction(offer);
+    if (src.current_dnd_action == action) return;
+    src.current_dnd_action = action;
+    if (src.resource.getVersion() >= 3) {
+        src.resource.sendAction(@bitCast(action));
+    }
+    if (offer.resource.getVersion() >= 3) {
+        offer.resource.sendAction(@bitCast(action));
+    }
+}
+
 fn offerRequest(offer_res: *server.wl.DataOffer, request: server.wl.DataOffer.Request, offer: *DataOffer) void {
     switch (request) {
         .accept => |r| {
-            _ = r;
-            // Ignored in M3 (action negotiation is not implemented).
+            // wlroots data_offer_handle_accept (wlr_data_offer.c:78-92):
+            // only drag offers relay accept feedback to the source;
+            // selection offers ignore it. The relay records the source's
+            // accepted state and forwards the mime as
+            // wl_data_source.target (a since-3 event, version-guarded).
+            if (offer.offer_type != .drag) return;
+            const src = offer.source orelse return;
+            src.accepted = r.mime_type != null;
+            if (src.resource.getVersion() >= 3) {
+                src.resource.sendTarget(r.mime_type);
+            }
         },
         .receive => |r| {
             // Relay the fd to the owning client: the source writes the
@@ -488,10 +710,32 @@ fn offerRequest(offer_res: *server.wl.DataOffer, request: server.wl.DataOffer.Re
                 _ = std.os.linux.close(r.fd);
                 return;
             };
+            // smithay hardening (selection/offer.rs:165-168): a mime the
+            // source never offered is denied — the fd is closed and no
+            // send is relayed (wlroots relays blindly).
+            const mime = std.mem.span(r.mime_type);
+            var offered = false;
+            for (src.mime_types.items) |m| {
+                if (std.mem.eql(u8, m, mime)) {
+                    offered = true;
+                    break;
+                }
+            }
+            if (!offered) {
+                log.debug(
+                    "offer.receive denied: mime '{s}' was not offered",
+                    offer.manager.io,
+                    offer.manager.log_cfg,
+                    "data_device",
+                    .{mime},
+                );
+                _ = std.os.linux.close(r.fd);
+                return;
+            }
             src.resource.sendSend(r.mime_type, r.fd);
             _ = std.os.linux.close(r.fd);
             log.debug("offer.receive relayed ({s})", offer.manager.io, offer.manager.log_cfg, "data_device", .{
-                std.mem.span(r.mime_type),
+                mime,
             });
         },
         .destroy => offer_res.destroy(),
@@ -505,13 +749,18 @@ fn offerRequest(offer_res: *server.wl.DataOffer, request: server.wl.DataOffer.Re
         },
         .set_actions => |r| {
             // wayland.xml wl_data_offer.set_actions (wlroots
-            // data_offer_handle_set_actions, wlr_data_offer.c):
+            // data_offer_handle_set_actions, wlr_data_offer.c:155-189):
             //   - dnd_actions must contain only dnd_action enum values
             //     and preferred_action must be a single one of them,
             //     else invalid_action_mask;
             //   - a preferred action the source does not support (a
             //     source without action support has mask 0) is
-            //     invalid_action.
+            //     invalid_action;
+            //   - only drag-and-drop offers accept set_actions; a
+            //     clipboard offer raises invalid_offer (wayland.xml:
+            //     "This request can only be made on drag-and-drop
+            //     offers, a protocol error will be raised otherwise";
+            //     wlroots data_offer_handle_set_actions O:178-182).
             const valid: u32 = 1 | 2 | 4; // copy | move | ask
             const dnd_actions: u32 = @bitCast(r.dnd_actions);
             const preferred_action: u32 = @bitCast(r.preferred_action);
@@ -526,13 +775,22 @@ fn offerRequest(offer_res: *server.wl.DataOffer, request: server.wl.DataOffer.Re
                 offer_res.postError(.invalid_action, "wl_data_offer.set_actions: offer has no source");
                 return;
             };
-            if (preferred_action != 0 and (src.actions & preferred_action) == 0) {
+            if (preferred_action != 0 and ((src.actions orelse 0) & preferred_action) == 0) {
                 offer_res.postError(
                     .invalid_action,
                     "wl_data_offer.set_actions: preferred action not supported by the source",
                 );
                 return;
             }
+            if (offer.offer_type != .drag) {
+                offer_res.postError(.invalid_offer, "wl_data_offer.set_actions: not a drag-and-drop offer");
+                return;
+            }
+            // A drag offer stores the destination's mask/preference and
+            // re-runs the negotiation (wlroots O:184-189).
+            offer.actions = dnd_actions;
+            offer.preferred_action = preferred_action;
+            updateAction(offer);
         },
     }
 }
@@ -625,11 +883,51 @@ const RegistryCapture = struct {
 /// Counts the cancelled events delivered to a wl_data_source.
 const SourceEvents = struct {
     cancelled_count: usize = 0,
+    send_count: usize = 0,
+    /// wl_data_source.action events (the negotiated DnD action, emitted
+    /// for drag offers).
+    action_count: usize = 0,
+    last_action: u32 = 0,
+    /// wl_data_source.target events (accept feedback, drag offers only).
+    target_count: usize = 0,
+    last_target: []const u8 = "",
 
     fn listener(source: *client.wl.DataSource, event: client.wl.DataSource.Event, data: *SourceEvents) void {
         _ = source;
         switch (event) {
             .cancelled => data.cancelled_count += 1,
+            .send => data.send_count += 1,
+            .action => |e| {
+                data.action_count += 1;
+                const v: u32 = @bitCast(e.dnd_action);
+                data.last_action = v;
+            },
+            .target => |e| {
+                data.target_count += 1;
+                data.last_target = if (e.mime_type) |m| std.mem.span(m) else "";
+            },
+            // DnD lifecycle events: the test client never drags; the
+            // arms exist for the exhaustive switch over the wire enum
+            // (the future DnD state machine would emit them).
+            .dnd_drop_performed => {},
+            .dnd_finished => {},
+        }
+    }
+};
+
+/// Records wl_data_offer.action events (the negotiated DnD action).
+const OfferEvents = struct {
+    action_count: usize = 0,
+    last_action: u32 = 0,
+
+    fn listener(offer: *client.wl.DataOffer, event: client.wl.DataOffer.Event, data: *OfferEvents) void {
+        _ = offer;
+        switch (event) {
+            .action => |e| {
+                data.action_count += 1;
+                const v: u32 = @bitCast(e.dnd_action);
+                data.last_action = v;
+            },
             else => {},
         }
     }
@@ -808,6 +1106,15 @@ fn surfaceForClient(ts: *TestServer, client_wire: *wire.Client) *surface_mod.Sur
     unreachable;
 }
 
+/// Focus the test client's surface and return a serial that validates
+/// for it. The seat records a serial in the receiving client's ring on
+/// every input delivery (seat.zig serialFor); keyboard focus is one, so
+/// the focus serial is the one to echo back in set_selection/start_drag.
+fn focusAndMintSerial(ts: *TestServer) u32 {
+    ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client.?));
+    return ts.seat.?.last_serial;
+}
+
 test "selection is stored seat-wide and replaced selections are cancelled" {
     const allocator = testing.allocator;
     var ts = try TestServer.init(allocator);
@@ -825,23 +1132,27 @@ test "selection is stored seat-wide and replaced selections are cancelled" {
     // No selection yet.
     try testing.expectEqual(@as(?*DataSource, null), ts.mgr.?.selection_source);
 
+    // A serial the seat handed to this client (the seat's per-client
+    // ring rejects everything else, wlroots model).
+    const serial = focusAndMintSerial(ts);
+
     // Client sets the selection: stored on the manager (seat-wide), not on
     // the device; the source is not cancelled.
-    device.setSelection(src_a, 0);
+    device.setSelection(src_a, serial);
     try ts.pump();
     try testing.expect(ts.mgr.?.selection_source != null);
     try testing.expectEqual(src_a.getId(), ts.mgr.?.selection_source.?.resource.getId());
     try testing.expectEqual(@as(usize, 0), events_a.cancelled_count);
 
     // Replacing with a different source cancels the previous owner.
-    device.setSelection(src_b, 0);
+    device.setSelection(src_b, serial);
     try ts.pump();
     try testing.expectEqual(src_b.getId(), ts.mgr.?.selection_source.?.resource.getId());
     try testing.expectEqual(@as(usize, 1), events_a.cancelled_count);
     try testing.expectEqual(@as(usize, 0), events_b.cancelled_count);
 
     // Null source clears the seat-wide selection and cancels the owner.
-    device.setSelection(null, 0);
+    device.setSelection(null, serial);
     try ts.pump();
     try testing.expectEqual(@as(?*DataSource, null), ts.mgr.?.selection_source);
     try testing.expectEqual(@as(usize, 1), events_b.cancelled_count);
@@ -858,7 +1169,7 @@ test "destroying the selected source clears the seat-wide selection" {
     var events: SourceEvents = .{};
     src.setListener(*SourceEvents, SourceEvents.listener, &events);
 
-    device.setSelection(src, 0);
+    device.setSelection(src, focusAndMintSerial(ts));
     try ts.pump();
     try testing.expectEqual(src.getId(), ts.mgr.?.selection_source.?.resource.getId());
 
@@ -882,7 +1193,7 @@ test "device release keeps the seat-wide selection" {
     var events: SourceEvents = .{};
     src.setListener(*SourceEvents, SourceEvents.listener, &events);
 
-    device.setSelection(src, 0);
+    device.setSelection(src, focusAndMintSerial(ts));
     try ts.pump();
 
     // The selection is owned by the manager (per seat), not the device:
@@ -904,24 +1215,27 @@ test "stale set_selection serials are ignored, not errored" {
     var events: SourceEvents = .{};
     src.setListener(*SourceEvents, SourceEvents.listener, &events);
 
-    // No input yet: the seat's last serial is 0, so 0 validates.
-    device.setSelection(src, 0);
+    // A serial the seat handed to this client: accepted (the seat's
+    // per-client ring, wlroots wlr_seat_client_validate_event_serial).
+    const serial = focusAndMintSerial(ts);
+    device.setSelection(src, serial);
     try ts.pump();
     try testing.expectEqual(src.getId(), ts.mgr.?.selection_source.?.resource.getId());
 
-    // A serial the seat never issued: the request is ignored, the
-    // selection is untouched and the source is not cancelled (wlroots
-    // logs and returns, wlr_seat.c wlr_seat_request_set_selection — it
-    // never posts a protocol error).
+    // A serial the seat never issued to this client: the request is
+    // ignored, the selection is untouched and the source is not
+    // cancelled (wlroots logs and returns — it never posts a protocol
+    // error). serial 0 is rejected too: the ring is empty of 0 once
+    // real serials exist (wlroots parity).
     const stale = ts.seat.?.display.nextSerial();
-    try testing.expect(stale != 0);
+    try testing.expect(stale != serial);
     device.setSelection(null, stale);
     try ts.pump();
     try testing.expectEqual(src.getId(), ts.mgr.?.selection_source.?.resource.getId());
     try testing.expectEqual(@as(usize, 0), events.cancelled_count);
 
     // Clearing with the valid serial still works.
-    device.setSelection(null, 0);
+    device.setSelection(null, serial);
     try ts.pump();
     try testing.expectEqual(@as(?*DataSource, null), ts.mgr.?.selection_source);
     try testing.expectEqual(@as(usize, 1), events.cancelled_count);
@@ -1098,6 +1412,368 @@ test "source.set_actions with invalid bits raises invalid_action_mask" {
     // wlr_data_source.c).
     const DndAction = client.wl.DataDeviceManager.DndAction;
     src.setActions(@as(DndAction, @bitCast(@as(u32, 8))));
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "source finalized at set_selection: later set_actions raises invalid_action_mask" {
+    // DD-3: a source handed to set_selection is used once (wlroots
+    // finalizes it, wlr_data_device.c:34-37); wayland.xml: "The given
+    // source may not be used in any further set_selection or start_drag
+    // requests". set_actions on a finalized source raises
+    // invalid_action_mask (wlroots data_source_set_actions,
+    // wlr_data_source.c:173-178).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+
+    device.setSelection(src, serial);
+    try ts.pump();
+    try testing.expectEqual(serial, ts.mgr.?.selection_serial);
+    try testing.expect(ts.mgr.?.sources.items[0].finalized);
+
+    const DndAction = client.wl.DataDeviceManager.DndAction;
+    src.setActions(@as(DndAction, @bitCast(@as(u32, 1))));
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "source finalized at start_drag: later set_actions raises invalid_action_mask" {
+    // DD-3: start_drag finalizes the source too (wlroots
+    // wlr_data_device.c:82-85), even though our start_drag is a stub
+    // that cancels the source.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    var src_events: SourceEvents = .{};
+    src.setListener(*SourceEvents, SourceEvents.listener, &src_events);
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+
+    device.startDrag(src, ts.surface.?, null, serial);
+    try ts.pump();
+    try testing.expect(ts.mgr.?.sources.items[0].finalized);
+    // The M3 stub cancels the (accepted) drag source.
+    try testing.expectEqual(@as(usize, 1), src_events.cancelled_count);
+
+    const DndAction = client.wl.DataDeviceManager.DndAction;
+    src.setActions(@as(DndAction, @bitCast(@as(u32, 1))));
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "a serial-rejected set_selection still finalizes the source" {
+    // DD-3 + DD-4 ordering: wlroots finalizes BEFORE validating the
+    // serial (wlr_data_device.c:24-45), so a request the serial gate
+    // rejects burns the source anyway — its set_actions now errors.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    try ts.pump();
+    _ = focusAndMintSerial(ts);
+    const stale = ts.seat.?.display.nextSerial(); // never handed to the client
+
+    device.setSelection(src, stale);
+    try ts.pump();
+    // Nothing was selected...
+    try testing.expectEqual(@as(?*DataSource, null), ts.mgr.?.selection_source);
+    // ...but the source was burned (wlroots parity).
+    try testing.expect(ts.mgr.?.sources.items[0].finalized);
+
+    const DndAction = client.wl.DataDeviceManager.DndAction;
+    src.setActions(@as(DndAction, @bitCast(@as(u32, 1))));
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "superseded set_selection serials are rejected" {
+    // DD-4: wlroots wlr_seat_request_set_selection (wlr_data_device.c:
+    // 148-153) rejects a serial older than the current selection's by
+    // more than half the wrap range, even when it validates.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src_a = try ts.wl_data_device_manager.?.createDataSource();
+    const src_b = try ts.wl_data_device_manager.?.createDataSource();
+    var events_a: SourceEvents = .{};
+    var events_b: SourceEvents = .{};
+    src_a.setListener(*SourceEvents, SourceEvents.listener, &events_a);
+    src_b.setListener(*SourceEvents, SourceEvents.listener, &events_b);
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+
+    device.setSelection(src_a, serial);
+    try ts.pump();
+    try testing.expectEqual(src_a.getId(), ts.mgr.?.selection_source.?.resource.getId());
+
+    // Simulate the selection having been set with a serial half a wrap
+    // in the future (unreachable through the wire in a test session):
+    // any request serial is now superseded. The request is rejected —
+    // selection unchanged, no cancel — but the source is still burned
+    // (finalize before the gates, wlroots).
+    ts.mgr.?.selection_serial = serial +% 0x8000_0000;
+    device.setSelection(src_b, serial);
+    try ts.pump();
+    try testing.expectEqual(src_a.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    try testing.expectEqual(@as(usize, 0), events_a.cancelled_count);
+    try testing.expectEqual(@as(usize, 0), events_b.cancelled_count);
+    try testing.expect(ts.mgr.?.sources.items[1].finalized);
+
+    // Restore the recorded serial: a normal re-set works and cancels
+    // the previous owner.
+    ts.mgr.?.selection_serial = serial;
+    device.setSelection(src_b, serial);
+    try ts.pump();
+    try testing.expectEqual(src_b.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    try testing.expectEqual(@as(usize, 1), events_a.cancelled_count);
+    try testing.expectEqual(@as(usize, 0), events_b.cancelled_count);
+}
+
+test "set_actions on a clipboard offer raises invalid_offer" {
+    // DD-5: wayland.xml wl_data_offer.set_actions — "This request can
+    // only be made on drag-and-drop offers, a protocol error will be
+    // raised otherwise"; wlroots posts WL_DATA_OFFER_ERROR_INVALID_OFFER
+    // (3) after the mask/preferred checks (wlr_data_offer.c:178-182).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    var dev_events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &dev_events);
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+    device.setSelection(src, serial);
+    try ts.pump();
+    try testing.expect(dev_events.last_offer != null);
+
+    const DndAction = client.wl.DataDeviceManager.DndAction;
+    dev_events.last_offer.?.setActions(
+        @as(DndAction, @bitCast(@as(u32, 1))),
+        @as(DndAction, @bitCast(@as(u32, 0))),
+    );
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try std.testing.expectEqual(@as(c_int, 3), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "set_selection with a DnD-action source raises invalid_source" {
+    // DD-6: KWin hardening — a source that advertised DnD actions
+    // cannot be a clipboard source (KWin data_device_set_selection,
+    // datadevice.cpp:91-101): wl_data_source.error.invalid_source (1)
+    // on the source. wlroots has no such check.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    const DndAction = client.wl.DataDeviceManager.DndAction;
+    src.setActions(@as(DndAction, @bitCast(@as(u32, 1))));
+    try ts.pump();
+
+    // The serial never matters: the KWin check fires before any serial
+    // validation.
+    device.setSelection(src, 0);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try std.testing.expectEqual(@as(c_int, 1), wl_display_get_protocol_error(ts.c_display.?, null, null));
+    try testing.expectEqual(@as(?*DataSource, null), ts.mgr.?.selection_source);
+}
+
+test "offer.receive with an unoffered mime closes the fd and relays nothing" {
+    // DD-7: smithay hardening (selection/offer.rs:165-168) — receive()
+    // validates the mime against the offered list; an unknown mime
+    // closes the fd and never relays a send (wlroots relays blindly).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var src_events: SourceEvents = .{};
+    src.setListener(*SourceEvents, SourceEvents.listener, &src_events);
+    var dev_events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &dev_events);
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+    device.setSelection(src, serial);
+    try ts.pump();
+    const offer = dev_events.last_offer.?;
+
+    var fds: [2]posix.socket_t = undefined;
+    const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+    offer.receive("application/x-unknown", fds[0]);
+    try ts.pump();
+    // No send relayed to the source...
+    try testing.expectEqual(@as(usize, 0), src_events.send_count);
+    // The client transfers ownership of its copy (protocol semantics);
+    // libwayland-client does not close it for us.
+    _ = std.os.linux.close(fds[0]);
+    // ...and the server closed ITS copy too: with both copies of the
+    // peer end gone, sending on the other end is EPIPE. Raw syscall with
+    // MSG_NOSIGNAL keeps it an error instead of a SIGPIPE (0.16 has no
+    // std.posix.write; linux.sendto returns a negated errno).
+    const send_rc = std.os.linux.sendto(fds[1], "x", 1, std.os.linux.MSG.NOSIGNAL, null, 0);
+    try testing.expectEqual(std.os.linux.E.PIPE, std.os.linux.errno(send_rc));
+    _ = std.os.linux.close(fds[1]);
+
+    // An offered mime still relays.
+    var fds2: [2]posix.socket_t = undefined;
+    const rc2 = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds2);
+    if (posix.errno(rc2) != .SUCCESS) return error.SocketpairFailed;
+    offer.receive("text/plain", fds2[0]);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), src_events.send_count);
+    _ = std.os.linux.close(fds2[0]);
+    _ = std.os.linux.close(fds2[1]);
+}
+
+test "action negotiation matrix matches wlroots data_offer_choose_action" {
+    // DD-2: direct unit test of the negotiation against the wlroots
+    // algorithm (data_offer_choose_action, wlr_data_offer.c:22-55):
+    // mask intersection, compositor-forced action, destination
+    // preferred, lowest-bit fallback, copy default for unset source
+    // actions.
+    // No intersection -> none.
+    try testing.expectEqual(@as(u32, 0), chooseActionRaw(dnd_action_move, dnd_action_copy, 0, 0));
+    // A source that never called set_actions is copy-only.
+    try testing.expectEqual(@as(u32, 1), chooseActionRaw(dnd_action_copy, null, 0, 0));
+    try testing.expectEqual(@as(u32, 0), chooseActionRaw(dnd_action_move, null, 0, 0));
+    // The compositor-forced action wins when both sides support it.
+    try testing.expectEqual(@as(u32, 2), chooseActionRaw(3, 3, dnd_action_move, dnd_action_copy));
+    // ...and is ignored when either side lacks it.
+    try testing.expectEqual(@as(u32, 1), chooseActionRaw(3, 3, dnd_action_ask, dnd_action_copy));
+    // The destination's preferred action wins when in the intersection.
+    try testing.expectEqual(@as(u32, 4), chooseActionRaw(7, 7, 0, dnd_action_ask));
+    try testing.expectEqual(@as(u32, 1), chooseActionRaw(7, 7, 0, 8)); // preferred outside -> fallback
+    // Fallback: the lowest common action bit.
+    try testing.expectEqual(@as(u32, 2), chooseActionRaw(6, 6, 0, 0));
+    try testing.expectEqual(@as(u32, 1), chooseActionRaw(7, 7, 0, 0));
+}
+
+test "drag offer action negotiation stores state and emits action to both sides" {
+    // DD-2: white-box drag simulation — with DnD deferred (DD-1) no
+    // drag offer can be created through the protocol; the test flips
+    // the delivered selection offer to a drag offer (as the future drag
+    // state machine would create it) and drives the negotiation over
+    // the wire. The negotiated action goes to both the destination
+    // (wl_data_offer.action) and the source (wl_data_source.action),
+    // version-guarded (v3 offers here).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var src_events: SourceEvents = .{};
+    src.setListener(*SourceEvents, SourceEvents.listener, &src_events);
+    var dev_events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &dev_events);
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+    device.setSelection(src, serial);
+    try ts.pump();
+    const offer = dev_events.last_offer.?;
+
+    const srv_offer = ts.mgr.?.offers.items[0];
+    srv_offer.offer_type = .drag;
+
+    const DndAction = client.wl.DataDeviceManager.DndAction;
+    offer.setActions(@as(DndAction, @bitCast(@as(u32, 1))), @as(DndAction, @bitCast(@as(u32, 0))));
+    var offer_events: OfferEvents = .{};
+    offer.setListener(*OfferEvents, OfferEvents.listener, &offer_events);
+    try ts.pump();
+
+    // Negotiation: the source never called set_actions -> copy-only;
+    // copy & copy = copy; no preferred; lowest bit = copy. The action is
+    // stored on the offer and the source, and emitted to both sides.
+    try testing.expectEqual(@as(u32, 1), srv_offer.actions);
+    try testing.expectEqual(@as(u32, 0), srv_offer.preferred_action);
+    try testing.expectEqual(@as(u32, 1), ts.mgr.?.selection_source.?.current_dnd_action);
+    try testing.expectEqual(@as(usize, 1), offer_events.action_count);
+    try testing.expectEqual(@as(u32, 1), offer_events.last_action);
+    try testing.expectEqual(@as(usize, 1), src_events.action_count);
+    try testing.expectEqual(@as(u32, 1), src_events.last_action);
+
+    // A re-set that does not change the negotiated action emits nothing
+    // (wlroots data_offer_update_action early-returns on an unchanged
+    // action, wlr_data_offer.c:57-76). copy|move with no preferred still
+    // negotiates copy (the source is copy-only), so no new events.
+    offer.setActions(@as(DndAction, @bitCast(@as(u32, 3))), @as(DndAction, @bitCast(@as(u32, 0))));
+    try ts.pump();
+    try testing.expectEqual(@as(u32, 3), srv_offer.actions);
+    try testing.expectEqual(@as(usize, 1), offer_events.action_count);
+    try testing.expectEqual(@as(usize, 1), src_events.action_count);
+}
+
+test "drag offer accept relays the mime to the source as target" {
+    // DD-2: wlroots data_offer_handle_accept (wlr_data_offer.c:78-92) —
+    // a drag offer relays accept feedback to the source: the accepted
+    // state is stored and the mime is forwarded as wl_data_source.target
+    // (since-3, version-guarded). Selection offers ignore accept.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var src_events: SourceEvents = .{};
+    src.setListener(*SourceEvents, SourceEvents.listener, &src_events);
+    var dev_events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &dev_events);
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+    device.setSelection(src, serial);
+    try ts.pump();
+    const offer = dev_events.last_offer.?;
+    ts.mgr.?.offers.items[0].offer_type = .drag;
+
+    offer.accept(serial, "text/plain");
+    try ts.pump();
+    try testing.expect(ts.mgr.?.selection_source.?.accepted);
+    try testing.expectEqual(@as(usize, 1), src_events.target_count);
+    try testing.expectEqualStrings("text/plain", src_events.last_target);
+
+    // A NULL accept resets the accepted state and forwards target(NULL).
+    offer.accept(serial, null);
+    try ts.pump();
+    try testing.expect(!ts.mgr.?.selection_source.?.accepted);
+    try testing.expectEqual(@as(usize, 2), src_events.target_count);
+    try testing.expectEqual(@as(usize, 0), src_events.last_target.len);
+}
+
+test "a second source.set_actions raises invalid_action_mask" {
+    // DD-3 companion: wlroots once-only rule (wlr_data_source.c:166-170)
+    // — set_actions may be called at most once, invalid_action_mask
+    // otherwise (wayland.xml: the source side sets the actions once).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    const DndAction = client.wl.DataDeviceManager.DndAction;
+    src.setActions(@as(DndAction, @bitCast(@as(u32, 1))));
+    try ts.pump();
+    try testing.expectEqual(@as(?u32, 1), ts.mgr.?.sources.items[0].actions);
+
+    src.setActions(@as(DndAction, @bitCast(@as(u32, 2))));
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
 }

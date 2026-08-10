@@ -27,17 +27,13 @@
 //!
 //! M3 simplifications (documented, foot-compatible):
 //!   - place_above/place_below are validated and recorded (restack_*
-//!     fields) but NOT applied by this module: the server reads the
-//!     fields per frame and reorders scene nodes (the child still draws
-//!     above its parent by default).
-//!   - Destroying a wl_subsurface while its surface lives leaves the
-//!     surface renderable as a plain surface (foot only destroys
-//!     subsurfaces at teardown).
+//!     fields) and the SERVER applies the reorder (main.zig
+//!     applyRestack); position and z-order are double-buffered on the
+//!     parent surface (F5: pending until the parent commits).
 //!   - Lifecycle is guarded: if either surface (child or parent) is
 //!     destroyed while the wl_subsurface lives, the compositor destroys
-//!     the wl_subsurface synchronously (the child keeps rendering as a
-//!     plain surface; a parent's death makes the wl_subsurface inert,
-//!     per wlroots' destroy-on-parent-destroy). No raw *Surface pointer
+//!     the wl_subsurface synchronously, and the child is unmapped
+//!     immediately (F6, wayland.xml:3279-3301). No raw *Surface pointer
 //!     outlives its surface.
 //!
 //! Imports: utils/*, core/wire.zig, core/display.zig, compositor/*.
@@ -137,8 +133,16 @@ pub const Subsurface = struct {
     surface: *Surface,
     /// The parent surface; same lifetime rule as `surface`.
     parent: *Surface,
+    /// Committed position (rendered by the server each frame).
     x: i32 = 0,
     y: i32 = 0,
+    /// Pending position (wl_subsurface.set_position): position is
+    /// double-buffered state on the parent surface (wayland.xml:
+    /// 3315-3317) — written at request time, applied when the parent
+    /// commits (F5; wlroots pending.x/y applied via the parent's
+    /// surface_synced_move_state, wlr_subcompositor.c:65-73, 161-179).
+    pending_x: i32 = 0,
+    pending_y: i32 = 0,
     sync: bool = true,
     /// A deferred commit is pending on the child surface: its pending
     /// state is locked (surface.cached_state_locks) and will be applied
@@ -151,11 +155,18 @@ pub const Subsurface = struct {
     /// same parent), validated at request time; 0 = none pending. The id
     /// is client-local (the whole registry is per-client here), so the
     /// server must resolve it against the compositor's surface list.
-    /// The server applies the reorder and resets this to 0.
+    /// Z-order is double-buffered on the parent surface (wayland.xml:
+    /// 3336-3337): the pending restack becomes effective when the parent
+    /// commits (F5), which sets `restack_committed`; the server applies
+    /// the reorder and resets both.
     restack_sibling_id: u32 = 0,
     /// true = place_above (the child goes above the reference),
     /// false = place_below.
     restack_above: bool = true,
+    /// The parent committed since the last restack request: the pending
+    /// restack is now effective and the server should apply it (and
+    /// reset this + restack_sibling_id).
+    restack_committed: bool = false,
     /// Fired when `surface` (the child) dies: the wl_subsurface must die
     /// with its role object.
     surface_listener: wire.Listener(*Surface),
@@ -305,8 +316,12 @@ fn getSubsurface(
 fn subsurfaceRequest(ss_res: *server.wl.Subsurface, request: server.wl.Subsurface.Request, ss: *Subsurface) void {
     switch (request) {
         .set_position => |r| {
-            ss.x = r.x;
-            ss.y = r.y;
+            // F5: position is double-buffered state on the parent
+            // surface (wayland.xml:3315-3317): pending until the parent
+            // commits (wlroots subsurface_handle_set_position writes
+            // pending.x/y, wlr_subcompositor.c:65-73).
+            ss.pending_x = r.x;
+            ss.pending_y = r.y;
         },
         .place_above => |r| {
             // Recorded for the server (main.zig reads restack_* per frame
@@ -344,9 +359,12 @@ fn subsurfaceRequest(ss_res: *server.wl.Subsurface, request: server.wl.Subsurfac
         },
         .destroy => {
             // wlroots subsurface_destroy (wlr_subcompositor.c:38-40)
-            // applies a leftover cache before the role dies; the child
-            // keeps rendering as a plain surface with its latest content.
+            // applies a leftover cache before the role dies, then unmaps
+            // the surface (F6: "The wl_surface is unmapped immediately",
+            // wayland.xml:3298-3301; wlr_surface_unmap at
+            // wlr_subcompositor.c:43).
             if (ss.sync_cached) flushCached(ss);
+            unmapChild(ss);
             ss_res.destroy();
         },
     }
@@ -379,10 +397,13 @@ fn onSurfaceDestroy(listener: *wire.Listener(*Surface), _: *Surface) void {
 /// destroys it; the client sees its object die. A leftover cache is
 /// applied first (wlroots subsurface_destroy -> wlr_surface_unlock_cached,
 /// wlr_subcompositor.c:38-40): the parent's commit will never come, so
-/// the child keeps its latest committed content as a plain surface.
+/// the child keeps its latest committed content — then it is unmapped
+/// (F6: "the sub-surface is unmapped" when the parent is destroyed,
+/// wayland.xml:3279-3280).
 fn onParentDestroy(listener: *wire.Listener(*Surface), _: *Surface) void {
     const ss: *Subsurface = @fieldParentPtr("parent_listener", listener);
     if (ss.sync_cached) flushCached(ss);
+    unmapChild(ss);
     teardownOnSurfaceDeath(ss);
 }
 
@@ -411,10 +432,29 @@ fn onSurfaceClientCommit(listener: *wire.Listener(*Surface), _: *Surface) void {
 /// synced child's cache. The flush runs the child through the normal
 /// commit pipeline (wlroots unlock_cached -> surface_commit_state,
 /// wlr_compositor.c:947-986); the child's own commit signal then cascades
-/// to its subsurfaces, so nested caches flush recursively.
+/// to its subsurfaces, so nested caches flush recursively. Also applies
+/// the child's pending position and promotes a pending restack — both
+/// are double-buffered state on the parent surface (F5; wayland.xml:
+/// 3315-3317, 3336-3337).
 fn onParentCommit(listener: *wire.Listener(*Surface), _: *Surface) void {
     const ss: *Subsurface = @fieldParentPtr("parent_commit_listener", listener);
+    ss.x = ss.pending_x;
+    ss.y = ss.pending_y;
+    if (ss.restack_sibling_id != 0) ss.restack_committed = true;
     if (ss.sync and ss.sync_cached) flushCached(ss);
+}
+
+/// Force-unmap the child surface (wlroots wlr_surface_unmap,
+/// wlr_subcompositor.c:43): a destroyed wl_subsurface must make the
+/// child disappear immediately (F6). Mirrors Surface.destroy's unmap
+/// transition (surface.zig:300-310): clears mapped, runs the role unmap
+/// hook and emits the unmap signal so the server drops the scene node.
+fn unmapChild(ss: *Subsurface) void {
+    const s = ss.surface;
+    if (!s.mapped) return;
+    s.mapped = false;
+    if (s.role) |role| if (role.unmap) |f| f(s);
+    s.events.unmap.emit(s);
 }
 
 /// Apply the child's deferred pending state now. Clears the lock first so
@@ -598,6 +638,8 @@ test "parent surface destroy removes the subsurface and clears the role" {
     try testing.expectEqual(@as(usize, 0), t.sc.subsurfaces.items.len);
     // The child keeps rendering as a plain surface: its role is cleared.
     try testing.expect(t.child.role == null);
+    // F6: the child is unmapped (it was never mapped here, so no
+    // transition fires — see the cached-commit test for the mapped case).
 
     // The child's destroy signal must not fire a dangling listener.
     t.child.resource.destroy();
@@ -704,10 +746,12 @@ test "parent destroy applies the cached commit" {
 
     // The parent's commit will never come; wlroots applies the cache at
     // subsurface_destroy (wlr_subcompositor.c:38-40) so the child keeps
-    // its latest committed content as a plain surface.
+    // its latest committed content — but F6 unmaps it: the parent's
+    // death must make the child disappear (wayland.xml:3279-3280).
     t.parent.resource.destroy();
     try testing.expectEqual(@as(usize, 0), t.sc.subsurfaces.items.len);
     try testing.expect(t.child.current.buffer == &buffer);
+    try testing.expect(!t.child.mapped);
     try testing.expect(t.child.role == null);
 }
 
@@ -777,6 +821,85 @@ test "place_above/below validate the reference and record the restack" {
     try t.comp.surfaces.append(allocator, other);
     subsurfaceRequest(ss.resource, .{ .place_above = .{ .sibling = other.resource } }, ss);
     try testing.expectEqual(third.resource.getId(), ss.restack_sibling_id);
+}
+
+test "set_position is double-buffered on the parent commit (F5)" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var t = try SubsurfaceTest.init(allocator, io, &log_cfg);
+    defer t.deinit();
+    const ss = t.sc.subsurfaces.items[0];
+
+    // Position is pending at request time (wayland.xml:3315-3317: "The
+    // position of the sub-surface is double-buffered state on the parent
+    // surface"): nothing changes until the parent commits.
+    subsurfaceRequest(ss.resource, .{ .set_position = .{ .x = 40, .y = 50 } }, ss);
+    try testing.expectEqual(@as(i32, 0), ss.x);
+    try testing.expectEqual(@as(i32, 0), ss.y);
+    try testing.expectEqual(@as(i32, 40), ss.pending_x);
+    try testing.expectEqual(@as(i32, 50), ss.pending_y);
+
+    // The parent's commit applies it (wlroots surface_synced_move_state,
+    // wlr_subcompositor.c:161-179).
+    t.parent.commit();
+    try testing.expectEqual(@as(i32, 40), ss.x);
+    try testing.expectEqual(@as(i32, 50), ss.y);
+
+    // A new set_position stays pending until the next parent commit.
+    subsurfaceRequest(ss.resource, .{ .set_position = .{ .x = 5, .y = 5 } }, ss);
+    try testing.expectEqual(@as(i32, 40), ss.x);
+    t.parent.commit();
+    try testing.expectEqual(@as(i32, 5), ss.x);
+    try testing.expectEqual(@as(i32, 5), ss.y);
+}
+
+test "restack is double-buffered on the parent commit (F5)" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var t = try SubsurfaceTest.init(allocator, io, &log_cfg);
+    defer t.deinit();
+    const ss = t.sc.subsurfaces.items[0];
+
+    // place_above records the pending restack; it becomes effective on
+    // the parent's commit (z-order is double-buffered state on the
+    // parent surface, wayland.xml:3336-3337).
+    subsurfaceRequest(ss.resource, .{ .place_above = .{ .sibling = t.parent.resource } }, ss);
+    try testing.expectEqual(t.parent.resource.getId(), ss.restack_sibling_id);
+    try testing.expect(!ss.restack_committed);
+    t.parent.commit();
+    try testing.expect(ss.restack_committed);
+}
+
+test "wl_subsurface.destroy unmaps the child (F6)" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var t = try SubsurfaceTest.init(allocator, io, &log_cfg);
+    defer t.deinit();
+    const ss = t.sc.subsurfaces.items[0];
+
+    var buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    t.child.attachBuffer(&buffer);
+    t.child.commit(); // deferred (sync child)
+    t.parent.commit(); // flush -> child maps
+    try testing.expect(t.child.mapped);
+
+    // Destroying the wl_subsurface unmaps the child immediately
+    // (wayland.xml:3298-3301; wlroots subsurface_destroy ->
+    // wlr_surface_unmap, wlr_subcompositor.c:43).
+    subsurfaceRequest(ss.resource, .destroy, ss);
+    try testing.expect(!t.child.mapped);
+    try testing.expect(t.child.role == null);
+    try testing.expectEqual(@as(usize, 0), t.sc.subsurfaces.items.len);
 }
 
 var test_child_commit_count: usize = 0;

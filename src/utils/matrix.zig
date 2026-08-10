@@ -71,7 +71,7 @@ pub fn boxTransform(box: geom.Rect, transform: geom.Transform, width: i32, heigh
 /// inside the transformed buffer region (a `height` x `width` region for the
 /// 90-degree family) maps to the buffer pixel whose 1x1 transformed box
 /// contains it. The `-1` terms account for a pixel covering `[p, p + 1)`.
-pub fn transformPoint(x: i32, y: i32, transform: geom.Transform, width: i32, height: i32) struct { x: i32, y: i32 } {
+pub fn transformPoint(x: i32, y: i32, transform: geom.Transform, width: i32, height: i32) geom.Point {
     return switch (transform) {
         .normal => .{ .x = x, .y = y },
         .@"90" => .{ .x = y, .y = height - 1 - x },

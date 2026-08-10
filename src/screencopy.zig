@@ -2,28 +2,48 @@
 //!
 //! Shm-only compositor: on frame creation the manager sends the `buffer`
 //! event (format/width/height/stride) + `buffer_done`; the client sends
-//! `copy(buffer)` with a matching ARGB8888 wl_shm buffer and the module
-//! copies the current output framebuffer (or the requested region) into
-//! it, then sends flags + ready with the capture timestamp. The cursor is
-//! already composited into the framebuffer by the scene (overlay_cursor
-//! is accepted and ignored).
+//! `copy(buffer)` (or `copy_with_damage(buffer)`) with a matching
+//! wl_shm buffer. The copy itself is DEFERRED to the next output commit
+//! (wlroots wlr_screencopy_v1.c:434-435: the copy samples a presented
+//! frame, never a mid-render or stale one); the ready event then carries
+//! the commit timestamp. `copy_with_damage` sends the accumulated
+//! per-client output damage boxes (wlroots screencopy_damage_accumulate,
+//! :47-61) instead of a full rect.
+//!
+//! overlay_cursor: the compositor's framebuffer always has the cursor
+//! composited into it, so overlay_cursor=1 is naturally satisfied; for
+//! overlay_cursor=0 the copy source is the cursor-less base framebuffer
+//! (a get_framebuffer callback flag — wlroots locks software cursors for
+//! the opposite reason, :443-446).
 //!
 //! The framebuffer is supplied by the compositor through a callback (the
-//! server's single output framebuffer); the wl_output argument is
-//! validated through another callback (the server's wl_output module).
+//! server's output framebuffers); the wl_output argument is validated
+//! through another callback (the server's wl_output module), and a
+//! request_frame callback wakes the renderer so the deferred copy gets
+//! its commit (wlroots wlr_output_update_needs_frame, :440). Captures of
+//! a disabled output fail at capture AND at copy (wlroots :508-511,
+//! :364-367).
 //!
 //! Imports: utils/*, core/wire.zig, core/display.zig, buffers/shm.zig,
-//! renderer/pixman.zig (sibling modules).
+//! renderer/pixman.zig, output/output.zig (sibling modules).
 
 const std = @import("std");
 const log = @import("./utils/log.zig");
 const wire = @import("./core/wire.zig");
 const display_mod = @import("./core/display.zig");
 const shm_mod = @import("./buffers/shm.zig");
+const buffer_mod = @import("./buffers/buffer.zig");
 const pixman = @import("./renderer/pixman.zig");
+const geom = @import("./utils/geom.zig");
+const damage_mod = @import("./utils/damage.zig");
+const matrix = @import("./utils/matrix.zig");
+const output_mod = @import("./output/output.zig");
 
 const server = @import("protocol").server;
 const client = @import("protocol").client;
+
+const Output = output_mod.Output;
+const CommitEvent = Output.CommitEvent;
 
 /// zwlr_screencopy_manager_v1 protocol version this library implements.
 pub const screencopy_version: u32 = 3;
@@ -35,15 +55,18 @@ pub const Screencopy = struct {
     display: *display_mod.CompositorDisplay,
     shm: *shm_mod.ShmState,
     global: ?*wire.Global = null,
-    /// Framebuffer of the captured output (current frame).
-    get_framebuffer: *const fn (ctx: *anyopaque) ?*pixman.Framebuffer,
+    /// Framebuffer of the captured output. `overlay_cursor` selects the
+    /// cursor-composited framebuffer (true) or the cursor-less base
+    /// (false).
+    get_framebuffer: *const fn (ctx: *anyopaque, overlay_cursor: bool) ?*pixman.Framebuffer,
     fb_ctx: *anyopaque,
-    /// True when the wl_output argument belongs to this compositor.
-    owns_output: *const fn (ctx: *anyopaque, resource: *server.wl.Output) bool,
+    /// Resolve a wl_output resource to the Output it belongs to; null
+    /// when it is not this compositor's output.
+    output_from_resource: *const fn (ctx: *anyopaque, resource: *server.wl.Output) ?*Output,
     output_ctx: *anyopaque,
-    /// Monotonic capture timestamp source (tv_sec_hi, tv_sec_lo, tv_nsec).
-    clock: *const fn (ctx: *anyopaque, out: *[3]u32) void,
-    clock_ctx: *anyopaque,
+    /// Wake the renderer so a deferred copy gets its next output commit.
+    request_frame: *const fn (ctx: *anyopaque) void,
+    request_ctx: *anyopaque,
     /// Completed captures: incremented once per served `copy` request
     /// (pixels fully copied into the client's buffer, before the frame
     /// is marked ready). The server reads this to time synth input
@@ -56,12 +79,12 @@ pub const Screencopy = struct {
         log_cfg: *const log.Config,
         display: *display_mod.CompositorDisplay,
         shm: *shm_mod.ShmState,
-        get_framebuffer: *const fn (ctx: *anyopaque) ?*pixman.Framebuffer,
+        get_framebuffer: *const fn (ctx: *anyopaque, overlay_cursor: bool) ?*pixman.Framebuffer,
         fb_ctx: *anyopaque,
-        owns_output: *const fn (ctx: *anyopaque, resource: *server.wl.Output) bool,
+        output_from_resource: *const fn (ctx: *anyopaque, resource: *server.wl.Output) ?*Output,
         output_ctx: *anyopaque,
-        clock: *const fn (ctx: *anyopaque, out: *[3]u32) void,
-        clock_ctx: *anyopaque,
+        request_frame: *const fn (ctx: *anyopaque) void,
+        request_ctx: *anyopaque,
     ) error{ OutOfMemory, GlobalCreateFailed }!*Screencopy {
         const self = try allocator.create(Screencopy);
         errdefer allocator.destroy(self);
@@ -73,10 +96,10 @@ pub const Screencopy = struct {
             .shm = shm,
             .get_framebuffer = get_framebuffer,
             .fb_ctx = fb_ctx,
-            .owns_output = owns_output,
+            .output_from_resource = output_from_resource,
             .output_ctx = output_ctx,
-            .clock = clock,
-            .clock_ctx = clock_ctx,
+            .request_frame = request_frame,
+            .request_ctx = request_ctx,
         };
         self.global = try display.addGlobal(
             server.zwlr.ScreencopyManagerV1,
@@ -96,17 +119,68 @@ pub const Screencopy = struct {
     }
 };
 
-/// Per-frame state: the capture region (output or clamped sub-rect) and
-/// the copy-once guard. Freed by the frame's destroy handler.
-const FrameState = struct {
+/// Per-client state (one per manager resource). Owns the with_damage
+/// damage accumulator (wlroots wlr_screencopy_v1_client.damages).
+/// Refcounted: 1 for the manager resource + 1 per outstanding frame, so
+/// teardown order between the manager and its frames never dangles.
+/// Destroy paths only touch the stored allocator — the Screencopy itself
+/// may already be gone at client teardown (the server destroys the
+/// manager global before its clients).
+const ClientState = struct {
+    allocator: std.mem.Allocator,
+    /// Owning module. Only dereferenced from request handlers (the loop
+    /// is running); destroy paths use the stored allocator because the
+    /// Screencopy may already be freed at client teardown.
     screencopy: *Screencopy,
+    /// Accumulated output damage since the last sent with_damage frame.
+    /// Starts whole at first use (wlroots screencopy_damage_create);
+    /// cleared after each sent frame. The whole flag covers the output.
+    damage: damage_mod.Damage,
+    /// The output being captured; null until the accumulator is armed.
+    output: ?*Output = null,
+    /// True once the commit/destroy listeners are attached to `output`.
+    armed: bool = false,
+    /// 1 for the manager resource + 1 per outstanding frame.
+    ref: u32 = 1,
+    commit_listener: wire.Listener(*CommitEvent),
+    output_destroy_listener: wire.Listener(*Output),
+};
+
+/// Per-frame state: the capture region (in buffer coordinates), the
+/// client's validated copy buffer, and the deferred-copy listeners. Freed
+/// by the frame's resource destroy handler.
+const FrameState = struct {
+    allocator: std.mem.Allocator,
+    screencopy: *Screencopy,
+    client: *ClientState,
     resource: *server.zwlr.ScreencopyFrameV1,
-    /// Region in output coordinates (already clamped to the output).
+    output: *Output,
+    /// Region in buffer coordinates (output framebuffer space), already
+    /// mapped through transform + scale.
     x: i32,
     y: i32,
     width: i32,
     height: i32,
-    used: bool = false,
+    overlay_cursor: bool,
+    /// copy_with_damage requested: the ready event carries accumulated
+    /// per-client damage boxes.
+    with_damage: bool = false,
+    /// The client's validated shm buffer; null until `copy` is
+    /// requested. Doubles as the already-used guard; cleared once the
+    /// frame is served or failed.
+    buffer: ?*buffer_mod.Buffer = null,
+    /// True once ready/failed was sent: the frame no longer reacts to
+    /// output commits or copy requests. The RESOURCE stays alive — the
+    /// client owns its lifetime and destroys it after ready/failed
+    /// (wlroots inerts the frame, wlr_screencopy_v1.c:208-221).
+    finished: bool = false,
+    /// Advertised format code (the source framebuffer's format).
+    shm_format: u32,
+    /// Advertised stride (tight for the format); the client's buffer
+    /// stride must match it exactly.
+    shm_stride: i32,
+    commit_listener: wire.Listener(*CommitEvent),
+    output_destroy_listener: wire.Listener(*Output),
 };
 
 fn bindManager(cli: *wire.Client, sc: *Screencopy, version: u32, id: u32) void {
@@ -114,17 +188,59 @@ fn bindManager(cli: *wire.Client, sc: *Screencopy, version: u32, id: u32) void {
         cli.postNoMemory();
         return;
     };
-    resource.setHandler(*Screencopy, managerRequest, null, sc);
+    const client_state = sc.allocator.create(ClientState) catch {
+        resource.destroy();
+        cli.postNoMemory();
+        return;
+    };
+    client_state.* = .{
+        .allocator = sc.allocator,
+        .screencopy = sc,
+        .damage = damage_mod.Damage.init(sc.allocator),
+        .commit_listener = wire.Listener(*CommitEvent).init(onClientOutputCommit),
+        .output_destroy_listener = wire.Listener(*Output).init(onClientOutputDestroy),
+    };
+    // Detached-state links so a conditional remove() (clientUnref before
+    // the accumulator was armed) is a no-op, never a dangling deref.
+    client_state.commit_listener.link.init();
+    client_state.output_destroy_listener.link.init();
+    resource.setHandler(*ClientState, managerRequest, managerDestroy, client_state);
+}
+
+fn managerDestroy(_: *server.zwlr.ScreencopyManagerV1, client_state: *ClientState) void {
+    clientUnref(client_state);
 }
 
 fn managerRequest(
     resource: *server.zwlr.ScreencopyManagerV1,
     request: server.zwlr.ScreencopyManagerV1.Request,
-    sc: *Screencopy,
+    client_state: *ClientState,
 ) void {
     switch (request) {
-        .capture_output => |r| capture(sc, resource, r.frame, r.output, 0, 0, 0, 0),
-        .capture_output_region => |r| capture(sc, resource, r.frame, r.output, r.x, r.y, r.width, r.height),
+        .capture_output => |r| capture(
+            client_state.screencopy,
+            resource,
+            client_state,
+            r.frame,
+            r.output,
+            r.overlay_cursor,
+            0,
+            0,
+            0,
+            0,
+        ),
+        .capture_output_region => |r| capture(
+            client_state.screencopy,
+            resource,
+            client_state,
+            r.frame,
+            r.output,
+            r.overlay_cursor,
+            r.x,
+            r.y,
+            r.width,
+            r.height,
+        ),
         .destroy => resource.destroy(),
     }
 }
@@ -132,52 +248,79 @@ fn managerRequest(
 fn capture(
     sc: *Screencopy,
     manager: *server.zwlr.ScreencopyManagerV1,
+    client_state: *ClientState,
     frame_id: u32,
     output_resource: *server.wl.Output,
+    overlay_cursor: i32,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
 ) void {
     const cli = output_resource.getClient();
-    if (!sc.owns_output(sc.output_ctx, output_resource)) {
+    const output = sc.output_from_resource(sc.output_ctx, output_resource) orelse {
         cli.postNoMemory(); // manager path is only reachable via a real output
         return;
+    };
+
+    if (!output.enabled) {
+        // Capturing a disabled output fails the frame (wlroots :508-511).
+        const failed = server.zwlr.ScreencopyFrameV1.create(cli, 1, frame_id) catch return;
+        failed.sendFailed();
+        return;
     }
-    const fb = sc.get_framebuffer(sc.fb_ctx) orelse {
+    const src_fb = sc.get_framebuffer(sc.fb_ctx, true) orelse {
         // No framebuffer yet: fail the frame without killing the client.
         const failed = server.zwlr.ScreencopyFrameV1.create(cli, 1, frame_id) catch return;
         failed.sendFailed();
         return;
     };
 
-    // The region is in output logical coordinates; clamp to the output.
-    var rx = x;
-    var ry = y;
-    var rw = width;
-    var rh = height;
+    // The region is in output LOGICAL coordinates; map it through the
+    // inverse transform and the scale into buffer coordinates (wlroots
+    // :576-580). The full-output form is the effective resolution
+    // directly. Boxes are NOT clamped: one that exceeds the source fails
+    // at copy time (wlroots :313-319).
+    var rx: i32 = undefined;
+    var ry: i32 = undefined;
+    var rw: i32 = undefined;
+    var rh: i32 = undefined;
     if (width == 0 and height == 0) {
         rx = 0;
         ry = 0;
-        rw = fb.width;
-        rh = fb.height;
+        rw = output.width;
+        rh = output.height;
     } else {
-        if (rx < 0) {
-            rw += rx;
-            rx = 0;
-        }
-        if (ry < 0) {
-            rh += ry;
-            ry = 0;
-        }
-        if (rx + rw > fb.width) rw = fb.width - rx;
-        if (ry + rh > fb.height) rh = fb.height - ry;
-        if (rw <= 0 or rh <= 0) {
-            const failed = server.zwlr.ScreencopyFrameV1.create(cli, 1, frame_id) catch return;
-            failed.sendFailed();
-            return;
-        }
+        const logical: geom.Rect = .{ .x = x, .y = y, .width = width, .height = height };
+        var box = matrix.boxTransform(logical, invertTransform(output.transform), output.width, output.height);
+        box.x = scaleCoord(box.x, output.scale);
+        box.y = scaleCoord(box.y, output.scale);
+        box.width = scaleCoord(box.width, output.scale);
+        box.height = scaleCoord(box.height, output.scale);
+        rx = box.x;
+        ry = box.y;
+        rw = box.width;
+        rh = box.height;
     }
+    if (rw <= 0 or rh <= 0) {
+        // A non-positive region is nonsense on the wire: fail rather than
+        // advertise an unusable buffer size.
+        const failed = server.zwlr.ScreencopyFrameV1.create(cli, 1, frame_id) catch return;
+        failed.sendFailed();
+        return;
+    }
+
+    // Advertise the shm path. The format is the source framebuffer's
+    // format — the pixman renderer's read format (ARGB8888 today, but
+    // not hardcoded; wlroots preferred_read_format :543). The stride is
+    // the tight minimum for a 4-byte format (pixel_format_info_min_stride
+    // for the ARGB8888 family).
+    const fmt: server.wl.Shm.Format = @enumFromInt(@as(c_int, @intCast(src_fb.format)));
+    const shm_stride = std.math.mul(i32, rw, 4) catch {
+        const failed = server.zwlr.ScreencopyFrameV1.create(cli, 1, frame_id) catch return;
+        failed.sendFailed();
+        return;
+    };
 
     // The frame inherits the manager resource's version (opcode-gated
     // events below must not leak to older clients).
@@ -191,17 +334,29 @@ fn capture(
         return;
     };
     state.* = .{
+        .allocator = sc.allocator,
         .screencopy = sc,
+        .client = client_state,
         .resource = frame,
+        .output = output,
         .x = rx,
         .y = ry,
         .width = rw,
         .height = rh,
+        .overlay_cursor = overlay_cursor != 0,
+        .shm_format = @intCast(@intFromEnum(fmt)),
+        .shm_stride = shm_stride,
+        .commit_listener = wire.Listener(*CommitEvent).init(onFrameOutputCommit),
+        .output_destroy_listener = wire.Listener(*Output).init(onFrameOutputDestroy),
     };
+    // Detached-state links: frameDestroy removes them unconditionally,
+    // which must be a no-op when the copy was never requested.
+    state.commit_listener.link.init();
+    state.output_destroy_listener.link.init();
     frame.setHandler(*FrameState, frameRequest, frameDestroy, state);
+    client_state.ref += 1;
 
-    // Advertise the shm path: ARGB8888, region size, tight stride.
-    frame.sendBuffer(.argb8888, @intCast(rw), @intCast(rh), @intCast(rw * 4));
+    frame.sendBuffer(fmt, @intCast(rw), @intCast(rh), @intCast(shm_stride));
     if (frame.getVersion() >= 3) frame.sendBufferDone();
 }
 
@@ -211,35 +366,42 @@ fn frameRequest(
     state: *FrameState,
 ) void {
     switch (request) {
-        .copy => |r| copyFrame(frame, state, r.buffer),
-        .copy_with_damage => |r| copyFrame(frame, state, r.buffer),
+        .copy => |r| {
+            if (state.finished) return; // served/failed: inert (wlroots frame == NULL)
+            copyRequest(frame, state, r.buffer, false);
+        },
+        .copy_with_damage => |r| {
+            if (state.finished) return;
+            copyRequest(frame, state, r.buffer, true);
+        },
         .destroy => frame.destroy(),
     }
 }
 
-fn frameDestroy(frame: *server.zwlr.ScreencopyFrameV1, state: *FrameState) void {
-    _ = frame;
-    const allocator = state.screencopy.allocator;
-    allocator.destroy(state);
-}
-
-fn copyFrame(
+/// Validate the client's buffer and defer the actual copy to the next
+/// output commit (wlroots frame_handle_copy, :347-456).
+fn copyRequest(
     frame: *server.zwlr.ScreencopyFrameV1,
     state: *FrameState,
     buffer: *server.wl.Buffer,
+    with_damage: bool,
 ) void {
-    if (state.used) {
+    if (state.buffer != null) {
         frame.postError(.already_used, "the frame was already copied");
         return;
     }
-    state.used = true;
-
-    const fb = state.screencopy.get_framebuffer(state.screencopy.fb_ctx) orelse {
-        frame.sendFailed();
+    if (!state.output.enabled) {
+        // The output was disabled between capture and copy (wlroots
+        // :364-367).
+        frameFailed(state);
         return;
-    };
+    }
+    state.with_damage = with_damage;
 
-    // The client's wl_buffer must be a shm buffer of the advertised size.
+    // The client's wl_buffer must be a shm buffer of the advertised
+    // size, format and exact stride (wlroots :381-421; the stride
+    // rejection is :418-421 — a padded client buffer must not be
+    // silently mis-copied row by row).
     const buf = state.screencopy.shm.fromResource(state.screencopy.allocator, @ptrCast(buffer)) catch {
         frame.postError(.invalid_buffer, "buffer is not a wl_shm buffer");
         return;
@@ -256,48 +418,75 @@ fn copyFrame(
         frame.postError(.invalid_buffer, "buffer has no shm data");
         return;
     };
-    // getFormat returns the raw wl_shm format code (ARGB8888 = 0).
-    if (wire.shm.Buffer.getFormat(shm) != 0) {
-        frame.postError(.invalid_buffer, "buffer format is not ARGB8888");
+    if (wire.shm.Buffer.getFormat(shm) != state.shm_format) {
+        frame.postError(.invalid_buffer, "buffer format does not match the frame");
         return;
     }
-    const begin = buf.impl.begin_data_ptr_access orelse {
-        frame.postError(.invalid_buffer, "buffer is not accessible");
+    const stride = wire.shm.Buffer.getStride(shm);
+    if (stride <= 0 or stride != state.shm_stride) {
+        frame.postError(.invalid_buffer, "buffer stride does not match the frame");
         return;
-    };
-    const end = buf.impl.end_data_ptr_access orelse {
-        frame.postError(.invalid_buffer, "buffer is not accessible");
-        return;
-    };
-    const dst_ptr = begin(buf) catch {
-        frame.postError(.invalid_buffer, "buffer access failed");
-        return;
-    };
-    defer end(buf);
-    // This module is a consumer: hold a lock while copying, then hand the
-    // buffer back (drop + unlock fires wl_buffer.release).
+    }
+    // Hold the buffer until the copy happens (the client may not reuse
+    // it before wl_buffer.release, which fires on the unlock).
     buf.lock() catch {
         frame.postError(.invalid_buffer, "buffer lock failed");
         return;
     };
-    defer buf.unlock();
+    state.buffer = buf;
 
-    // Row-wise copy of the region (both sides are ARGB8888).
-    const dst = dst_ptr.?;
-    const dst_stride: usize = @intCast(buf.width * 4);
-    const src_stride: usize = @intCast(fb.width * 4);
-    const src_offset: usize = @as(usize, @intCast(state.y)) * src_stride +
-        @as(usize, @intCast(state.x)) * 4;
-    const row_len: usize = @intCast(state.width * 4);
-    var row: usize = 0;
-    while (row < @as(usize, @intCast(state.height))) : (row += 1) {
-        const src_row = fb.data[src_offset + row * src_stride ..][0..row_len];
-        const dst_row = dst[row * dst_stride ..][0..row_len];
-        @memcpy(dst_row, src_row);
+    if (with_damage) {
+        // Arm the per-client damage accumulator. It starts whole
+        // (wlroots screencopy_damage_create) and accumulates the output
+        // damage of every later commit.
+        clientArmDamage(state.client, state.output);
     }
 
-    // Hand the buffer back to the client (it may reuse it).
-    buf.drop();
+    // The copy happens at the next output commit (wlroots :434-435):
+    // arm the commit listener and wake the renderer so a commit comes
+    // (wlroots :440).
+    state.output.events.commit.add(&state.commit_listener);
+    state.output.events.destroy.add(&state.output_destroy_listener);
+    state.screencopy.request_frame(state.screencopy.request_ctx);
+}
+
+/// The deferred copy: runs inside the output's commit signal, after the
+/// compositor presented the new buffer.
+fn onFrameOutputCommit(listener: *wire.Listener(*CommitEvent), event: *CommitEvent) void {
+    const state: *FrameState = @fieldParentPtr("commit_listener", listener);
+    const committed = event.state.committed;
+
+    // The output was disabled by this commit: the copy cannot proceed
+    // (wlroots :354-356).
+    if (committed & Output.State.committed_enabled != 0 and !state.output.enabled) {
+        frameFailed(state);
+        return;
+    }
+    // Wait for a commit that presents a buffer (wlroots :358-363).
+    if (committed & Output.State.committed_buffer == 0) return;
+    if (state.buffer == null) return; // copy not requested yet
+    if (state.with_damage) {
+        // With damage: only copy once there is something new to report
+        // (wlroots :366-371).
+        if (state.client.damage.isEmpty()) return;
+    }
+
+    const src = state.screencopy.get_framebuffer(state.screencopy.fb_ctx, state.overlay_cursor) orelse {
+        frameFailed(state);
+        return;
+    };
+    // The box must lie inside the source (wlroots :313-319).
+    if (state.x < 0 or state.y < 0 or
+        state.x + state.width > src.width or state.y + state.height > src.height or
+        state.width <= 0 or state.height <= 0)
+    {
+        frameFailed(state);
+        return;
+    }
+    if (!copyPixels(state, src)) {
+        frameFailed(state);
+        return;
+    }
 
     // The capture is fully served: pixels are in the client's buffer.
     // The server times its synth input off this counter (the client's
@@ -305,22 +494,232 @@ fn copyFrame(
     // be predicted reliably against the client's retry window.
     state.screencopy.captures_served += 1;
 
-    // Damage + flags + ready. The timestamp is the capture time.
+    // Damage boxes + flags + ready. The timestamp is the COMMIT time:
+    // the presented frame's time (wlroots sends event->when, :337).
     // damage is since 2 (wlr-screencopy-unstable-v1.xml:191): a v1 frame
-    // must not receive it — the v1 client listener has no damage slot and
-    // libwayland-client aborts on a listener-less opcode. The frame
-    // inherits the manager's bound version (capture, above), so gate on
-    // the frame version; buffer_done (>=3) is gated at frame creation.
-    if (frame.getVersion() >= 2) {
-        frame.sendDamage(@intCast(state.x), @intCast(state.y), @intCast(state.width), @intCast(state.height));
+    // must not receive it — the v1 client listener has no damage slot
+    // and libwayland-client aborts on a listener-less opcode.
+    if (state.resource.getVersion() >= 2) sendFrameDamage(state);
+    state.resource.sendFlags(.{});
+    const when = event.when_ns;
+    const sec: u64 = when / std.time.ns_per_s;
+    const nsec: u32 = @truncate(when % std.time.ns_per_s);
+    // ready is a plain event (not a destructor — "the client should
+    // destroy the object"). The frame is finished: detach the output
+    // listeners so it stops reacting to commits (the O14 bug), hand the
+    // buffer back, and wait for the client's destroy to free the state.
+    state.resource.sendReady(@truncate(sec >> 32), @truncate(sec), nsec);
+    finishFrame(state);
+}
+
+fn onFrameOutputDestroy(listener: *wire.Listener(*Output), _: *Output) void {
+    const state: *FrameState = @fieldParentPtr("output_destroy_listener", listener);
+    frameFailed(state);
+}
+
+/// failed is a plain event (not a destructor — "the client should
+/// destroy the object"): send it, finish the frame, and keep the
+/// resource for the client's destroy.
+fn frameFailed(state: *FrameState) void {
+    state.resource.sendFailed();
+    finishFrame(state);
+}
+
+/// The frame was served or failed: detach the output listeners, hand
+/// the client buffer back, and mark the frame finished so further copy
+/// requests and output commits are ignored. The resource itself stays
+/// alive — the client owns its lifetime and destroys it after
+/// ready/failed (wlroots inerts the frame, wlr_screencopy_v1.c:208-221);
+/// frameDestroy then frees the state. Listener links may be detached
+/// (never armed) or already removed — remove only when attached.
+fn finishFrame(state: *FrameState) void {
+    if (state.commit_listener.link.prev != null and
+        state.commit_listener.link.prev != &state.commit_listener.link)
+    {
+        state.commit_listener.link.remove();
     }
-    frame.sendFlags(.{});
-    var ts: [3]u32 = undefined;
-    state.screencopy.clock(state.screencopy.clock_ctx, &ts);
-    frame.sendReady(ts[0], ts[1], ts[2]);
-    log.debug("screencopy frame {d}x{d}@{d},{d} copied", state.screencopy.io, state.screencopy.log_cfg, "screencopy", .{
-        state.width, state.height, state.x, state.y,
-    });
+    if (state.output_destroy_listener.link.prev != null and
+        state.output_destroy_listener.link.prev != &state.output_destroy_listener.link)
+    {
+        state.output_destroy_listener.link.remove();
+    }
+    if (state.buffer) |b| {
+        b.drop();
+        if (b.n_locks > 0) b.unlock();
+    }
+    state.buffer = null;
+    state.finished = true;
+}
+
+/// Row-wise copy of the region into the client's shm buffer. Both sides
+/// are the advertised format (ARGB8888 family).
+fn copyPixels(state: *FrameState, src: *pixman.Framebuffer) bool {
+    const buf = state.buffer orelse return false;
+    const get_shm = buf.impl.get_shm orelse return false;
+    const shm = get_shm(buf) orelse return false;
+    const begin = buf.impl.begin_data_ptr_access orelse return false;
+    const end = buf.impl.end_data_ptr_access orelse return false;
+    const dst_ptr = begin(buf) catch return false;
+    defer end(buf);
+    const dst = dst_ptr orelse return false;
+    // The stride was validated to equal the advertised tight stride.
+    const dst_stride: usize = @intCast(wire.shm.Buffer.getStride(shm));
+    const src_stride: usize = @intCast(src.stride);
+    const src_offset: usize = @as(usize, @intCast(state.y)) * src_stride +
+        @as(usize, @intCast(state.x)) * 4;
+    const row_len: usize = @intCast(state.width * 4);
+    var row: usize = 0;
+    while (row < @as(usize, @intCast(state.height))) : (row += 1) {
+        const src_row = src.data[src_offset + row * src_stride ..][0..row_len];
+        const dst_row = dst[row * dst_stride ..][0..row_len];
+        @memcpy(dst_row, src_row);
+    }
+    return true;
+}
+
+/// Send the accumulated damage boxes and clear the accumulator (wlroots
+/// frame_send_damage, :156-181).
+fn sendFrameDamage(state: *FrameState) void {
+    const d = &state.client.damage;
+    if (d.whole) {
+        const out = state.output;
+        state.resource.sendDamage(0, 0, @intCast(out.width), @intCast(out.height));
+    } else {
+        for (d.rects.items) |r| {
+            state.resource.sendDamage(@intCast(r.x), @intCast(r.y), @intCast(r.width), @intCast(r.height));
+        }
+    }
+    d.clear();
+}
+
+/// The frame resource was destroyed (ready/failed sent, client destroy,
+/// client teardown): detach listeners, hand the buffer back, free.
+fn frameDestroy(_: *server.zwlr.ScreencopyFrameV1, state: *FrameState) void {
+    const client_state = state.client;
+    const allocator = state.allocator;
+    // The frame may be finished already (listeners removed, buffer
+    // handed back) or destroyed before its first copy: remove only what
+    // is still attached and hand the buffer back only if still held.
+    if (state.commit_listener.link.prev != null and
+        state.commit_listener.link.prev != &state.commit_listener.link)
+    {
+        state.commit_listener.link.remove();
+    }
+    if (state.output_destroy_listener.link.prev != null and
+        state.output_destroy_listener.link.prev != &state.output_destroy_listener.link)
+    {
+        state.output_destroy_listener.link.remove();
+    }
+    if (state.buffer) |b| {
+        b.drop();
+        if (b.n_locks > 0) b.unlock();
+    }
+    allocator.destroy(state);
+    clientUnref(client_state);
+}
+
+/// Drop one reference to a ClientState; free it at zero (manager
+/// resource gone AND all frames gone). Only touches the stored allocator
+/// and the (possibly already emitted) output signals — safe at any
+/// teardown order.
+fn clientUnref(client_state: *ClientState) void {
+    if (client_state.ref > 0) client_state.ref -= 1;
+    if (client_state.ref != 0) return;
+    if (client_state.armed) {
+        client_state.commit_listener.link.remove();
+        client_state.output_destroy_listener.link.remove();
+        client_state.armed = false;
+    }
+    client_state.damage.deinit();
+    const allocator = client_state.allocator;
+    allocator.destroy(client_state);
+}
+
+/// Arm the per-client damage accumulator on the output: start whole and
+/// accumulate the damage of every later commit (wlroots
+/// screencopy_damage_get_or_create).
+fn clientArmDamage(client_state: *ClientState, output: *Output) void {
+    if (client_state.armed) return;
+    client_state.output = output;
+    client_state.damage.addWhole();
+    client_state.armed = true;
+    output.events.commit.add(&client_state.commit_listener);
+    output.events.destroy.add(&client_state.output_destroy_listener);
+}
+
+fn onClientOutputCommit(listener: *wire.Listener(*CommitEvent), event: *CommitEvent) void {
+    const client_state: *ClientState = @fieldParentPtr("commit_listener", listener);
+    accumulateDamage(client_state, event);
+}
+
+fn onClientOutputDestroy(listener: *wire.Listener(*Output), _: *Output) void {
+    const client_state: *ClientState = @fieldParentPtr("output_destroy_listener", listener);
+    if (client_state.armed) {
+        // The output signal is being destroyed with the output; only the
+        // commit listener must be detached (the destroy listener dies
+        // with the signal). The frame's own output-destroy listener fails
+        // any pending copy.
+        client_state.commit_listener.link.remove();
+        client_state.armed = false;
+    }
+}
+
+/// Accumulate a committed state's damage into the client's region
+/// (wlroots screencopy_damage_accumulate, :47-61): the submitted damage
+/// (clamped to the output), or whole damage when the compositor
+/// submitted a buffer without damage.
+fn accumulateDamage(client_state: *ClientState, event: *CommitEvent) void {
+    const st = event.state;
+
+    if (st.damage.whole) {
+        client_state.damage.addWhole();
+        return;
+    }
+    if (st.damage.rects.items.len > 0) {
+        const out = client_state.output orelse return;
+        const bounds: geom.Rect = .{ .x = 0, .y = 0, .width = out.width, .height = out.height };
+        for (st.damage.rects.items) |r| {
+            const clamped = bounds.intersect(r) orelse continue;
+            damageAddRect(&client_state.damage, clamped);
+        }
+        return;
+    }
+    if (st.committed & Output.State.committed_buffer != 0) {
+        client_state.damage.addWhole();
+    }
+}
+
+/// Add a rect to the accumulator, skipping exact duplicates: repeated
+/// identical commits must not emit duplicate damage boxes (wlroots unions
+/// into a pixman region, which merges identical boxes).
+fn damageAddRect(d: *damage_mod.Damage, r: geom.Rect) void {
+    if (d.whole) return;
+    for (d.rects.items) |existing| {
+        if (existing.x == r.x and existing.y == r.y and
+            existing.width == r.width and existing.height == r.height) return;
+    }
+    d.add(r) catch return;
+}
+
+/// wl_output_transform inverse (wlroots util/transform.c:66-85): maps a
+/// logical box back into buffer space via matrix.boxTransform.
+fn invertTransform(t: geom.Transform) geom.Transform {
+    return switch (t) {
+        .normal => .normal,
+        .@"90" => .@"270",
+        .@"180" => .@"180",
+        .@"270" => .@"90",
+        .flipped => .flipped,
+        .flipped_90 => .flipped_270,
+        .flipped_180 => .flipped_180,
+        .flipped_270 => .flipped_90,
+    };
+}
+
+/// Scale a coordinate by the output scale, truncating toward zero like
+/// wlroots' C int *= double (wlr_screencopy_v1.c:578-581).
+fn scaleCoord(v: i32, scale: f32) i32 {
+    return @intFromFloat(@as(f64, v) * @as(f64, scale));
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +729,6 @@ fn copyFrame(
 const testing = std.testing;
 const posix = std.posix;
 const backend_mod = @import("./backend/backend.zig");
-const output_mod = @import("./output/output.zig");
 const wl_output_mod = @import("./output/wl_output.zig");
 
 const FakeBackendImpl = struct {
@@ -344,12 +742,12 @@ const fake_backend_impl: backend_mod.Backend.Impl = .{
 };
 
 const FakeOutputImpl = struct {
-    fn testState(_: *output_mod.Output, _: *const output_mod.Output.State) error{InvalidState}!void {}
-    fn commit(_: *output_mod.Output, _: *const output_mod.Output.State) error{CommitFailed}!void {}
+    fn testState(_: *Output, _: *const Output.State) error{InvalidState}!void {}
+    fn commit(_: *Output, _: *const Output.State) error{CommitFailed}!void {}
     fn destroy(_: std.mem.Allocator, _: *anyopaque) void {}
 };
 
-const fake_output_impl: output_mod.Output.Impl = .{
+const fake_output_impl: Output.Impl = .{
     .@"test" = FakeOutputImpl.testState,
     .commit = FakeOutputImpl.commit,
     .destroy = FakeOutputImpl.destroy,
@@ -387,6 +785,10 @@ const FrameEvents = struct {
     failed_count: usize = 0,
     damage_count: usize = 0,
     buffer_done_count: usize = 0,
+    damage_x: u32 = 0,
+    damage_y: u32 = 0,
+    damage_width: u32 = 0,
+    damage_height: u32 = 0,
 
     fn listener(
         frame: *client.zwlr.ScreencopyFrameV1,
@@ -399,7 +801,13 @@ const FrameEvents = struct {
             .flags => data.flags_count += 1,
             .ready => data.ready_count += 1,
             .failed => data.failed_count += 1,
-            .damage => data.damage_count += 1,
+            .damage => |d| {
+                data.damage_count += 1;
+                data.damage_x = d.x;
+                data.damage_y = d.y;
+                data.damage_width = d.width;
+                data.damage_height = d.height;
+            },
             .buffer_done => data.buffer_done_count += 1,
             // The compositor is shm-only: linux_dmabuf is never sent.
             .linux_dmabuf => data.buffer_done_count += 1,
@@ -416,7 +824,7 @@ const TestServer = struct {
     display: ?*display_mod.CompositorDisplay = null,
     shm: ?*shm_mod.ShmState = null,
     backend: ?*backend_mod.Backend = null,
-    output: ?*output_mod.Output = null,
+    output: ?*Output = null,
     wl_output: ?*wl_output_mod.WlOutput = null,
     fb: ?*pixman.Framebuffer = null,
     sc: ?*Screencopy = null,
@@ -429,6 +837,10 @@ const TestServer = struct {
     /// retained so the buffer stays valid until the frame is ready.
     shm_pool: ?*client.wl.ShmPool = null,
     buffer: ?*client.wl.Buffer = null,
+    /// Requests to wake the renderer (no-op in tests).
+    frame_requests: usize = 0,
+    /// Dummy listener data for the wl_output proxy.
+    output_listener_data: u8 = 0,
     /// Backend data pointer (the fake impl never reads it).
     dummy: u8 = 0,
 
@@ -458,11 +870,11 @@ const TestServer = struct {
         errdefer if (ts.shm) |s| s.deinit();
 
         // One fake 64x64 output: the wl_output global supplies the
-        // capture_output object argument and owns_output its identity
-        // check; the framebuffer is the capture source.
+        // capture_output object argument and output_from_resource its
+        // identity check; the framebuffer is the capture source.
         ts.backend = try backend_mod.Backend.init(allocator, &ts.io, &ts.log_cfg, &fake_backend_impl, &ts.dummy);
         errdefer if (ts.backend) |b| b.destroy();
-        ts.output = try output_mod.Output.create(
+        ts.output = try Output.create(
             allocator,
             &ts.io,
             &ts.log_cfg,
@@ -491,9 +903,9 @@ const TestServer = struct {
             ts.shm.?,
             getFramebuffer,
             ts,
-            ownsOutput,
+            outputFromResource,
             ts,
-            captureClock,
+            requestFrame,
             ts,
         );
         errdefer if (ts.sc) |sc| sc.deinit();
@@ -517,7 +929,8 @@ const TestServer = struct {
 
         // Round 2: bind wl_shm (for the copy buffer), wl_output (the
         // capture argument) and the screencopy manager at the tested
-        // version.
+        // version. The wl_output bind response is consumed by a dummy
+        // listener (libwayland-client aborts on listener-less opcodes).
         ts.wl_shm = try registry.bind(reg_capture.shm_name.?, client.wl.Shm, 1);
         ts.wl_output_client = try registry.bind(reg_capture.output_name.?, client.wl.Output, 1);
         ts.screencopy_mgr = try registry.bind(
@@ -525,9 +938,17 @@ const TestServer = struct {
             client.zwlr.ScreencopyManagerV1,
             manager_version,
         );
+        ts.wl_output_client.?.setListener(*u8, ignoreOutputEvents, &ts.output_listener_data);
         try ts.pump();
+
+        // Enable the output: captures of a disabled output fail (wlroots
+        // :508-511), and the deferred copy needs a commit to fire.
+        try enableOutput(ts);
         return ts;
     }
+
+    /// Consume the wl_output bind-time state dump.
+    fn ignoreOutputEvents(_: *client.wl.Output, _: client.wl.Output.Event, _: *u8) void {}
 
     fn deinit(ts: *TestServer) void {
         // Tear the client down first: its resource destroy handlers (the
@@ -550,16 +971,21 @@ const TestServer = struct {
     /// advertised size. The pool is retained so the buffer stays valid for
     /// the copy roundtrip.
     fn createBuffer(ts: *TestServer) !*client.wl.Buffer {
-        if (ts.buffer) |b| return b;
+        return createBufferWithStride(ts, 64 * 4);
+    }
+
+    /// Create a 64x64 ARGB8888 wl_shm buffer with an explicit stride
+    /// (for the stride-validation test).
+    fn createBufferWithStride(ts: *TestServer, stride: i32) !*client.wl.Buffer {
         const width: i32 = 64;
         const height: i32 = 64;
         const fd = try std.posix.memfd_create("screencopy-test-buffer", std.os.linux.MFD.CLOEXEC);
         defer _ = std.os.linux.close(fd);
-        const pool_size = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+        const pool_size = @as(usize, @intCast(stride)) * @as(usize, @intCast(height));
         const rc = std.os.linux.ftruncate(fd, @intCast(pool_size));
         if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
         ts.shm_pool = try ts.wl_shm.?.createPool(fd, @intCast(pool_size));
-        ts.buffer = try ts.shm_pool.?.createBuffer(0, width, height, width * 4, .argb8888);
+        ts.buffer = try ts.shm_pool.?.createBuffer(0, width, height, stride, .argb8888);
         return ts.buffer.?;
     }
 
@@ -583,22 +1009,49 @@ const TestServer = struct {
     }
 };
 
-fn getFramebuffer(ctx: *anyopaque) ?*pixman.Framebuffer {
+/// Commit an enabling state so the output is enabled and the deferred
+/// copy has a commit to fire on.
+fn enableOutput(ts: *TestServer) !void {
+    var state = Output.State.init(ts.allocator);
+    defer state.deinit();
+    state.committed = Output.State.committed_enabled | Output.State.committed_mode;
+    state.enabled = true;
+    state.mode = .{ .width = 64, .height = 64, .refresh_msec = 16 };
+    try ts.output.?.commitState(&state);
+}
+
+/// Commit a frame (buffer + optional damage) to fire the deferred copy.
+fn commitOutput(ts: *TestServer) !void {
+    try commitOutputDamage(ts, null);
+}
+
+fn commitOutputDamage(ts: *TestServer, rect: ?geom.Rect) !void {
+    var state = Output.State.init(ts.allocator);
+    defer state.deinit();
+    state.committed = Output.State.committed_enabled | Output.State.committed_mode |
+        Output.State.committed_buffer;
+    state.enabled = true;
+    state.mode = .{ .width = 64, .height = 64, .refresh_msec = 16 };
+    state.buffer = @ptrCast(ts.fb.?);
+    if (rect) |r| try state.damage.add(r);
+    try ts.output.?.commitState(&state);
+}
+
+fn getFramebuffer(ctx: *anyopaque, _: bool) ?*pixman.Framebuffer {
     const ts: *TestServer = @ptrCast(@alignCast(ctx));
     return ts.fb;
 }
 
-fn ownsOutput(ctx: *anyopaque, resource: *server.wl.Output) bool {
+fn outputFromResource(ctx: *anyopaque, resource: *server.wl.Output) ?*Output {
     const ts: *TestServer = @ptrCast(@alignCast(ctx));
-    const wl_output = ts.wl_output orelse return false;
-    return wl_output.owns(resource);
+    const wl_output = ts.wl_output orelse return null;
+    if (!wl_output.owns(resource)) return null;
+    return ts.output;
 }
 
-/// Capture timestamp: fixed monotonic triple.
-fn captureClock(_: *anyopaque, out: *[3]u32) void {
-    out[0] = 0;
-    out[1] = 42;
-    out[2] = 0;
+fn requestFrame(ctx: *anyopaque) void {
+    const ts: *TestServer = @ptrCast(@alignCast(ctx));
+    ts.frame_requests += 1;
 }
 
 test "v1 manager: frame gets buffer/flags/ready but never damage or buffer_done" {
@@ -620,6 +1073,15 @@ test "v1 manager: frame gets buffer/flags/ready but never damage or buffer_done"
     frame.copy(buffer);
     try ts.pump();
 
+    // The copy is deferred to the next output commit: nothing yet, and
+    // the renderer was asked for a frame.
+    try testing.expectEqual(@as(usize, 0), events.flags_count);
+    try testing.expectEqual(@as(usize, 0), events.ready_count);
+    try testing.expectEqual(@as(usize, 1), ts.frame_requests);
+
+    try commitOutput(ts);
+    try ts.pump();
+
     // flags + ready are since 1 and arrive; damage is since 2 and must
     // not: the v1 client listener has no damage slot and libwayland-client
     // aborts on the listener-less opcode, killing the client.
@@ -627,9 +1089,10 @@ test "v1 manager: frame gets buffer/flags/ready but never damage or buffer_done"
     try testing.expectEqual(@as(usize, 1), events.ready_count);
     try testing.expectEqual(@as(usize, 0), events.damage_count);
     try testing.expectEqual(@as(usize, 0), events.failed_count);
+    try testing.expectEqual(@as(usize, 1), ts.sc.?.captures_served);
 }
 
-test "v3 manager: damage and buffer_done arrive" {
+test "v3 manager: copy is deferred to the next output commit" {
     const allocator = testing.allocator;
     var ts = try TestServer.init(allocator); // manager bound at 3
     defer ts.deinit();
@@ -644,8 +1107,118 @@ test "v3 manager: damage and buffer_done arrive" {
     const buffer = try ts.createBuffer();
     frame.copy(buffer);
     try ts.pump();
-    try testing.expectEqual(@as(usize, 1), events.damage_count);
-    try testing.expectEqual(@as(usize, 1), events.flags_count);
+    // Deferred: no ready until a commit presents a new frame.
+    try testing.expectEqual(@as(usize, 0), events.ready_count);
+    try testing.expectEqual(@as(usize, 1), ts.frame_requests);
+
+    // A commit with no buffer (a mode-only or enable-only state) does not
+    // serve the copy: it waits for a presented buffer.
+    var no_buf = Output.State.init(ts.allocator);
+    defer no_buf.deinit();
+    no_buf.committed = Output.State.committed_enabled;
+    no_buf.enabled = true;
+    try ts.output.?.commitState(&no_buf);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), events.ready_count);
+
+    try commitOutput(ts);
+    try ts.pump();
     try testing.expectEqual(@as(usize, 1), events.ready_count);
     try testing.expectEqual(@as(usize, 0), events.failed_count);
+    // Plain copy: no damage events (only copy_with_damage sends them).
+    try testing.expectEqual(@as(usize, 0), events.damage_count);
+}
+
+test "capturing a disabled output fails the frame" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // Disable the output, then capture: the frame fails immediately
+    // (wlroots :508-511).
+    var disable = Output.State.init(ts.allocator);
+    defer disable.deinit();
+    disable.committed = Output.State.committed_enabled;
+    disable.enabled = false;
+    try ts.output.?.commitState(&disable);
+
+    const frame = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var events: FrameEvents = .{};
+    frame.setListener(*FrameEvents, FrameEvents.listener, &events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.failed_count);
+    try testing.expectEqual(@as(usize, 0), events.buffer_count);
+}
+
+test "copy_with_damage sends accumulated damage boxes" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // Frame 1: the accumulator starts whole, so the first with_damage
+    // copy reports the full output (wlroots screencopy_damage_create).
+    const frame1 = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var fe1: FrameEvents = .{};
+    frame1.setListener(*FrameEvents, FrameEvents.listener, &fe1);
+    try ts.pump();
+    const buffer1 = try ts.createBuffer();
+    frame1.copyWithDamage(buffer1);
+    try ts.pump();
+    try commitOutput(ts);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), fe1.ready_count);
+    try testing.expectEqual(@as(usize, 1), fe1.damage_count);
+    try testing.expectEqual(@as(u32, 0), fe1.damage_x);
+    try testing.expectEqual(@as(u32, 0), fe1.damage_y);
+    try testing.expectEqual(@as(u32, 64), fe1.damage_width);
+    try testing.expectEqual(@as(u32, 64), fe1.damage_height);
+
+    // A commit with a partial-damage region accumulates it (no frame is
+    // pending, so this only feeds the per-client region).
+    try commitOutputDamage(ts, .{ .x = 10, .y = 12, .width = 5, .height = 6 });
+
+    // Frame 2: the accumulated partial damage is sent as its own box.
+    // The serving commit must itself carry partial damage — a buffer
+    // commit without damage accumulates as whole (wlroots :62-66).
+    const frame2 = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var fe2: FrameEvents = .{};
+    frame2.setListener(*FrameEvents, FrameEvents.listener, &fe2);
+    try ts.pump();
+    const buffer2 = try ts.createBuffer();
+    frame2.copyWithDamage(buffer2);
+    try ts.pump();
+    try commitOutputDamage(ts, .{ .x = 10, .y = 12, .width = 5, .height = 6 });
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), fe2.ready_count);
+    try testing.expectEqual(@as(usize, 1), fe2.damage_count);
+    try testing.expectEqual(@as(u32, 10), fe2.damage_x);
+    try testing.expectEqual(@as(u32, 12), fe2.damage_y);
+    try testing.expectEqual(@as(u32, 5), fe2.damage_width);
+    try testing.expectEqual(@as(u32, 6), fe2.damage_height);
+
+    // The client owns the frame lifetime: destroying a served frame is
+    // legal ("can be sent at any time" — the E2E client does exactly
+    // this after verifying pixels). The resource must still exist, so
+    // this must not produce a protocol error (invalid object).
+    frame1.destroy();
+    try ts.pump();
+    frame2.destroy();
+    try ts.pump();
+}
+
+test "padded client stride is rejected as invalid_buffer" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const frame = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var events: FrameEvents = .{};
+    frame.setListener(*FrameEvents, FrameEvents.listener, &events);
+    try ts.pump();
+
+    // Advertised tight stride is 64*4 = 256; a padded 260-byte stride
+    // must be rejected (wlroots :418-421), not silently mis-copied.
+    const padded = try ts.createBufferWithStride(64 * 4 + 4);
+    frame.copy(padded);
+    try testing.expectError(error.ClientDispatchFailed, ts.pump());
 }

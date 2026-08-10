@@ -46,7 +46,13 @@ pub const CompositorDisplay = struct {
     pub fn deinit(self: *CompositorDisplay) void {
         assert(!self.destroyed);
         self.destroyed = true;
-        // Server.destroy tears down clients, globals and the event loop.
+        // wl_display_destroy does NOT tear down clients (libwayland frees
+        // sockets/loop/globals only, wayland-server.c:1395-1418);
+        // destroying them first is the documented pre-step
+        // (wayland-server.c:1769-1777) and matches tinywl.c:1075. Without
+        // it, live clients' resources (wl_surface and friends) leak at
+        // shutdown and their destructors never run (F11).
+        self.server.destroyClients();
         self.server.destroy();
         const allocator = self.allocator;
         if (self.socket_name) |name| allocator.free(name);
