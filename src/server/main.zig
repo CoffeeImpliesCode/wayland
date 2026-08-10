@@ -249,6 +249,17 @@ const ServerState = struct {
     /// without motion never produces a delta, so the seat's
     /// click-to-focus is unchanged.
     camera_drag: ?DragPoint = null,
+    /// The camera state at the last render: a change (pan/zoom) forces
+    /// whole-output damage so the partial upload never smears the
+    /// previous canvas (the drag-streak bug).
+    last_camera: Camera = .{
+        .center_x = @as(f64, @floatFromInt(output_width)) / 2.0,
+        .center_y = @as(f64, @floatFromInt(output_height)) / 2.0,
+        .zoom = 1,
+        .rotation = 0,
+        .screen_w = @floatFromInt(output_width),
+        .screen_h = @floatFromInt(output_height),
+    },
     /// Whether the drag has crossed the movement threshold (a real pan has
     /// started). A press alone only arms camera_drag; the pan (and the
     /// fast-render blockiness) begins once the pointer moves > drag_threshold
@@ -1310,8 +1321,15 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // is the upload region for the raylib backend; the pixman repaint
     // below stays a full repaint. The first frame damages the whole
     // output — the window texture starts blank, so a partial first upload
-    // would leave the background uninitialized.
-    if (self.frames_rendered == 0) {
+    // would leave the background uninitialized. A CAMERA change (pan,
+    // zoom) moves every pixel, so the whole output is damaged too —
+    // otherwise the partial upload smears the previous canvas around the
+    // dragged cursor (the drag-streak bug).
+    const camera_changed = self.last_camera.center_x != self.camera.center_x or
+        self.last_camera.center_y != self.camera.center_y or
+        self.last_camera.zoom != self.camera.zoom;
+    self.last_camera = self.camera;
+    if (self.frames_rendered == 0 or camera_changed) {
         so.addDamage(.{ .x = 0, .y = 0, .width = out.mode.width, .height = out.mode.height });
     }
     const out_rect: geom.Rect = .{ .x = 0, .y = 0, .width = out.mode.width, .height = out.mode.height };

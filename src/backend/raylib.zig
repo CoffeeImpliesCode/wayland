@@ -150,6 +150,11 @@ pub const RaylibBackend = struct {
         // cursor surface or the fallback arrow) at the pointer position.
         // Without this the OS cursor renders on top too — a double cursor.
         raylib.HideCursor();
+        // Grab the X input focus: under a WM-less display (Xvfb, and
+        // Xwayland without an X11 WM — e.g. a Wayland session with no X
+        // WM) the window never receives key events otherwise. GLFW's
+        // focus path falls back to XSetInputFocus without a WM.
+        raylib.SetWindowFocused();
 
         // Blank RGBA8888 texture (GenImageColor produces
         // UNCOMPRESSED_R8G8B8A8) the framebuffer is uploaded into per
