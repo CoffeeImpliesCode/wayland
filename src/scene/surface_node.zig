@@ -463,6 +463,12 @@ pub fn untrackAll(scene: *Scene) void {
 fn onCommit(listener: *wire.Listener(*Surface), _: *Surface) void {
     const sn: *SurfaceNode = @fieldParentPtr("commit_listener", listener);
     sn.update();
+    // The commit→present wake (note 137 F1): a content commit must
+    // schedule a composite, or interactive clients' updates starve
+    // behind the idle-frame skip (the frame_kick would present the
+    // previous framebuffer). The compositor listens and calls its
+    // requestRender.
+    sn.scene.events.content_dirty.emit(sn.scene);
 }
 
 /// wl_surface.unmap signal: the surface stopped being mapped — a

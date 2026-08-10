@@ -18,6 +18,7 @@ const std = @import("std");
 const geom = @import("../utils/geom.zig");
 const damage_mod = @import("../utils/damage.zig");
 const log = @import("../utils/log.zig");
+const wire = @import("../core/wire.zig");
 const backend_mod = @import("../backend/backend.zig");
 const output_mod = @import("../output/output.zig");
 const renderer_mod = @import("../renderer/renderer.zig");
@@ -62,6 +63,13 @@ pub const Scene = struct {
     /// The compositor's subcompositor: subsurface tree parenting (set by
     /// the compositor; null = no subsurface support).
     subcompositor: ?*subsurface_mod.Subcompositor = null,
+    /// A tracked surface committed new content: the compositor should
+    /// schedule a render (the commit→present wake — note 137 F1).
+    /// Without it the node is synced but no frame is ever composited, so
+    /// interactive clients' content starves behind the idle-frame skip.
+    events: struct {
+        content_dirty: wire.Signal(*Scene) = undefined,
+    } = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: *std.Io, log_cfg: *const log.Config) !*Scene {
         const root = try SceneNode.create(allocator, null, .tree);
@@ -75,6 +83,7 @@ pub const Scene = struct {
             .root = root,
             .surface_nodes = std.AutoHashMap(*surface_mod.Surface, *surface_node_mod.SurfaceNode).init(allocator),
         };
+        self.events.content_dirty.init();
         log.debug("scene created", io, log_cfg, "scene", .{});
         return self;
     }

@@ -160,7 +160,8 @@ fn drawItem(
     // loop (pixel output changes; tests carry pixman's exact values).
     // Non-normal transforms, scaled surfaces, and fractional opacity keep
     // the hand-rolled loop below (the stride/fast-mode logic only exists
-    // there; pixman does not need it).
+    // there; pixman does not need it — measured: pixman at full res beats
+    // the hand-rolled stride-3 loop ~2-3x even during camera drags).
     if (item.transform == .normal and
         item.opacity == 1.0 and
         item.world_w == @as(f64, @floatFromInt(item.texture.width)) and

@@ -278,6 +278,9 @@ const ServerState = struct {
 
     new_output_listener: wire.Listener(*wayland.output.Output),
     frame_listener: wire.Listener(*wayland.output.Output),
+    /// A surface committed new content (scene.events.content_dirty):
+    /// schedule a render so the update actually composites (note 137 F1).
+    content_dirty_listener: wire.Listener(*wayland.scene.Scene),
     new_toplevel_listener: wire.Listener(*wayland.shell.XdgToplevel),
     new_popup_listener: wire.Listener(*wayland.shell.XdgPopup),
     new_activation_token_listener: wire.Listener(*wayland.xdg_activation.ActivationToken),
@@ -533,6 +536,7 @@ pub fn main(init: std.process.Init) !void {
         .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
         .new_input_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onNewInput),
         .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
+        .content_dirty_listener = wire.Listener(*wayland.scene.Scene).init(onSceneContentDirty),
         .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
         .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
         .new_layer_surface_listener = wire.Listener(*wayland.layer_shell.LayerSurface).init(onNewLayerSurface),
@@ -555,6 +559,15 @@ pub fn main(init: std.process.Init) !void {
     defer if (state.scene) |scene| scene.deinit();
     defer if (state.scene_output) |so| so.destroy();
     defer cleanupSurfaceEntries(&state);
+    // Destroy the clients FIRST in the teardown (LIFO: registered last,
+    // runs first — before the scene/shm/module deinits below). Their
+    // surface/buffer destroy signals must fire against LIVE modules: the
+    // shm map remove (shm.zig:223), the surface-node registry and the
+    // seat cleanup all touch module state. display.deinit ALSO calls
+    // destroyClients as idempotent safety (no clients left here), which
+    // alone would run AFTER the shm deinit — the shutdown UAF a live
+    // client (e.g. foot at window close) hit.
+    defer display.destroyClients();
 
     backend.events.new_output.add(&state.new_output_listener);
     if (input_backend) |ib| {
@@ -815,6 +828,7 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
     // wire events). Set before any surface is tracked (surfaces only
     // appear after backend.start()).
     scene.subcompositor = self.subcompositor;
+    scene.events.content_dirty.add(&self.content_dirty_listener);
     out.events.frame.add(&self.frame_listener);
 
     // M3: expose the output to clients (geometry/mode/scale/name) and
@@ -1250,6 +1264,13 @@ fn maybeSynthInput(self: *ServerState) void {
             }
         }
     }
+}
+
+/// A surface committed new content: schedule a render so the update is
+/// composited this frame (the commit→present wake, note 137 F1).
+fn onSceneContentDirty(listener: *wire.Listener(*wayland.scene.Scene), _: *wayland.scene.Scene) void {
+    const self: *ServerState = @fieldParentPtr("content_dirty_listener", listener);
+    requestRender(self);
 }
 
 fn onOutputFrame(listener: *wire.Listener(*wayland.output.Output), out: *wayland.output.Output) void {

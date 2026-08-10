@@ -43,6 +43,15 @@ pub const CompositorDisplay = struct {
         return display;
     }
 
+    /// Destroy every live client (the documented pre-step before
+    /// wl_display_destroy, wayland-server.c:1769-1777). The compositor
+    /// calls this FIRST in its teardown so the client destroy signals
+    /// fire against live modules; deinit calls it again as idempotent
+    /// safety for library consumers that never did.
+    pub fn destroyClients(self: *CompositorDisplay) void {
+        self.server.destroyClients();
+    }
+
     pub fn deinit(self: *CompositorDisplay) void {
         assert(!self.destroyed);
         self.destroyed = true;

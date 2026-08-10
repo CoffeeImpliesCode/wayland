@@ -146,6 +146,12 @@ pub const RaylibBackend = struct {
         // but no server) segfaults in raylib (a NULL core handle).
         errdefer raylib.CloseWindow();
         raylib.SetTargetFPS(60);
+        // raylib's default exit key is ESCAPE (SetExitKey default): Escape
+        // would set WindowShouldClose and our shouldClose() would stop the
+        // server — killing the compositor the moment a terminal user
+        // presses a totally normal key. Disable it; the window close is
+        // the WM close button (WindowShouldClose stays wired for that).
+        raylib.SetExitKey(0);
         // The compositor draws its own cursor (the library Cursor: client
         // cursor surface or the fallback arrow) at the pointer position.
         // Without this the OS cursor renders on top too — a double cursor.
