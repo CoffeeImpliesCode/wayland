@@ -105,6 +105,36 @@ const specials = [_]Entry{
     .{ .raylib_key = 345, .xkb = 105 }, // right control
     .{ .raylib_key = 346, .xkb = 108 }, // right alt
     .{ .raylib_key = 347, .xkb = 134 }, // right super
+    .{ .raylib_key = 39, .xkb = 48 }, // apostrophe '
+    .{ .raylib_key = 44, .xkb = 59 }, // comma ,
+    .{ .raylib_key = 45, .xkb = 20 }, // minus -
+    .{ .raylib_key = 46, .xkb = 60 }, // period .
+    .{ .raylib_key = 47, .xkb = 61 }, // slash /
+    .{ .raylib_key = 59, .xkb = 47 }, // semicolon ;
+    .{ .raylib_key = 61, .xkb = 21 }, // equal =
+    .{ .raylib_key = 91, .xkb = 34 }, // left bracket [
+    .{ .raylib_key = 92, .xkb = 51 }, // backslash \
+    .{ .raylib_key = 93, .xkb = 35 }, // right bracket ]
+    .{ .raylib_key = 96, .xkb = 49 }, // grave `
+    .{ .raylib_key = 260, .xkb = 118 }, // insert
+    .{ .raylib_key = 348, .xkb = 135 }, // menu
+    .{ .raylib_key = 320, .xkb = 90 }, // keypad 0
+    .{ .raylib_key = 321, .xkb = 87 }, // keypad 1
+    .{ .raylib_key = 322, .xkb = 88 }, // keypad 2
+    .{ .raylib_key = 323, .xkb = 89 }, // keypad 3
+    .{ .raylib_key = 324, .xkb = 83 }, // keypad 4
+    .{ .raylib_key = 325, .xkb = 84 }, // keypad 5
+    .{ .raylib_key = 326, .xkb = 85 }, // keypad 6
+    .{ .raylib_key = 327, .xkb = 79 }, // keypad 7
+    .{ .raylib_key = 328, .xkb = 80 }, // keypad 8
+    .{ .raylib_key = 329, .xkb = 81 }, // keypad 9
+    .{ .raylib_key = 330, .xkb = 91 }, // keypad .
+    .{ .raylib_key = 331, .xkb = 106 }, // keypad /
+    .{ .raylib_key = 332, .xkb = 63 }, // keypad *
+    .{ .raylib_key = 333, .xkb = 82 }, // keypad -
+    .{ .raylib_key = 334, .xkb = 86 }, // keypad +
+    .{ .raylib_key = 335, .xkb = 104 }, // keypad enter
+    .{ .raylib_key = 336, .xkb = 125 }, // keypad =
 };
 
 /// The raylib input poll hook: reads raylib input state and feeds the

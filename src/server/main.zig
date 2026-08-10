@@ -170,6 +170,11 @@ const ServerState = struct {
     /// Repeating xdg_wm_base ping timer (F3): pings every live client;
     /// an unanswered ping on the next tick posts the unresponsive error.
     ping_timer: ?*zio.ev.Timer = null,
+    /// Server-side key repeat timer (seat.onRepeatTick): armed on a key
+    /// press, self-stops when the key is released. The seat owns the
+    /// repeat state (delay/interval); this is just the clock.
+    repeat_timer: ?*zio.ev.Timer = null,
+    repeat_timer_armed: bool = false,
     /// raylib window input poll timer: polls the window + feeds the seat
     /// from the loop (NOT the commit) at ~60 Hz; only armed for the raylib
     /// backend. A fed event requests a render (the frame flush follows).
@@ -654,6 +659,15 @@ pub fn main(init: std.process.Init) !void {
     ping_timer.c.callback = onPingTick;
     state.ping_timer = &ping_timer;
     loop.add(&ping_timer.c);
+
+    // Server-side key repeat (seat key_repeat_delay/rate): one-shot
+    // timer; the initial add arms a harmless no-op tick (nothing repeats),
+    // onSeatKey re-arms it on a key press and disarms on release.
+    var repeat_timer = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(600) });
+    repeat_timer.c.userdata = &state;
+    repeat_timer.c.callback = onRepeatTick;
+    state.repeat_timer = &repeat_timer;
+    loop.add(&repeat_timer.c);
 
     // raylib window input: poll + feed the seat from the loop at ~60 Hz.
     // The commit must NOT poll (mid-render feeding lands after the frame's
@@ -1170,6 +1184,12 @@ fn onRaylibPollTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
     defer loop.setTimer(self.raylib_poll_timer.?, .{ .duration = zio.Duration.fromMilliseconds(16) });
     if (build_options.enable_raylib) {
+        // The window's close button (X) shuts the server down.
+        if (raylib_mod.RaylibBackend.shouldClose(self.backend)) {
+            log.info("raylib window close requested; stopping", self.io, self.log_cfg, "server", .{});
+            loop.stop();
+            return;
+        }
         if (raylib_mod.RaylibBackend.pollWindowInput(self.backend)) {
             requestRender(self);
         }
@@ -1841,6 +1861,37 @@ fn onSeatKey(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.S
         log.info("Mod4+Escape pressed: stopping", self.io, self.log_cfg, "server", .{});
         if (self.loop) |loop| loop.stop();
     }
+    // Server-side key repeat: arm the timer on a press (fires after the
+    // seat's delay, then re-arms at the rate while the key is held);
+    // disarm on release. Repeated events re-fire this signal with
+    // pressed=true, but the timer is already armed then.
+    if (self.repeat_timer) |t| {
+        if (seat.last_key_pressed) {
+            if (!self.repeat_timer_armed) {
+                self.repeat_timer_armed = true;
+                if (self.loop) |loop| {
+                    loop.setTimer(t, .{
+                        .duration = zio.Duration.fromMilliseconds(@intCast(@max(seat.key_repeat_delay, 1))),
+                    });
+                }
+            }
+        } else {
+            self.repeat_timer_armed = false;
+            if (self.loop) |loop| _ = loop.clearTimer(t);
+        }
+    }
+}
+
+/// One-shot repeat timer tick: emit the held key's repeat + re-arm at the
+/// seat's interval while the key is held; otherwise stay dead.
+fn onRepeatTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
+    const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
+    if (!self.seat.repeatActive()) {
+        self.repeat_timer_armed = false;
+        return;
+    }
+    self.seat.onRepeatTick();
+    loop.setTimer(self.repeat_timer.?, .{ .duration = zio.Duration.fromMilliseconds(self.seat.repeatIntervalMs()) });
 }
 
 /// M4 camera drag: the left button press anchors a pan gesture; motion

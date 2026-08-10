@@ -171,6 +171,12 @@ pub const Options = struct {
     /// capability bit is not announced and get_pointer yields a dead
     /// object (no events).
     pointer: bool = true,
+    /// Server-side key repeat: delay before the first repeat (ms) and
+    /// rate in keys/second (wlroots defaults: 600/25, tinywl.c:157).
+    /// The seat runs a repeat timer (onRepeatTick) and advertises these
+    /// via wl_keyboard.repeat_info.
+    repeat_delay_ms: u32 = 600,
+    repeat_rate: u32 = 25,
 };
 
 pub const Seat = struct {
@@ -237,12 +243,21 @@ pub const Seat = struct {
     /// positions, wlr_seat_pointer.c:252-263). Sentinel = never sent.
     last_motion_fixed_x: Fixed = @enumFromInt(std.math.minInt(i32)),
     last_motion_fixed_y: Fixed = @enumFromInt(std.math.minInt(i32)),
-    /// wl_keyboard.repeat_info payload (get_keyboard, seat.zig:517).
-    /// 0/0 = no server-side repeat: clients do their own key repetition
-    /// (legal; the compositor takes over repetition only with a repeat
-    /// timer, which this seat does not run — see note 132 F13).
+    /// wl_keyboard.repeat_info payload (get_keyboard, seat.zig:517) +
+    /// the server-side repeat timing: delay before the first repeat (ms),
+    /// rate in keys/second. Populated from Options; the compositor runs
+    /// the repeat timer (onRepeatTick) and arms it while a key is held.
     key_repeat_rate: i32 = 0,
     key_repeat_delay: i32 = 0,
+    /// Keycode (xkb space) currently held for server-side repeat; null
+    /// when nothing repeats. Last-pressed wins (wlroots wlr_keyboard).
+    repeating: ?u32 = null,
+    /// Monotonic-ms deadline of the next repeated key event.
+    repeat_next_at: i64 = 0,
+    /// State of the most recent key event (compositor bindings; mirrors
+    /// last_keysym — the key signal is the notification, these fields
+    /// carry the payload).
+    last_key_pressed: bool = false,
 
     /// Per-client seat state (serial ringset, v120 accumulators, frame
     /// pending): see SeatClient.
@@ -325,6 +340,8 @@ pub const Seat = struct {
             .log_cfg = log_cfg,
             .display = display,
             .options = options,
+            .key_repeat_rate = @intCast(options.repeat_rate),
+            .key_repeat_delay = @intCast(options.repeat_delay_ms),
             .xkb = xkb,
             .keyboards = .empty,
             .pressed = .empty,
@@ -768,6 +785,7 @@ pub const Seat = struct {
     /// rejects enter/leave carrying a foreign client's surface.
     pub fn setKeyboardFocus(self: *Seat, surface: ?*Surface) void {
         if (surface == self.keyboard_focus) return;
+        self.repeating = null; // a focus change stops server-side repeat
         if (self.keyboard_focus) |old| {
             const old_res = old.resource;
             const old_client = old_res.getClient();
@@ -809,14 +827,25 @@ pub const Seat = struct {
     /// xkb keycodes internally (wlr_keyboard.c:115-120) — F1.
     pub fn keyEvent(self: *Seat, keycode: u32, pressed: bool) void {
         self.last_keysym = self.xkb.updateKey(keycode, pressed);
+        self.last_key_pressed = pressed;
 
         if (pressed) {
+            // Server-side repeat: record the held key. The repeat timer
+            // (compositor-side, armed from the key signal) calls
+            // onRepeatTick; last-pressed wins (wlroots wlr_keyboard).
+            if (self.repeating == null) {
+                self.repeating = keycode;
+                self.repeat_next_at = @as(i64, nowMs(self)) + self.key_repeat_delay;
+            } else {
+                self.repeating = keycode; // keep the current repeat clock
+            }
             if (!std.mem.containsAtLeast(u32, self.pressed.items, 1, &.{keycode})) {
                 self.pressed.append(self.allocator, keycode) catch |err| {
                     log.warn("pressed-keys append failed: {s}", self.io, self.log_cfg, "seat", .{@errorName(err)});
                 };
             }
         } else {
+            if (self.repeating == keycode) self.repeating = null;
             const idx = std.mem.indexOfScalar(u32, self.pressed.items, keycode) orelse 0;
             if (idx < self.pressed.items.len and
                 self.pressed.items[idx] == keycode)
@@ -855,6 +884,30 @@ pub const Seat = struct {
             }
         }
         self.events.key.emit(self);
+    }
+
+    /// True while a key is held for server-side repeat (the compositor's
+    /// repeat timer should stay armed).
+    pub fn repeatActive(self: *Seat) bool {
+        return self.repeating != null;
+    }
+
+    /// Interval between repeated events (ms), from the advertised rate.
+    pub fn repeatIntervalMs(self: *Seat) u64 {
+        return @intCast(@max(1000 / @max(self.key_repeat_rate, 1), 1));
+    }
+
+    /// One repeat tick (compositor's repeat timer): re-emit the held key
+    /// as pressed when its repeat deadline passed. The timer re-arms
+    /// while repeatActive(); the deadline advances by the interval so the
+    /// rate is exact regardless of timer jitter.
+    pub fn onRepeatTick(self: *Seat) void {
+        const kc = self.repeating orelse return;
+        const now = nowMs(self);
+        if (now >= self.repeat_next_at) {
+            self.repeat_next_at = now + @as(i64, @intCast(self.repeatIntervalMs()));
+            self.keyEvent(kc, true);
+        }
     }
 
     /// Current cursor surface resource (client-set via
@@ -930,6 +983,7 @@ pub const Seat = struct {
     pub fn surfaceDestroyed(self: *Seat, surface: *Surface) void {
         if (self.pointer_focus == surface) self.pointerLeave();
         if (self.keyboard_focus == surface) {
+            self.repeating = null; // the repeating key's target died
             if (self.keyboard_focus_listener.link.prev != null) self.keyboard_focus_listener.link.remove();
             const serial = self.nextSerial();
             const wl_client = surface.resource.getClient();
@@ -1588,6 +1642,53 @@ test "keyboard and pointer events reach only the focused client" {
     try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis); // unchanged
     try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis_value120); // unchanged
     try std.testing.expectEqual(@as(usize, 0), b.ptr_events.axis_stop);
+}
+
+test "server-side key repeat: press, delay, repeat, release stops" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+    // 1ms delay + 1000/s rate so the first repeat fires immediately
+    // after the delay elapses.
+    ts.seat.?.key_repeat_delay = 1;
+    ts.seat.?.key_repeat_rate = 1000;
+    try std.testing.expectEqual(@as(u64, 1), ts.seat.?.repeatIntervalMs());
+
+    const a = &ts.a;
+    const surface_a = surfaceForClient(ts, a.server);
+    ts.pick_state.surface = surface_a;
+    ts.seat.?.pointerMotion(10, 10);
+    try ts.pump();
+    ts.seat.?.pointerButton(btn_left, true);
+    try ts.pump(); // click-to-focus
+    try std.testing.expect(a.kbd_events.entered);
+
+    // Press: one event + the repeat arms.
+    ts.seat.?.keyEvent(38, true); // 'a'
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.kbd_events.keys);
+    try std.testing.expect(ts.seat.?.repeatActive());
+
+    // Past the delay: the tick re-emits the held key as pressed.
+    try std.Io.sleep(ts.io, .fromMilliseconds(2), .awake);
+    ts.seat.?.onRepeatTick();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.kbd_events.keys);
+    try std.testing.expectEqual(@as(u32, 30), a.kbd_events.last_key);
+
+    // Release disarms; later ticks stay silent (the release itself was
+    // the 3rd key event; no 4th follows).
+    ts.seat.?.keyEvent(38, false);
+    try ts.pump();
+    try std.testing.expect(!ts.seat.?.repeatActive());
+    try std.testing.expectEqual(@as(usize, 3), a.kbd_events.keys);
+    try std.Io.sleep(ts.io, .fromMilliseconds(2), .awake);
+    ts.seat.?.onRepeatTick();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 3), a.kbd_events.keys);
 }
 
 test "keyboard enter is followed by a modifiers event" {

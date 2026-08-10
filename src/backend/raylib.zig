@@ -94,6 +94,13 @@ pub const RaylibBackend = struct {
         return false;
     }
 
+    /// The window's close button (X) or Alt+F4 was used: the compositor
+    /// should shut down (WindowShouldClose is updated by PollInputEvents).
+    pub fn shouldClose(base: *backend.Backend) bool {
+        _ = base;
+        return raylib.WindowShouldClose();
+    }
+
     /// Create a single-output raylib backend running at `mode`, with the
     /// window titled `title`. Frames are paced by a wire event loop timer
     /// at `mode.refresh_msec` (like the headless backend); the window
@@ -139,6 +146,10 @@ pub const RaylibBackend = struct {
         // but no server) segfaults in raylib (a NULL core handle).
         errdefer raylib.CloseWindow();
         raylib.SetTargetFPS(60);
+        // The compositor draws its own cursor (the library Cursor: client
+        // cursor surface or the fallback arrow) at the pointer position.
+        // Without this the OS cursor renders on top too — a double cursor.
+        raylib.HideCursor();
 
         // Blank RGBA8888 texture (GenImageColor produces
         // UNCOMPRESSED_R8G8B8A8) the framebuffer is uploaded into per

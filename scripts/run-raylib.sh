@@ -46,7 +46,10 @@ fi
 # the headless/DRM E2E and conflicts with the window's real input).
 export WAYLAND_BACKEND="${WAYLAND_BACKEND:-raylib}"
 export WAYLAND_CAMERA="${WAYLAND_CAMERA:-cx=640,cy=360,zoom=1.5}"
-export WAYLAND_LOG="${WAYLAND_LOG:-err,server=info}"
+# Debug-by-default so the demo shows what the server does; the per-frame
+# render lines are change-driven (idle-skip), so this stays readable.
+# Override with WAYLAND_LOG=err,server=info for quiet runs.
+export WAYLAND_LOG="${WAYLAND_LOG:-err,server=debug,raylib=debug}"
 export WAYLAND_WATCHDOG_DISABLE=1
 
 LOG="$XDG_RUNTIME_DIR/raylib-server.log"
@@ -55,8 +58,12 @@ echo "run-raylib: starting server (backend=$WAYLAND_BACKEND, log=$LOG)..."
 # dir). GLFW would find THAT socket via WAYLAND_DISPLAY and connect to the
 # compositor it is itself serving — a deadlock before the window opens. Run
 # the server with WAYLAND_DISPLAY unset so GLFW opens the window over X11
-# (DISPLAY -> Xwayland on a Wayland session).
-env -u WAYLAND_DISPLAY ./zig-out/bin/wayland-server > "$LOG" 2>&1 &
+# (DISPLAY -> Xwayland on a Wayland session). Output is teed so the
+# server's log is visible in this terminal while the file stays for
+# harnesses (WAYLAND_SOCKET= is grepped from the log). Process
+# substitution keeps $SRV the SERVER's pid (a `| tee` pipeline would make
+# it the tee's, orphaning the server on kill).
+env -u WAYLAND_DISPLAY ./zig-out/bin/wayland-server > >(tee "$LOG") 2>&1 &
 SRV=$!
 trap 'kill "$SRV" 2>/dev/null; exit 0' INT TERM EXIT
 
