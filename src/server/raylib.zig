@@ -37,9 +37,10 @@ const Raylib = struct {
     /// that was never created.
     out: ?*output.Output,
     mode: output.Mode,
-    /// Input poll hook: called right after PollInputEvents in every
-    /// commit (server-side raylib_input.zig feeds the seat from it).
-    poll_hook: ?*const fn (ctx: *anyopaque) void = null,
+    /// Input poll hook: called from the wire-loop poll timer (NOT the
+    /// commit — feeding the seat mid-render races the frame flush and
+    /// never re-schedules a frame). Returns true when it fed the seat.
+    poll_hook: ?*const fn (ctx: *anyopaque) bool = null,
     poll_ctx: ?*anyopaque = null,
 };
 
@@ -69,12 +70,28 @@ const output_impl: output.Output.Impl = .{
 };
 
 pub const RaylibBackend = struct {
-    /// Install the per-frame input poll hook (see raylib_input.zig). The
-    /// hook runs after PollInputEvents in each commit, on the main thread.
-    pub fn setInputHook(base: *backend.Backend, hook: ?*const fn (ctx: *anyopaque) void, ctx: ?*anyopaque) void {
+    /// Install the loop-side input poll hook (see raylib_input.zig). The
+    /// hook runs from the wire-loop poll timer on the main thread, never
+    /// inside the commit.
+    pub fn setInputHook(base: *backend.Backend, hook: ?*const fn (ctx: *anyopaque) bool, ctx: ?*anyopaque) void {
         const rl: *Raylib = @ptrCast(@alignCast(base.data));
         rl.poll_hook = hook;
         rl.poll_ctx = ctx;
+    }
+
+    /// Poll the window's input events and feed the seat through the
+    /// installed hook. Call from the wire-loop poll timer, NEVER from the
+    /// commit: feeding the seat mid-render lands after the frame's flush
+    /// point and the in_render guard suppresses the follow-up frame, so
+    /// the events would sit queued forever. Returns true when the hook
+    /// fed the seat (the caller should request a render).
+    pub fn pollWindowInput(base: *backend.Backend) bool {
+        const rl: *Raylib = @ptrCast(@alignCast(base.data));
+        raylib.PollInputEvents();
+        if (rl.poll_hook) |hook| {
+            return hook(rl.poll_ctx.?);
+        }
+        return false;
     }
 
     /// Create a single-output raylib backend running at `mode`, with the
@@ -269,10 +286,6 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
         } else {
             bgraToRgba(out.io, out.log_cfg, scratch, fb_px);
         }
-        const perf_t_poll = perfNs(out.io);
-        raylib.PollInputEvents();
-        const rl_b: *Raylib = @ptrCast(@alignCast(out.backend.data));
-        if (rl_b.poll_hook) |hook| hook(rl_b.poll_ctx.?);
         const perf_t_swap = perfNs(out.io);
         if (upload) |region| {
             raylib.UpdateTextureRec(od.texture, .{
@@ -292,8 +305,7 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
         const perf_t_draw = perfNs(out.io);
         if (od.perf) {
             log_mod.info(perf_raylib_fmt, out.io, out.log_cfg, "perf", .{
-                (perf_t_poll - perf_t0) / 1000,
-                (perf_t_swap - perf_t_poll) / 1000,
+                (perf_t_swap - perf_t0) / 1000,
                 (perf_t_upload - perf_t_swap) / 1000,
                 (perf_t_draw - perf_t_upload) / 1000,
                 (perf_t_draw - perf_t0) / 1000,
@@ -382,7 +394,7 @@ fn bgraToRgbaRegion(
 }
 
 /// Present-stage perf trace format (WAYLAND_PERF=1).
-const perf_raylib_fmt = "perf raylib pre={d}us poll={d}us swap={d}us upload={d}us draw={d}us";
+const perf_raylib_fmt = "perf raylib swap={d}us upload={d}us draw={d}us total={d}us";
 
 /// Monotonic nanoseconds for the perf trace.
 fn perfNs(io: *std.Io) u64 {

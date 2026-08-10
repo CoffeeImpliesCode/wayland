@@ -223,6 +223,10 @@ const ServerState = struct {
     /// Repeating xdg_wm_base ping timer (F3): pings every live client;
     /// an unanswered ping on the next tick posts the unresponsive error.
     ping_timer: ?*zio.ev.Timer = null,
+    /// raylib window input poll timer: polls the window + feeds the seat
+    /// from the loop (NOT the commit) at ~60 Hz; only armed for the raylib
+    /// backend. A fed event requests a render (the frame flush follows).
+    raylib_poll_timer: ?*zio.ev.Timer = null,
     /// Whether the watchdog is active (WAYLAND_WATCHDOG_DISABLE unset).
     /// Guards BOTH the initial loop.add and the renderFrame re-arm: zio's
     /// setTimer arms an un-armed timer, so a re-arm on a disabled watchdog
@@ -705,6 +709,19 @@ pub fn main(init: std.process.Init) !void {
     state.ping_timer = &ping_timer;
     loop.add(&ping_timer.c);
 
+    // raylib window input: poll + feed the seat from the loop at ~60 Hz.
+    // The commit must NOT poll (mid-render feeding lands after the frame's
+    // flush + the in_render guard suppresses the follow-up frame, leaving
+    // the events queued forever). The timer requests a render when the
+    // poll fed something, so events flush on the next pointerFrame().
+    if (backend_is_raylib and build_options.enable_raylib) {
+        var raylib_poll_timer = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(16) });
+        raylib_poll_timer.c.userdata = &state;
+        raylib_poll_timer.c.callback = onRaylibPollTick;
+        state.raylib_poll_timer = &raylib_poll_timer;
+        loop.add(&raylib_poll_timer.c);
+    }
+
     try backend.start(); // fires new_output; the headless timer paces frames
     if (input_backend) |ib| try ib.start();
 
@@ -1186,6 +1203,22 @@ fn onPingTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
             res.postError(.unresponsive, "client did not respond to xdg_wm_base.ping");
         } else {
             t.ping();
+        }
+    }
+}
+
+/// raylib window input poll tick (~60 Hz): poll the window + feed the
+/// seat, then request a render so the events flush on the next
+/// pointerFrame(). Re-arms itself. Polling happens HERE, never in the
+/// commit — mid-render feeding lands after the frame's flush and the
+/// in_render guard suppresses the follow-up frame, so events would sit
+/// queued forever.
+fn onRaylibPollTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
+    const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
+    defer loop.setTimer(self.raylib_poll_timer.?, .{ .duration = zio.Duration.fromMilliseconds(16) });
+    if (build_options.enable_raylib) {
+        if (raylib_mod.RaylibBackend.pollWindowInput(self.backend)) {
+            requestRender(self);
         }
     }
 }

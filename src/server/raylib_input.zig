@@ -121,15 +121,25 @@ pub fn create(allocator: std.mem.Allocator, seat: *seat_mod.Seat) error{OutOfMem
     return input;
 }
 
-/// Poll hook called by the raylib backend after PollInputEvents.
-pub fn poll(ctx: *anyopaque) void {
+/// Poll hook called from the wire-loop poll timer (raylib backend). Feed
+/// the seat + return whether anything changed (the caller then requests a
+/// render). Called outside the render, so the events flush on the next
+/// frame's pointerFrame().
+pub fn poll(ctx: *anyopaque) bool {
     const input: *RaylibInput = @ptrCast(@alignCast(ctx));
     const seat = input.seat;
+    var fed = false;
 
     inline for (.{ letters, digits, specials }) |table| {
         for (table) |e| {
-            if (raylib.IsKeyPressed(e.raylib_key)) seat.keyEvent(e.xkb, true);
-            if (raylib.IsKeyReleased(e.raylib_key)) seat.keyEvent(e.xkb, false);
+            if (raylib.IsKeyPressed(e.raylib_key)) {
+                seat.keyEvent(e.xkb, true);
+                fed = true;
+            }
+            if (raylib.IsKeyReleased(e.raylib_key)) {
+                seat.keyEvent(e.xkb, false);
+                fed = true;
+            }
         }
     }
 
@@ -138,11 +148,18 @@ pub fn poll(ctx: *anyopaque) void {
     const py: i32 = @intFromFloat(@round(pos.y));
     if (px != seat.pointer_x or py != seat.pointer_y) {
         seat.pointerMotion(px, py);
+        fed = true;
     }
 
     inline for (.{ 0, 1, 2 }) |b| {
-        if (raylib.IsMouseButtonPressed(b)) seat.pointerButton(@intCast(seat_mod.btn_left + b), true);
-        if (raylib.IsMouseButtonReleased(b)) seat.pointerButton(@intCast(seat_mod.btn_left + b), false);
+        if (raylib.IsMouseButtonPressed(b)) {
+            seat.pointerButton(@intCast(seat_mod.btn_left + b), true);
+            fed = true;
+        }
+        if (raylib.IsMouseButtonReleased(b)) {
+            seat.pointerButton(@intCast(seat_mod.btn_left + b), false);
+            fed = true;
+        }
     }
 
     const wheel = raylib.GetMouseWheelMove();
@@ -151,5 +168,7 @@ pub fn poll(ctx: *anyopaque) void {
         // sane notch range before the lossy cast (zbc: no unbounded casts).
         const notches: i32 = @intFromFloat(@min(@max(wheel, -100.0), 100.0));
         seat.pointerAxis(.vertical_scroll, .wheel, wheel * 10.0, notches);
+        fed = true;
     }
+    return fed;
 }
