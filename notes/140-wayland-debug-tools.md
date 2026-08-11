@@ -182,6 +182,38 @@ available free from libwayland for any server run (wayland-server.c:1283).
   our in-module wire tests; libinput-record/replay could replace parts of
   uinput-devices.py for deterministic input repro.
 
+## 9. Setup in devenv (2026-08-12, verified)
+
+devenv.nix packages now include the client-side debug tools (all real
+Wayland clients — they exercise the wire from outside, against our server
+or a reference compositor):
+
+- wayland-utils (wayland-info, wayland-display), wl-clipboard (wl-copy,
+  wl-paste), wev, grim + slurp, wl-mirror, weston (reference compositor +
+  clients: weston-terminal, weston-debug, ...)
+- wayland-debug (wmww): custom derivation (pure Python, pinned to master
+  110592a); run/pipe/file modes work with the stock libwayland; gdb mode
+  needs a debug-symbol libwayland (upstream libwayland_debug_symbols.md).
+
+Verified against a headless weston on a scratch socket:
+
+```
+export XDG_RUNTIME_DIR=/tmp/wlrt && mkdir -p $XDG_RUNTIME_DIR
+weston --backend=headless --socket=wtest --idle-time=0 &
+WAYLAND_DISPLAY=wtest wayland-info          # globals + versions: works
+WAYLAND_DISPLAY=wtest WAYLAND_DEBUG=1 wayland-info 2>&1 \
+  | wayland-debug -p                        # filtered wire view: works
+```
+
+wl-copy and grim need capabilities weston-headless lacks (seat; weston
+has no zwlr_screencopy) — they target OUR compositor, which implements
+zwlr_screencopy_v1 (grim) and has a seat. Not tool failures.
+
+Not in devenv (deliberate): wlcs needs a compositor integration module we
+have not written yet (note §8 — future gate); libinput's nixpkgs package
+ships no debug tools (libinput-debug-events etc. are built only in the
+source tree; our input backend is raylib, not libinput).
+
 ## Sources
 
 - https://wayland.freedesktop.org/extras.html (official tool list; the
