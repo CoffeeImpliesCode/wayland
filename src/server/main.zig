@@ -249,6 +249,14 @@ const ServerState = struct {
     /// without motion never produces a delta, so the seat's
     /// click-to-focus is unchanged.
     camera_drag: ?DragPoint = null,
+    /// Interactive move (xdg_toplevel.move — the client's titlebar drag):
+    /// the toplevel being moved, null when idle. The move owns the
+    /// pointer grab until the button release (the client sees no pointer
+    /// events during the move).
+    moving_toplevel: ?*wayland.shell.XdgToplevel = null,
+    /// The pointer's WORLD position at the last move tick; the node
+    /// moves by the delta between ticks.
+    move_anchor: geom.FPoint = .{ .x = 0, .y = 0 },
     /// The camera state at the last render: a change (pan/zoom) forces
     /// whole-output damage so the partial upload never smears the
     /// previous canvas (the drag-streak bug).
@@ -890,6 +898,7 @@ const ToplevelListeners = struct {
     set_app_id: wire.Listener(*wayland.shell.XdgToplevel),
     request_minimize: wire.Listener(*wayland.shell.XdgToplevel),
     request_fullscreen: wire.Listener(*wayland.shell.FullscreenRequest),
+    request_move: wire.Listener(*wayland.shell.MoveRequest),
     destroy: wire.Listener(*wayland.shell.XdgToplevel),
 };
 
@@ -924,8 +933,35 @@ fn onToplevelFullscreen(
     _ = req.output;
 }
 
-fn onToplevelDestroy(listener: *wire.Listener(*wayland.shell.XdgToplevel), _: *wayland.shell.XdgToplevel) void {
+fn onToplevelMove(listener: *wire.Listener(*wayland.shell.MoveRequest), req: *wayland.shell.MoveRequest) void {
+    const tl: *ToplevelListeners = @fieldParentPtr("request_move", listener);
+    const self = tl.state;
+    const seat = req.seat;
+    const client = req.toplevel.xdg_surface.surface.resource.getClient();
+    // The serial must be a recent input-event serial on the request's
+    // seat (wlroots wlr_xdg_toplevel_move validates the same way).
+    if (!seat.validateEventSerial(client, req.serial)) return;
+    // The move owns the gesture: cancel any armed camera drag.
+    self.camera_drag = null;
+    self.drag_active = false;
+    self.fast_render = false;
+    self.moving_toplevel = req.toplevel;
+    const wp = self.camera.screenToWorld(@floatFromInt(seat.pointer_x), @floatFromInt(seat.pointer_y));
+    self.move_anchor = .{ .x = wp.x, .y = wp.y };
+    seat.setPointerGrab(true);
+    const surface_id = req.toplevel.xdg_surface.surface.resource.getId();
+    log.info("interactive move start surface@{d}", self.io, self.log_cfg, "server", .{surface_id});
+}
+
+fn onToplevelDestroy(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
     const tl: *ToplevelListeners = @fieldParentPtr("destroy", listener);
+    // The moved toplevel died mid-gesture: end the move and release the
+    // grab so the pointer returns to the clients.
+    if (tl.state.moving_toplevel == t) {
+        tl.state.moving_toplevel = null;
+        tl.state.seat.setPointerGrab(false);
+        log.info("interactive move cancelled (toplevel destroyed)", tl.state.io, tl.state.log_cfg, "server", .{});
+    }
     tl.state.allocator.destroy(tl);
 }
 
@@ -946,12 +982,14 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
         .set_app_id = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelAppId),
         .request_minimize = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelMinimize),
         .request_fullscreen = wire.Listener(*wayland.shell.FullscreenRequest).init(onToplevelFullscreen),
+        .request_move = wire.Listener(*wayland.shell.MoveRequest).init(onToplevelMove),
         .destroy = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelDestroy),
     };
     t.events.set_title.add(&tl.set_title);
     t.events.set_app_id.add(&tl.set_app_id);
     t.events.request_minimize.add(&tl.request_minimize);
     t.events.request_fullscreen.add(&tl.request_fullscreen);
+    t.events.request_move.add(&tl.request_move);
     t.events.destroy.add(&tl.destroy);
     log.info("new toplevel (title={s} app_id={s}) total={d}", self.io, self.log_cfg, "server", .{
         t.title orelse "(none)",
@@ -1950,6 +1988,10 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
         self.camera_drag = null;
         self.drag_active = false;
         self.fast_render = false;
+        if (self.moving_toplevel != null) {
+            self.moving_toplevel = null;
+            log.info("interactive move end", self.io, self.log_cfg, "server", .{});
+        }
         seat.setPointerGrab(false);
     }
 }
@@ -1962,6 +2004,29 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
 /// not jump.
 fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_pointer_move_listener", listener);
+    // Interactive move: the toplevel's node follows the pointer delta
+    // (world coords — the screen delta divided by the zoom, matching the
+    // pick transform). The whole output is damaged so the partial upload
+    // cannot smear the old position.
+    if (self.moving_toplevel) |t| {
+        const wp = self.camera.screenToWorld(@floatFromInt(seat.pointer_x), @floatFromInt(seat.pointer_y));
+        const dx = wp.x - self.move_anchor.x;
+        const dy = wp.y - self.move_anchor.y;
+        self.move_anchor = .{ .x = wp.x, .y = wp.y };
+        if (self.scene) |scene| {
+            if (wayland.surface_node.surfaceNodeFor(scene, t.xdg_surface.surface)) |sn| {
+                if (sn.node) |node| {
+                    node.x += @intFromFloat(@round(dx));
+                    node.y += @intFromFloat(@round(dy));
+                }
+            }
+        }
+        if (self.scene_output) |so| {
+            so.addDamage(.{ .x = 0, .y = 0, .width = self.framebuffer.width, .height = self.framebuffer.height });
+        }
+        requestRender(self);
+        return;
+    }
     // A drag is armed (button held). If it hasn't crossed the threshold
     // yet, a sub-threshold move is a hover (cursor follows, no pan); once
     // it crosses, start the pan.
