@@ -38,6 +38,7 @@ const matrix = @import("../utils/matrix.zig");
 const scene_mod = @import("scene.zig");
 const surface_mod = @import("../compositor/surface.zig");
 const subsurface_mod = @import("../compositor/subsurface.zig");
+const role_mod = @import("../compositor/role.zig");
 const output_mod = @import("../output/output.zig");
 const buffer_mod = @import("../buffers/buffer.zig");
 // Imported for the test blocks (fabricated textures).
@@ -103,6 +104,12 @@ pub const SurfaceNode = struct {
     /// no commit to carry it; idempotent with the commit path (detach
     /// nulls the node/tree slots).
     unmap_listener: wire.Listener(*Surface),
+    /// wl_surface.map signal listener: a surface can become mapped
+    /// without its own commit (a subsurface mapping via parent-chain
+    /// propagation), so the output association must be recomputed on map,
+    /// not only at attach (which already ran at the buffer commit while
+    /// the surface was still hidden).
+    map_listener: wire.Listener(*Surface),
     /// wl_surface.enter/leave signal listeners (the surface module emits
     /// the signals on the output association changing; these send the
     /// wl_surface.enter/leave wire events — the per-output enter/leave
@@ -125,6 +132,13 @@ pub const SurfaceNode = struct {
             return;
         };
         const size = surfaceSize(s, buf);
+        // The wp_viewport source crop (F-AX-12), in surface-local
+        // coordinates (after buffer_transform + buffer_scale,
+        // viewporter.xml). Texture pixels = src x buffer_scale under the
+        // inverse transform: at this compositor's scale 1 / no transform
+        // it is a direct pass-through. Scale > 1 must multiply by
+        // current.scale (and inverse-transform) before setting bn.src.
+        const src: ?geom.FRect = if (s.current.viewport.has_src) s.current.viewport.src else null;
         if (sn.node) |node| {
             // Same-size commit: update the texture in place (no alloc, no
             // texture churn — the per-frame hot path). The dst rect is
@@ -136,6 +150,7 @@ pub const SurfaceNode = struct {
                     if (f(sn.ctx, tex, s, buf)) {
                         bn.dst_width = size.w;
                         bn.dst_height = size.h;
+                        bn.src = src;
                         node.enable(true);
                         return;
                     }
@@ -153,6 +168,7 @@ pub const SurfaceNode = struct {
             bn.texture = texture;
             bn.dst_width = size.w;
             bn.dst_height = size.h;
+            bn.src = src;
             node.enable(true);
         } else {
             // First map: create the tree container (under the parent
@@ -178,6 +194,7 @@ pub const SurfaceNode = struct {
             node.kind.buffer.texture = texture;
             node.kind.buffer.dst_width = size.w;
             node.kind.buffer.dst_height = size.h;
+            node.kind.buffer.src = src;
             sn.node = node;
 
             // The surface maps on the output(s) its node intersects:
@@ -241,6 +258,7 @@ pub const SurfaceNode = struct {
         sn.commit_listener.link.remove();
         sn.destroy_listener.link.remove();
         sn.unmap_listener.link.remove();
+        sn.map_listener.link.remove();
         sn.enter_listener.link.remove();
         sn.leave_listener.link.remove();
         _ = sn.scene.surface_nodes.remove(sn.surface);
@@ -249,9 +267,13 @@ pub const SurfaceNode = struct {
 
     /// The node's surface is presented this frame (it has an active
     /// node): append it to the frame's presented list. OOM logs and
-    /// skips.
+    /// skips. A hidden subsurface (unmapped parent chain) gets no
+    /// frame_done/presentation feedback: it is skipped even though its
+    /// scene node exists (created buffer-driven while hidden,
+    /// wayland.xml:3254-3258).
     pub fn appendPresented(sn: *SurfaceNode, list: *std.ArrayList(*Surface)) void {
         if (sn.node == null) return;
+        if (!sn.surface.mapped) return;
         list.append(sn.scene.allocator, sn.surface) catch |err| {
             log.warn(
                 "presented list append OOM: {s}",
@@ -326,6 +348,15 @@ pub const SurfaceNode = struct {
     /// Called at attach and detach; idempotent.
     fn updateOutputs(sn: *SurfaceNode) void {
         const s = sn.surface;
+        // A surface whose effective map is gated off (subsurface under an
+        // unmapped parent) is on NO output: no wl_surface.enter while
+        // hidden (wayland.xml:3254-3258). The surface module's map signal
+        // (map_listener) re-runs this when the gate passes, so a child
+        // that maps via parent-chain propagation gets its enter tracking.
+        if (!s.isEffectivelyMapped()) {
+            s.setLeft();
+            return;
+        }
         var on_output: ?*output_mod.Output = null;
         if (sn.node) |node| {
             const rect = node.absolutePosition();
@@ -391,6 +422,7 @@ pub fn trackSurface(
         .commit_listener = wire.Listener(*Surface).init(onCommit),
         .destroy_listener = wire.Listener(*Surface).init(onDestroy),
         .unmap_listener = wire.Listener(*Surface).init(onUnmap),
+        .map_listener = wire.Listener(*Surface).init(onMap),
         .enter_listener = wire.Listener(*output_mod.Output).init(onEnter),
         .leave_listener = wire.Listener(*output_mod.Output).init(onLeave),
     };
@@ -401,6 +433,7 @@ pub fn trackSurface(
     surface.events.commit.add(&sn.commit_listener);
     surface.events.destroy.add(&sn.destroy_listener);
     surface.events.unmap.add(&sn.unmap_listener);
+    surface.events.map.add(&sn.map_listener);
     surface.events.enter.add(&sn.enter_listener);
     surface.events.leave.add(&sn.leave_listener);
     // The surface may have committed its buffer before we subscribed (the
@@ -481,6 +514,16 @@ fn onUnmap(listener: *wire.Listener(*Surface), _: *Surface) void {
     sn.detach();
 }
 
+/// wl_surface.map signal: the surface became effectively mapped — its own
+/// commit OR parent-chain propagation (a subsurface mapping when its
+/// parent maps, no commit of its own). Recompute the output association:
+/// the scene node already exists (created buffer-driven at the earlier
+/// commit), so only the enter tracking needs to catch up.
+fn onMap(listener: *wire.Listener(*Surface), _: *Surface) void {
+    const sn: *SurfaceNode = @fieldParentPtr("map_listener", listener);
+    sn.updateOutputs();
+}
+
 /// wl_surface destroyed: run the impl's compositor-side cleanup hook,
 /// then tear the binding down. The surface is still valid inside the
 /// destroy signal (its buffers are released after the signal).
@@ -530,9 +573,16 @@ fn surfaceSize(s: *Surface, buf: *Buffer) geom.Size {
         .w = @divExact(rect.width, s.current.scale),
         .h = @divExact(rect.height, s.current.scale),
     };
-    // A wp_viewport destination overrides the surface size (the source is
-    // scaled to it); foot at scale 1 sets dst == buffer size, a no-op.
-    return s.viewport_dst orelse size;
+    // A wp_viewport overrides the surface size (F-AX-11): the destination
+    // size when set; else the source rect size when a crop is set (crop
+    // without scaling); else the buffer-derived size. The @intFromFloat
+    // is exact: F-AX-12's bad_size validation guarantees an integral src
+    // when no destination is set. foot at scale 1 sets dst == buffer
+    // size, a no-op.
+    const vp = s.current.viewport;
+    if (vp.has_dst) return vp.dst;
+    if (vp.has_src) return .{ .w = @intFromFloat(vp.src.width), .h = @intFromFloat(vp.src.height) };
+    return size;
 }
 
 // --- Tests --------------------------------------------------------------
@@ -966,6 +1016,8 @@ test "SurfaceNode subsurface trees nest under the parent's tree" {
         .parent_listener = wire.Listener(*Surface).init(noopSurfaceListener),
         .client_commit_listener = wire.Listener(*Surface).init(noopSurfaceListener),
         .parent_commit_listener = wire.Listener(*Surface).init(noopSurfaceListener),
+        .parent_map_listener = wire.Listener(*Surface).init(noopSurfaceListener),
+        .parent_unmap_listener = wire.Listener(*Surface).init(noopSurfaceListener),
     };
     fake_sub.subsurfaces.append(allocator, ss) catch unreachable;
 
@@ -1010,3 +1062,134 @@ test "SurfaceNode subsurface trees nest under the parent's tree" {
 }
 
 fn noopSurfaceListener(_: *wire.Listener(*Surface), _: *Surface) void {}
+
+/// The parent whose mapped flag the test gate consults (the surface the
+/// fake Subsurface links the child to). SAFETY: test fixture; set before
+/// use, only read by testGateMapped during the test body.
+var test_gate_parent: ?*Surface = null;
+
+/// Simulates the real subsurface mapped_gate (subsurface.zig
+/// subsurfaceMappedGate): the child maps only when its parent is mapped.
+fn testGateMapped(_: *Surface) bool {
+    const p = test_gate_parent orelse return true;
+    return p.mapped;
+}
+
+test "hidden subsurface is not presented" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    // Teardown order (LIFO), same as the nesting test: the client (and
+    // with it every surface) dies while comp + fake_sub are alive, then
+    // the scene, then the fake registry, then the compositor.
+    const scene = try makeScene(allocator, io, &log_cfg);
+    var tw = try surface_mod.TestWire.init();
+    const comp = try surface_mod.testCompositor(allocator, io, &log_cfg);
+    const parent = try surface_mod.testSurface(allocator, io, &log_cfg, comp, &tw);
+    const child = try surface_mod.testSurface(allocator, io, &log_cfg, comp, &tw);
+    var ctx: TestCtx = .{ .allocator = allocator };
+
+    // A fake subcompositor registry: one Subsurface entry linking
+    // child -> parent (the scene only reads the list).
+    const fake_sub = try allocator.create(Subcompositor);
+    fake_sub.* = .{
+        .allocator = allocator,
+        .io = io,
+        .log_cfg = &log_cfg,
+        // SAFETY: test fixture; never dereferenced.
+        .display = @ptrFromInt(0x10),
+        .compositor = comp,
+        .subsurfaces = .empty,
+    };
+    scene.subcompositor = fake_sub;
+
+    const ss = try allocator.create(Subsurface);
+    ss.* = .{
+        .allocator = allocator,
+        .io = io,
+        .log_cfg = &log_cfg,
+        .subcompositor = fake_sub,
+        // SAFETY: test fixture; the resource is never dereferenced.
+        .resource = @ptrFromInt(0x20),
+        .surface = child,
+        .parent = parent,
+        .surface_listener = wire.Listener(*Surface).init(noopSurfaceListener),
+        .parent_listener = wire.Listener(*Surface).init(noopSurfaceListener),
+        .client_commit_listener = wire.Listener(*Surface).init(noopSurfaceListener),
+        .parent_commit_listener = wire.Listener(*Surface).init(noopSurfaceListener),
+        .parent_map_listener = wire.Listener(*Surface).init(noopSurfaceListener),
+        .parent_unmap_listener = wire.Listener(*Surface).init(noopSurfaceListener),
+    };
+    fake_sub.subsurfaces.append(allocator, ss) catch unreachable;
+
+    defer allocator.destroy(comp);
+    defer allocator.destroy(ss);
+    defer allocator.destroy(fake_sub);
+    defer fake_sub.subsurfaces.deinit(allocator);
+    defer scene.deinit();
+    defer tw.deinit();
+
+    // An output covers the origin (the node's position): a mapped child
+    // would enter it.
+    const created = try makeOutput(allocator, io, &log_cfg);
+    const out = created[0];
+    defer out.destroy();
+    defer created[1].destroy();
+    const so = try SceneOutput.create(allocator, io, &log_cfg, scene, out);
+    defer so.destroy();
+    try testing.expectEqual(@as(usize, 1), scene.scene_outputs.items.len);
+
+    // Gate the child's mapped state on the parent chain, mirroring the
+    // real subsurface role's mapped_gate (subsurface.zig).
+    var gate_role: role_mod.SurfaceRole = .{ .name = "test-subsurface-gate", .mapped_gate = testGateMapped };
+    test_gate_parent = parent;
+    try role_mod.assignRole(child, &gate_role, null);
+
+    const child_sn = try trackSurface(scene, child, &test_impl, &ctx);
+    _ = try trackSurface(scene, parent, &test_impl, &ctx);
+
+    // The child commits a buffer while the parent is unmapped: it does
+    // NOT map (parent gate), so it gets no enter and is not presented —
+    // even though its scene node exists (created buffer-driven).
+    var child_buffer: Buffer = undefined;
+    surface_mod.testBuffer(allocator, &child_buffer);
+    child.attachBuffer(&child_buffer);
+    child.commit();
+    try testing.expect(!child.mapped);
+    try testing.expect(child_sn.node != null);
+    try testing.expect(child.outputs == null);
+    collectPresented(scene);
+    try testing.expectEqual(@as(usize, 0), scene.presented.items.len);
+
+    // The parent maps: the child's effective map follows (the real
+    // subsurface parent_map_listener drives child.updateMapped here), the
+    // map signal recomputes the enter tracking, and the child is
+    // presented.
+    var parent_buffer: Buffer = undefined;
+    surface_mod.testBuffer(allocator, &parent_buffer);
+    parent.attachBuffer(&parent_buffer);
+    parent.commit();
+    try testing.expect(parent.mapped);
+    child.updateMapped();
+    try testing.expect(child.mapped);
+    try testing.expect(child.outputs == out);
+    collectPresented(scene);
+    var child_presented = false;
+    for (scene.presented.items) |p| {
+        if (p == child) child_presented = true;
+    }
+    try testing.expect(child_presented);
+
+    // The parent unmaps: the child unmaps with it (recursive rule) and
+    // drops out of the presented list.
+    parent.attachBuffer(null);
+    parent.commit();
+    try testing.expect(!parent.mapped);
+    child.updateMapped();
+    try testing.expect(!child.mapped);
+    try testing.expect(child.outputs == null);
+    collectPresented(scene);
+    try testing.expectEqual(@as(usize, 0), scene.presented.items.len);
+}

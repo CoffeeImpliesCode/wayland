@@ -29,9 +29,11 @@
 //!      d. move the get_release callback lists with the buffer
 //!      e. role.commit hook
 //!      f. emit the commit signal
-//!      g. map/unmap transition: mapped = (current.buffer != null and
-//!         width/height > 0); on change, run the map/unmap signal and
-//!         the role hook (unmap: signal first, then role — F37)
+//!      g. map/unmap transition: mapped = isEffectivelyMapped (current
+//!         buffer != null with width/height > 0 AND the role's mapped
+//!         gate — the subsurface parent chain, wayland.xml:3254-3258);
+//!         on change, run the map/unmap signal and the role hook (unmap:
+//!         signal first, then role — F37)
 //!      h. unlock the current buffer (wlroots wlr_compositor.c:570-574) so
 //!         the client may reuse it (double buffering); the release signal
 //!         fires here (buffers/buffer.zig) and completes get_release
@@ -168,6 +170,12 @@ pub const State = struct {
     /// damage is always empty after a transfer, so wlroots' conditional
     /// clear-and-copy (wlr_compositor.c:374-385) is identical.
     committed: Committed = .{},
+    /// wp_viewport crop/scale state (wlroots wlr_surface_state.viewport,
+    /// wlr_compositor.h:45-50): written by the viewporter module from
+    /// set_source/set_destination, applied by the commit (F-AX-11). The
+    /// pending value persists across commits; a commit without the
+    /// committed.viewport bit keeps the current value.
+    viewport: Viewport = .{},
     /// wl_callback resources created by wl_surface.frame. Completed with
     /// done(ms) at present time by Surface.sendFrameDone (wlroots
     /// wlr_surface_send_frame_done); they accumulate here until then.
@@ -188,6 +196,19 @@ pub const State = struct {
         scale: bool = false,
         /// A wl_surface.offset (or pre-v5 attach offset) arrived.
         offset: bool = false,
+        /// A wp_viewport.set_source / set_destination arrived.
+        viewport: bool = false,
+    };
+
+    /// wp_viewport crop/scale state (wlroots wlr_surface_state.viewport,
+    /// wlr_compositor.h:45-50): the source crop in surface-local
+    /// coordinates (after buffer_transform + buffer_scale) and the
+    /// destination size. has_src/has_dst false = that half is unset.
+    pub const Viewport = struct {
+        has_src: bool = false,
+        src: geom.FRect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+        has_dst: bool = false,
+        dst: geom.Size = .{ .w = 0, .h = 0 },
     };
 
     pub fn init(allocator: std.mem.Allocator) State {
@@ -253,13 +274,9 @@ pub const Surface = struct {
     /// Snapshot of the committed state before the last applyCommit
     /// (see Previous above).
     previous: Previous = .{},
-    /// Whether the surface currently presents content (buffer with a
-    /// positive size; see the map transition in commit).
+    /// Whether the surface currently presents content: positive-size
+    /// current buffer AND the role's mapped gate (see updateMapped).
     mapped: bool = false,
-    /// wp_viewport destination size (set_destination), null = unset (the
-    /// surface keeps its buffer-derived size). Written by the viewporter
-    /// module; the scene node size honors it.
-    viewport_dst: ?geom.Size = null,
     /// Deferred-commit lock (mirrors wlroots' pending.cached_state_locks,
     /// wlr_compositor.c:942-945): while set, commit() keeps the pending
     /// state accumulating instead of applying it (wlr_compositor.c:594-598).
@@ -609,13 +626,50 @@ pub const Surface = struct {
         if (s.role) |role| if (role.commit) |f| f(s);
         s.events.commit.emit(s);
 
-        // 10. Map/unmap transition. wlroots maps only when the buffer has
-        // a positive size (wlr_surface_state_has_buffer,
-        // wlr_compositor.h:356); the unmap transition stays buffer == null.
-        const now_mapped = blk: {
-            const b = s.current.buffer orelse break :blk false;
-            break :blk b.width > 0 and b.height > 0;
-        };
+        // 10. Map/unmap transition: `mapped` follows isEffectivelyMapped
+        // (positive-size current buffer AND the role's mapped gate — the
+        // subsurface parent chain, wayland.xml:3254-3258).
+        s.updateMapped();
+
+        // 11. Unlock the current buffer (wlroots wlr_compositor.c:570-574)
+        // so the client can reuse it immediately (double buffering). The
+        // lockless re-attach special case leaves n_locks at 0, so guard the
+        // unlock; the release signal fires here (buffers/buffer.zig) and
+        // the get_release callbacks for this buffer complete.
+        if (s.current.buffer) |b| {
+            if (b.n_locks > 0) b.unlock();
+            s.fireReleaseCallbacksCurrent();
+        }
+    }
+
+    /// Whether the surface is effectively mapped: it has a current buffer
+    /// with a positive size AND its role's mapped gate passes. The gate
+    /// (SurfaceRole.mapped_gate) adds the role condition — the subsurface
+    /// role fails while any ancestor in the parent chain is unmapped
+    /// (wayland.xml:3254-3258: a sub-surface maps only when the parent
+    /// surface is mapped; the rules apply recursively). The scene uses
+    /// this for enter/present decisions; `mapped` (the transition) is
+    /// driven by updateMapped.
+    pub fn isEffectivelyMapped(s: *Surface) bool {
+        const b = s.current.buffer orelse return false;
+        if (!(b.width > 0 and b.height > 0)) return false;
+        if (s.role) |role| {
+            if (role.mapped_gate) |gate| return gate(s);
+        }
+        return true;
+    }
+
+    /// The map/unmap transition: `mapped` follows isEffectivelyMapped.
+    /// wlroots maps only when the buffer has a positive size
+    /// (wlr_surface_state_has_buffer, wlr_compositor.h:356); the mapped
+    /// gate extends that with the role condition (subsurface parent
+    /// chain). On change: map runs the role hook then the map signal;
+    /// unmap emits the signal first, then the role hook (F37, wlroots
+    /// wlr_surface_unmap wlr_compositor.c:854-872). Runs from applyCommit
+    /// (step 10) and from the subsurface's parent map/unmap listeners
+    /// (parent-chain propagation with no child commit of its own).
+    pub fn updateMapped(s: *Surface) void {
+        const now_mapped = s.isEffectivelyMapped();
         if (now_mapped and !s.mapped) {
             s.mapped = true;
             if (s.role) |role| if (role.map) |f| f(s);
@@ -627,16 +681,6 @@ pub const Surface = struct {
             // the signal first.
             s.events.unmap.emit(s);
             if (s.role) |role| if (role.unmap) |f| f(s);
-        }
-
-        // 11. Unlock the current buffer (wlroots wlr_compositor.c:570-574)
-        // so the client can reuse it immediately (double buffering). The
-        // lockless re-attach special case leaves n_locks at 0, so guard the
-        // unlock; the release signal fires here (buffers/buffer.zig) and
-        // the get_release callbacks for this buffer complete.
-        if (s.current.buffer) |b| {
-            if (b.n_locks > 0) b.unlock();
-            s.fireReleaseCallbacksCurrent();
         }
     }
 
@@ -982,6 +1026,7 @@ pub fn swapState(current: *State, allocator: Allocator, pending: *State) void {
     }
     if (pending.committed.transform) current.transform = pending.transform;
     if (pending.committed.scale) current.scale = pending.scale;
+    if (pending.committed.viewport) current.viewport = pending.viewport;
     if (pending.committed.offset) {
         current.dx = pending.dx;
         current.dy = pending.dy;

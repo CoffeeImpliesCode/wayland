@@ -30,11 +30,15 @@
 //!     fields) and the SERVER applies the reorder (main.zig
 //!     applyRestack); position and z-order are double-buffered on the
 //!     parent surface (F5: pending until the parent commits).
-//!   - Lifecycle is guarded: if either surface (child or parent) is
-//!     destroyed while the wl_subsurface lives, the compositor destroys
-//!     the wl_subsurface synchronously, and the child is unmapped
-//!     immediately (F6, wayland.xml:3279-3301). No raw *Surface pointer
-//!     outlives its surface.
+//!   - Lifecycle is guarded: a child-surface death destroys the
+//!     wl_subsurface synchronously; a PARENT-surface death makes it
+//!     inert instead — the resource stays alive (requests ignored,
+//!     destroy works; wlroots keeps it with NULL user data,
+//!     wlr_subcompositor.c:43) and the child is unmapped immediately
+//!     (F6, wayland.xml:3279-3301). No raw *Surface pointer outlives
+//!     its surface: inert entries are out of the registry with their
+//!     listeners detached, so nothing dereferences the dangling
+//!     pointers.
 //!
 //! Imports: utils/*, core/wire.zig, core/display.zig, compositor/*.
 
@@ -127,9 +131,11 @@ pub const Subsurface = struct {
     subcompositor: *Subcompositor,
     resource: *server.wl.Subsurface,
     /// The child surface (wl_subsurface role). Valid only while this
-    /// entry is in `subcompositor.subsurfaces`: either surface's death
-    /// tears the entry down synchronously (see onSurfaceDestroy /
-    /// onParentDestroy), so no raw pointer outlives its surface.
+    /// entry is in `subcompositor.subsurfaces`: the child's death tears
+    /// the entry down synchronously (see onSurfaceDestroy), and the
+    /// parent's death removes the entry at the inert step (see
+    /// onParentDestroy) — no raw pointer is dereferenced post-removal,
+    /// so no pointer outlives its surface.
     surface: *Surface,
     /// The parent surface; same lifetime rule as `surface`.
     parent: *Surface,
@@ -167,11 +173,21 @@ pub const Subsurface = struct {
     /// restack is now effective and the server should apply it (and
     /// reset this + restack_sibling_id).
     restack_committed: bool = false,
+    /// True once the parent surface died: the wl_subsurface RESOURCE stays
+    /// alive but inert (wlroots wl_resource_set_user_data(resource, NULL),
+    /// wlr_subcompositor.c:43) — every request is silently ignored, only
+    /// wl_subsurface.destroy works. While inert, `surface`/`parent` are
+    /// dangling (either may die after the parent) and MUST NOT be
+    /// dereferenced: the listeners are detached, the registry entry is
+    /// gone, and requests no-op, so no code path touches them.
+    inert: bool = false,
     /// Fired when `surface` (the child) dies: the wl_subsurface must die
     /// with its role object.
     surface_listener: wire.Listener(*Surface),
-    /// Fired when `parent` dies: the wl_subsurface becomes inert and is
-    /// destroyed by the compositor.
+    /// Fired when `parent` dies: the wl_subsurface becomes inert — the
+    /// resource stays alive, the child is unmapped and loses its role
+    /// (wayland.xml:3288-3289 only requires the sub-surface to be
+    /// unmapped; wlroots keeps the resource, wlr_subcompositor.c:43).
     parent_listener: wire.Listener(*Surface),
     /// On the child's client_commit signal: decides whether each commit is
     /// deferred (sync chain) or flushes a leftover cache. Mirrors
@@ -180,10 +196,41 @@ pub const Subsurface = struct {
     /// On the parent's commit signal: flushes the child's cached commit.
     /// Mirrors subsurface_handle_parent_commit (wlr_subcompositor.c:240-250).
     parent_commit_listener: wire.Listener(*Surface),
+    /// On the parent's map signal: the child's mapped state is gated on
+    /// the parent chain (wayland.xml:3254-3258), so a parent map may map
+    /// the child with no child commit of its own — re-run the child's
+    /// map transition (wlr_subcompositor.c:195-199 considers this at
+    /// map time).
+    parent_map_listener: wire.Listener(*Surface),
+    /// On the parent's unmap signal: the child unmaps with it (recursive
+    /// rule, wayland.xml:3258-3262). Re-runs the child's map transition.
+    parent_unmap_listener: wire.Listener(*Surface),
 };
 
-/// The shared role for subsurface surfaces.
-const subsurface_role: role_mod.SurfaceRole = .{ .name = "subsurface" };
+/// The shared role for subsurface surfaces. The mapped_gate couples the
+/// child's mapped state to the parent chain (wayland.xml:3254-3258): a
+/// subsurface maps only when the whole ancestor chain is mapped, and
+/// unmaps when any ancestor unmaps (recursively).
+const subsurface_role: role_mod.SurfaceRole = .{
+    .name = "subsurface",
+    .mapped_gate = subsurfaceMappedGate,
+};
+
+/// The mapped gate: true when every ancestor in the subsurface parent
+/// chain is mapped. Each ancestor's `mapped` flag is itself effective
+/// (gated at its own map), so a per-level check implements the recursive
+/// rule from wayland.xml:3254-3258 ("A sub-surface becomes mapped, when
+/// a non-NULL wl_buffer is applied and the parent surface is mapped...
+/// A sub-surface is hidden if the parent becomes hidden... These rules
+/// apply recursively"). Returns true for a surface whose role was
+/// cleared (inert parent death): the child renders as a plain surface.
+fn subsurfaceMappedGate(s: *Surface) bool {
+    var ss = subsurfaceFromSurface(s) orelse return true;
+    while (true) {
+        if (!ss.parent.mapped) return false;
+        ss = subsurfaceFromSurface(ss.parent) orelse return true;
+    }
+}
 
 fn bindSubcompositor(client: *wire.Client, sc: *Subcompositor, version: u32, id: u32) void {
     const resource = server.wl.Subcompositor.create(client, version, id) catch {
@@ -272,6 +319,8 @@ fn getSubsurface(
         .parent_listener = wire.Listener(*Surface).init(onParentDestroy),
         .client_commit_listener = wire.Listener(*Surface).init(onSurfaceClientCommit),
         .parent_commit_listener = wire.Listener(*Surface).init(onParentCommit),
+        .parent_map_listener = wire.Listener(*Surface).init(onParentMap),
+        .parent_unmap_listener = wire.Listener(*Surface).init(onParentUnmap),
     };
     // Listener.init leaves `link` undefined; put it in the detached state
     // so the error paths below (which route through subsurfaceDestroy ->
@@ -284,11 +333,15 @@ fn getSubsurface(
     ss.client_commit_listener.link.next = null;
     ss.parent_commit_listener.link.prev = null;
     ss.parent_commit_listener.link.next = null;
+    ss.parent_map_listener.link.prev = null;
+    ss.parent_map_listener.link.next = null;
+    ss.parent_unmap_listener.link.prev = null;
+    ss.parent_unmap_listener.link.next = null;
     ss_res.setHandler(*Subsurface, subsurfaceRequest, subsurfaceDestroy, ss);
-    // The wl_subsurface cannot outlive either surface: tearing it down
-    // when one dies also removes this entry from the registry, so the
-    // per-frame sync (server/main.zig syncSubsurfaceNodes) never sees a
-    // dead *Surface.
+    // The wl_subsurface cannot reference a dead *Surface: the child's
+    // death tears the entry down; the parent's death removes the entry
+    // at the inert step — so the per-frame sync (server/main.zig
+    // syncSubsurfaceNodes) never sees a dead *Surface.
     surface.events.destroy.add(&ss.surface_listener);
     parent.events.destroy.add(&ss.parent_listener);
     // Sync caching: the child's client_commit signal decides deferral
@@ -296,6 +349,12 @@ fn getSubsurface(
     // 577-598); the parent's commit signal flushes the cache.
     surface.events.client_commit.add(&ss.client_commit_listener);
     parent.events.commit.add(&ss.parent_commit_listener);
+    // Mapped-state coupling (wayland.xml:3254-3258): the child's mapped
+    // flag derives from the parent chain, so the parent's map/unmap
+    // transitions re-run the child's own transition (a child maps/unmaps
+    // with its parent even with no child commit).
+    parent.events.map.add(&ss.parent_map_listener);
+    parent.events.unmap.add(&ss.parent_unmap_listener);
     sc.subsurfaces.append(sc.allocator, ss) catch {
         ss_res.destroy();
         resource.postNoMemory();
@@ -314,6 +373,18 @@ fn getSubsurface(
 }
 
 fn subsurfaceRequest(ss_res: *server.wl.Subsurface, request: server.wl.Subsurface.Request, ss: *Subsurface) void {
+    // An inert wl_subsurface (parent destroyed) ignores every request;
+    // only destroy still works (wlroots keeps the resource inert,
+    // wlr_subcompositor.c:43: subsurface_from_resource returns NULL and
+    // each handler early-returns). The `surface`/`parent` pointers are
+    // dangling while inert — no request may touch them.
+    if (ss.inert) {
+        switch (request) {
+            .destroy => ss_res.destroy(),
+            else => {},
+        }
+        return;
+    }
     switch (request) {
         .set_position => |r| {
             // F5: position is double-buffered state on the parent
@@ -392,19 +463,53 @@ fn onSurfaceDestroy(listener: *wire.Listener(*Surface), _: *Surface) void {
     teardownOnSurfaceDeath(ss);
 }
 
-/// The parent surface died: the wl_subsurface is inert. Per wlroots
-/// (wlr_subcompositor.c destroy-on-parent-destroy) the compositor
-/// destroys it; the client sees its object die. A leftover cache is
-/// applied first (wlroots subsurface_destroy -> wlr_surface_unlock_cached,
-/// wlr_subcompositor.c:38-40): the parent's commit will never come, so
-/// the child keeps its latest committed content — then it is unmapped
-/// (F6: "the sub-surface is unmapped" when the parent is destroyed,
-/// wayland.xml:3279-3280).
+/// The parent surface died: the wl_subsurface becomes INERT, not
+/// destroyed. Per wlroots (wlr_subcompositor.c:43 keeps the resource
+/// alive with NULL user data; spec wayland.xml:3288-3289 only says "the
+/// sub-surface is unmapped"), the client keeps its wl_subsurface object
+/// and may still destroy it; every other request is silently ignored. A
+/// leftover cache is applied first (wlroots subsurface_destroy ->
+/// wlr_surface_unlock_cached, wlr_subcompositor.c:38-40): the parent's
+/// commit will never come, so the child keeps its latest committed
+/// content — then it is unmapped (F6: "the sub-surface is unmapped" when
+/// the parent is destroyed, wayland.xml:3279-3280) and loses its role
+/// (it keeps rendering as a plain surface, like wl_subsurface.destroy).
 fn onParentDestroy(listener: *wire.Listener(*Surface), _: *Surface) void {
     const ss: *Subsurface = @fieldParentPtr("parent_listener", listener);
     if (ss.sync_cached) flushCached(ss);
     unmapChild(ss);
-    teardownOnSurfaceDeath(ss);
+    // Inert step: unhook every listener, drop the registry entry, clear
+    // the child's role and mark inert. The RESOURCE stays alive; the
+    // later destroy request frees `ss` via subsurfaceDestroy (whose
+    // role-clear is skipped for inert entries — `ss.surface` dangles).
+    detachListeners(ss);
+    const sc = ss.subcompositor;
+    const idx = std.mem.indexOfScalar(*Subsurface, sc.subsurfaces.items, ss) orelse 0;
+    if (idx < sc.subsurfaces.items.len and sc.subsurfaces.items[idx] == ss) {
+        _ = sc.subsurfaces.orderedRemove(idx);
+    }
+    ss.surface.role = null;
+    ss.surface.role_resource = null;
+    ss.inert = true;
+}
+
+/// On the parent's map signal: the child's mapped state is gated on the
+/// parent chain (wayland.xml:3254-3258), so a parent map maps the child
+/// with no child commit — re-run the child's map transition. Runs right
+/// after the parent's own step-10 transition, closing the one-frame gap
+/// of a sync child flushed during the parent's commit (which saw the
+/// parent's PRE-commit mapped value).
+fn onParentMap(listener: *wire.Listener(*Surface), _: *Surface) void {
+    const ss: *Subsurface = @fieldParentPtr("parent_map_listener", listener);
+    ss.surface.updateMapped();
+}
+
+/// On the parent's unmap signal: the child unmaps with it (recursive
+/// rule, wayland.xml:3258-3262). Re-runs the child's map transition; the
+/// child's own unmap signal fires inside, cascading down the tree.
+fn onParentUnmap(listener: *wire.Listener(*Surface), _: *Surface) void {
+    const ss: *Subsurface = @fieldParentPtr("parent_unmap_listener", listener);
+    ss.surface.updateMapped();
 }
 
 /// On the child's client_commit signal (fired by Surface.commit before
@@ -495,22 +600,24 @@ fn subsurfaceFromSurface(s: *Surface) ?*Subsurface {
     return @ptrCast(@alignCast(ud));
 }
 
-/// Detach both lifecycle listeners, then destroy the wl_subsurface
-/// resource. The destroy handler runs synchronously: it removes the entry
-/// from the registry and frees `ss` — so `ss` must not be touched after
-/// the resource.destroy() call.
+/// Detach all listeners, then destroy the wl_subsurface resource. The
+/// destroy handler runs synchronously: it removes the entry from the
+/// registry and frees `ss` — so `ss` must not be touched after the
+/// resource.destroy() call.
 fn teardownOnSurfaceDeath(ss: *Subsurface) void {
     detachListeners(ss);
     ss.resource.destroy();
 }
 
-/// Unsubscribe all four listeners. Idempotent: a link in the detached
+/// Unsubscribe all six listeners. Idempotent: a link in the detached
 /// state (prev/next null) is skipped.
 fn detachListeners(ss: *Subsurface) void {
     if (ss.surface_listener.link.prev != null) ss.surface_listener.link.remove();
     if (ss.parent_listener.link.prev != null) ss.parent_listener.link.remove();
     if (ss.client_commit_listener.link.prev != null) ss.client_commit_listener.link.remove();
     if (ss.parent_commit_listener.link.prev != null) ss.parent_commit_listener.link.remove();
+    if (ss.parent_map_listener.link.prev != null) ss.parent_map_listener.link.remove();
+    if (ss.parent_unmap_listener.link.prev != null) ss.parent_unmap_listener.link.remove();
 }
 
 fn subsurfaceDestroy(ss_res: *server.wl.Subsurface, ss: *Subsurface) void {
@@ -520,11 +627,18 @@ fn subsurfaceDestroy(ss_res: *server.wl.Subsurface, ss: *Subsurface) void {
     detachListeners(ss);
     const sc = ss.subcompositor;
     // The surface loses its role; it keeps rendering as a plain surface
-    // until it unmaps (the server's commit path handles that).
-    if (ss.surface.role == &subsurface_role) {
-        ss.surface.role = null;
-        ss.surface.role_resource = null;
+    // until it unmaps (the server's commit path handles that). For an
+    // INERT subsurface (parent died first) the child surface may already
+    // be freed, so dereferencing `ss.surface` is a use-after-free — the
+    // role was already cleared at the inert step (onParentDestroy).
+    if (!ss.inert) {
+        if (ss.surface.role == &subsurface_role) {
+            ss.surface.role = null;
+            ss.surface.role_resource = null;
+        }
     }
+    // Registry removal is a defensive no-op for an inert entry: it was
+    // already removed at the inert step.
     const idx = std.mem.indexOfScalar(*Subsurface, sc.subsurfaces.items, ss) orelse 0;
     if (idx < sc.subsurfaces.items.len and sc.subsurfaces.items[idx] == ss) {
         _ = sc.subsurfaces.orderedRemove(idx);
@@ -631,15 +745,29 @@ test "parent surface destroy removes the subsurface and clears the role" {
     var t = try SubsurfaceTest.init(allocator, io, &log_cfg);
     defer t.deinit();
     try testing.expectEqual(@as(usize, 1), t.sc.subsurfaces.items.len);
+    const ss = t.sc.subsurfaces.items[0];
+    const ss_res = ss.resource;
 
-    // Parent death makes the wl_subsurface inert: destroyed by the
-    // compositor, entry removed from the registry.
+    // Parent death makes the wl_subsurface INERT: the registry entry is
+    // removed and the child loses its role, but the RESOURCE survives
+    // (wlroots keeps it with NULL user data, wlr_subcompositor.c:43;
+    // wayland.xml:3288-3289 only requires the sub-surface to be unmapped).
     t.parent.resource.destroy();
     try testing.expectEqual(@as(usize, 0), t.sc.subsurfaces.items.len);
     // The child keeps rendering as a plain surface: its role is cleared.
     try testing.expect(t.child.role == null);
+    try testing.expect(ss.inert);
     // F6: the child is unmapped (it was never mapped here, so no
     // transition fires — see the cached-commit test for the mapped case).
+
+    // Requests on the inert object are silently ignored: no state change,
+    // no protocol error, no crash.
+    subsurfaceRequest(ss_res, .set_sync, ss);
+    try testing.expect(ss.sync);
+    subsurfaceRequest(ss_res, .{ .set_position = .{ .x = 10, .y = 20 } }, ss);
+    try testing.expectEqual(@as(i32, 0), ss.x);
+    try testing.expectEqual(@as(i32, 0), ss.y);
+    subsurfaceRequest(ss_res, .destroy, ss);
 
     // The child's destroy signal must not fire a dangling listener.
     t.child.resource.destroy();
@@ -656,6 +784,15 @@ test "synced child commits are deferred until the parent commits" {
     defer t.deinit();
     const ss = t.sc.subsurfaces.items[0];
     try testing.expect(ss.sync); // subsurfaces start synchronized
+
+    // The parent maps first: the child's mapped state is gated on the
+    // parent chain (wayland.xml:3254-3258), so a flush can only map the
+    // child under a mapped parent.
+    var parent_buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &parent_buffer);
+    t.parent.attachBuffer(&parent_buffer);
+    t.parent.commit();
+    try testing.expect(t.parent.mapped);
 
     var buffer: buffer_mod.Buffer = undefined;
     surface_mod.testBuffer(allocator, &buffer);
@@ -692,6 +829,15 @@ test "a desync child commits immediately" {
     const ss = t.sc.subsurfaces.items[0];
     subsurfaceRequest(ss.resource, .set_desync, ss);
     try testing.expect(!ss.sync);
+
+    // The parent maps first: a desync child commits immediately but its
+    // mapped state is still gated on the parent chain
+    // (wayland.xml:3254-3258).
+    var parent_buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &parent_buffer);
+    t.parent.attachBuffer(&parent_buffer);
+    t.parent.commit();
+    try testing.expect(t.parent.mapped);
 
     var buffer: buffer_mod.Buffer = undefined;
     surface_mod.testBuffer(allocator, &buffer);
@@ -886,6 +1032,14 @@ test "wl_subsurface.destroy unmaps the child (F6)" {
     defer t.deinit();
     const ss = t.sc.subsurfaces.items[0];
 
+    // The parent maps first (the child maps only under a mapped parent,
+    // wayland.xml:3254-3258).
+    var parent_buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &parent_buffer);
+    t.parent.attachBuffer(&parent_buffer);
+    t.parent.commit();
+    try testing.expect(t.parent.mapped);
+
     var buffer: buffer_mod.Buffer = undefined;
     surface_mod.testBuffer(allocator, &buffer);
     t.child.attachBuffer(&buffer);
@@ -900,6 +1054,189 @@ test "wl_subsurface.destroy unmaps the child (F6)" {
     try testing.expect(!t.child.mapped);
     try testing.expect(t.child.role == null);
     try testing.expectEqual(@as(usize, 0), t.sc.subsurfaces.items.len);
+}
+
+test "parent destroy inerts the wl_subsurface; requests are ignored and destroy still works" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var t = try SubsurfaceTest.init(allocator, io, &log_cfg);
+    defer t.deinit();
+    const ss = t.sc.subsurfaces.items[0];
+    const ss_res = ss.resource;
+
+    // Map the child through the sync pipeline: attach+commit (deferred),
+    // then the parent's commit flushes and the child maps (parent mapped,
+    // so the mapped gate passes).
+    var buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    t.child.attachBuffer(&buffer);
+    t.child.commit();
+    try testing.expect(!t.child.mapped); // deferred
+    var parent_buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &parent_buffer);
+    t.parent.attachBuffer(&parent_buffer);
+    t.parent.commit(); // flush -> child maps
+    try testing.expect(t.parent.mapped);
+    try testing.expect(t.child.mapped);
+
+    // The parent dies: the wl_subsurface becomes INERT — registry entry
+    // removed, child unmapped + role cleared, but the RESOURCE survives
+    // (wayland.xml:3288-3289 only unmaps the sub-surface; wlroots keeps
+    // the resource inert, wlr_subcompositor.c:43).
+    t.parent.resource.destroy();
+    try testing.expectEqual(@as(usize, 0), t.sc.subsurfaces.items.len);
+    try testing.expect(t.child.role == null);
+    try testing.expect(!t.child.mapped);
+    try testing.expect(ss.inert);
+
+    // Requests on the inert resource are silently ignored: no state
+    // change, no protocol error, no crash.
+    subsurfaceRequest(ss_res, .{ .set_position = .{ .x = 5, .y = 6 } }, ss);
+    subsurfaceRequest(ss_res, .set_sync, ss);
+    try testing.expectEqual(@as(i32, 0), ss.x);
+    try testing.expectEqual(@as(i32, 0), ss.y);
+    try testing.expect(ss.sync);
+
+    // wl_subsurface.destroy still works on the inert object; the child
+    // stays a plain surface, and teardown (client destroy at deinit)
+    // does not double-free.
+    subsurfaceRequest(ss_res, .destroy, ss);
+    try testing.expect(t.child.role == null);
+}
+
+test "desync child does not map while the parent is unmapped" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var t = try SubsurfaceTest.init(allocator, io, &log_cfg);
+    defer t.deinit();
+    const ss = t.sc.subsurfaces.items[0];
+    subsurfaceRequest(ss.resource, .set_desync, ss);
+
+    // The commit applies immediately (desync), but the mapped state is
+    // gated on the parent chain (wayland.xml:3254-3258): an unmapped
+    // parent keeps the child hidden.
+    var buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    t.child.attachBuffer(&buffer);
+    t.child.commit();
+    try testing.expect(t.child.current.buffer == &buffer);
+    try testing.expect(!t.child.mapped);
+}
+
+test "child maps when the parent maps" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var t = try SubsurfaceTest.init(allocator, io, &log_cfg);
+    defer t.deinit();
+    const ss = t.sc.subsurfaces.items[0];
+    subsurfaceRequest(ss.resource, .set_desync, ss);
+
+    var buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    t.child.attachBuffer(&buffer);
+    t.child.commit();
+    try testing.expect(!t.child.mapped); // parent still unmapped
+
+    // The parent maps: the child maps with it — propagation via the
+    // parent's map signal (parent_map_listener re-runs the child's map
+    // transition), no child commit needed.
+    var parent_buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &parent_buffer);
+    t.parent.attachBuffer(&parent_buffer);
+    t.parent.commit();
+    try testing.expect(t.parent.mapped);
+    try testing.expect(t.child.mapped);
+}
+
+test "child unmaps when the parent unmaps" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var t = try SubsurfaceTest.init(allocator, io, &log_cfg);
+    defer t.deinit();
+    const ss = t.sc.subsurfaces.items[0];
+    subsurfaceRequest(ss.resource, .set_desync, ss);
+
+    // Map both: parent first, then the child (gate passes).
+    var parent_buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &parent_buffer);
+    t.parent.attachBuffer(&parent_buffer);
+    t.parent.commit();
+    var buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    t.child.attachBuffer(&buffer);
+    t.child.commit();
+    try testing.expect(t.parent.mapped);
+    try testing.expect(t.child.mapped);
+
+    // The parent unmaps: the child unmaps with it (recursive rule,
+    // wayland.xml:3258-3262) via the parent's unmap signal.
+    t.parent.attachBuffer(null);
+    t.parent.commit();
+    try testing.expect(!t.parent.mapped);
+    try testing.expect(!t.child.mapped);
+    // The child's buffer stays committed; it remaps when the parent does.
+    try testing.expect(t.child.current.buffer == &buffer);
+}
+
+test "grandchild hidden when the ancestor unmaps" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var t = try SubsurfaceTest.init(allocator, io, &log_cfg);
+    defer t.deinit();
+    // Nest a grandchild under the child (the registry order is creation
+    // order: child's entry first, grandchild's second).
+    const grandchild = try surface_mod.testSurface(allocator, io, &log_cfg, t.comp, &t.tw);
+    try t.comp.surfaces.append(allocator, grandchild);
+    const sc_res2 = try server.wl.Subcompositor.create(t.tw.client, 1, t.tw.newId());
+    getSubsurface(t.sc, sc_res2, t.tw.newId(), grandchild.resource, t.child.resource);
+
+    // Desync both levels: every commit applies immediately, isolating the
+    // mapped-gate behavior from the sync cache flush.
+    const ss_child = t.sc.subsurfaces.items[0];
+    const ss_grand = t.sc.subsurfaces.items[1];
+    subsurfaceRequest(ss_child.resource, .set_desync, ss_child);
+    subsurfaceRequest(ss_grand.resource, .set_desync, ss_grand);
+
+    // Map the whole tree, parent first (the gate passes level by level).
+    var parent_buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &parent_buffer);
+    t.parent.attachBuffer(&parent_buffer);
+    t.parent.commit();
+    var child_buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &child_buffer);
+    t.child.attachBuffer(&child_buffer);
+    t.child.commit();
+    var gc_buffer: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &gc_buffer);
+    grandchild.attachBuffer(&gc_buffer);
+    grandchild.commit();
+    try testing.expect(t.parent.mapped);
+    try testing.expect(t.child.mapped);
+    try testing.expect(grandchild.mapped);
+
+    // Unmap the ROOT: the recursive rule hides the whole subtree — the
+    // child unmaps with the parent (parent_unmap_listener), and the
+    // grandchild with the child (its own parent_unmap_listener cascade).
+    t.parent.attachBuffer(null);
+    t.parent.commit();
+    try testing.expect(!t.parent.mapped);
+    try testing.expect(!t.child.mapped);
+    try testing.expect(!grandchild.mapped);
 }
 
 var test_child_commit_count: usize = 0;

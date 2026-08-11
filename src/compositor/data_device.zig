@@ -978,14 +978,29 @@ const TestServer = struct {
     wl_seat: ?*client.wl.Seat = null,
     wl_data_device_manager: ?*client.wl.DataDeviceManager = null,
     surface: ?*client.wl.Surface = null,
+    /// A second client on its own socketpair, for focus-move tests:
+    /// client A owns the selection, client B gains keyboard focus and
+    /// must receive the re-delivered offer (the seat and primary
+    /// selection tests use the same two-client shape). B binds the same
+    /// globals and creates its own focusable surface, but never a data
+    /// device unless a test asks for one, so the single-client tests'
+    /// device/source/offer counts are unaffected.
+    client_b: ?*wire.Client = null,
+    c_display_b: ?*client.wl.Display = null,
+    wl_compositor_b: ?*client.wl.Compositor = null,
+    wl_seat_b: ?*client.wl.Seat = null,
+    wl_data_device_manager_b: ?*client.wl.DataDeviceManager = null,
+    surface_b: ?*client.wl.Surface = null,
     /// Mirrors main.zig's onSurfaceDestroy wiring: the seat's focus is
-    /// cleared when the test client's surface is destroyed (client
+    /// cleared when a test client's surface is destroyed (client
     /// teardown, or an explicit wl_surface.destroy), so the seat never
     /// holds a dangling surface and deliverSelectionToFocus never reads
     /// freed surface memory (production calls Seat.surfaceDestroyed from
     /// onSurfaceDestroy, main.zig; the TestServer drives the protocol
-    /// directly, so the wiring must be replicated here).
+    /// directly, so the wiring must be replicated here). One listener
+    /// per client surface.
     surface_listener: wire.Listener(*surface_mod.Surface),
+    surface_listener_b: wire.Listener(*surface_mod.Surface),
 
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, seat and manager all store it).
@@ -1005,6 +1020,7 @@ const TestServer = struct {
             .io = std.Io.Threaded.global_single_threaded.io(),
             .log_cfg = .{ .min_level = .err },
             .surface_listener = wire.Listener(*surface_mod.Surface).init(onSurfaceDestroy),
+            .surface_listener_b = wire.Listener(*surface_mod.Surface).init(onSurfaceDestroyB),
         };
         ts.display = try display_mod.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
         errdefer if (ts.display) |d| d.deinit();
@@ -1052,6 +1068,43 @@ const TestServer = struct {
         // (same effect: the focus never outlives its surface).
         const srv_surface = surfaceForClient(ts, ts.client.?);
         srv_surface.events.destroy.add(&ts.surface_listener);
+
+        // Second client: B binds the same globals on its own socketpair
+        // and creates its own focusable surface. Connected before the
+        // harness returns so every test can move keyboard focus between
+        // two clients (same two-client shape as the seat and primary
+        // selection tests).
+        var fds_b: [2]posix.socket_t = undefined;
+        const rc_b = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds_b);
+        if (posix.errno(rc_b) != .SUCCESS) return error.SocketpairFailed;
+        ts.client_b = wire.Client.create(ts.display.?.getServer(), fds_b[0]) orelse return error.ClientCreateFailed;
+        ts.c_display_b = client.wl.Display.connectToFd(fds_b[1]) catch return error.ClientConnectFailed;
+
+        // Round 1: registry + global announcements.
+        const registry_b = try ts.c_display_b.?.getRegistry();
+        var capture_b: RegistryCapture = .{};
+        registry_b.setListener(*RegistryCapture, RegistryCapture.listener, &capture_b);
+        try ts.pump();
+        if (capture_b.compositor_name == null or
+            capture_b.seat_name == null or
+            capture_b.data_device_manager_name == null)
+        {
+            return error.GlobalMissing;
+        }
+
+        // Round 2: bind wl_compositor (to create a focusable surface),
+        // wl_seat and wl_data_device_manager.
+        ts.wl_compositor_b = try registry_b.bind(capture_b.compositor_name.?, client.wl.Compositor, 7);
+        ts.surface_b = try ts.wl_compositor_b.?.createSurface();
+        ts.wl_seat_b = try registry_b.bind(capture_b.seat_name.?, client.wl.Seat, 7);
+        ts.wl_data_device_manager_b = try registry_b.bind(
+            capture_b.data_device_manager_name.?,
+            client.wl.DataDeviceManager,
+            ddm_version,
+        );
+        try ts.pump();
+        const srv_surface_b = surfaceForClient(ts, ts.client_b.?);
+        srv_surface_b.events.destroy.add(&ts.surface_listener_b);
         return ts;
     }
 
@@ -1064,9 +1117,22 @@ const TestServer = struct {
         if (ts.seat) |seat| seat.surfaceDestroyed(surface);
     }
 
+    /// Client B's surface died: clear the seat's focus for B's surface
+    /// too (same wiring as onSurfaceDestroy; a focus held on B's surface
+    /// at teardown must not dangle).
+    fn onSurfaceDestroyB(listener: *wire.Listener(*surface_mod.Surface), surface: *surface_mod.Surface) void {
+        const ts: *TestServer = @fieldParentPtr("surface_listener_b", listener);
+        if (ts.seat) |seat| seat.surfaceDestroyed(surface);
+    }
+
     fn deinit(ts: *TestServer) void {
-        // Tear the client down first: its resource destroy handlers
-        // (sourceDestroy/deviceDestroy) must run while the manager lives.
+        // Tear the clients down first (LIFO): their resource destroy
+        // handlers (sourceDestroy/deviceDestroy) must run while the
+        // manager lives. A client dropped by a protocol error has its
+        // server-side resource already destroyed by the server, so its
+        // `client` pointer is null and only the display is disconnected.
+        if (ts.c_display_b) |d| d.disconnect();
+        if (ts.client_b) |c| c.destroy();
         if (ts.c_display) |d| d.disconnect();
         if (ts.client) |c| c.destroy();
         if (ts.mgr) |m| m.deinit();
@@ -1078,20 +1144,40 @@ const TestServer = struct {
     }
 
     /// Client flush -> server event loop dispatch -> server flush ->
-    /// client dispatch. Drives one roundtrip without blocking.
+    /// client dispatch. Drives one roundtrip without blocking. Tolerates
+    /// a client that has not connected yet (initAtVersion connects B
+    /// with only client A live) and a client dropped by a protocol error.
     fn pump(ts: *TestServer) !void {
-        if (ts.c_display.?.flush() != .SUCCESS) return error.ClientFlushFailed;
+        if (ts.c_display) |d| {
+            if (d.flush() != .SUCCESS) return error.ClientFlushFailed;
+        }
+        if (ts.c_display_b) |d| {
+            if (d.flush() != .SUCCESS) return error.ClientFlushFailed;
+        }
         try ts.display.?.getServer().getEventLoop().dispatch(0);
         ts.display.?.flushClients();
-        var fds = [_]posix.pollfd{
-            .{ .fd = ts.c_display.?.getFd(), .events = posix.POLL.IN, .revents = 0 },
-        };
-        if (try posix.poll(&fds, 0) > 0) {
-            if (ts.c_display.?.dispatch() != .SUCCESS) {
-                // Protocol error or disconnect: the server has already
-                // destroyed its client (dangling) — forget it for deinit.
-                ts.client = null;
-                return error.ClientDispatchFailed;
+        var fds: [2]posix.pollfd = undefined;
+        var count: usize = 0;
+        if (ts.c_display) |d| {
+            fds[count] = .{ .fd = d.getFd(), .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
+        if (ts.c_display_b) |d| {
+            fds[count] = .{ .fd = d.getFd(), .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
+        if (count == 0) return;
+        if (try posix.poll(fds[0..count], 0) > 0) {
+            for (fds[0..count]) |fd| {
+                if (fd.revents & posix.POLL.IN == 0) continue;
+                const is_a = ts.c_display != null and fd.fd == ts.c_display.?.getFd();
+                const disp = if (is_a) ts.c_display.? else ts.c_display_b.?;
+                if (disp.dispatch() != .SUCCESS) {
+                    // Protocol error or disconnect: the server has already
+                    // destroyed its client (dangling) — forget it for deinit.
+                    if (is_a) ts.client = null else ts.client_b = null;
+                    return error.ClientDispatchFailed;
+                }
             }
         }
     }
@@ -1370,6 +1456,117 @@ test "new data device binding receives the current selection at bind time" {
     try testing.expect(!dev2_events.last_selection_null);
     // One live offer per device of the focused client.
     try testing.expectEqual(@as(usize, 2), ts.mgr.?.offers.items.len);
+}
+
+/// Device events for the focus-move test: counts selections and captures
+/// the mime list of each received offer. The offer listener is attached
+/// from inside the data_offer handler so it is live before the offer's
+/// own events are dispatched in the same round (the server sends
+/// data_offer -> mimes -> selection, deliverSelectionToFocus). This
+/// struct is test-local because attaching an offer listener from the
+/// device listener would collide with tests that setListener the same
+/// offer proxy again (wl_proxy_add_dispatcher asserts on a second
+/// listener).
+const FocusEvents = struct {
+    selection_count: usize = 0,
+    last_selection_null: bool = false,
+    mime_count: usize = 0,
+    has_text_plain: bool = false,
+
+    fn listener(device: *client.wl.DataDevice, event: client.wl.DataDevice.Event, data: *FocusEvents) void {
+        _ = device;
+        switch (event) {
+            .selection => |e| {
+                data.selection_count += 1;
+                data.last_selection_null = e.id == null;
+            },
+            .data_offer => |e| e.id.setListener(*FocusEvents, FocusEvents.offerListener, data),
+            // DnD events: the test client never drags; the arms exist for
+            // exhaustive switch over the wire event enum.
+            .enter => {},
+            .leave => {},
+            .motion => {},
+            .drop => {},
+        }
+    }
+
+    fn offerListener(offer: *client.wl.DataOffer, event: client.wl.DataOffer.Event, data: *FocusEvents) void {
+        _ = offer;
+        switch (event) {
+            .offer => |e| {
+                data.mime_count += 1;
+                if (std.mem.eql(u8, std.mem.span(e.mime_type), "text/plain")) data.has_text_plain = true;
+            },
+            // DnD negotiation events: the test client never negotiates
+            // (offers are clipboard offers); the arm exists for the
+            // exhaustive switch over the wire event enum.
+            .action => |e| {
+                const v: u32 = @bitCast(e.dnd_action);
+                _ = v;
+            },
+            .source_actions => |e| {
+                const v: u32 = @bitCast(e.source_actions);
+                _ = v;
+            },
+        }
+    }
+};
+
+test "selection is re-delivered to the newly focused client on keyboard focus enter" {
+    // S4: the seat re-emits keyboard_focus AFTER enter+modifiers when
+    // focus moves (seat.zig:858), and data_device re-delivers the
+    // stored seat-wide selection to the newly focused client on that
+    // signal (onKeyboardFocus -> deliverSelectionToFocus): a live
+    // non-null selection set by client A must reach client B as a fresh
+    // data_offer + selection when B gains keyboard focus, with B's
+    // offer carrying A's mime and A's previous offer destroyed (one
+    // live offer total; wlroots seat_client_send_selection destroys
+    // all offers before re-sending, wlr_data_device.c).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // Client A (the owner) and client B (the focus target): each binds
+    // its own data device.
+    const device_a = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const device_b = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var events_a: FocusEvents = .{};
+    var events_b: FocusEvents = .{};
+    device_a.setListener(*FocusEvents, FocusEvents.listener, &events_a);
+    device_b.setListener(*FocusEvents, FocusEvents.listener, &events_b);
+    try ts.pump();
+
+    // Focus client A and set a live selection.
+    ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client.?));
+    try ts.pump();
+    const serial = ts.seat.?.last_serial;
+    device_a.setSelection(src, serial);
+    try ts.pump();
+    // A holds the only offer (focus-enter NULL delivery + the selection
+    // delivery); B, never focused, has received nothing.
+    try testing.expectEqual(@as(usize, 2), events_a.selection_count);
+    try testing.expect(!events_a.last_selection_null);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+    try testing.expectEqual(@as(usize, 0), events_b.selection_count);
+
+    // Focus moves to client B: the stored selection is re-delivered.
+    ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client_b.?));
+    try ts.pump();
+
+    // B receives exactly one data_offer + selection, and the offer
+    // carries A's mime ("text/plain").
+    try testing.expectEqual(@as(usize, 1), events_b.selection_count);
+    try testing.expect(!events_b.last_selection_null);
+    try testing.expectEqual(@as(usize, 1), events_b.mime_count);
+    try testing.expect(events_b.has_text_plain);
+
+    // A's previous offer was destroyed: exactly one live offer remains
+    // (B's), referencing A's source, and A receives no new events.
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+    try testing.expectEqual(src.getId(), ts.mgr.?.offers.items[0].source.?.resource.getId());
+    try testing.expectEqual(@as(usize, 2), events_a.selection_count);
 }
 
 test "offer.finish on a clipboard offer raises invalid_finish" {

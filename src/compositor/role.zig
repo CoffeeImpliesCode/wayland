@@ -34,6 +34,11 @@ pub const SurfaceRole = struct {
     unmap: ?*const fn (surface: *Surface) void = null,
     /// Called when the surface is destroyed, before the destroy signal.
     destroy: ?*const fn (surface: *Surface) void = null,
+    /// Optional map condition: when set, the surface's effective mapped
+    /// state is (positive-size current buffer) AND gate(surface). The
+    /// subsurface role uses it to gate a child on the parent chain
+    /// (wayland.xml:3254-3258); null = no gate (every other role).
+    mapped_gate: ?*const fn (surface: *Surface) bool = null,
 };
 
 pub const RoleError = error{RoleConflict};

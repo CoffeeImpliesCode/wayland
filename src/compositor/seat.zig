@@ -216,6 +216,13 @@ pub const Seat = struct {
     /// the notification, these fields carry the payload).
     last_button: u32 = 0,
     last_button_pressed: bool = false,
+    /// Pointer buttons the focused client believes are held (delivered
+    /// pressed without a delivered release). setPointerGrab(true)
+    /// synthesizes releases for these (wlroots reset_buttons on grab
+    /// focus change, wlr_seat_pointer.c:435-437) so a client gesture
+    /// cannot extend into the compositor's grab (S2).
+    held_buttons: [16]u32 = undefined,
+    held_button_count: usize = 0,
     /// The most recent scroll axis event: the axis + discrete notch
     /// count (compositor bindings; mirrors last_keysym — the axis signal
     /// is the notification, these fields carry the payload).
@@ -537,9 +544,33 @@ pub const Seat = struct {
 
     /// Start/stop the compositor's implicit pointer grab (see
     /// pointer_grab). The seat keeps delivering motion/buttons to the
-    /// compositor listeners so the gesture keeps working.
+    /// compositor listeners so the gesture keeps working. Starting the
+    /// grab synthesizes a release (+ closing frame) for every button the
+    /// client believes is held, with a fresh per-client serial (wlroots
+    /// reset_buttons on grab focus change, wlr_seat_pointer.c:435-437):
+    /// the client's own gesture state must not extend into the
+    /// compositor's gesture (S2).
     pub fn setPointerGrab(self: *Seat, grabbed: bool) void {
         self.pointer_grab = grabbed;
+        if (!grabbed or self.held_button_count == 0) return;
+        if (self.pointer_focus) |focus| {
+            const focus_client = focus.resource.getClient();
+            const time = nowMs(self);
+            var delivered = false;
+            for (self.held_buttons[0..self.held_button_count]) |button| {
+                const serial = serialFor(self, focus_client);
+                for (self.pointers.items) |ptr| {
+                    if (ptr.getClient() != focus_client) continue;
+                    ptr.sendButton(serial, time, button, .released);
+                    delivered = true;
+                }
+            }
+            if (delivered) self.markFramePending(focus_client);
+        }
+        // The buttons are logically released whether or not a focus
+        // client got the release; a later physical release is then a
+        // no-op for the set (the pointerButton gate swallows it anyway).
+        self.held_button_count = 0;
     }
 
     /// Move the pointer to output coords (x, y): hit-test, deliver
@@ -646,11 +677,12 @@ pub const Seat = struct {
         // Button goes only to the focused client's pointer resources
         // (wlroots: wlr_seat_pointer_send_button iterates
         // focused_client->pointers, wlr_seat_pointer.c:274-295). Under
-        // the compositor's grab the client sees no presses; a RELEASE is
-        // always delivered so the client can clear its own gesture state
-        // (the terminal's text-selection drag ends on the release — a
-        // swallowed release would leave it extending the selection).
-        if (!self.pointer_grab or !pressed) {
+        // the compositor's grab the client sees NEITHER press nor
+        // release (S2): the camera drag / interactive move owns the
+        // buttons, and the client's gesture state is cleared by the
+        // synthetic releases setPointerGrab(true) sends — a swallowed
+        // release cannot leave it extending a text selection.
+        if (!self.pointer_grab) {
             if (self.pointer_focus) |focus| {
                 const focus_client = focus.resource.getClient();
                 const serial = serialFor(self, focus_client);
@@ -661,6 +693,24 @@ pub const Seat = struct {
                     delivered = true;
                 }
                 if (delivered) self.markFramePending(focus_client);
+            }
+            // Track what the client believes is held (delivered presses
+            // without a delivered release) for the grab-start synthetic
+            // releases. Gated events never touch the set — the client
+            // did not see them (S2).
+            if (pressed) {
+                if (self.held_button_count < self.held_buttons.len and
+                    std.mem.indexOfScalar(u32, self.held_buttons[0..self.held_button_count], button) == null)
+                {
+                    self.held_buttons[self.held_button_count] = button;
+                    self.held_button_count += 1;
+                }
+            } else {
+                const idx = std.mem.indexOfScalar(u32, self.held_buttons[0..self.held_button_count], button) orelse 0;
+                if (idx < self.held_button_count and self.held_buttons[idx] == button) {
+                    self.held_buttons[idx] = self.held_buttons[self.held_button_count - 1];
+                    self.held_button_count -= 1;
+                }
             }
         }
         self.events.button.emit(self);
@@ -711,6 +761,13 @@ pub const Seat = struct {
         self.last_axis_discrete = discrete;
         self.events.axis.emit(self);
 
+        // Under the compositor's grab (camera drag / interactive move)
+        // no axis reaches the focused client (S2): the client must not
+        // scroll while the compositor owns the gesture. The axis signal
+        // above still fired, so the compositor's zoom binding keeps
+        // working (suppressing wheel-zoom during a grab is compositor
+        // policy, out of scope here).
+        if (self.pointer_grab) return;
         const focus = self.pointer_focus orelse return;
         const focus_client = focus.resource.getClient();
         const time = nowMs(self);
@@ -926,10 +983,43 @@ pub const Seat = struct {
         self.events.key.emit(self);
     }
 
+    /// One server-side repeat of a held key (S1): sends the key event
+    /// with the v10 "repeated" state (or "pressed" for a pre-v10
+    /// resource, which has no repeated state) WITHOUT touching the xkb
+    /// state — the key is already down, so the pressed set, the
+    /// modifiers and last_keysym stay exactly as the press left them
+    /// (the repeat is not a new press). The key signal still fires so
+    /// compositor bindings and main.zig's repeat-timer arming keep
+    /// working.
+    fn sendKeyRepeat(self: *Seat, keycode: u32) void {
+        self.last_key_pressed = true;
+        const time = nowMs(self);
+        // Same delivery shape as keyEvent: the focused client's keyboards
+        // only (wlroots wlr_seat_keyboard_send_key iterates
+        // focused_client->keyboards, wlr_seat_keyboard.c:67-84).
+        if (self.keyboard_focus) |focus| {
+            const focus_client = focus.resource.getClient();
+            const serial = serialFor(self, focus_client);
+            for (self.keyboards.items) |kbd| {
+                if (kbd.getClient() != focus_client) continue;
+                const state: server.wl.Keyboard.KeyState = if (kbd.getVersion() >= 10) .repeated else .pressed;
+                kbd.sendKey(serial, time, keycode - 8, state);
+            }
+        }
+        self.events.key.emit(self);
+    }
+
     /// True while a key is held for server-side repeat (the compositor's
     /// repeat timer should stay armed).
     pub fn repeatActive(self: *Seat) bool {
         return self.repeating != null;
+    }
+
+    /// Monotonic-ms deadline of the next repeated key event (0 when
+    /// nothing repeats). main.zig re-arms its repeat timer against this
+    /// so a marginally-early tick does not skip an emission (S7).
+    pub fn repeatNextAt(self: *Seat) i64 {
+        return self.repeat_next_at;
     }
 
     /// Interval between repeated events (ms), from the advertised rate.
@@ -938,15 +1028,17 @@ pub const Seat = struct {
     }
 
     /// One repeat tick (compositor's repeat timer): re-emit the held key
-    /// as pressed when its repeat deadline passed. The timer re-arms
-    /// while repeatActive(); the deadline advances by the interval so the
-    /// rate is exact regardless of timer jitter.
+    /// when its repeat deadline passed — as the v10 "repeated" state
+    /// (pressed for pre-v10 clients) via sendKeyRepeat, without touching
+    /// the xkb state (S1). The timer re-arms while repeatActive(); the
+    /// deadline advances by the interval so the rate is exact regardless
+    /// of timer jitter.
     pub fn onRepeatTick(self: *Seat) void {
         const kc = self.repeating orelse return;
         const now = nowMs(self);
         if (now >= self.repeat_next_at) {
             self.repeat_next_at = now + @as(i64, @intCast(self.repeatIntervalMs()));
-            self.keyEvent(kc, true);
+            self.sendKeyRepeat(kc);
         }
     }
 
@@ -1129,7 +1221,13 @@ pub const Seat = struct {
         self.surfaceDestroyed(surface);
     }
 
-    fn nowMs(self: *Seat) u32 {
+    /// The seat's monotonic-ms clock: CLOCK_MONOTONIC via std.Io.Clock
+    /// (.awake), the same source main.zig's repeat-timer arming uses
+    /// (S7). The wire `time` fields are u32 and the truncation wraps
+    /// every ~49.7 days — fine, the protocol defines an undefined base,
+    /// and the repeat-deadline math subtracts two truncations so short
+    /// intervals stay exact.
+    pub fn nowMs(self: *Seat) u32 {
         return @truncate(@as(u64, @bitCast(std.Io.Clock.now(.awake, self.io.*).toMilliseconds())));
     }
 };
@@ -1172,7 +1270,17 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
                 kbd.sendKeymap(.xkb_v1, fd, seat.xkb.keymap_size);
                 _ = std.os.linux.close(fd);
             }
-            if (kbd.getVersion() >= 4) kbd.sendRepeatInfo(seat.key_repeat_rate, seat.key_repeat_delay);
+            // S1 (v10 repeat contract): a v10 resource is told rate 0 —
+            // the compositor owns repeats and delivers them with the v10
+            // "repeated" key state (the wire contract only permits that
+            // state after a rate-0 repeat_info, wayland.xml:2039-2043;
+            // KWin keyboard.cpp:79-84 does the same). A pre-v10 resource
+            // keeps the real rate and gets pressed-state repeats: it has
+            // no repeated state at all.
+            if (kbd.getVersion() >= 4) kbd.sendRepeatInfo(
+                if (kbd.getVersion() >= 10) 0 else seat.key_repeat_rate,
+                seat.key_repeat_delay,
+            );
             // Late enter only for the focused client (wlroots:
             // focused_client == seat_client, wlr_seat_keyboard.c:449-460).
             // A foreign-surface enter is rejected by libwayland.
@@ -1348,8 +1456,12 @@ const KeyboardEvents = struct {
     mods_group: u32 = 0,
     repeat_info: usize = 0,
     repeat_rate: i32 = 0,
+    repeat_delay: i32 = 0,
     keys: usize = 0,
     last_key: u32 = 0,
+    /// The most recent key event's state (pressed/released/repeated —
+    /// the v10 repeat contract, S1).
+    last_key_state: server.wl.Keyboard.KeyState = .pressed,
     // SAFETY: filled during the test before any read.
     order: [16]Order = undefined,
     order_len: usize = 0,
@@ -1380,6 +1492,7 @@ const KeyboardEvents = struct {
             .key => |e| {
                 data.keys += 1;
                 data.last_key = e.key;
+                data.last_key_state = e.state;
                 data.log(.key);
             },
             .modifiers => |e| {
@@ -1391,6 +1504,7 @@ const KeyboardEvents = struct {
             .repeat_info => |e| {
                 data.repeat_info += 1;
                 data.repeat_rate = e.rate;
+                data.repeat_delay = e.delay;
             },
         }
     }
@@ -1752,6 +1866,195 @@ test "server-side key repeat: press, delay, repeat, release stops" {
     try std.testing.expectEqual(@as(usize, 3), a.kbd_events.keys);
 }
 
+test "v10 clients get repeat_info rate 0 and repeated-state repeats (S1)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server);
+
+    // The harness binds wl_seat at v10: repeat_info advertises rate 0
+    // (the compositor owns repeats, S1) with the real delay. A v10
+    // resource may only receive "repeated" key states after a rate-0
+    // repeat_info (wayland.xml:2039-2043).
+    try std.testing.expectEqual(@as(usize, 1), a.kbd_events.repeat_info);
+    try std.testing.expectEqual(@as(i32, 0), a.kbd_events.repeat_rate);
+    try std.testing.expectEqual(@as(i32, 600), a.kbd_events.repeat_delay);
+
+    // Focus A and press key 38 ('a'): one pressed event, wire scancode 30.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump(); // click-to-focus
+    try std.testing.expect(a.kbd_events.entered);
+
+    seat.keyEvent(38, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.kbd_events.keys);
+    try std.testing.expectEqual(server.wl.Keyboard.KeyState.pressed, a.kbd_events.last_key_state);
+    try std.testing.expectEqual(@as(u32, 30), a.kbd_events.last_key);
+
+    // Two repeat ticks past the deadline: both emit with the v10
+    // "repeated" state, wire scancode 30, and no xkb state change (the
+    // repeat is not a new press). The deadline is poked into the past so
+    // the ticks fire without a 600ms sleep.
+    seat.repeat_next_at = @as(i64, seat.nowMs()) - 1000;
+    seat.onRepeatTick();
+    seat.repeat_next_at = @as(i64, seat.nowMs()) - 1000;
+    seat.onRepeatTick();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 3), a.kbd_events.keys);
+    try std.testing.expectEqual(server.wl.Keyboard.KeyState.repeated, a.kbd_events.last_key_state);
+    try std.testing.expectEqual(@as(u32, 30), a.kbd_events.last_key);
+}
+
+test "pre-v10 clients get repeat_info rate 25 and pressed-state repeats (S1)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server);
+
+    // Bind a second wl_keyboard for client A at wl_seat version 9 (the
+    // v7-bind pattern): a pre-v10 resource keeps the real repeat rate
+    // and receives repeats as plain pressed events (no repeated state
+    // below v10, S1).
+    const registry = try a.display.getRegistry();
+    var capture: RegistryCapture = .{};
+    registry.setListener(*RegistryCapture, RegistryCapture.listener, &capture);
+    try pumpOne(ts, a.display);
+    const seat9 = try registry.bind(capture.seat_name.?, client.wl.Seat, 9);
+    const kbd9 = try seat9.getKeyboard();
+    var kbd9_events: KeyboardEvents = .{};
+    kbd9.setListener(*KeyboardEvents, KeyboardEvents.listener, &kbd9_events);
+    try ts.pump();
+
+    try std.testing.expectEqual(@as(usize, 1), kbd9_events.repeat_info);
+    try std.testing.expectEqual(seat.key_repeat_rate, kbd9_events.repeat_rate);
+    try std.testing.expectEqual(@as(i32, 600), kbd9_events.repeat_delay);
+
+    // Focus A, press, poke the deadline, tick: the v9 resource sees a
+    // pressed-state repeat while the same client's v10 resource sees
+    // repeated.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump(); // click-to-focus
+    seat.keyEvent(38, true);
+    try ts.pump();
+    seat.repeat_next_at = @as(i64, seat.nowMs()) - 1000;
+    seat.onRepeatTick();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.kbd_events.keys);
+    try std.testing.expectEqual(server.wl.Keyboard.KeyState.repeated, a.kbd_events.last_key_state);
+    try std.testing.expectEqual(@as(usize, 2), kbd9_events.keys);
+    try std.testing.expectEqual(server.wl.Keyboard.KeyState.pressed, kbd9_events.last_key_state);
+    try std.testing.expectEqual(@as(u32, 30), kbd9_events.last_key);
+}
+
+test "implicit pointer grab gates axis and button release (S2)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server);
+
+    // Focus A; the press is delivered normally (the camera drag starts
+    // on the press, the grab only on the threshold-crossing motion).
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.button);
+
+    // Grab start synthesizes a release (+ closing frame) for the held
+    // button so the client's gesture state cannot extend into the drag
+    // (wlroots reset_buttons, wlr_seat_pointer.c:435-437).
+    seat.setPointerGrab(true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 3), a.ptr_events.frame);
+
+    // During the grab the focused client sees NO button release, NO
+    // axis and NO motion (the compositor's own listeners still get
+    // them).
+    seat.pointerButton(btn_left, false);
+    seat.pointerAxis(.vertical_scroll, .wheel, 10.0, 1);
+    seat.pointerMotion(20, 20);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 0), a.ptr_events.axis);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.motion);
+
+    // A button pressed AND released mid-grab produces nothing either.
+    seat.pointerButton(btn_right, true);
+    seat.pointerButton(btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+}
+
+test "repeat tick before the deadline is a no-op, after it emits exactly once (S7)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server);
+
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump(); // click-to-focus
+
+    // Press arms the repeat clock at now + delay (600ms default): a tick
+    // before the deadline emits nothing AND leaves the deadline alone.
+    seat.keyEvent(38, true);
+    try ts.pump();
+    const deadline = seat.repeat_next_at;
+    try std.testing.expect(deadline > @as(i64, seat.nowMs()));
+    seat.onRepeatTick();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.kbd_events.keys);
+    try std.testing.expectEqual(deadline, seat.repeat_next_at);
+
+    // Past the deadline: exactly one repeat, and the deadline advances
+    // by the interval (40ms at rate 25) so an immediate re-tick is
+    // silent — the same invariant main.zig's remaining-time re-arm keeps
+    // (S7).
+    seat.repeat_next_at = deadline - 1000;
+    seat.onRepeatTick();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.kbd_events.keys);
+    try std.testing.expect(seat.repeat_next_at > deadline - 1000);
+    try std.testing.expect(seat.repeat_next_at > @as(i64, seat.nowMs()));
+    seat.onRepeatTick();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.kbd_events.keys);
+}
+
 test "keyboard enter is followed by a modifiers event" {
     const allocator = std.testing.allocator;
     const ts = TestServer.init(allocator) catch |err| {
@@ -2054,8 +2357,12 @@ test "keymap change re-broadcasts to all clients (F10)" {
     try std.testing.expectEqual(modifiers_before + 1, a.kbd_events.modifiers);
     try std.testing.expectEqual(@as(u32, 0), a.kbd_events.mods_group);
     // repeat_info was advertised at bind (F4: configurable rate/delay).
+    // The v10 test client is told rate 0 — the compositor owns repeats
+    // and delivers them with the v10 "repeated" state (S1); the delay
+    // still carries the real value.
     try std.testing.expectEqual(@as(usize, 1), a.kbd_events.repeat_info);
-    try std.testing.expectEqual(seat.key_repeat_rate, a.kbd_events.repeat_rate);
+    try std.testing.expectEqual(@as(i32, 0), a.kbd_events.repeat_rate);
+    try std.testing.expectEqual(@as(i32, 600), a.kbd_events.repeat_delay);
 }
 
 test "seat teardown sends leave to the focused client (F11)" {

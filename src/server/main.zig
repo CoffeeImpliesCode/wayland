@@ -1971,8 +1971,9 @@ fn onSeatKey(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.S
     }
 }
 
-/// One-shot repeat timer tick: emit the held key's repeat + re-arm at the
-/// seat's interval while the key is held; otherwise stay dead.
+/// One-shot repeat timer tick: emit the held key's repeat + re-arm at
+/// the seat's repeat deadline (the remaining time to it) while the key
+/// is held; otherwise stay dead.
 fn onRepeatTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
     if (!self.seat.repeatActive()) {
@@ -1980,7 +1981,18 @@ fn onRepeatTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
         return;
     }
     self.seat.onRepeatTick();
-    loop.setTimer(self.repeat_timer.?, .{ .duration = zio.Duration.fromMilliseconds(self.seat.repeatIntervalMs()) });
+    // Re-arm against the seat's actual repeat deadline, not a fixed
+    // interval (S7): a marginally-early tick must not skip the emission
+    // AND advance the deadline by a full interval. After an emission the
+    // deadline is in the future (advanced inside onRepeatTick), so the
+    // remaining time is positive; an early tick re-arms for the exact
+    // remaining time instead. Clamped to [1, interval] so the timer
+    // never spins on a 0-duration arm. Both clocks are CLOCK_MONOTONIC
+    // ms (the seat's nowMs is the same source).
+    const remaining: i64 = self.seat.repeatNextAt() - @as(i64, self.seat.nowMs());
+    const interval: i64 = @intCast(self.seat.repeatIntervalMs());
+    const arm_ms: u32 = @intCast(@max(@as(i64, 1), @min(interval, remaining)));
+    loop.setTimer(self.repeat_timer.?, .{ .duration = zio.Duration.fromMilliseconds(arm_ms) });
 }
 
 /// M4 camera drag: the left button press anchors a pan gesture; motion
