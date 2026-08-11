@@ -334,6 +334,12 @@ pub const XdgSurface = struct {
     geometry_set: bool = false,
     toplevel: ?*XdgToplevel = null,
     popup: ?*XdgPopup = null,
+    /// xdg_popup objects created on top of this xdg_surface, in creation
+    /// order (X04a): the "has popups on top" check for xdg_popup.grab /
+    /// xdg_popup.destroy reads this list (wlroots popup->base->popups).
+    /// Only xdg-parented popups are tracked; layer-parented popups
+    /// (layer_parent, L1) are not, until F2 owns layer-popup stacking.
+    popups: std.ArrayList(*XdgPopup) = .empty,
     events: struct {
         destroy: wire.Signal(*XdgSurface),
         /// A configure event was just sent on this xdg_surface; the serial
@@ -371,6 +377,15 @@ pub const XdgSurface = struct {
         xdg.configured = false;
         xdg.acked_serial = null;
         xdg.sent_serials.clearRetainingCapacity();
+        // X06: the sent payload lists die with the map (wlroots destroys
+        // the whole configure list in reset_xdg_surface): a stale payload
+        // must never be matchable by a future ack, even if serials wrap.
+        // Clear-not-deinit is correct: the destroy paths deinit right
+        // after, and remap cycles avoid re-allocation. The role is still
+        // attached on the unmap paths; on the destroy paths it has been
+        // detached already and the deinit covers the payload list.
+        if (xdg.toplevel) |t| t.sent_payloads.clearRetainingCapacity();
+        if (xdg.popup) |p| p.sent_payloads.clearRetainingCapacity();
     }
 
     /// Handle xdg_surface.ack_configure. The serial must have been sent
@@ -508,12 +523,12 @@ fn xdgSurfaceGetToplevel(xdg: *XdgSurface, id: u32) void {
     // the default set at role creation, create_xdg_toplevel:299-309); the
     // configure() gate on the client version decides whether it is sent.
     if (res.getVersion() >= 5) {
-        t.scheduled.wm_capabilities = .{
+        t.setWmCapabilities(.{
             .window_menu = true,
             .maximize = true,
             .fullscreen = true,
             .minimize = true,
-        };
+        });
     }
     xdg.toplevel = t;
     xdg.role = .toplevel;
@@ -593,6 +608,20 @@ fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
         res.destroy();
         return;
     };
+    // X04a: track the popup as a child of its parent xdg_surface; the
+    // topmost check for grab/destroy reads the parent's child list. A
+    // null parent (bare xdg_surface) and layer parents are not tracked.
+    if (popup.parent) |parent_xdg| {
+        parent_xdg.popups.append(parent_xdg.allocator, popup) catch {
+            // Roll back the shell-list entry (the popup is its last item).
+            _ = shell.popups.swapRemove(shell.popups.items.len - 1);
+            xdg.resource.postNoMemory();
+            xdg.popup = null;
+            xdg.role = .none;
+            res.destroy();
+            return;
+        };
+    }
     shell.events.new_popup.emit(popup);
     log.info("new xdg_popup on wl_surface {*} at ({d},{d}) {d}x{d}", xdg.io, xdg.log_cfg, log_tag, .{
         xdg.surface,
@@ -620,6 +649,15 @@ fn xdgSurfaceDestroy(res: *server.xdg.Surface, xdg: *XdgSurface) void {
         wm_state.surfaces.deinit(shell.allocator);
         shell.allocator.destroy(wm_state);
     }
+    // X04a: detach child popups while this surface is still alive — they
+    // reference it as their parent, and a later popupDestroy of a child
+    // must never dereference freed memory (client teardown destroys
+    // ancestors first, in object-id order). Mirror of the toplevel child
+    // detach in toplevelDestroy.
+    for (xdg.popups.items) |child| {
+        child.parent = null;
+    }
+    xdg.popups.clearRetainingCapacity();
     // Destroy role objects first: their destroy handlers detach from `xdg`.
     if (xdg.toplevel) |t| t.resource.destroy();
     if (xdg.popup) |p| p.resource.destroy();
@@ -633,6 +671,7 @@ fn xdgSurfaceDestroy(res: *server.xdg.Surface, xdg: *XdgSurface) void {
     xdg.unmapSurface();
     xdg.events.destroy.emit(xdg);
     xdg.sent_serials.deinit(shell.allocator);
+    xdg.popups.deinit(shell.allocator);
     shell.allocator.destroy(xdg);
 }
 
@@ -648,15 +687,6 @@ pub const WmCapabilities = struct {
     maximize: bool = false,
     fullscreen: bool = false,
     minimize: bool = false,
-
-    pub fn isEmpty(c: WmCapabilities) bool {
-        return !c.window_menu and !c.maximize and !c.fullscreen and !c.minimize;
-    }
-
-    pub fn eql(a: WmCapabilities, b: WmCapabilities) bool {
-        return a.window_menu == b.window_menu and a.maximize == b.maximize and
-            a.fullscreen == b.fullscreen and a.minimize == b.minimize;
-    }
 
     /// Serialize into the wire array, in enum value order (window_menu=1,
     /// maximize=2, fullscreen=3, minimize=4; at most 4 entries).
@@ -745,16 +775,27 @@ pub const ToplevelState = struct {
     min_size: geom.Size = .{ .w = 0, .h = 0 },
     max_size: geom.Size = .{ .w = 0, .h = 0 },
     /// Recommended window-geometry bounds (xdg_toplevel.configure_bounds,
-    /// since v4); 0 = unknown (equivalent to never sent).
+    /// since v4); written by setConfigureBounds. An explicit 0,0 is legal
+    /// and sent as-is when the bit is armed (X07).
     bounds_width: i32 = 0,
     bounds_height: i32 = 0,
     /// Compositor-advertised wm_capabilities (since v5): which interactive
-    /// requests the compositor supports. Sent on the first configure and
-    /// whenever the set changes; empty = never announced.
+    /// requests the compositor supports. Written by setWmCapabilities; an
+    /// empty set is legal and announced as a zero-length array (X07).
     wm_capabilities: WmCapabilities = .{},
     /// Client requested minimization (xdg_toplevel.set_minimized). Not a
     /// wire state; recorded for the compositor's minimize policy.
     minimized: bool = false,
+};
+
+/// Which optional per-configure payloads the compositor asked for on the
+/// NEXT configure (X07): configure_bounds and wm_capabilities are sent
+/// only when the corresponding bit is armed (via setConfigureBounds /
+/// setWmCapabilities), and each bit clears after its send (wlroots
+/// configure->fields, wlr_xdg_toplevel.c:36-63).
+const ConfigureFields = packed struct {
+    configure_bounds: bool = false,
+    wm_capabilities: bool = false,
 };
 
 /// Payload of the XdgToplevel request_resize signal: the seat whose
@@ -800,15 +841,10 @@ pub const XdgToplevel = struct {
     /// parent destruction/unmap can reparent or clear the children's
     /// pointers (no dangling references).
     children: std.ArrayList(*XdgToplevel) = .empty,
-    /// Whether wm_capabilities has been sent at least once (the protocol
-    /// requires it before the first xdg_surface.configure).
-    wm_capabilities_sent: bool = false,
-    /// The last wm_capabilities set announced; a changed set is re-sent
-    /// before the next configure.
-    last_wm_capabilities: WmCapabilities = .{},
-    /// The last configure_bounds announced; a change is re-sent before
-    /// the next configure.
-    sent_bounds: geom.Size = .{ .w = 0, .h = 0 },
+    /// Per-payload request bits for the NEXT configure (X07): armed by
+    /// setConfigureBounds / setWmCapabilities, consumed (and cleared) by
+    /// configure().
+    fields: ConfigureFields = .{},
     events: struct {
         /// Client requested an interactive move; the payload carries the
         /// seat + serial the client echoed (F11).
@@ -834,6 +870,26 @@ pub const XdgToplevel = struct {
         destroy: wire.Signal(*XdgToplevel),
     },
 
+    /// Request configure_bounds (w, h) on the next configure (X07): the
+    /// event is sent only when this bit is armed and the client version is
+    /// >= 4; the bit clears after the send. An explicit 0,0 is legal and
+    /// is sent as-is (wlroots: the compositor requests the payload per
+    /// configure rather than the value changing).
+    pub fn setConfigureBounds(t: *XdgToplevel, w: i32, h: i32) void {
+        t.scheduled.bounds_width = w;
+        t.scheduled.bounds_height = h;
+        t.fields.configure_bounds = true;
+    }
+
+    /// Request a wm_capabilities announcement on the next configure (X07):
+    /// sent only when this bit is armed and the client version is >= 5;
+    /// the bit clears after the send. An empty set is legal and is
+    /// announced as a zero-length array.
+    pub fn setWmCapabilities(t: *XdgToplevel, caps: WmCapabilities) void {
+        t.scheduled.wm_capabilities = caps;
+        t.fields.wm_capabilities = true;
+    }
+
     /// Send a configure event for this toplevel: optional configure_bounds
     /// and wm_capabilities (version-gated, F4), then xdg_toplevel.configure
     /// with the states derived from `scheduled`, then xdg_surface.configure
@@ -843,30 +899,27 @@ pub const XdgToplevel = struct {
         const xdg = t.xdg_surface;
         const serial = xdg.shell.display.nextSerial();
         const version = t.resource.getVersion();
-        // configure_bounds (since v4): sent when the recommended bounds
-        // changed; 0,0 = unknown (equivalent to never sent).
-        if (version >= 4 and (t.scheduled.bounds_width != 0 or t.scheduled.bounds_height != 0) and
-            (t.scheduled.bounds_width != t.sent_bounds.w or t.scheduled.bounds_height != t.sent_bounds.h))
-        {
+        // configure_bounds (since v4): sent when the compositor armed the
+        // bit via setConfigureBounds; the bit clears after the send
+        // (wlroots sends iff configure->fields has the bounds bit,
+        // wlr_xdg_toplevel.c:36-47).
+        if (version >= 4 and t.fields.configure_bounds) {
             t.resource.sendConfigureBounds(t.scheduled.bounds_width, t.scheduled.bounds_height);
-            t.sent_bounds = .{ .w = t.scheduled.bounds_width, .h = t.scheduled.bounds_height };
+            t.fields.configure_bounds = false;
         }
-        // wm_capabilities (since v5): the protocol requires the event
-        // before the first xdg_surface.configure and on every change.
-        const caps = t.scheduled.wm_capabilities;
-        if (version >= 5 and !caps.isEmpty() and
-            (!t.wm_capabilities_sent or !caps.eql(t.last_wm_capabilities)))
-        {
+        // wm_capabilities (since v5): sent when armed via
+        // setWmCapabilities, including an empty set; the bit clears after
+        // the send (wlroots wlr_xdg_toplevel.c:44-63).
+        if (version >= 5 and t.fields.wm_capabilities) {
             var cap_buf: [4]u32 = undefined;
-            const cap_values = caps.toArray(&cap_buf);
+            const cap_values = t.scheduled.wm_capabilities.toArray(&cap_buf);
             var cap_array: server.wl.Array = .{
                 .size = cap_values.len * @sizeOf(u32),
                 .alloc = cap_buf.len * @sizeOf(u32),
                 .data = &cap_buf,
             };
             t.resource.sendWmCapabilities(&cap_array);
-            t.wm_capabilities_sent = true;
-            t.last_wm_capabilities = caps;
+            t.fields.wm_capabilities = false;
         }
         var buf: [13]u32 = undefined;
         const states = stateValues(&t.scheduled, &buf, version);
@@ -1179,7 +1232,7 @@ fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Tople
 /// invalid; the parent's unmap reparents children (see resetOnUnmap).
 fn setToplevelParent(t: *XdgToplevel, toplevel_res: *server.xdg.Toplevel, parent: ?*server.xdg.Toplevel) void {
     // Resolve the requested parent to its XdgToplevel, if any.
-    const new_parent: ?*XdgToplevel = if (parent) |res|
+    var new_parent: ?*XdgToplevel = if (parent) |res|
         @ptrCast(@alignCast(res.getUserData()))
     else
         null;
@@ -1200,6 +1253,13 @@ fn setToplevelParent(t: *XdgToplevel, toplevel_res: *server.xdg.Toplevel, parent
             }
             cursor = c.parent;
         }
+    }
+    // X03: an unmapped toplevel cannot be a parent (wlroots
+    // wlr_xdg_toplevel.c:193-199 installs the parent only when it is
+    // mapped). The map state is read once at set_parent time; a later
+    // map of the parent requires a fresh set_parent request.
+    if (new_parent != null and !new_parent.?.xdg_surface.surface.mapped) {
+        new_parent = null;
     }
     // Drop the old link before installing the new one.
     if (t.parent) |old| {
@@ -1353,17 +1413,46 @@ pub const XdgPopup = struct {
 fn popupRequest(popup_res: *server.xdg.Popup, request: server.xdg.Popup.Request, popup: *XdgPopup) void {
     _ = popup_res;
     switch (request) {
-        // Destructor: libwayland does not auto-destroy; we do (runs popupDestroy).
-        .destroy => popup.resource.destroy(),
-        // F2 (popup grabs) is STRUCTURAL (needs seat grabs + popup
-        // stacking); tracked in notes/133.
-        .grab => log.debug(
-            "xdg_popup.grab ignored (popup grabs are F2, structural)",
-            popup.io,
-            popup.log_cfg,
-            log_tag,
-            .{},
-        ),
+        // X04a: destroying a non-topmost popup is an error (wlroots
+        // xdg_popup_handle_destroy, wlr_xdg_popup.c:351-355): popups
+        // created on top of this one must be destroyed first, deepest
+        // first. The check reads this surface's child list.
+        .destroy => {
+            if (popup.xdg_surface.popups.items.len != 0) {
+                popup.xdg_surface.wm_base.res.postError(
+                    .not_the_topmost_popup,
+                    "xdg_popup was not created on the topmost popup",
+                );
+                return;
+            }
+            // Destructor: libwayland does not auto-destroy; we do (runs popupDestroy).
+            popup.resource.destroy();
+        },
+        // X04a: the grab error surface (wlroots xdg_popup_handle_grab,
+        // wlr_xdg_popup.c:288-301): a mapped popup cannot grab
+        // (invalid_grab on the popup) and a non-topmost popup cannot grab
+        // (not_the_topmost_popup on the wm_base). The real seat-grab
+        // machinery is F2 (tracked in notes/133).
+        .grab => {
+            if (popup.xdg_surface.surface.mapped) {
+                popup.resource.postError(.invalid_grab, "xdg_popup is already mapped");
+                return;
+            }
+            if (popup.xdg_surface.popups.items.len != 0) {
+                popup.xdg_surface.wm_base.res.postError(
+                    .not_the_topmost_popup,
+                    "xdg_popup was not created on the topmost popup",
+                );
+                return;
+            }
+            log.debug(
+                "xdg_popup.grab ignored (popup grabs are F2, structural)",
+                popup.io,
+                popup.log_cfg,
+                log_tag,
+                .{},
+            );
+        },
         .reposition => |r| {
             // Per the XML, the positioner must be complete; an incomplete
             // one is invalid_positioner on the wm_base (wlroots
@@ -1380,7 +1469,13 @@ fn popupRequest(popup_res: *server.xdg.Popup, request: server.xdg.Popup.Request,
             // into scheduled, then configure; ours is synchronous).
             popup.positioner_rules = positioner.*;
             popup.recomputeGeometry();
-            popup.resource.sendRepositioned(r.token);
+            // X09: repositioned is since v3 (xdg-shell.xml:1398); a
+            // below-v3 binding must never receive it. The request itself
+            // is also v3+, so this is defense-in-depth (load-bearing once
+            // the X05 reactive-reconfigure path reaches this handler).
+            if (popup.resource.getVersion() >= 3) {
+                popup.resource.sendRepositioned(r.token);
+            }
             popup.configure() catch popup.resource.postNoMemory();
         },
     }
@@ -1391,6 +1486,13 @@ fn popupDestroy(popup_res: *server.xdg.Popup, popup: *XdgPopup) void {
     const shell = popup.xdg_surface.shell;
     if (std.mem.findScalar(*XdgPopup, shell.popups.items, popup)) |i| {
         _ = shell.popups.swapRemove(i);
+    }
+    // X04a: detach from the parent's child list (swap-remove like the
+    // shell list above); layer-parented popups are not tracked.
+    if (popup.parent) |parent_xdg| {
+        if (std.mem.findScalar(*XdgPopup, parent_xdg.popups.items, popup)) |i| {
+            _ = parent_xdg.popups.swapRemove(i);
+        }
     }
     popup.events.destroy.emit(popup);
     const xdg = popup.xdg_surface;
@@ -2389,10 +2491,10 @@ test "xdg toplevel configure/ack roundtrip" {
     try std.testing.expectEqual(serial1, xdg.acked_serial.?);
 
     // Compositor side: schedule a new size with the maximized state (F6:
-    // policy writes the scheduled state) and announce new bounds (F4).
+    // policy writes the scheduled state) and announce new bounds (F4; the
+    // X07 setter arms the per-configure payload bit).
     t.scheduled.maximized = true;
-    t.scheduled.bounds_width = 1000;
-    t.scheduled.bounds_height = 700;
+    t.setConfigureBounds(1000, 700);
     try t.configure(800, 600);
     try ts.pump();
 
@@ -2403,11 +2505,11 @@ test "xdg toplevel configure/ack roundtrip" {
     try std.testing.expectEqual(@as(u32, 1), tl_events.states[0]); // maximized
     try std.testing.expectEqual(geom.Size{ .w = 800, .h = 600 }, t.configured_size);
     // configure_bounds arrives before this configure (and is not re-sent
-    // for an unchanged value).
+    // unless re-armed: the bit clears after the send).
     try std.testing.expectEqual(@as(usize, 1), tl_events.bounds_count);
     try std.testing.expectEqual(@as(i32, 1000), tl_events.bounds_width);
     try std.testing.expectEqual(@as(i32, 700), tl_events.bounds_height);
-    // wm_capabilities is not re-sent when unchanged.
+    // wm_capabilities is not re-sent when the bit is not re-armed.
     try std.testing.expectEqual(@as(usize, 1), tl_events.caps_count);
     const serial2 = xs_events.serial;
     try std.testing.expect(serial2 != serial1);
@@ -2561,6 +2663,15 @@ test "unmap via null buffer resets the configure state machine" {
     try std.testing.expect(srv.surface.mapped);
     try std.testing.expect(srv.configured);
 
+    // Two further configures (neither acked): the sent payloads survive
+    // until the unmap resets them (X06).
+    const t = ts.shell.?.toplevels.items[0];
+    try t.configure(0, 0);
+    try t.configure(0, 0);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), t.sent_payloads.items.len);
+    try std.testing.expectEqual(@as(usize, 2), srv.sent_serials.items.len);
+
     // Unmap via NULL buffer: the configure state machine resets.
     wl_surface.attach(null, 0, 0);
     wl_surface.commit();
@@ -2569,11 +2680,14 @@ test "unmap via null buffer resets the configure state machine" {
     try std.testing.expect(!srv.configured);
     try std.testing.expect(!srv.configure_sent);
     try std.testing.expect(srv.acked_serial == null);
+    // X06: the sent payload lists are cleared with the reset.
+    try std.testing.expectEqual(@as(usize, 0), t.sent_payloads.items.len);
+    try std.testing.expectEqual(@as(usize, 0), srv.sent_serials.items.len);
 
     // Re-map requires a fresh configure: a buffer-less commit first...
     wl_surface.commit();
     try ts.pump();
-    try std.testing.expectEqual(@as(usize, 2), xs_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 4), xs_events.configure_count);
     const serial2 = xs_events.serial;
     try std.testing.expect(serial2 != serial1);
     xdg_surface.ackConfigure(serial2);
@@ -3217,15 +3331,57 @@ test "wm_capabilities and configure_bounds version gating (F4)" {
     // First configure: no wm_capabilities at v4.
     try std.testing.expectEqual(@as(usize, 1), tl_events.configure_count);
     try std.testing.expectEqual(@as(usize, 0), tl_events.caps_count);
-    // configure_bounds still works at v4.
+    // configure_bounds still works at v4 (the X07 setter arms the bit).
     const t = ts.shell.?.toplevels.items[0];
-    t.scheduled.bounds_width = 640;
-    t.scheduled.bounds_height = 480;
+    t.setConfigureBounds(640, 480);
     try t.configure(0, 0);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), tl_events.bounds_count);
     try std.testing.expectEqual(@as(i32, 640), tl_events.bounds_width);
     try std.testing.expectEqual(@as(i32, 480), tl_events.bounds_height);
+}
+
+test "empty wm_capabilities and 0,0 bounds are legal sendable payloads (X07)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const toplevel = try xdg_surface.getToplevel();
+    var tl_events: ToplevelEvents = .{};
+    toplevel.setListener(*ToplevelEvents, ToplevelEvents.listener, &tl_events);
+    try ts.pump();
+
+    // First configure carries the seeded default capabilities (F4).
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), tl_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 1), tl_events.caps_count);
+    try std.testing.expectEqual(@as(usize, 4), tl_events.caps_len);
+
+    // Re-arm: an empty capability set is announced as a zero-length array,
+    // and an explicit 0,0 bounds pair is sent as-is (X07 flag semantics:
+    // the payload is compositor-requested, not value-derived).
+    const t = ts.shell.?.toplevels.items[0];
+    t.setWmCapabilities(.{});
+    t.setConfigureBounds(0, 0);
+    try t.configure(0, 0);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), tl_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 2), tl_events.caps_count);
+    try std.testing.expectEqual(@as(usize, 0), tl_events.caps_len);
+    try std.testing.expectEqual(@as(usize, 1), tl_events.bounds_count);
+    try std.testing.expectEqual(@as(i32, 0), tl_events.bounds_width);
+    try std.testing.expectEqual(@as(i32, 0), tl_events.bounds_height);
+
+    // Re-arm semantics: the bits clear after the send, so a configure
+    // without a fresh setter call emits neither payload again.
+    try t.configure(0, 0);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 3), tl_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 2), tl_events.caps_count);
+    try std.testing.expectEqual(@as(usize, 1), tl_events.bounds_count);
 }
 
 test "role-object destroy before map resets the configure machine (F8)" {
@@ -3253,6 +3409,14 @@ test "role-object destroy before map resets the configure machine (F8)" {
     const srv = ts.shell.?.toplevels.items[0].xdg_surface;
     try std.testing.expect(srv.configured);
 
+    // A fresh configure that is never acked: its payload must not survive
+    // the role destroy (X06).
+    const t = ts.shell.?.toplevels.items[0];
+    try t.configure(0, 0);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), t.sent_payloads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), srv.sent_serials.items.len);
+
     // Destroy the role object while the surface is unmapped: the configure
     // state machine must reset (F8) — the old acked state must not survive
     // into the next role.
@@ -3267,6 +3431,9 @@ test "role-object destroy before map resets the configure machine (F8)" {
     // without the F8 reset).
     _ = try xdg_surface.getToplevel();
     try ts.pump();
+    // X06: the fresh role starts with no stale configure payloads (the
+    // destroyed role's payload list was emptied before its deinit).
+    try std.testing.expectEqual(@as(usize, 0), ts.shell.?.toplevels.items[0].sent_payloads.items.len);
     const buffer = try ts.createBuffer();
     wl_surface.attach(buffer, 0, 0);
     wl_surface.commit();
@@ -3567,13 +3734,35 @@ test "set_parent stores the parent and rejects descendant cycles (F16)" {
         defer ts.deinit();
         const wl_surface_a = try ts.wl_compositor.?.createSurface();
         const xdg_surface_a = try ts.wm_base.?.getXdgSurface(wl_surface_a);
+        var xs_events_a: XdgSurfaceEvents = .{};
+        xdg_surface_a.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events_a);
         const a = try xdg_surface_a.getToplevel();
         const wl_surface_b = try ts.wl_compositor.?.createSurface();
         const xdg_surface_b = try ts.wm_base.?.getXdgSurface(wl_surface_b);
+        var xs_events_b: XdgSurfaceEvents = .{};
+        xdg_surface_b.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events_b);
         const b = try xdg_surface_b.getToplevel();
         try ts.pump();
         const t_a = ts.shell.?.toplevels.items[0];
         const t_b = ts.shell.?.toplevels.items[1];
+
+        // X03: the parent link installs only when the parent is mapped —
+        // map A and B (commit -> configure, ack, attach buffer, commit).
+        const buffer = try ts.createBuffer();
+        wl_surface_a.commit();
+        try ts.pump();
+        xdg_surface_a.ackConfigure(xs_events_a.serial);
+        wl_surface_a.attach(buffer, 0, 0);
+        wl_surface_a.commit();
+        try ts.pump();
+        wl_surface_b.commit();
+        try ts.pump();
+        xdg_surface_b.ackConfigure(xs_events_b.serial);
+        wl_surface_b.attach(buffer, 0, 0);
+        wl_surface_b.commit();
+        try ts.pump();
+        try std.testing.expect(t_a.xdg_surface.surface.mapped);
+        try std.testing.expect(t_b.xdg_surface.surface.mapped);
 
         // A.parent = B: stored and exposed; B tracks A as a child.
         a.setParent(b);
@@ -3597,16 +3786,45 @@ test "set_parent stores the parent and rejects descendant cycles (F16)" {
         defer ts.deinit();
         const wl_surface_a = try ts.wl_compositor.?.createSurface();
         const xdg_surface_a = try ts.wm_base.?.getXdgSurface(wl_surface_a);
+        var xs_events_a: XdgSurfaceEvents = .{};
+        xdg_surface_a.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events_a);
         const a = try xdg_surface_a.getToplevel();
         const wl_surface_b = try ts.wl_compositor.?.createSurface();
         const xdg_surface_b = try ts.wm_base.?.getXdgSurface(wl_surface_b);
+        var xs_events_b: XdgSurfaceEvents = .{};
+        xdg_surface_b.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events_b);
         const b = try xdg_surface_b.getToplevel();
         const wl_surface_c = try ts.wl_compositor.?.createSurface();
         const xdg_surface_c = try ts.wm_base.?.getXdgSurface(wl_surface_c);
+        var xs_events_c: XdgSurfaceEvents = .{};
+        xdg_surface_c.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events_c);
         const c = try xdg_surface_c.getToplevel();
         try ts.pump();
         const t_a = ts.shell.?.toplevels.items[0];
         const t_c = ts.shell.?.toplevels.items[2];
+
+        // Map A, B and C (X03: the parent must be mapped to install).
+        const buffer = try ts.createBuffer();
+        wl_surface_a.commit();
+        try ts.pump();
+        xdg_surface_a.ackConfigure(xs_events_a.serial);
+        wl_surface_a.attach(buffer, 0, 0);
+        wl_surface_a.commit();
+        try ts.pump();
+        wl_surface_b.commit();
+        try ts.pump();
+        xdg_surface_b.ackConfigure(xs_events_b.serial);
+        wl_surface_b.attach(buffer, 0, 0);
+        wl_surface_b.commit();
+        try ts.pump();
+        wl_surface_c.commit();
+        try ts.pump();
+        xdg_surface_c.ackConfigure(xs_events_c.serial);
+        wl_surface_c.attach(buffer, 0, 0);
+        wl_surface_c.commit();
+        try ts.pump();
+        try std.testing.expect(t_a.xdg_surface.surface.mapped);
+        try std.testing.expect(t_c.xdg_surface.surface.mapped);
 
         a.setParent(b);
         c.setParent(a);
@@ -3619,6 +3837,218 @@ test "set_parent stores the parent and rejects descendant cycles (F16)" {
         const err = protocolError(ts);
         try std.testing.expectEqual(@as(c_int, 1), err.code); // invalid_parent
         try std.testing.expectEqualStrings("xdg_toplevel", err.interface);
+    }
+}
+
+test "set_parent to an unmapped toplevel clears the parent (X03)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface_a = try ts.wl_compositor.?.createSurface();
+    const xdg_surface_a = try ts.wm_base.?.getXdgSurface(wl_surface_a);
+    var xs_events_a: XdgSurfaceEvents = .{};
+    xdg_surface_a.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events_a);
+    const a = try xdg_surface_a.getToplevel();
+    const wl_surface_b = try ts.wl_compositor.?.createSurface();
+    const xdg_surface_b = try ts.wm_base.?.getXdgSurface(wl_surface_b);
+    var xs_events_b: XdgSurfaceEvents = .{};
+    xdg_surface_b.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events_b);
+    const b = try xdg_surface_b.getToplevel();
+    try ts.pump();
+    const t_a = ts.shell.?.toplevels.items[0];
+    const t_b = ts.shell.?.toplevels.items[1];
+
+    // Neither toplevel is mapped: the parent link is not installed (the
+    // request is treated as null, wlroots wlr_xdg_toplevel.c:193-199).
+    a.setParent(b);
+    try ts.pump();
+    try std.testing.expect(t_a.parent == null);
+    try std.testing.expect(t_b.children.items.len == 0);
+
+    // Map B, then re-issue set_parent: the link installs.
+    const buffer = try ts.createBuffer();
+    wl_surface_b.commit();
+    try ts.pump();
+    xdg_surface_b.ackConfigure(xs_events_b.serial);
+    wl_surface_b.attach(buffer, 0, 0);
+    wl_surface_b.commit();
+    try ts.pump();
+    try std.testing.expect(t_b.xdg_surface.surface.mapped);
+
+    a.setParent(b);
+    try ts.pump();
+    try std.testing.expect(t_a.parent == t_b);
+    try std.testing.expect(t_b.children.items.len == 1);
+    try std.testing.expect(t_b.children.items[0] == t_a);
+}
+
+test "grab on a mapped popup posts invalid_grab (X04a)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // Map the parent toplevel first.
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    var parent_xs_events: XdgSurfaceEvents = .{};
+    parent_xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &parent_xs_events);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+    parent_wl_surface.commit();
+    try ts.pump();
+    parent_xdg_surface.ackConfigure(parent_xs_events.serial);
+
+    // Create the popup and map it.
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    positioner.destroy();
+    try ts.pump();
+
+    // The shared test buffer: created AFTER the popup surface so the
+    // server-side teardown (a protocol error destroys the client's
+    // resources in creation order) kills the popup's wl_surface before
+    // the wl_buffer resource. Otherwise the F42 buffer-death listener
+    // clears the popup's current slot first and the untracked wrapper is
+    // orphaned (ShmBufferData + Buffer leak).
+    const buffer = try ts.createBuffer();
+    parent_wl_surface.attach(buffer, 0, 0);
+    parent_wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(ts.shell.?.toplevels.items[0].xdg_surface.surface.mapped);
+    wl_surface.commit();
+    try ts.pump();
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    const p = ts.shell.?.popups.items[0];
+    try std.testing.expect(p.xdg_surface.surface.mapped);
+
+    // Grab on the mapped popup: invalid_grab (code 0) on the xdg_popup.
+    popup.grab(ts.wl_seat.?, 1);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 0), err.code); // invalid_grab
+    try std.testing.expectEqualStrings("xdg_popup", err.interface);
+}
+
+test "grab on a non-topmost popup posts not_the_topmost_popup (X04a)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+
+    // P1 on the toplevel; P2 on top of P1: P1 is no longer topmost.
+    const wl_surface_p1 = try ts.wl_compositor.?.createSurface();
+    const xdg_surface_p1 = try ts.wm_base.?.getXdgSurface(wl_surface_p1);
+    const popup1 = try xdg_surface_p1.getPopup(parent_xdg_surface, positioner);
+    const wl_surface_p2 = try ts.wl_compositor.?.createSurface();
+    const xdg_surface_p2 = try ts.wm_base.?.getXdgSurface(wl_surface_p2);
+    const popup2 = try xdg_surface_p2.getPopup(xdg_surface_p1, positioner);
+    _ = popup2;
+    positioner.destroy();
+    try ts.pump();
+
+    // P2 is tracked as a child of P1's xdg_surface.
+    const p1 = ts.shell.?.popups.items[0];
+    const p2 = ts.shell.?.popups.items[1];
+    try std.testing.expectEqual(@as(usize, 1), p1.xdg_surface.popups.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p2.xdg_surface.popups.items.len);
+
+    // Grab on the non-topmost, unmapped P1: not_the_topmost_popup (code 2)
+    // on the xdg_wm_base (not the popup).
+    popup1.grab(ts.wl_seat.?, 1);
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const err = protocolError(ts);
+    try std.testing.expectEqual(@as(c_int, 2), err.code); // not_the_topmost_popup
+    try std.testing.expectEqualStrings("xdg_wm_base", err.interface);
+}
+
+test "destroy of a non-topmost popup posts not_the_topmost_popup (X04a)" {
+    const allocator = std.testing.allocator;
+
+    // Destroying a non-topmost popup is an error on the wm_base.
+    {
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+        const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+        _ = try parent_xdg_surface.getToplevel();
+        try ts.pump();
+        const positioner = try ts.wm_base.?.createPositioner();
+        positioner.setSize(100, 50);
+        positioner.setAnchorRect(10, 20, 200, 100);
+        positioner.setAnchor(.bottom_right);
+        positioner.setGravity(.bottom_right);
+        const wl_surface_p1 = try ts.wl_compositor.?.createSurface();
+        const xdg_surface_p1 = try ts.wm_base.?.getXdgSurface(wl_surface_p1);
+        const popup1 = try xdg_surface_p1.getPopup(parent_xdg_surface, positioner);
+        const wl_surface_p2 = try ts.wl_compositor.?.createSurface();
+        const xdg_surface_p2 = try ts.wm_base.?.getXdgSurface(wl_surface_p2);
+        const popup2 = try xdg_surface_p2.getPopup(xdg_surface_p1, positioner);
+        _ = popup2;
+        positioner.destroy();
+        try ts.pump();
+
+        popup1.destroy();
+        try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+        const err = protocolError(ts);
+        try std.testing.expectEqual(@as(c_int, 2), err.code); // not_the_topmost_popup
+        try std.testing.expectEqualStrings("xdg_wm_base", err.interface);
+    }
+
+    // Destroying the topmost popup succeeds: P2 goes away and P1's child
+    // list empties.
+    {
+        var ts = try TestServer.init(allocator);
+        defer ts.deinit();
+        const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+        const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+        _ = try parent_xdg_surface.getToplevel();
+        try ts.pump();
+        const positioner = try ts.wm_base.?.createPositioner();
+        positioner.setSize(100, 50);
+        positioner.setAnchorRect(10, 20, 200, 100);
+        positioner.setAnchor(.bottom_right);
+        positioner.setGravity(.bottom_right);
+        const wl_surface_p1 = try ts.wl_compositor.?.createSurface();
+        const xdg_surface_p1 = try ts.wm_base.?.getXdgSurface(wl_surface_p1);
+        const popup1 = try xdg_surface_p1.getPopup(parent_xdg_surface, positioner);
+        const wl_surface_p2 = try ts.wl_compositor.?.createSurface();
+        const xdg_surface_p2 = try ts.wm_base.?.getXdgSurface(wl_surface_p2);
+        const popup2 = try xdg_surface_p2.getPopup(xdg_surface_p1, positioner);
+        positioner.destroy();
+        try ts.pump();
+        const p1 = ts.shell.?.popups.items[0];
+
+        popup2.destroy();
+        try ts.pump();
+        try std.testing.expectEqual(@as(usize, 1), ts.shell.?.popups.items.len);
+        try std.testing.expectEqual(@as(usize, 0), p1.xdg_surface.popups.items.len);
+
+        // P1 is topmost again: destroying it succeeds too.
+        popup1.destroy();
+        try ts.pump();
+        try std.testing.expectEqual(@as(usize, 0), ts.shell.?.popups.items.len);
     }
 }
 

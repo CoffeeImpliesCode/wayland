@@ -13,18 +13,23 @@
 //!   after commit posts already_used=0.
 //! - (b) validation at commit: a set serial must have been given to the
 //!   token's client (the seat's per-client serial ring,
-//!   seat.validateEventSerial; wlroots wlr_seat_client_validate_event_serial)
-//!   and a set surface must be the seat's current keyboard- or
-//!   pointer-focused surface — unless the surface was destroyed before
-//!   commit, in which case the constraint is dropped (XA-2, wlroots
+//!   seat.validateEventSerial; wlroots wlr_seat_client_validate_event_serial).
+//!   The surface-focus constraint applies only when a serial was set — a
+//!   set surface must then be the seat's current keyboard- or
+//!   pointer-focused surface (wlroots checks focus only inside
+//!   `if (token->seat != NULL)`, wlr_xdg_activation_v1.c:108-123; A1), and
+//!   a surface destroyed before commit drops the constraint (XA-2, wlroots
 //!   surface-destroy listener). On failure the done() event still fires,
 //!   but with a random token the compositor will never accept, and the
 //!   token is dropped from the activation registry (the client cannot
 //!   distinguish).
 //! - (c) activate() with an unknown token is silently ignored (never an
 //!   error).
-//! - (d) single use: a used token is destroyed (wlroots model); a second
-//!   activate() with the same token is ignored.
+//! - (d) single use: a used token is consumed (wlroots model): the object
+//!   is freed and the creating client's token resource is made inert with
+//!   a no-op handler, so the client's later destroy is a silent no-op
+//!   (wlroots inerts the resource, wlr_xdg_activation_v1.c:104-106; A2); a
+//!   second activate() with the same token is ignored.
 //! - (e) expiry: a 30s one-shot event-loop timer per token (wire loop
 //!   timers, cf. backend/headless.zig re-arming).
 //! - (f) a successfully committed token fires `events.new_token` before
@@ -277,8 +282,10 @@ fn activationRequest(
 }
 
 /// xdg_activation_v1.activate: forward a known token to the compositor.
-/// Unknown tokens are silently ignored; a used token is destroyed after its
-/// single delivery (model decisions (c) and (d)).
+/// Unknown tokens are silently ignored; a used token is consumed after its
+/// single delivery — the creating client's token resource is made inert
+/// (wlroots inerts the resource, wlr_xdg_activation_v1.c:104-106) so the
+/// client's later destroy is a silent no-op (model decisions (c) and (d)).
 fn activationActivate(activation: *XdgActivation, token_str: []const u8, surface_res: *server.wl.Surface) void {
     const token = activation.findToken(token_str) orelse {
         log.debug("activate: unknown token ignored", activation.io, activation.log_cfg, log_tag, .{});
@@ -286,9 +293,16 @@ fn activationActivate(activation: *XdgActivation, token_str: []const u8, surface
     };
     // Resolve the wire surface to the compositor's Surface wrapper. A
     // surface the compositor no longer knows is treated like an unknown
-    // token (the client cannot legitimately produce one).
+    // token (the client cannot legitimately produce one); the token is
+    // consumed here too (inert + free, same as the delivery path).
     const surface = surfaceForResource(activation, surface_res) orelse {
-        if (token.resource) |res| res.destroy() else destroyToken(token);
+        if (token.resource) |res| {
+            // Inert with a live no-op handler before freeing the struct: a
+            // null dispatcher would make libwayland abort the compositor on
+            // the client's next request (wayland-server.c wl_closure_invoke).
+            res.setHandler(?*ActivationToken, deadTokenHandler, null, null);
+        }
+        destroyToken(token);
         return;
     };
     var req: ActivateRequest = .{
@@ -296,8 +310,17 @@ fn activationActivate(activation: *XdgActivation, token_str: []const u8, surface
         .surface = surface,
     };
     activation.events.request_activate.emit(&req);
-    // Single use: the token is destroyed after the delivery (wlroots model).
-    if (token.resource) |res| res.destroy() else destroyToken(token);
+    // Single use: the token is consumed after the delivery (wlroots model).
+    // Inert the creating client's resource BEFORE freeing the object — with
+    // a live no-op handler, not a null dispatcher (a null dispatcher makes
+    // libwayland abort the compositor on the client's next request,
+    // wayland-server.c wl_closure_invoke; the live handler keeps the
+    // client's later destroy a silent destroy of the wire resource) — then
+    // destroyToken (registry unlink, timer cancel, free).
+    if (token.resource) |res| {
+        res.setHandler(?*ActivationToken, deadTokenHandler, null, null);
+    }
+    destroyToken(token);
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +375,29 @@ fn onTokenSurfaceDestroy(listener: *wire.Listener(*surface_mod.Surface), surface
     const token: *ActivationToken = @fieldParentPtr("surface_listener", listener);
     token.surface_listener.link.remove();
     token.surface = null;
+}
+
+/// Request handler for inerted (consumed) activation tokens: the
+/// ActivationToken struct is freed, so nothing is dereferenced — every
+/// request is a silent no-op (wlroots inerts the resource on activate,
+/// wlr_xdg_activation_v1.c:104-106). The destroy callback is null, so
+/// client teardown cannot call into the freed struct; the client's own
+/// destroy destroys the wire resource (libwayland dispatches the
+/// destructor like any other request — a NULL dispatcher would abort the
+/// compositor, wayland-server.c wl_closure_invoke).
+fn deadTokenHandler(
+    token_res: *server.xdg.ActivationTokenV1,
+    request: server.xdg.ActivationTokenV1.Request,
+    data: ?*ActivationToken,
+) void {
+    _ = data;
+    switch (request) {
+        .destroy => token_res.destroy(),
+        .set_serial => {},
+        .set_app_id => {},
+        .set_surface => {},
+        .commit => {},
+    }
 }
 
 fn tokenRequest(
@@ -420,9 +466,11 @@ fn tokenRequest(
 }
 
 /// Free a token: unlink from the registry, detach the surface listener,
-/// cancel the timer, free owned strings and the object. Only valid when the
+/// cancel the timer, free owned strings and the object. Valid when the
 /// wire resource is already destroyed (internal tokens, invoked from the
-/// resource destroy handler) or absent (external tokens).
+/// resource destroy handler), absent (external tokens), or made inert
+/// first (activate(), A2 — the live-but-inert resource keeps the client's
+/// later destroy a silent no-op).
 fn destroyToken(token: *ActivationToken) void {
     const activation = token.activation;
     if (std.mem.findScalar(*ActivationToken, activation.tokens.items, token)) |i| {
@@ -487,20 +535,22 @@ fn tokenCommit(token: *ActivationToken) void {
 
 /// Model decision (b): a set serial must have been given to the token's
 /// client (the seat's per-client serial ring, seat.validateEventSerial —
-/// wlroots wlr_seat_client_validate_event_serial), and a set surface must
-/// be the seat's current keyboard- or pointer-focused surface. A surface
-/// destroyed before commit drops the constraint (XA-2, wlroots XA:202-208,
-/// XA:109-114).
+/// wlroots wlr_seat_client_validate_event_serial). The surface-focus
+/// constraint applies ONLY when a serial was set: wlroots checks focus
+/// only inside `if (token->seat != NULL)` (wlr_xdg_activation_v1.c:
+/// 108-123), so a launcher binding a surface without a serial still
+/// activates (A1). A surface destroyed before commit drops the constraint
+/// (XA-2, wlroots XA:202-208, XA:109-114).
 fn tokenValid(token: *ActivationToken) bool {
-    const activation = token.activation;
     if (token.serial) |serial| {
         // The seat is the one from set_serial's seat argument (XA-5).
         const seat = token.seat orelse return false;
         if (!seat.validateEventSerial(token.resource.?.getClient(), serial)) return false;
-    }
-    if (token.surface) |surface| {
-        const seat = activation.seat;
-        if (seat.keyboard_focus != surface and seat.pointer_focus != surface) return false;
+        // Focus gate (A1): only a serial-bearing token must name the seat's
+        // current keyboard- or pointer-focused surface.
+        if (token.surface) |surface| {
+            if (seat.keyboard_focus != surface and seat.pointer_focus != surface) return false;
+        }
     }
     return true;
 }
@@ -778,6 +828,40 @@ test "activation token commit -> done -> activate fires once" {
     try std.testing.expectEqual(@as(usize, 0), ts.activation.?.tokens.items.len);
 }
 
+test "activation activate inerts the token resource; client destroy is a no-op (A2)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var capture: ActivateCapture = .{
+        .listener = wire.Listener(*ActivateRequest).init(ActivateCapture.notify),
+    };
+    ts.activation.?.events.request_activate.add(&capture.listener);
+
+    const surface = try ts.wl_compositor.?.createSurface();
+    var token_events: TokenEvents = .{};
+    const token = try ts.activation_client.?.getActivationToken();
+    token.setListener(*TokenEvents, TokenEvents.listener, &token_events);
+
+    token.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ts.activation.?.tokens.items.len);
+
+    // activate consumes the token: request_activate fires once and the
+    // token leaves the registry (single-use preserved).
+    ts.activation_client.?.activate(@ptrCast(&token_events.token), surface);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(usize, 0), ts.activation.?.tokens.items.len);
+
+    // The creating client can still destroy its token resource: activate
+    // inerted it with a no-op handler (wlroots parity, A2), so the destroy
+    // is a silent no-op — the pump SUCCEEDS with no abort, no protocol
+    // error, and the connection stays healthy.
+    token.destroy();
+    try ts.pump();
+}
+
 test "activation bogus serial -> invalid done token, activate ignored" {
     const allocator = std.testing.allocator;
     var ts = try TestServer.init(allocator);
@@ -810,6 +894,49 @@ test "activation bogus serial -> invalid done token, activate ignored" {
     ts.activation_client.?.activate(@ptrCast(&token_events.token), surface);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 0), capture.count);
+}
+
+test "activation set_surface without set_serial is valid and activates (A1)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var capture: ActivateCapture = .{
+        .listener = wire.Listener(*ActivateRequest).init(ActivateCapture.notify),
+    };
+    ts.activation.?.events.request_activate.add(&capture.listener);
+    var new_capture: NewTokenCapture = .{
+        .listener = wire.Listener(*ActivationToken).init(NewTokenCapture.notify),
+    };
+    ts.activation.?.events.new_token.add(&new_capture.listener);
+
+    // The bound surface is NOT the seat's focus (nothing is focused).
+    const surface = try ts.wl_compositor.?.createSurface();
+    var token_events: TokenEvents = .{};
+    const token = try ts.activation_client.?.getActivationToken();
+    token.setListener(*TokenEvents, TokenEvents.listener, &token_events);
+
+    // The launcher flow: set_surface with NO set_serial. wlroots checks
+    // focus only inside `if (token->seat != NULL)` (A1), so the token
+    // commits valid, fires new_token, and activates — today the focus check
+    // dropped it.
+    token.setSurface(surface);
+    token.commit();
+    try ts.pump();
+
+    try std.testing.expectEqual(@as(usize, 1), token_events.done_count);
+    try std.testing.expectEqual(@as(usize, 32), std.mem.sliceTo(&token_events.token, 0).len);
+    try std.testing.expectEqual(@as(usize, 1), ts.activation.?.tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 1), new_capture.count);
+
+    const target = try ts.wl_compositor.?.createSurface();
+    ts.activation_client.?.activate(@ptrCast(&token_events.token), target);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings(
+        std.mem.sliceTo(&token_events.token, 0),
+        std.mem.sliceTo(&capture.token, 0),
+    );
 }
 
 test "activation post-commit set_app_id -> already_used" {

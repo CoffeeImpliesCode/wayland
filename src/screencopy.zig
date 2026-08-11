@@ -259,7 +259,11 @@ fn capture(
 ) void {
     const cli = output_resource.getClient();
     const output = sc.output_from_resource(sc.output_ctx, output_resource) orelse {
-        cli.postNoMemory(); // manager path is only reachable via a real output
+        // Foreign wl_output: fail the frame, don't kill the client
+        // (wlroots wlr_screencopy_v1.c:508-511 — output == NULL also
+        // send_failed, never no_memory).
+        const failed = server.zwlr.ScreencopyFrameV1.create(cli, 1, frame_id) catch return;
+        failed.sendFailed();
         return;
     };
 
@@ -755,7 +759,11 @@ const fake_output_impl: Output.Impl = .{
 
 const RegistryCapture = struct {
     shm_name: ?u32 = null,
+    /// First wl_output global: the compositor's owned output.
     output_name: ?u32 = null,
+    /// Second wl_output global: the foreign output (a resource bound to
+    /// it is not owned by the compositor's wl_output module).
+    output_name_foreign: ?u32 = null,
     screencopy_name: ?u32 = null,
 
     fn listener(registry: *client.wl.Registry, event: client.wl.Registry.Event, data: *RegistryCapture) void {
@@ -766,7 +774,13 @@ const RegistryCapture = struct {
                 if (std.mem.eql(u8, name, "wl_shm")) {
                     data.shm_name = g.name;
                 } else if (std.mem.eql(u8, name, "wl_output")) {
-                    data.output_name = g.name;
+                    // Globals are announced in registration order; the
+                    // compositor's output is registered first.
+                    if (data.output_name == null) {
+                        data.output_name = g.name;
+                    } else {
+                        data.output_name_foreign = g.name;
+                    }
                 } else if (std.mem.eql(u8, name, "zwlr_screencopy_manager_v1")) {
                     data.screencopy_name = g.name;
                 }
@@ -826,12 +840,18 @@ const TestServer = struct {
     backend: ?*backend_mod.Backend = null,
     output: ?*Output = null,
     wl_output: ?*wl_output_mod.WlOutput = null,
+    /// A second, foreign output: its wl_output global gives the
+    /// capture-flow tests a resource NOT owned by the compositor's
+    /// wl_output module.
+    output_foreign: ?*Output = null,
+    wl_output_foreign: ?*wl_output_mod.WlOutput = null,
     fb: ?*pixman.Framebuffer = null,
     sc: ?*Screencopy = null,
     client: ?*wire.Client = null,
     c_display: ?*client.wl.Display = null,
     wl_shm: ?*client.wl.Shm = null,
     wl_output_client: ?*client.wl.Output = null,
+    wl_output_foreign_client: ?*client.wl.Output = null,
     screencopy_mgr: ?*client.zwlr.ScreencopyManagerV1 = null,
     /// Lazily-created shm pool + buffer for the copy request; the pool is
     /// retained so the buffer stays valid until the frame is ready.
@@ -893,6 +913,28 @@ const TestServer = struct {
             "test",
             "test output",
         );
+        // The foreign output: never captured, never enabled — it exists
+        // only so a client can hold a wl_output resource the
+        // compositor's wl_output module does not own.
+        ts.output_foreign = try Output.create(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.backend.?,
+            &fake_output_impl,
+            &ts.dummy,
+            .{ .width = 32, .height = 32, .refresh_msec = 16 },
+        );
+        errdefer if (ts.output_foreign) |o| o.destroy();
+        ts.wl_output_foreign = try wl_output_mod.WlOutput.create(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.output_foreign.?,
+            "foreign",
+            "foreign output",
+        );
         ts.fb = try pixman.Framebuffer.create(allocator, 64, 64);
         errdefer if (ts.fb) |fb| fb.deinit();
         ts.sc = try Screencopy.init(
@@ -923,7 +965,9 @@ const TestServer = struct {
         var reg_capture: RegistryCapture = .{};
         registry.setListener(*RegistryCapture, RegistryCapture.listener, &reg_capture);
         try ts.pump();
-        if (reg_capture.shm_name == null or reg_capture.output_name == null or reg_capture.screencopy_name == null) {
+        if (reg_capture.shm_name == null or reg_capture.output_name == null or
+            reg_capture.output_name_foreign == null or reg_capture.screencopy_name == null)
+        {
             return error.GlobalMissing;
         }
 
@@ -933,12 +977,14 @@ const TestServer = struct {
         // listener (libwayland-client aborts on listener-less opcodes).
         ts.wl_shm = try registry.bind(reg_capture.shm_name.?, client.wl.Shm, 1);
         ts.wl_output_client = try registry.bind(reg_capture.output_name.?, client.wl.Output, 1);
+        ts.wl_output_foreign_client = try registry.bind(reg_capture.output_name_foreign.?, client.wl.Output, 1);
         ts.screencopy_mgr = try registry.bind(
             reg_capture.screencopy_name.?,
             client.zwlr.ScreencopyManagerV1,
             manager_version,
         );
         ts.wl_output_client.?.setListener(*u8, ignoreOutputEvents, &ts.output_listener_data);
+        ts.wl_output_foreign_client.?.setListener(*u8, ignoreOutputEvents, &ts.output_listener_data);
         try ts.pump();
 
         // Enable the output: captures of a disabled output fail (wlroots
@@ -959,6 +1005,7 @@ const TestServer = struct {
         // Destroying the output frees the WlOutput via its destroy
         // listener (wl_output.zig onOutputDestroy).
         if (ts.output) |o| o.destroy();
+        if (ts.output_foreign) |o| o.destroy();
         if (ts.backend) |b| b.destroy();
         if (ts.fb) |fb| fb.deinit();
         if (ts.shm) |s| s.deinit();
@@ -1148,6 +1195,34 @@ test "capturing a disabled output fails the frame" {
     try ts.pump();
     try testing.expectEqual(@as(usize, 1), events.failed_count);
     try testing.expectEqual(@as(usize, 0), events.buffer_count);
+}
+
+test "capturing a foreign wl_output fails the frame" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // A wl_output resource bound to the foreign output's global is not
+    // owned by the compositor's wl_output module: the capture must fail
+    // the frame cleanly, not disconnect the client (wlroots
+    // wlr_screencopy_v1.c:508-511 — output == NULL is send_failed, not
+    // no_memory).
+    const frame = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_foreign_client.?);
+    var events: FrameEvents = .{};
+    frame.setListener(*FrameEvents, FrameEvents.listener, &events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.failed_count);
+    try testing.expectEqual(@as(usize, 0), events.buffer_count);
+
+    // The connection survives the failed frame: a subsequent capture
+    // with the owned output round-trips normally (a no_memory/postError
+    // kill would have torn the client down and pump() would fail).
+    const frame2 = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var events2: FrameEvents = .{};
+    frame2.setListener(*FrameEvents, FrameEvents.listener, &events2);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), events2.failed_count);
+    try testing.expectEqual(@as(usize, 1), events2.buffer_count);
 }
 
 test "copy_with_damage sends accumulated damage boxes" {

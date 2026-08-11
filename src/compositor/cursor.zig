@@ -45,6 +45,8 @@ const compositor_mod = @import("compositor.zig");
 const surface_mod = @import("surface.zig");
 const seat_mod = @import("seat.zig");
 
+const client = @import("protocol").client;
+
 const Scene = scene_mod.Scene;
 const SceneNode = scene_mod.SceneNode;
 const Texture = texture_mod.Texture;
@@ -88,6 +90,11 @@ pub const Cursor = struct {
     /// wl_pointer.set_cursor applied since the last update (the seat's
     /// cursor_surface signal): force a re-import on the next update.
     surface_dirty: bool = false,
+    /// The client cursor surface's buffer scale applied at the last
+    /// update (surface.current.scale; 1 when no scaled surface is set).
+    /// update() renders the texture at its LOGICAL size — buffer pixels
+    /// divided by this scale (S6) — and draw() renders the same size.
+    client_scale: i32 = 1,
     /// Seat listener for the cursor_surface signal.
     cursor_surface_listener: wire.Listener(*seat_mod.Seat),
 
@@ -185,9 +192,18 @@ pub const Cursor = struct {
         // changed (a commit): an unchanged buffer's pixels are the same,
         // so the current texture stays exact.
         var surface_texture: ?*Texture = null;
+        var client_scale: i32 = 1;
         if (seat.cursorSurface()) |res| {
             for (self.compositor.surfaces.items) |s| {
                 if (s.resource != res) continue;
+                // S6: the cursor image occupies its LOGICAL footprint —
+                // the buffer size divided by the surface's buffer scale
+                // (the hotspot is in surface-local logical coordinates
+                // too, so it stays unscaled, matching the logical-size
+                // image). current.scale is validated > 0 at
+                // set_buffer_scale (surface.zig:901) and defaults to 1;
+                // guard the division anyway.
+                client_scale = if (s.current.scale > 1) s.current.scale else 1;
                 if (s.buffer) |buf| {
                     if (self.surface_dirty or self.texture_buffer != buf or self.texture == null) {
                         surface_texture = self.importSurfaceTexture(s) orelse null;
@@ -199,6 +215,7 @@ pub const Cursor = struct {
                 break;
             }
         }
+        self.client_scale = client_scale;
         self.surface_dirty = false;
         if (self.texture) |t| {
             if (t != surface_texture) t.destroy();
@@ -208,8 +225,11 @@ pub const Cursor = struct {
             self.texture = tex;
             const node = self.buf_node;
             node.kind.buffer.texture = tex;
-            node.kind.buffer.dst_width = tex.width;
-            node.kind.buffer.dst_height = tex.height;
+            // Logical size: buffer pixels ÷ buffer scale (S6), clamped to
+            // 1 so a tiny buffer cannot produce a 0-size node.
+            const scale: i32 = if (self.client_scale > 1) self.client_scale else 1;
+            node.kind.buffer.dst_width = @max(1, @divTrunc(tex.width, scale));
+            node.kind.buffer.dst_height = @max(1, @divTrunc(tex.height, scale));
             node.x = x - seat.cursor_hotspot_x;
             node.y = y - seat.cursor_hotspot_y;
             node.enable(true);
@@ -249,12 +269,15 @@ pub const Cursor = struct {
         var cursor_items: [1]canvas_mod.CanvasItem = undefined;
         if (self.texture) |tex| {
             const seat = self.seat;
+            // S6: the same logical size as the scene node (buffer pixels
+            // ÷ buffer scale, clamped to 1).
+            const scale: i32 = if (self.client_scale > 1) self.client_scale else 1;
             cursor_items[0] = .{
                 .texture = tex,
                 .world_x = @floatFromInt(seat.pointer_x - seat.cursor_hotspot_x),
                 .world_y = @floatFromInt(seat.pointer_y - seat.cursor_hotspot_y),
-                .world_w = @floatFromInt(tex.width),
-                .world_h = @floatFromInt(tex.height),
+                .world_w = @floatFromInt(@max(1, @divTrunc(tex.width, scale))),
+                .world_h = @floatFromInt(@max(1, @divTrunc(tex.height, scale))),
                 .opacity = 1.0,
             };
         } else {
@@ -365,10 +388,34 @@ fn onSeatCursorSurface(listener: *wire.Listener(*seat_mod.Seat), _: *seat_mod.Se
 }
 
 const testing = std.testing;
+const posix = std.posix;
+
+/// Registry names the S6 wire test needs (wl_compositor + wl_shm).
+const CursorRegistryCapture = struct {
+    compositor_name: ?u32 = null,
+    shm_name: ?u32 = null,
+
+    fn listener(registry: *client.wl.Registry, event: client.wl.Registry.Event, data: *CursorRegistryCapture) void {
+        _ = registry;
+        switch (event) {
+            .global => |g| {
+                const name = std.mem.span(g.interface);
+                if (std.mem.eql(u8, name, "wl_compositor")) {
+                    data.compositor_name = g.name;
+                } else if (std.mem.eql(u8, name, "wl_shm")) {
+                    data.shm_name = g.name;
+                }
+            },
+            .global_remove => {},
+        }
+    }
+};
 
 /// Minimal cursor test server: display + compositor + seat + scene +
-/// renderer + Cursor. No wire clients; the seat's pointer state is
-/// driven directly (pointerMotion / cursorSurface fields).
+/// renderer + Cursor. The fallback tests drive the seat's pointer state
+/// directly (pointerMotion / cursorSurface fields); the S6 wire test
+/// attaches a real client (client + c_display) owned here so deinit can
+/// tear it down FIRST (LIFO), before the modules.
 const TestCursorServer = struct {
     allocator: Allocator,
     io: std.Io,
@@ -379,6 +426,14 @@ const TestCursorServer = struct {
     scene: ?*Scene = null,
     renderer: ?*renderer_mod.Renderer = null,
     cursor: ?*Cursor = null,
+    /// The S6 test's server-side wire client (null in the fallback-only
+    /// tests). Destroyed first in deinit so the resource destroy
+    /// handlers run while the compositor/display modules are alive; a
+    /// client dropped by a protocol error is nulled by pump (the server
+    /// already destroyed it) so deinit never double-destroys (mirrors
+    /// data_device.zig's TestServer).
+    client: ?*wire.Client = null,
+    c_display: ?*client.wl.Display = null,
 
     fn init(allocator: Allocator) !*TestCursorServer {
         const ts = try allocator.create(TestCursorServer);
@@ -406,6 +461,14 @@ const TestCursorServer = struct {
     }
 
     fn deinit(ts: *TestCursorServer) void {
+        // Tear the wire client down FIRST (LIFO): its resource destroy
+        // handlers (Surface.destroy → buffer release) must run while the
+        // compositor and display modules are alive. A client dropped by
+        // a protocol error has its server-side client already destroyed
+        // by the server, so `client` is null and only the client display
+        // is disconnected (mirrors data_device.zig's TestServer deinit).
+        if (ts.c_display) |d| d.disconnect();
+        if (ts.client) |c| c.destroy();
         if (ts.cursor) |c| c.deinit();
         if (ts.renderer) |r| r.destroy();
         if (ts.scene) |s| s.deinit();
@@ -545,4 +608,155 @@ test "client cursor surface without an importable buffer falls back to the rect"
         Rect{ .x = 30, .y = 30, .width = cursor_size, .height = cursor_size },
         fp3.new[0].?,
     );
+}
+
+test "scale-2 client cursor surface renders at its logical size (S6)" {
+    const allocator = testing.allocator;
+    const ts = TestCursorServer.init(allocator) catch |err| {
+        std.debug.print("cursor test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+    const cursor = ts.cursor.?;
+    const seat = ts.seat.?;
+
+    // Real wire client: bind wl_compositor + wl_shm, create a 32x32
+    // opaque-white shm buffer, a surface with buffer_scale 2, attach +
+    // commit. Only this path yields a surface with an importable buffer
+    // (a real wire.shm.Buffer); the compositor registers the surface and
+    // the commit publishes current.scale = 2 + s.buffer.
+    try ts.display.?.initShm();
+    var fds: [2]posix.socket_t = undefined;
+    const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+    // Owned by the harness: deinit destroys the client FIRST (LIFO) so
+    // the resource destroy handlers run while the modules live, and
+    // pump nulls the pointer on a dispatch failure (the server already
+    // destroyed the client — a dangling re-destroy would log libwayland's
+    // "re-entrant client destruction").
+    ts.client = wire.Client.create(ts.display.?.getServer(), fds[0]) orelse return error.ClientCreateFailed;
+    ts.c_display = client.wl.Display.connectToFd(fds[1]) catch return error.ClientConnectFailed;
+
+    const pumpClient = struct {
+        fn pump(ts2: *TestCursorServer) !void {
+            const disp = ts2.c_display.?;
+            if (disp.flush() != .SUCCESS) return error.ClientFlushFailed;
+            try ts2.display.?.getServer().getEventLoop().dispatch(0);
+            ts2.display.?.flushClients();
+            var pfds = [_]posix.pollfd{
+                .{ .fd = disp.getFd(), .events = posix.POLL.IN, .revents = 0 },
+            };
+            if (try posix.poll(&pfds, 0) > 0) {
+                if (disp.dispatch() != .SUCCESS) {
+                    // Protocol error or disconnect: the server has already
+                    // destroyed its client (dangling) — forget it for deinit.
+                    ts2.client = null;
+                    return error.ClientDispatchFailed;
+                }
+            }
+        }
+    }.pump;
+
+    // Round 1: registry + global announcements.
+    const registry = try ts.c_display.?.getRegistry();
+    var capture: CursorRegistryCapture = .{};
+    registry.setListener(*CursorRegistryCapture, CursorRegistryCapture.listener, &capture);
+    try pumpClient(ts);
+    if (capture.compositor_name == null or capture.shm_name == null) return error.GlobalMissing;
+
+    // Round 2: bind wl_compositor + wl_shm, make the 32x32 buffer.
+    const wl_compositor = try registry.bind(capture.compositor_name.?, client.wl.Compositor, 7);
+    const shm = try registry.bind(capture.shm_name.?, client.wl.Shm, 1);
+    const width: i32 = 32;
+    const height: i32 = 32;
+    const fd = try std.posix.memfd_create("cursor-test-buffer", std.os.linux.MFD.CLOEXEC);
+    defer _ = std.os.linux.close(fd);
+    const pool_size = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+    const trc = std.os.linux.ftruncate(fd, @intCast(pool_size));
+    if (std.os.linux.errno(trc) != .SUCCESS) return error.FtruncateFailed;
+    // Fill the pool with opaque white (ARGB8888: every byte 0xFF) so the
+    // rendered footprint is observable in the framebuffer.
+    const pool_map = try std.posix.mmap(
+        null,
+        pool_size,
+        std.posix.PROT{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED },
+        fd,
+        0,
+    );
+    @memset(pool_map, 0xFF);
+    std.posix.munmap(pool_map);
+    const pool = try shm.createPool(fd, @intCast(pool_size));
+    defer pool.destroy();
+    const buffer = try pool.createBuffer(0, width, height, width * 4, .argb8888);
+    defer buffer.destroy();
+
+    // The cursor surface: buffer_scale 2, 32x32 buffer attached + committed.
+    const wl_surface = try wl_compositor.createSurface();
+    wl_surface.setBufferScale(2);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try pumpClient(ts);
+
+    const surface = for (ts.compositor.?.surfaces.items) |s| {
+        if (s.resource.getClient() == ts.client.?) break s;
+    } else unreachable;
+    try testing.expectEqual(@as(i32, 2), surface.current.scale);
+    try testing.expect(surface.buffer != null);
+
+    // set_cursor with hotspot (5, 6) at pointer (30, 40), then update.
+    seat.pointerMotion(30, 40);
+    seat.cursor_surface_resource = surface.resource;
+    seat.cursor_hotspot_x = 5;
+    seat.cursor_hotspot_y = 6;
+    seat.events.cursor_surface.emit(seat);
+    const fp = cursor.update();
+
+    // The texture is imported and the node lands at pointer - hotspot
+    // (the hotspot is logical and the image is logical-sized, S6).
+    try testing.expect(cursor.texture != null);
+    try testing.expect(cursor.buf_node.enabled);
+    try testing.expectEqual(@as(i32, 30 - 5), cursor.buf_node.x);
+    try testing.expectEqual(@as(i32, 40 - 6), cursor.buf_node.y);
+    try testing.expectEqual(@as(i32, 2), cursor.client_scale);
+    // 32x32 buffer at scale 2 renders 16x16 (clamped to >= 1).
+    try testing.expectEqual(@as(i32, 16), cursor.buf_node.kind.buffer.dst_width);
+    try testing.expectEqual(@as(i32, 16), cursor.buf_node.kind.buffer.dst_height);
+    // The update footprint covers the logical 16x16 rect.
+    const expected: Rect = .{ .x = 25, .y = 34, .width = 16, .height = 16 };
+    try testing.expectEqual(expected, fp.new[1].?);
+
+    // The draw path renders the same 16x16 footprint: opaque white over
+    // the red base exactly where the hotspot puts it (world == fb coords
+    // for the identity camera, as the fallback test asserts).
+    const fb = try pixman_mod.Framebuffer.create(allocator, 64, 64);
+    defer fb.deinit();
+    fb.fill(.{ 0, 0, 255, 255 });
+    cursor.draw(fb);
+    const stride: usize = @intCast(fb.stride);
+    const at = struct {
+        fn pixel(f: *pixman_mod.Framebuffer, s: usize, x: usize, y: usize) [4]u8 {
+            return f.data[y * s + x * 4 ..][0..4].*;
+        }
+    }.pixel;
+    // Inside the 16x16 footprint: white (the scale-2 image).
+    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, at(fb, stride, 33, 42));
+    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, at(fb, stride, 25, 34));
+    // Outside it: the red base (a scale-1 render would have painted
+    // twice as far right/down).
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(fb, stride, 24, 34));
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(fb, stride, 41, 42));
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(fb, stride, 48, 48));
+
+    // Release the attached buffer: destroy the server-side surface NOW,
+    // while the wl_buffer resource is still alive. Client teardown
+    // (ts.deinit → client.destroy) destroys the wl_buffer BEFORE the
+    // wl_surface (libwayland's object-map iteration is id order), and the
+    // surface's F42 buffer-resource listener then nulls the current slot
+    // without freeing the wrapper — with no ShmState wired the wrapper is
+    // untracked and surface-owned, so it would leak (Buffer + ShmBufferData).
+    // Surface.destroy runs the same release path as the wire destructor
+    // (drop/unlock/destroy the untracked wrapper) and inertizes the
+    // resource, so the later client teardown destroys an inert resource.
+    surface.destroy();
 }

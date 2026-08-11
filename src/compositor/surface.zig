@@ -54,8 +54,6 @@
 //! M1 simplifications (documented at each site):
 //! - opaque/input regions are snapshotted as the region's rect list at
 //!   request time (the client may destroy the wl_region afterwards).
-//! - surface damage is not clipped to the surface bounds before the
-//!   buffer-coordinate translation.
 //! - get_release callbacks fire at the commit that releases their buffer
 //!   (M1 has no texture cache, so usage ends at the commit).
 //!
@@ -930,14 +928,32 @@ pub const Surface = struct {
     /// Translate the pending surface damage into buffer coordinates and
     /// union it into the pending buffer_damage list (wlroots
     /// surface_update_damage, wlr_compositor.c:248-296) — run BEFORE the
-    /// swap so the commit path is allocation-free after it (F31). Scale
-    /// first, then invert the buffer transform. Damage is a hint, so
-    /// over-reporting (saturating on overflow) is safe; on OOM the rects
-    /// translated so far are kept and the commit proceeds.
+    /// swap so the commit path is allocation-free after it (F31). Both
+    /// lists are clipped to their bounds first (wlroots
+    /// surface_finalize_pending, wlr_compositor.c:240-245): surface
+    /// damage against the surface bounds (0,0,size.w,size.h), buffer
+    /// damage against the buffer bounds (0,0,buf.width,buf.height) —
+    /// fully-outside rects drop, partials trim. Then scale first, and
+    /// invert the buffer transform. Damage is a hint, so over-reporting
+    /// (saturating on overflow) is safe; on OOM the rects translated so
+    /// far are kept and the commit proceeds.
     fn translateDamage(s: *Surface) void {
         const buf = s.pending.buffer orelse return;
         const transform = s.pending.transform;
         const size = transform.transformedSize(buf.width, buf.height);
+        // Surface damage is in surface coordinates, so it clips against
+        // the SURFACE bounds — the (transformed) buffer size divided by
+        // the buffer scale — not the buffer bounds (wlroots
+        // surface_finalize_pending). The scale is always >= 1
+        // (handleSetBufferScale rejects <= 0); guard > 0 anyway.
+        const scale: i32 = if (s.pending.scale > 0) s.pending.scale else 1;
+        clipDamage(&s.pending.surface_damage.rects, .{
+            .x = 0,
+            .y = 0,
+            .width = @divTrunc(size.w, scale),
+            .height = @divTrunc(size.h, scale),
+        });
+        clipDamage(&s.pending.buffer_damage.rects, .{ .x = 0, .y = 0, .width = buf.width, .height = buf.height });
         const inv = inverseTransform(transform);
         for (s.pending.surface_damage.rects.items) |rect| {
             const scaled: Rect = .{
@@ -954,6 +970,21 @@ pub const Surface = struct {
         }
     }
 };
+
+/// Clip a damage rect list to a bounding rect in place (wlroots
+/// surface_finalize_pending, wlr_compositor.c:240-245): fully-outside
+/// rects drop, partials trim to the intersection. The list compacts in
+/// place — no allocation. The `whole` flag is untouched: whole damage is
+/// unbounded by construction (rects is empty then).
+fn clipDamage(rects: *std.ArrayList(Rect), bounds: Rect) void {
+    var out: usize = 0;
+    for (rects.items) |rect| {
+        const clipped = Rect.intersect(rect, bounds) orelse continue;
+        rects.items[out] = clipped;
+        out += 1;
+    }
+    rects.shrinkRetainingCapacity(out);
+}
 
 /// The client destroyed the wl_buffer resource backing the attached
 /// (pending) or committed (current) buffer (F42). Mirrors wlroots'
@@ -1966,14 +1997,16 @@ test "commit translates surface damage into buffer coordinates" {
     testBuffer(allocator, &buffer); // 10x10, scale 1, normal transform
     s.attachBuffer(&buffer);
     s.handleDamage(1, 2, 3, 4);
-    s.handleDamageBuffer(10, 20, 30, 40);
+    s.handleDamageBuffer(1, 1, 3, 3);
     s.commit();
 
-    // The damage_buffer rect stays as-is; the surface damage (1,2,3,4) is
-    // appended translated (scale 1, normal transform: unchanged).
+    // The in-bounds damage_buffer rect stays as-is; the surface damage
+    // (1,2,3,4) is appended translated (scale 1, normal transform:
+    // unchanged). Out-of-bounds rects are clipped away by translateDamage
+    // (C4 — see the bounds-clipping test below).
     try testing.expectEqual(@as(usize, 2), s.current.buffer_damage.rects.items.len);
     try testing.expectEqual(
-        Rect{ .x = 10, .y = 20, .width = 30, .height = 40 },
+        Rect{ .x = 1, .y = 1, .width = 3, .height = 3 },
         s.current.buffer_damage.rects.items[0],
     );
     try testing.expectEqual(Rect{ .x = 1, .y = 2, .width = 3, .height = 4 }, s.current.buffer_damage.rects.items[1]);
@@ -1999,13 +2032,100 @@ test "surface damage translation applies scale and transform" {
     s.handleSetBufferScale(2);
     s.handleSetBufferTransform(server.wl.Output.Transform.@"90");
     s.attachBuffer(&buffer);
-    s.handleDamage(1, 2, 3, 4);
+    // In-bounds rect: the C4 clip (surface bounds = 5x5 at scale 2)
+    // must not trim it — this test covers the translate, not the clip.
+    s.handleDamage(1, 1, 3, 3);
     s.commit();
 
-    // Scale 2: (1,2,3,4) -> (2,4,6,8). Inverse of 90 is 270, applied to
-    // the 10x10 surface box: (x,y,w,h) = (4,2,8,6).
+    // Scale 2: (1,1,3,3) -> (2,2,6,6). Inverse of 90 is 270, applied to
+    // the 10x10 surface box: (x,y,w,h) = (2,2,6,6).
     try testing.expectEqual(@as(usize, 1), s.current.buffer_damage.rects.items.len);
-    try testing.expectEqual(Rect{ .x = 4, .y = 2, .width = 8, .height = 6 }, s.current.buffer_damage.rects.items[0]);
+    try testing.expectEqual(Rect{ .x = 2, .y = 2, .width = 6, .height = 6 }, s.current.buffer_damage.rects.items[0]);
+}
+
+test "damage is clipped to surface and buffer bounds at commit" {
+    // C4: translateDamage clips both damage lists to their coordinate
+    // bounds before the scale/transform translate (wlroots
+    // surface_finalize_pending, wlr_compositor.c:240-245): surface damage
+    // against the surface bounds, buffer damage against the buffer
+    // bounds. Fully-outside rects drop, partials trim — retained lists
+    // stay bounded (damage is a hint).
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    var buffer: Buffer = undefined;
+    testBuffer(allocator, &buffer); // 10x10, resized to 100x100
+    buffer.width = 100;
+    buffer.height = 100;
+
+    // Scale 1: an overflowing rect trims to the full surface, a
+    // fully-outside rect drops, a partial trims; the fully-out-of-bounds
+    // damage_buffer rect drops and a partial one trims to the buffer.
+    s.attachBuffer(&buffer);
+    s.handleDamage(-50, -50, 300, 300);
+    s.handleDamage(1000, 1000, 50, 50);
+    s.handleDamage(80, 80, 50, 50);
+    s.handleDamageBuffer(120, 120, 50, 50);
+    s.handleDamageBuffer(-10, -10, 30, 30);
+    s.commit();
+
+    // buffer_damage: the trimmed partial buffer rect first (accumulation
+    // order), then the two translated surface rects.
+    try testing.expectEqual(@as(usize, 3), s.current.buffer_damage.rects.items.len);
+    try testing.expectEqual(
+        Rect{ .x = 0, .y = 0, .width = 20, .height = 20 },
+        s.current.buffer_damage.rects.items[0],
+    );
+    try testing.expectEqual(
+        Rect{ .x = 0, .y = 0, .width = 100, .height = 100 },
+        s.current.buffer_damage.rects.items[1],
+    );
+    try testing.expectEqual(
+        Rect{ .x = 80, .y = 80, .width = 20, .height = 20 },
+        s.current.buffer_damage.rects.items[2],
+    );
+    // The fully-outside (1000,1000,50,50) rect is absent; every rect lies
+    // within the 100x100 buffer bounds.
+    for (s.current.buffer_damage.rects.items) |r| {
+        try testing.expect(r.x >= 0 and r.y >= 0);
+        try testing.expect(r.x + r.width <= 100 and r.y + r.height <= 100);
+    }
+
+    // Surface damage is clipped too (the M2 ring reads it): the
+    // fully-outside rect dropped, the others trimmed.
+    try testing.expectEqual(@as(usize, 2), s.current.surface_damage.rects.items.len);
+    try testing.expectEqual(
+        Rect{ .x = 0, .y = 0, .width = 100, .height = 100 },
+        s.current.surface_damage.rects.items[0],
+    );
+    try testing.expectEqual(
+        Rect{ .x = 80, .y = 80, .width = 20, .height = 20 },
+        s.current.surface_damage.rects.items[1],
+    );
+
+    // Scale 2 (surface 50x50): a surface rect at x=-10 clips to
+    // x in [0,50] BEFORE scaling, so the translated buffer rect never
+    // goes negative or exceeds 100 px. Pre-fix this rect scaled to
+    // (-20,0,160,20) — outside the buffer.
+    s.handleSetBufferScale(2);
+    s.attachBuffer(&buffer); // re-attach of the current buffer: no double lock
+    s.handleDamage(-10, 0, 80, 10);
+    s.commit();
+
+    try testing.expectEqual(@as(usize, 1), s.current.buffer_damage.rects.items.len);
+    try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 100, .height = 20 }, s.current.buffer_damage.rects.items[0]);
+    for (s.current.buffer_damage.rects.items) |r| {
+        try testing.expect(r.x >= 0 and r.y >= 0);
+        try testing.expect(r.x + r.width <= 100 and r.y + r.height <= 100);
+    }
 }
 
 test "OOM in the commit path aborts without applying partial state" {

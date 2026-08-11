@@ -3,10 +3,12 @@
 //!
 //! Scope: the manager global + per-surface wp_fractional_scale_v1
 //! objects. The compositor advertises a preferred_scale (the numerator
-//! of a fraction with denominator 120) when a surface's output scale
-//! changes. This server runs at scale 1, so the advertised scale is
-//! always 120 — the event still silences clients that gate on the
-//! protocol (foot) and gives them their preferred render path.
+//! of a fraction with denominator 120) once set via setPreferredScale;
+//! until then no event is sent (wlroots sends only after a scale was
+//! notified, wlr_fractional_scale_v1.c:144-146). This server runs at
+//! scale 1, so main.zig sets 120 — the event still silences clients
+//! that gate on the protocol (foot) and gives them their preferred
+//! render path.
 //!
 //! Cross-module contract: the manager binds per client;
 //! get_fractional_scale creates a wp_fractional_scale_v1 for a
@@ -30,10 +32,6 @@ const display_mod = @import("../core/display.zig");
 
 const log_tag = "fractional_scale";
 
-/// The preferred scale (numerator of a fraction over 120) this compositor
-/// advertises. Always 120 (scale 1.0).
-const preferred_scale: u32 = 120;
-
 pub const FractionalScale = struct {
     allocator: std.mem.Allocator,
     io: *std.Io,
@@ -43,6 +41,10 @@ pub const FractionalScale = struct {
     global: ?*wire.Global = null,
     /// Per-surface fractional_scale objects, for the exists check.
     objects: std.ArrayList(*ScaleState) = .empty,
+    /// The compositor's preferred scale (numerator over 120); null until
+    /// setPreferredScale — no preferred_scale event is sent before that
+    /// (wlroots wlr_fractional_scale_v1.c:144-146).
+    preferred_scale: ?u32 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -78,6 +80,15 @@ pub const FractionalScale = struct {
         while (self.objects.items.len > 0) self.objects.items[0].res.destroy();
         self.objects.deinit(allocator);
         allocator.destroy(self);
+    }
+
+    /// Advertise the compositor's preferred scale (numerator over 120)
+    /// and notify every existing per-surface object immediately
+    /// (wlroots notify_scale). The value is retained: later
+    /// get_fractional_scale binds send it on creation.
+    pub fn setPreferredScale(self: *FractionalScale, scale_numerator: u32) void {
+        self.preferred_scale = scale_numerator;
+        for (self.objects.items) |st| st.res.sendPreferredScale(scale_numerator);
     }
 };
 
@@ -148,12 +159,15 @@ fn fractionalScaleRequest(
             // and mark the state inert, since the object outlives the
             // surface (presentation Feedback pattern).
             surface.events.destroy.add(&st.destroy_listener);
-            // Advertise the compositor's scale immediately.
-            res.sendPreferredScale(preferred_scale);
-            log.debug("fractional scale for surface@{d}: {d}/120", fs.io, fs.log_cfg, log_tag, .{
-                surface.resource.getId(),
-                preferred_scale,
-            });
+            // Advertise the compositor's preferred scale once set; the
+            // default is unset, which sends nothing (wlroots :144-146).
+            if (fs.preferred_scale) |scale| {
+                res.sendPreferredScale(scale);
+                log.debug("fractional scale for surface@{d}: {d}/120", fs.io, fs.log_cfg, log_tag, .{
+                    surface.resource.getId(),
+                    scale,
+                });
+            }
         },
     }
 }
@@ -239,7 +253,9 @@ const RegistryCapture = struct {
 };
 
 /// Client-side capture of wp_fractional_scale_v1 events: the compositor
-/// advertises its preferred scale immediately on bind.
+/// advertises its preferred scale once set (setPreferredScale), sending
+/// the event to live objects immediately and to new binds on
+/// get_fractional_scale.
 const ScaleEvents = struct {
     preferred_scales: u32 = 0,
 
@@ -347,6 +363,9 @@ test "surface destroy prunes the fractional-scale entry" {
     const allocator = std.testing.allocator;
     var ts = try TestServer.init(allocator);
     defer ts.deinit();
+    // The compositor sets its scale up front (like main.zig), so binds
+    // advertise it immediately.
+    ts.fs.?.setPreferredScale(120);
 
     // Surface A binds a fractional-scale object; the compositor
     // advertises its preferred scale immediately.
@@ -384,4 +403,53 @@ test "surface destroy prunes the fractional-scale entry" {
 
     // Teardown (deinit) exercises the remaining paths under the testing
     // allocator: no leak, no double free, no use-after-free.
+}
+
+test "preferred_scale is not sent until set" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // The compositor never set a scale: get_fractional_scale must not
+    // emit preferred_scale (wlroots wlr_fractional_scale_v1.c:144-146).
+    const surface = try ts.wl_compositor.?.createSurface();
+    var events: ScaleEvents = .{};
+    const fs_obj = try ts.wl_fs_manager.?.getFractionalScale(surface);
+    fs_obj.setListener(*ScaleEvents, ScaleEvents.listener, &events);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 0), events.preferred_scales);
+    try std.testing.expectEqual(@as(usize, 1), ts.fs.?.objects.items.len);
+}
+
+test "setPreferredScale notifies existing objects and later binds" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // Two surfaces bind before any scale is set: no events yet.
+    const surface_a = try ts.wl_compositor.?.createSurface();
+    var events_a: ScaleEvents = .{};
+    const obj_a = try ts.wl_fs_manager.?.getFractionalScale(surface_a);
+    obj_a.setListener(*ScaleEvents, ScaleEvents.listener, &events_a);
+    const surface_b = try ts.wl_compositor.?.createSurface();
+    var events_b: ScaleEvents = .{};
+    const obj_b = try ts.wl_fs_manager.?.getFractionalScale(surface_b);
+    obj_b.setListener(*ScaleEvents, ScaleEvents.listener, &events_b);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 0), events_a.preferred_scales);
+    try std.testing.expectEqual(@as(u32, 0), events_b.preferred_scales);
+
+    // Setting the scale notifies both live objects (wlroots notify_scale).
+    ts.fs.?.setPreferredScale(120);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 1), events_a.preferred_scales);
+    try std.testing.expectEqual(@as(u32, 1), events_b.preferred_scales);
+
+    // A later bind sends the retained value immediately.
+    const surface_c = try ts.wl_compositor.?.createSurface();
+    var events_c: ScaleEvents = .{};
+    const obj_c = try ts.wl_fs_manager.?.getFractionalScale(surface_c);
+    obj_c.setListener(*ScaleEvents, ScaleEvents.listener, &events_c);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 1), events_c.preferred_scales);
 }

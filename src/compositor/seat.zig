@@ -188,6 +188,19 @@ pub const Seat = struct {
     options: Options,
     /// The wl_seat global, for teardown.
     global: ?*wire.Global = null,
+    /// Bound wl_seat resources (one per client bind; S3). Capability and
+    /// name changes re-broadcast to every resource in this list.
+    seats: std.ArrayList(*server.wl.Seat) = .empty,
+    /// The seat's CURRENT capability mask (bitmask of
+    /// capabilities_keyboard / capabilities_pointer): what bindSeat
+    /// announces and what setCapabilities re-broadcasts on change.
+    /// Initialized from Options; updated by setCapabilities. Touch is
+    /// never in the mask (DEFER).
+    capabilities: u32 = 0,
+    /// The wl_seat name (owned when set via setName, else the "default"
+    /// literal). Re-broadcast to v2+ wl_seat resources on change.
+    seat_name: [:0]const u8 = "default",
+    seat_name_owned: bool = false,
     xkb: *xkb_mod.Xkb,
 
     // Keyboard -----------------------------------------------------------
@@ -355,6 +368,9 @@ pub const Seat = struct {
             .log_cfg = log_cfg,
             .display = display,
             .options = options,
+            .capabilities = (if (options.keyboard) capabilities_keyboard else 0) |
+                (if (options.pointer) capabilities_pointer else 0),
+            .seats = .empty,
             .key_repeat_rate = @intCast(options.repeat_rate),
             .key_repeat_delay = @intCast(options.repeat_delay_ms),
             .xkb = xkb,
@@ -430,8 +446,19 @@ pub const Seat = struct {
         self.display.flushClients();
         while (self.keyboards.items.len > 0) self.keyboards.items[0].destroy();
         while (self.pointers.items.len > 0) self.pointers.items[0].destroy();
+        // The wl_seat resources die here too: each destroy fires the
+        // per-resource destroy listener (onSeatResDestroy), which prunes
+        // the list, so the loop drains — the resources must not fire
+        // into the freed seat at client teardown (same rule as
+        // keyboard/pointer above). The listener (not a setHandler
+        // destroy callback) is what makes this safe: a resource inerted
+        // with setDispatcher(null, null, null, null) has no callback,
+        // but its destroy listener still fires and prunes it.
+        while (self.seats.items.len > 0) self.seats.items[0].destroy();
         if (self.global) |g| g.remove();
         const allocator = self.allocator;
+        self.seats.deinit(allocator);
+        if (self.seat_name_owned) allocator.free(self.seat_name);
         self.keyboards.deinit(allocator);
         self.pointers.deinit(allocator);
         self.client_state.deinit(allocator);
@@ -1114,6 +1141,54 @@ pub const Seat = struct {
         if (self.keyboard_focus != null) self.sendKeyboardModifiers();
     }
 
+    /// Runtime capability update (S3, wlr_seat_set_capabilities,
+    /// wlr_seat.c:390-451): store the new mask, re-send wl_seat.capabilities
+    /// to every bound wl_seat resource, then inert the keyboard/pointer
+    /// resources whose capability was removed (they leave the seat's
+    /// lists via the existing keyboardDestroy/pointerDestroy bookkeeping,
+    /// so no further events reach them; the client resources stay alive
+    /// until the client releases them). Focus state is deliberately left
+    /// untouched — the focused surface is compositor policy and an inert
+    /// keyboard/pointer simply stops delivering.
+    ///
+    /// Touch is NOT part of the mask (DEFER): this seat never advertises
+    /// touch, so this API can never enable it.
+    pub fn setCapabilities(self: *Seat, caps: u32) void {
+        // No-op on an unchanged mask: the dormant API cannot fire
+        // mid-test by accident.
+        if (self.capabilities == caps) return;
+        self.capabilities = caps;
+        for (self.seats.items) |res| {
+            res.sendCapabilities(.{
+                .keyboard = caps & capabilities_keyboard != 0,
+                .pointer = caps & capabilities_pointer != 0,
+            });
+        }
+        if (caps & capabilities_keyboard == 0) {
+            while (self.keyboards.items.len > 0) keyboardDestroy(self.keyboards.items[0], self);
+        }
+        if (caps & capabilities_pointer == 0) {
+            while (self.pointers.items.len > 0) pointerDestroy(self.pointers.items[0], self);
+        }
+    }
+
+    /// Runtime seat-name update (S3, wlr_seat_set_name): store the name
+    /// and re-send wl_seat.name to every bound v2+ wl_seat resource. The
+    /// name is duplicated into seat-owned storage (freed on the next set
+    /// and at deinit).
+    pub fn setName(self: *Seat, name: []const u8) void {
+        const owned = self.allocator.dupeZ(u8, name) catch |err| {
+            log.warn("setName allocation failed: {s}", self.io, self.log_cfg, "seat", .{@errorName(err)});
+            return;
+        };
+        if (self.seat_name_owned) self.allocator.free(self.seat_name);
+        self.seat_name = owned;
+        self.seat_name_owned = true;
+        for (self.seats.items) |res| {
+            if (res.getVersion() >= 2) res.sendName(self.seat_name);
+        }
+    }
+
     /// A surface was destroyed: drop any focus pointing at it. The
     /// surface is still alive inside the destroy signal (the caller,
     /// main.zig:1572, runs before the Surface frees), so the focused
@@ -1236,17 +1311,70 @@ pub const Seat = struct {
 // wl_seat request handling
 // ---------------------------------------------------------------------------
 
+/// Per-wl_seat-resource bookkeeping: the destroy LISTENER that prunes
+/// the resource from the seat's broadcast list. A Listener link can sit
+/// on only one destroy signal at a time, so one heap-allocated data
+/// struct (with the listener embedded, shm.zig pattern) is allocated per
+/// resource; onSeatResDestroy frees it when the resource dies.
+///
+/// The listener — not the setHandler destroy callback — is what
+/// guarantees pruning: inerting the resource with
+/// setDispatcher(null, null, null, null) (the XA-5 recipe,
+/// xdg_activation.zig:1107) nulls the destroy callback, and a nulled
+/// callback leaves a freed resource pointer in `seats` for Seat.deinit's
+/// destroy loop to hit. Destroy LISTENERS fire regardless of the
+/// callback (libwayland remove_and_destroy_resource emits the destroy
+/// signal before invoking resource->destroy).
+const SeatResData = struct {
+    seat: *Seat,
+    listener: wire.Listener(*wire.Resource),
+};
+
+fn onSeatResDestroy(listener: *wire.Listener(*wire.Resource), resource: *wire.Resource) void {
+    const d: *SeatResData = @fieldParentPtr("listener", listener);
+    const seat = d.seat;
+    const res: *server.wl.Seat = @ptrCast(resource);
+    if (std.mem.findScalar(*server.wl.Seat, seat.seats.items, res)) |idx| {
+        _ = seat.seats.orderedRemove(idx);
+    }
+    seat.allocator.destroy(d);
+}
+
 fn bindSeat(wl_client: *wire.Client, seat: *Seat, version: u32, id: u32) void {
     const resource = server.wl.Seat.create(wl_client, version, id) catch {
         wl_client.postNoMemory();
         return;
     };
+    // No setHandler destroy callback: pruning runs through the destroy
+    // listener below, which survives external inerting (see
+    // onSeatResDestroy). The append must precede the listener
+    // registration so an allocation failure leaves no armed listener
+    // whose data would outlive the seat.
     resource.setHandler(*Seat, seatRequest, null, seat);
+    seat.seats.append(seat.allocator, resource) catch {
+        wl_client.postNoMemory();
+        return;
+    };
+    const data = seat.allocator.create(SeatResData) catch {
+        // No listener to prune this entry: drop it now, or deinit's
+        // destroy loop would hit a resource with no callback and no
+        // listener. The resource itself stays alive and dies silently
+        // with its client.
+        wl_client.postNoMemory();
+        _ = seat.seats.pop();
+        return;
+    };
+    data.* = .{ .seat = seat, .listener = wire.Listener(*wire.Resource).init(onSeatResDestroy) };
+    // addDestroyListener lives on the base Resource (the generated Seat
+    // opaque delegates its other methods through the same identity cast).
+    @as(*wire.Resource, @ptrCast(resource)).addDestroyListener(&data.listener);
+    // Announce the CURRENT capabilities/name (S3): initialized from
+    // Options, replaced by setCapabilities/setName at runtime.
     resource.sendCapabilities(.{
-        .keyboard = seat.options.keyboard,
-        .pointer = seat.options.pointer,
+        .keyboard = seat.capabilities & capabilities_keyboard != 0,
+        .pointer = seat.capabilities & capabilities_pointer != 0,
     });
-    if (resource.getVersion() >= 2) resource.sendName("default");
+    if (resource.getVersion() >= 2) resource.sendName(seat.seat_name);
 }
 
 fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat: *Seat) void {
@@ -1258,7 +1386,9 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
             };
             kbd.setHandler(*Seat, keyboardRequest, keyboardDestroy, seat);
             // Capability disabled: keep the object dead (no keymap, no
-            // events, no list entry) — mirrors the get_touch dead object.
+            // events, no list entry) — deliberate smithay-style policy
+            // for capabilities the seat may regain; get_touch (which can
+            // never exist here) posts missing_capability instead (S3).
             if (!seat.options.keyboard) return;
             seat.keyboards.append(seat.allocator, kbd) catch {
                 resource.getClient().postNoMemory();
@@ -1301,7 +1431,9 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
             };
             ptr.setHandler(*Seat, pointerRequest, pointerDestroy, seat);
             // Capability disabled: keep the object dead (no events, no
-            // list entry) — mirrors the get_touch dead object.
+            // list entry) — deliberate smithay-style policy for
+            // capabilities the seat may regain; get_touch (which can
+            // never exist here) posts missing_capability instead (S3).
             if (!seat.options.pointer) return;
             seat.pointers.append(seat.allocator, ptr) catch {
                 resource.getClient().postNoMemory();
@@ -1322,14 +1454,16 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
                 }
             }
         },
-        .get_touch => |r| {
-            // Touch is not advertised in the seat capabilities; if a
-            // client asks anyway, create a dead object (no events).
-            const touch = server.wl.Touch.create(resource.getClient(), resource.getVersion(), r.id) catch {
-                resource.getClient().postNoMemory();
-                return;
-            };
-            touch.setHandler(*Seat, touchRequest, null, seat);
+        .get_touch => {
+            // Touch has never existed on this seat: kill the probing
+            // client with the protocol error instead of handing out a
+            // never-emitting object (wlroots posts
+            // WL_SEAT_ERROR_MISSING_CAPABILITY when the capability never
+            // existed, wlr_seat.c:53-66). Deliberately inconsistent with
+            // the disabled get_keyboard/get_pointer dead-object policy
+            // above — those cover capabilities the seat can regain, while
+            // touch is DEFER and can never exist here.
+            resource.postError(.missing_capability, "wl_seat.get_touch called when no touch capability has existed");
         },
         .release => resource.destroy(),
     }
@@ -1354,6 +1488,9 @@ fn pointerDestroy(resource: *server.wl.Pointer, seat: *Seat) void {
     seat.pruneSeatClient(resource.getClient());
 }
 
+/// wl_touch request handling. UNREACHABLE today: get_touch posts
+/// missing_capability and never creates the resource (touch is DEFER).
+/// Kept so the release path exists the moment touch lands.
 fn touchRequest(resource: *server.wl.Touch, request: server.wl.Touch.Request, seat: *Seat) void {
     _ = seat;
     switch (request) {
@@ -1547,6 +1684,34 @@ const PointerEvents = struct {
     }
 };
 
+/// Event log for one client-side wl_seat (S3): capabilities/name
+/// re-broadcasts (wl_seat.capabilities is sent on bind AND on every
+/// setCapabilities; wl_seat.name on bind and every setName).
+const SeatEvents = struct {
+    capabilities: usize = 0,
+    last_capability: server.wl.Seat.Capability = .{},
+    names: usize = 0,
+    last_name: [64]u8 = undefined,
+    last_name_len: usize = 0,
+
+    fn listener(seat: *client.wl.Seat, event: client.wl.Seat.Event, data: *SeatEvents) void {
+        _ = seat;
+        switch (event) {
+            .capabilities => |e| {
+                data.capabilities += 1;
+                data.last_capability = e.capabilities;
+            },
+            .name => |e| {
+                data.names += 1;
+                const name = std.mem.span(e.name);
+                const n = @min(name.len, data.last_name.len);
+                @memcpy(data.last_name[0..n], name[0..n]);
+                data.last_name_len = n;
+            },
+        }
+    }
+};
+
 /// One connected in-memory client: server-side wire client + client-side
 /// compositor/seat proxies, surface, keyboard and pointer.
 const TestClient = struct {
@@ -1559,6 +1724,7 @@ const TestClient = struct {
     pointer: *client.wl.Pointer,
     kbd_events: KeyboardEvents = .{},
     ptr_events: PointerEvents = .{},
+    seat_events: SeatEvents = .{},
 };
 
 /// The seat's hit-test context: which surface the pick returns.
@@ -1712,6 +1878,7 @@ fn connectClient(ts: *TestServer, tc: *TestClient) !void {
     };
     tc.keyboard.setListener(*KeyboardEvents, KeyboardEvents.listener, &tc.kbd_events);
     tc.pointer.setListener(*PointerEvents, PointerEvents.listener, &tc.ptr_events);
+    tc.seat.setListener(*SeatEvents, SeatEvents.listener, &tc.seat_events);
     try pumpOne(ts, c_display);
     ts.clients += 1;
 }
@@ -2417,4 +2584,103 @@ test "focused-surface destroy sends leave before clearing (F12)" {
     try std.testing.expectEqual(KeyboardEvents.Order.leave, a.kbd_events.order[a.kbd_events.order_len - 1]);
     try std.testing.expect(seat.pointer_focus == null);
     try std.testing.expect(seat.keyboard_focus == null);
+}
+
+test "wl_seat.get_touch on a touch-less seat kills the client (S3)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    // The seat advertises keyboard + pointer only: a client probing
+    // touch dies with wl_seat missing_capability (0) instead of holding
+    // a live object that never emits (wlroots wlr_seat.c:53-66).
+    const a = &ts.a;
+    const touch = try a.seat.getTouch();
+    _ = touch;
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+}
+
+test "setCapabilities re-broadcasts and inerts removed-capability resources (S3)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server);
+
+    // The initial bind announced keyboard + pointer (one capabilities
+    // event each).
+    try std.testing.expectEqual(@as(usize, 1), a.seat_events.capabilities);
+    try std.testing.expect(a.seat_events.last_capability.keyboard);
+    try std.testing.expect(a.seat_events.last_capability.pointer);
+
+    // Drop the pointer capability: EVERY bound wl_seat resource gets a
+    // second capabilities event with the new mask
+    // (wlr_seat_set_capabilities, wlr_seat.c:390-451)...
+    seat.setCapabilities(capabilities_keyboard);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.seat_events.capabilities);
+    try std.testing.expectEqual(@as(usize, 2), b.seat_events.capabilities);
+    try std.testing.expect(a.seat_events.last_capability.keyboard);
+    try std.testing.expect(!a.seat_events.last_capability.pointer);
+
+    // ...and the wl_pointer resources are inerted: dropped from the
+    // seat's list, so no event reaches them (the client resources stay
+    // alive; no crash). The keyboard resources survive.
+    try std.testing.expectEqual(@as(usize, 0), seat.pointers.items.len);
+    try std.testing.expectEqual(@as(usize, 2), seat.keyboards.items.len);
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    try std.testing.expect(!a.ptr_events.entered);
+    try std.testing.expect(!b.ptr_events.entered);
+
+    // An unchanged mask is a no-op: the dormant API cannot fire
+    // mid-test by accident.
+    seat.setCapabilities(capabilities_keyboard);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.seat_events.capabilities);
+}
+
+test "setName re-broadcasts to v2+ seat resources only (S3)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const seat = ts.seat.?;
+    try std.testing.expectEqual(@as(usize, 1), a.seat_events.names);
+    try std.testing.expectEqualStrings("default", a.seat_events.last_name[0..a.seat_events.last_name_len]);
+
+    // A v1 seat resource never receives the name event
+    // (wl_seat.name is since_version 2).
+    const registry = try a.display.getRegistry();
+    var capture: RegistryCapture = .{};
+    registry.setListener(*RegistryCapture, RegistryCapture.listener, &capture);
+    try pumpOne(ts, a.display);
+    const seat1 = try registry.bind(capture.seat_name.?, client.wl.Seat, 1);
+    var seat1_events: SeatEvents = .{};
+    seat1.setListener(*SeatEvents, SeatEvents.listener, &seat1_events);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), seat1_events.names);
+
+    // setName re-broadcasts to every bound v2+ resource, not the v1 one.
+    seat.setName("my-seat");
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.seat_events.names);
+    try std.testing.expectEqual(@as(usize, 2), b.seat_events.names);
+    try std.testing.expectEqualStrings("my-seat", a.seat_events.last_name[0..a.seat_events.last_name_len]);
+    try std.testing.expectEqual(@as(usize, 0), seat1_events.names);
 }

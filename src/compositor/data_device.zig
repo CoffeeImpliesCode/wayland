@@ -29,6 +29,23 @@
 //!     so a rejected request still burns it; set_actions on a finalized
 //!     source — or a second set_actions — raises invalid_action_mask
 //!     (wlr_data_source.c:166-178).
+//!   - A cancelled source is inert (F-SEL-3): the replaced/cleared
+//!     owner's struct is freed and its wire resource becomes a no-op
+//!     (wlroots nulls the resource user data on cancel,
+//!     client_data_source_destroy, wlr_data_source.c:114-120). Re-passing
+//!     a cancelled source to set_selection behaves exactly like NULL — it
+//!     clears the selection.
+//!   - set_selection with the current source updates the serial only
+//!     (F-SEL-4; wlroots wlr_seat_set_selection early-returns on
+//!     selection_source == source, wlr_data_device.c:184-189): no cancel,
+//!     no re-delivery.
+//!   - Every delivered offer emits wl_data_offer.source_actions (v3+)
+//!     between its mime events and the selection event (F-SEL-2,
+//!     wayland.xml:710-719); a clipboard source's mask is 0, the future
+//!     drag path sends the real mask through the same line.
+//!   - get_data_device with an inert or foreign seat argument yields a
+//!     dead device (F-SEL-5): the object id stays valid, every request
+//!     is a no-op (wlroots wlr_data_device.c:238-244).
 //!   - set_selection with a source that advertised DnD actions raises
 //!     wl_data_source.error.invalid_source (KWin datadevice.cpp:91-101
 //!     hardening; wlroots has no such check).
@@ -298,6 +315,23 @@ fn managerRequest(
                 resource.getClient().postNoMemory();
                 return;
             };
+            // F-SEL-5: the seat argument must map to a live seat (the
+            // XA-5 pattern, xdg_activation.zig:369-380). An inert or
+            // foreign seat still yields a device resource — the client's
+            // object id must stay valid, or the next request kills the
+            // client — but the device is dead: no struct, no list entry,
+            // no bind-time delivery (wlroots creates the resource with
+            // NULL user data when the seat client is NULL and skips
+            // linking, wlr_data_device.c:238-244).
+            const seat_ud = r.seat.getUserData() orelse {
+                dev_res.setHandler(?*DataDevice, deadDeviceHandler, null, null);
+                return;
+            };
+            const seat: *seat_mod.Seat = @ptrCast(@alignCast(seat_ud));
+            if (seat != mgr.seat) {
+                dev_res.setHandler(?*DataDevice, deadDeviceHandler, null, null);
+                return;
+            }
             const dev = mgr.allocator.create(DataDevice) catch {
                 dev_res.destroy();
                 resource.getClient().postNoMemory();
@@ -402,6 +436,46 @@ fn sourceRequest(src_res: *server.wl.DataSource, request: server.wl.DataSource.R
     }
 }
 
+/// Unlink a data source from the manager and free it (mime list +
+/// struct). Shared by cancelSource and sourceDestroy.
+fn freeSource(mgr: *DataDeviceManager, src: *DataSource) void {
+    if (std.mem.findScalar(*DataSource, mgr.sources.items, src)) |idx| {
+        _ = mgr.sources.orderedRemove(idx);
+    }
+    for (src.mime_types.items) |m| mgr.allocator.free(m);
+    src.mime_types.deinit(mgr.allocator);
+    const allocator = mgr.allocator;
+    allocator.destroy(src);
+}
+
+/// Cancel a source and inert it: the cancelled event goes out, the wire
+/// resource's user data is dropped (its requests become no-ops via
+/// deadSourceHandler, so a later client request cannot touch the freed
+/// struct) and the struct is freed (wlroots nulls the source resource's
+/// user data on cancel, client_data_source_destroy, wlr_data_source.c:
+/// 114-120). A cancelled source re-passed to set_selection extracts to
+/// null and behaves exactly like NULL — it clears the selection.
+fn cancelSource(mgr: *DataDeviceManager, src: *DataSource) void {
+    src.resource.sendCancelled();
+    src.resource.setHandler(?*DataSource, deadSourceHandler, null, null);
+    freeSource(mgr, src);
+}
+
+/// Request handler for inerted (cancelled) data sources: the struct is
+/// freed, so nothing is dereferenced — every request is a no-op
+/// (wlroots: wl_resource_set_user_data(NULL) on cancel). The destroy
+/// callback is null, so client teardown cannot call into the freed
+/// struct.
+fn deadSourceHandler(resource: *server.wl.DataSource, request: server.wl.DataSource.Request, data: ?*DataSource) void {
+    _ = resource;
+    _ = data;
+    switch (request) {
+        .offer => {},
+        .set_actions => {},
+        .destroy => {},
+    }
+}
+
 fn sourceDestroy(src_res: *server.wl.DataSource, src: *DataSource) void {
     _ = src_res;
     const mgr = src.manager;
@@ -418,13 +492,7 @@ fn sourceDestroy(src_res: *server.wl.DataSource, src: *DataSource) void {
         src.resource.sendCancelled();
         deliverSelectionToFocus(mgr);
     }
-    if (std.mem.findScalar(*DataSource, mgr.sources.items, src)) |idx| {
-        _ = mgr.sources.orderedRemove(idx);
-    }
-    for (src.mime_types.items) |m| mgr.allocator.free(m);
-    src.mime_types.deinit(mgr.allocator);
-    const allocator = mgr.allocator;
-    allocator.destroy(src);
+    freeSource(mgr, src);
 }
 
 // ---------------------------------------------------------------------------
@@ -439,21 +507,28 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
             // validation, per wlroots data_device_set_selection
             // (wlr_data_device.c:24-45: finalize at :34-37, then
             // wlr_seat_request_set_selection validates): a request the
-            // gates reject still burns the source.
+            // gates reject still burns the source. Extraction is
+            // null-tolerant (F-SEL-3): a cancelled source's resource is
+            // inert (null user data), and behaves exactly like NULL —
+            // the clear branch below.
+            var new_source: ?*DataSource = null;
             if (r.source) |src_res| {
-                const src: *DataSource = @ptrCast(@alignCast(src_res.getUserData()));
-                // KWin hardening: a source that advertised DnD actions
-                // cannot be a clipboard source — invalid_source on the
-                // source (KWin data_device_set_selection,
-                // datadevice.cpp:91-101; wlroots has no such check).
-                if ((src.actions orelse 0) != 0) {
-                    src_res.postError(
-                        .invalid_source,
-                        "wl_data_source.set_selection: data source is for drag and drop",
-                    );
-                    return;
+                if (src_res.getUserData()) |ud| {
+                    const src: *DataSource = @ptrCast(@alignCast(ud));
+                    // KWin hardening: a source that advertised DnD actions
+                    // cannot be a clipboard source — invalid_source on the
+                    // source (KWin data_device_set_selection,
+                    // datadevice.cpp:91-101; wlroots has no such check).
+                    if ((src.actions orelse 0) != 0) {
+                        src_res.postError(
+                            .invalid_source,
+                            "wl_data_source.set_selection: data source is for drag and drop",
+                        );
+                        return;
+                    }
+                    src.finalized = true;
+                    new_source = src;
                 }
-                src.finalized = true;
             }
             // Serial validation (wlroots wlr_seat_request_set_selection,
             // wlr_data_device.c:144-165): the serial must have been
@@ -483,11 +558,25 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
                 );
                 return;
             }
-            if (r.source) |src_res| {
-                const src: *DataSource = @ptrCast(@alignCast(src_res.getUserData()));
-                // A new selection: cancel the previous one.
+            // F-SEL-4: re-passing the current live source updates the
+            // serial only — no cancel, no re-delivery (wlroots
+            // wlr_seat_set_selection early-returns on
+            // selection_source == source, updating only selection_serial,
+            // wlr_data_device.c:184-189).
+            if (new_source) |src| {
+                if (mgr.selection_source) |cur| {
+                    if (src == cur) {
+                        mgr.selection_serial = r.serial;
+                        return;
+                    }
+                }
+            }
+            if (new_source) |src| {
+                // A new selection: cancel the previous owner (inerting
+                // it — the cancelled source's struct is freed and its
+                // wire resource becomes a no-op, F-SEL-3).
                 if (mgr.selection_source) |old| {
-                    if (old != src) old.resource.sendCancelled();
+                    if (old != src) cancelSource(mgr, old);
                 }
                 mgr.selection_source = src;
                 mgr.selection_serial = r.serial;
@@ -495,10 +584,9 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
                     src.mime_types.items.len,
                 });
             } else {
-                // Null source: clear the selection.
-                if (mgr.selection_source) |old| {
-                    old.resource.sendCancelled();
-                }
+                // Null source — or a cancelled (inert) source: clear the
+                // selection.
+                if (mgr.selection_source) |old| cancelSource(mgr, old);
                 mgr.selection_source = null;
                 mgr.selection_serial = r.serial;
             }
@@ -512,10 +600,15 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
             // validates the pointer grab serial): a denied drag still
             // burns the source, but leaves it alive — the client keeps
             // it (smithay "denying drag from client without implicit
-            // grab", data_device/device.rs).
+            // grab", data_device/device.rs). Extraction is
+            // null-tolerant (F-SEL-3): a selection-cancelled source is
+            // inert, so start_drag on it no-ops instead of crashing on
+            // the freed struct.
             if (r.source) |src_res| {
-                const src: *DataSource = @ptrCast(@alignCast(src_res.getUserData()));
-                src.finalized = true;
+                if (src_res.getUserData()) |ud| {
+                    const src: *DataSource = @ptrCast(@alignCast(ud));
+                    src.finalized = true;
+                }
             }
             // The drag serial must have been handed to THIS client
             // (wlroots validates the pointer grab serial via the
@@ -530,13 +623,33 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
                 );
                 return;
             }
-            // No DnD in M3: the source is cancelled.
+            // No DnD in M3: the source is cancelled. The stub cancel is
+            // deliberately NOT converted to cancelSource — F-SEL-1
+            // reworks this block, and converting it would flip the
+            // "source finalized at start_drag" test (a later set_actions
+            // must still raise invalid_action_mask) to a silent no-op.
             if (r.source) |src_res| {
-                const src: *DataSource = @ptrCast(@alignCast(src_res.getUserData()));
-                src.resource.sendCancelled();
+                if (src_res.getUserData()) |ud| {
+                    const src: *DataSource = @ptrCast(@alignCast(ud));
+                    src.resource.sendCancelled();
+                }
             }
         },
         .release => dev_res.destroy(),
+    }
+}
+
+/// Request handler for inerted (dead) data devices: no struct exists, so
+/// every request is a no-op (wlroots: the resource carries NULL user
+/// data, wlr_data_device.c:238-244). The destroy callback is null, so
+/// client teardown cannot call into a freed struct.
+fn deadDeviceHandler(resource: *server.wl.DataDevice, request: server.wl.DataDevice.Request, data: ?*DataDevice) void {
+    _ = resource;
+    _ = data;
+    switch (request) {
+        .set_selection => {},
+        .start_drag => {},
+        .release => {},
     }
 }
 
@@ -615,6 +728,16 @@ fn deliverSelectionToFocus(mgr: *DataDeviceManager) void {
             // the mimes before data_offer would silently drop them.
             dev.resource.sendDataOffer(offer_res);
             for (s.mime_types.items) |m| offer_res.sendOffer(m.ptr);
+            // F-SEL-2: wl_data_offer.source_actions is mandated
+            // "immediately after creating the wl_data_offer object"
+            // (wayland.xml:710-719) — the emission sits between the
+            // per-mime offer events and the selection event, v3+ only.
+            // The payload is the source's action mask: 0 for a clipboard
+            // source (the KWin invalid_source gate rejects
+            // action-advertising sources at set_selection); the future
+            // drag offer creation (F-SEL-1) sends the real mask through
+            // this same line (wlroots wlr_drag.c:99-101).
+            if (offer_res.getVersion() >= 3) offer_res.sendSourceActions(@bitCast(s.actions orelse 0));
             dev.resource.sendSelection(offer_res);
             log.debug("selection delivered to focused client ({d} mimes)", mgr.io, mgr.log_cfg, "data_device", .{
                 s.mime_types.items.len,
@@ -958,6 +1081,66 @@ const DeviceEvents = struct {
             .leave => {},
             .motion => {},
             .drop => {},
+        }
+    }
+};
+
+/// Records the delivery order of one offer's events: mime offers (0),
+/// source_actions (1) and the device's selection (2), so the F-SEL-2
+/// emission point (between the mime events and the selection event,
+/// wayland.xml:710-719) can be asserted. The offer listener is attached
+/// from inside the data_offer handler so it is live before the offer's
+/// own events are dispatched in the same round (the server sends
+/// data_offer -> mimes -> source_actions -> selection,
+/// deliverSelectionToFocus).
+const SourceActionsSequence = struct {
+    /// Event kinds in delivery order (0 = mime offer, 1 = source_actions,
+    /// 2 = selection). Fixed-size: a test delivers at most one offer with
+    /// one mime; the initial focus delivery contributes one NULL
+    /// selection at most.
+    kinds: [8]u8 = [_]u8{0} ** 8,
+    kind_count: usize = 0,
+    source_actions_count: usize = 0,
+    last_source_actions: u32 = 0,
+
+    fn record(data: *SourceActionsSequence, kind: u8) void {
+        if (data.kind_count < data.kinds.len) {
+            data.kinds[data.kind_count] = kind;
+            data.kind_count += 1;
+        }
+    }
+
+    fn deviceListener(
+        device: *client.wl.DataDevice,
+        event: client.wl.DataDevice.Event,
+        data: *SourceActionsSequence,
+    ) void {
+        _ = device;
+        switch (event) {
+            .data_offer => |e| {
+                e.id.setListener(*SourceActionsSequence, SourceActionsSequence.offerListener, data);
+            },
+            .selection => record(data, 2),
+            // DnD events: the test client never drags; the arms exist for
+            // exhaustive switch over the wire event enum.
+            .enter => {},
+            .leave => {},
+            .motion => {},
+            .drop => {},
+        }
+    }
+
+    fn offerListener(offer: *client.wl.DataOffer, event: client.wl.DataOffer.Event, data: *SourceActionsSequence) void {
+        _ = offer;
+        switch (event) {
+            .offer => record(data, 0),
+            .source_actions => |e| {
+                data.source_actions_count += 1;
+                const v: u32 = @bitCast(e.source_actions);
+                data.last_source_actions = v;
+                record(data, 1);
+            },
+            .action => {},
         }
     }
 };
@@ -2008,4 +2191,231 @@ test "v3 manager creates v3 children" {
     try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
     try testing.expectEqual(@as(u32, 3), ts.mgr.?.sources.items[0].resource.getVersion());
     try testing.expectEqual(@as(u32, 3), ts.mgr.?.devices.items[0].resource.getVersion());
+}
+
+test "selection offer carries source_actions after the mime events, before selection" {
+    // F-SEL-2: wayland.xml mandates wl_data_offer.source_actions
+    // "immediately after creating the wl_data_offer object"
+    // (wayland.xml:710-719). The emission sits between the per-mime
+    // offer events and the selection event, v3+ only. A clipboard
+    // source carries mask 0: its actions were never set, and the KWin
+    // invalid_source gate rejects action-advertising sources at
+    // set_selection anyway.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var seq: SourceActionsSequence = .{};
+    device.setListener(*SourceActionsSequence, SourceActionsSequence.deviceListener, &seq);
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+
+    device.setSelection(src, serial);
+    try ts.pump();
+
+    // Exactly one source_actions event on the delivered offer, value 0
+    // for a clipboard source.
+    try testing.expectEqual(@as(usize, 1), seq.source_actions_count);
+    try testing.expectEqual(@as(u32, 0), seq.last_source_actions);
+    // Delivery order: the focus delivery's selection(NULL) first, then
+    // mime offer (0), source_actions (1), selection (2).
+    try testing.expectEqual(@as(usize, 4), seq.kind_count);
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 1, 2 }, seq.kinds[0..seq.kind_count]);
+}
+
+test "offer source_actions payload reflects the source's action mask (white-box)" {
+    // F-SEL-2 white-box: the emission line reads src.actions — set a
+    // real mask on the source and deliver, asserting the payload
+    // bitcasts to it. Mirrors the drag simulation (the offer is flipped
+    // to a drag offer, as the future F-SEL-1 drag-offer creation would
+    // create it): the wire set_actions on a source that then went
+    // through set_selection would trip the KWin invalid_source gate, so
+    // the selection is placed white-box instead.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    const DndAction = client.wl.DataDeviceManager.DndAction;
+    src.setActions(@as(DndAction, @bitCast(@as(u32, 1 | 2)))); // copy | move
+    var seq: SourceActionsSequence = .{};
+    device.setListener(*SourceActionsSequence, SourceActionsSequence.deviceListener, &seq);
+    try ts.pump();
+    try testing.expectEqual(@as(?u32, 3), ts.mgr.?.sources.items[0].actions);
+
+    // White-box: place the source as the seat-wide selection (bypasses
+    // the KWin invalid_source gate) and deliver via the keyboard focus,
+    // then flip the offer to a drag offer like the drag negotiation
+    // test does.
+    ts.mgr.?.selection_source = ts.mgr.?.sources.items[0];
+    ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client.?));
+    try ts.pump();
+    ts.mgr.?.offers.items[0].offer_type = .drag;
+
+    // Exactly one source_actions event, the payload bitcast to the mask.
+    try testing.expectEqual(@as(usize, 1), seq.source_actions_count);
+    try testing.expectEqual(@as(u32, 3), seq.last_source_actions);
+    // Delivery order: mime offer (0), source_actions (1), selection (2).
+    try testing.expectEqual(@as(usize, 3), seq.kind_count);
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 2 }, seq.kinds[0..seq.kind_count]);
+}
+
+test "pre-v3 offers receive no source_actions event" {
+    // F-SEL-2 version guard: the source_actions event is since-3; a v2
+    // device's offer must not carry it (a since-3 event against a client
+    // that never agreed to v3 would be a wire violation).
+    const allocator = testing.allocator;
+    var ts = try TestServer.initAtVersion(allocator, 2);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var seq: SourceActionsSequence = .{};
+    device.setListener(*SourceActionsSequence, SourceActionsSequence.deviceListener, &seq);
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+
+    device.setSelection(src, serial);
+    try ts.pump();
+
+    try testing.expectEqual(@as(usize, 0), seq.source_actions_count);
+    // The offer delivery still carries the mime and the selection.
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 2 }, seq.kinds[0..seq.kind_count]);
+}
+
+test "a cancelled source is inert: re-passing it clears the selection" {
+    // F-SEL-3: a replaced selection's source is cancelled AND inerted —
+    // the struct is freed and the wire resource's requests become no-ops
+    // (wlroots nulls the source resource's user data on cancel,
+    // client_data_source_destroy, wlr_data_source.c:114-120). Re-passing
+    // the cancelled source to set_selection behaves exactly like passing
+    // NULL: the selection is cleared, the current owner is cancelled,
+    // no crash on the freed struct.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src_a = try ts.wl_data_device_manager.?.createDataSource();
+    const src_b = try ts.wl_data_device_manager.?.createDataSource();
+    var events_a: SourceEvents = .{};
+    src_a.setListener(*SourceEvents, SourceEvents.listener, &events_a);
+    var events_b: SourceEvents = .{};
+    src_b.setListener(*SourceEvents, SourceEvents.listener, &events_b);
+    var dev_events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &dev_events);
+    try ts.pump();
+    const serial = focusAndMintSerial(ts);
+
+    device.setSelection(src_a, serial);
+    try ts.pump();
+    try testing.expectEqual(src_a.getId(), ts.mgr.?.selection_source.?.resource.getId());
+
+    // Replacing with B cancels A and inerts it: the struct is freed and
+    // unlinked from the manager's source list.
+    device.setSelection(src_b, serial);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_a.cancelled_count);
+    try testing.expectEqual(src_b.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.sources.items.len);
+
+    // Re-passing the cancelled source with a valid serial behaves like
+    // NULL: the selection is cleared (selection(NULL) to the focused
+    // client), the current owner is cancelled, and no offer remains.
+    device.setSelection(src_a, serial);
+    try ts.pump();
+    try testing.expectEqual(@as(?*DataSource, null), ts.mgr.?.selection_source);
+    try testing.expect(dev_events.last_selection_null);
+    try testing.expectEqual(@as(usize, 1), events_b.cancelled_count);
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.offers.items.len);
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.sources.items.len);
+}
+
+test "re-setting the current selection source updates the serial only" {
+    // F-SEL-4: wlroots wlr_seat_set_selection early-returns when the
+    // incoming source is already the selection, updating only
+    // selection_serial (wlr_data_device.c:184-189) — no cancel, no
+    // re-delivery round-trip.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    var src_events: SourceEvents = .{};
+    src.setListener(*SourceEvents, SourceEvents.listener, &src_events);
+    var dev_events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &dev_events);
+    try ts.pump();
+    const serial1 = focusAndMintSerial(ts);
+
+    device.setSelection(src, serial1);
+    try ts.pump();
+    try testing.expectEqual(serial1, ts.mgr.?.selection_serial);
+    const selection_count = dev_events.selection_count;
+
+    // A second serial handed to the same client: a key event to the
+    // focused client mints one (re-focusing the same surface is a no-op
+    // in Seat.setKeyboardFocus).
+    ts.seat.?.keyEvent(38, true); // 'a'
+    ts.seat.?.keyEvent(38, false);
+    const serial2 = ts.seat.?.last_serial;
+    try testing.expect(serial2 != serial1);
+
+    // Re-set the same source: serial advanced, no re-delivery, no
+    // cancel, the live offer untouched.
+    device.setSelection(src, serial2);
+    try ts.pump();
+    try testing.expectEqual(serial2, ts.mgr.?.selection_serial);
+    try testing.expectEqual(selection_count, dev_events.selection_count);
+    try testing.expectEqual(@as(usize, 0), src_events.cancelled_count);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+}
+
+test "get_data_device with an inert seat yields a dead device" {
+    // F-SEL-5: the seat argument must map to a live seat (the XA-5
+    // pattern, xdg_activation.zig:369-380). An inert seat still yields
+    // a device resource — the client's object id must stay valid — but
+    // the device is dead: no struct, no list entry, every request a
+    // no-op (wlroots creates the resource with NULL user data when the
+    // seat client is NULL, wlr_data_device.c:238-244).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // Inert the server-side wl_seat resource (the XA-5 recipe,
+    // xdg_activation.zig:1003-1006).
+    const seat_res = ts.client.?.getObject(ts.wl_seat.?.getId()).?;
+    seat_res.setDispatcher(null, null, null, null);
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    var dev_events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &dev_events);
+    try ts.pump();
+
+    // The inert path wires a dead handler without appending to the
+    // manager's device list.
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.devices.items.len);
+
+    // set_selection on the dead device is a silent no-op: nothing is
+    // stored, nothing is delivered, no protocol error, no crash. The
+    // source stays unfinalized (the request never reaches the gates).
+    device.setSelection(src, focusAndMintSerial(ts));
+    try ts.pump();
+    try testing.expectEqual(@as(?*DataSource, null), ts.mgr.?.selection_source);
+    try testing.expectEqual(@as(usize, 0), dev_events.selection_count);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.sources.items.len);
+    try testing.expect(!ts.mgr.?.sources.items[0].finalized);
+
+    // release on the dead device works (the object id stays valid).
+    device.release();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.devices.items.len);
 }

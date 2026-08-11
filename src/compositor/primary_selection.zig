@@ -33,6 +33,23 @@
 //!     the source and a second set_selection with the same source is
 //!     denied silently. smithay deliberately does NOT enforce used-once
 //!     (device.rs) — ours is stricter than smithay, matching wlroots.
+//!   - Re-passing the CURRENT selection source updates the serial
+//!     silently (F-SEL-4; wlroots wlr_seat_set_primary_selection
+//!     early-returns on selection_source == source,
+//!     wlr_primary_selection.c:81-86) — the used-once denial does not
+//!     fire for it.
+//!   - A cancelled source is inert (F-SEL-3): the replaced/cleared
+//!     owner's struct is freed and its wire resource becomes a no-op
+//!     (wlroots nulls the resource user data on cancel,
+//!     wlr_primary_selection_v1.c:110-121). Re-passing a cancelled
+//!     source to set_selection behaves exactly like NULL — it clears the
+//!     selection.
+//!   - get_device with an inert or foreign seat argument yields a dead
+//!     device (F-SEL-5): the object id stays valid, every request is a
+//!     no-op.
+//!   - offer.receive with a mime the source never offered closes the fd
+//!     and relays nothing (F-SEL-6, smithay parity — mirrors the DD-7
+//!     check in data_device.zig).
 //!   - set_selection delivers data_offer + one offer event per mime +
 //!     selection to the focused client's devices; a NULL source delivers
 //!     selection(NULL).
@@ -251,6 +268,22 @@ fn managerRequest(
                 resource.getClient().postNoMemory();
                 return;
             };
+            // F-SEL-5: the seat argument must map to a live seat (the
+            // XA-5 pattern, xdg_activation.zig:369-380). An inert or
+            // foreign seat still yields a device resource — the client's
+            // object id must stay valid, or the next request kills the
+            // client — but the device is dead: no struct, no list entry,
+            // no bind-time delivery (wlroots: NULL user data for a dead
+            // seat client, wlr_primary_selection_v1.c).
+            const seat_ud = r.seat.getUserData() orelse {
+                dev_res.setHandler(?*PrimarySelectionDevice, deadDeviceHandler, null, null);
+                return;
+            };
+            const seat: *seat_mod.Seat = @ptrCast(@alignCast(seat_ud));
+            if (seat != mgr.seat) {
+                dev_res.setHandler(?*PrimarySelectionDevice, deadDeviceHandler, null, null);
+                return;
+            }
             const dev = mgr.allocator.create(PrimarySelectionDevice) catch {
                 dev_res.destroy();
                 resource.getClient().postNoMemory();
@@ -309,6 +342,48 @@ fn sourceRequest(
     }
 }
 
+/// Unlink a primary selection source from the manager and free it (mime
+/// list + struct). Shared by cancelSource and sourceDestroy.
+fn freeSource(mgr: *PrimarySelection, src: *PrimarySelectionSource) void {
+    if (std.mem.findScalar(*PrimarySelectionSource, mgr.sources.items, src)) |idx| {
+        _ = mgr.sources.orderedRemove(idx);
+    }
+    for (src.mime_types.items) |m| mgr.allocator.free(m);
+    src.mime_types.deinit(mgr.allocator);
+    const allocator = mgr.allocator;
+    allocator.destroy(src);
+}
+
+/// Cancel a source and inert it: the cancelled event goes out, the wire
+/// resource's user data is dropped (its requests become no-ops via
+/// deadSourceHandler, so a later client request cannot touch the freed
+/// struct) and the struct is freed (wlroots nulls the source resource's
+/// user data on cancel, wlr_primary_selection_v1.c:110-121). A cancelled
+/// source re-passed to set_selection extracts to null and behaves
+/// exactly like NULL — it clears the selection.
+fn cancelSource(mgr: *PrimarySelection, src: *PrimarySelectionSource) void {
+    src.resource.sendCancelled();
+    src.resource.setHandler(?*PrimarySelectionSource, deadSourceHandler, null, null);
+    freeSource(mgr, src);
+}
+
+/// Request handler for inerted (cancelled) primary selection sources:
+/// the struct is freed, so nothing is dereferenced — every request is a
+/// no-op. The destroy callback is null, so client teardown cannot call
+/// into the freed struct.
+fn deadSourceHandler(
+    resource: *server.zwp.PrimarySelectionSourceV1,
+    request: server.zwp.PrimarySelectionSourceV1.Request,
+    data: ?*PrimarySelectionSource,
+) void {
+    _ = resource;
+    _ = data;
+    switch (request) {
+        .offer => {},
+        .destroy => {},
+    }
+}
+
 fn sourceDestroy(src_res: *server.zwp.PrimarySelectionSourceV1, src: *PrimarySelectionSource) void {
     _ = src_res;
     const mgr = src.manager;
@@ -321,13 +396,7 @@ fn sourceDestroy(src_res: *server.zwp.PrimarySelectionSourceV1, src: *PrimarySel
         src.resource.sendCancelled();
         if (mgr.focus_client) |fc| deliverToFocusedClient(mgr, fc);
     }
-    if (std.mem.findScalar(*PrimarySelectionSource, mgr.sources.items, src)) |idx| {
-        _ = mgr.sources.orderedRemove(idx);
-    }
-    for (src.mime_types.items) |m| mgr.allocator.free(m);
-    src.mime_types.deinit(mgr.allocator);
-    const allocator = mgr.allocator;
-    allocator.destroy(src);
+    freeSource(mgr, src);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,15 +412,36 @@ fn deviceRequest(
         .set_selection => |r| {
             const mgr = dev.manager;
             const caller = dev.resource.getClient();
+            // Extract the source with null tolerance (F-SEL-3): a
+            // cancelled source's resource is inert (null user data) and
+            // behaves exactly like NULL — it clears the selection
+            // instead of dereferencing the freed struct.
+            var new_source: ?*PrimarySelectionSource = null;
+            if (r.source) |src_res| {
+                if (src_res.getUserData()) |ud| {
+                    new_source = @ptrCast(@alignCast(ud));
+                }
+            }
+            // F-SEL-4: re-passing the CURRENT selection source updates
+            // the serial silently — no cancel, no re-delivery, and the
+            // used-once denial below does not fire (wlroots
+            // wlr_seat_set_primary_selection early-returns on
+            // selection_source == source, wlr_primary_selection.c:81-86;
+            // wlroots has no used-once gate at all — ours stays for
+            // non-current finalized sources).
+            if (new_source) |src| {
+                if (mgr.selection_source == src) {
+                    mgr.selection_serial = r.serial;
+                    return;
+                }
+            }
             // The source is finalized (used once) BEFORE the focus and
             // ordering gates, per wlroots device_handle_set_selection
             // (wlr_primary_selection_v1.c:213-216): a request the gates
-            // reject still burns the source.
-            var new_source: ?*PrimarySelectionSource = null;
-            if (r.source) |src_res| {
-                const src: *PrimarySelectionSource = @ptrCast(@alignCast(src_res.getUserData()));
-                // A source is used once: a second set_selection with the
-                // same source is denied silently.
+            // reject still burns the source. A second set_selection with
+            // the same used-once (non-current) source is denied
+            // silently.
+            if (new_source) |src| {
                 if (src.finalized) {
                     log.debug(
                         "denying primary selection: source already used",
@@ -363,7 +453,6 @@ fn deviceRequest(
                     return;
                 }
                 src.finalized = true;
-                new_source = src;
             }
             // Only the keyboard-focused client may set the primary
             // selection; everyone else is denied silently (smithay:
@@ -411,9 +500,11 @@ fn deviceRequest(
                 return;
             }
             if (new_source) |src| {
-                // A new selection: cancel the previous owner.
+                // A new selection: cancel the previous owner (inerting
+                // it — the cancelled source's struct is freed and its
+                // wire resource becomes a no-op, F-SEL-3).
                 if (mgr.selection_source) |old| {
-                    if (old != src) old.resource.sendCancelled();
+                    if (old != src) cancelSource(mgr, old);
                 }
                 mgr.selection_source = src;
                 mgr.selection_serial = r.serial;
@@ -422,8 +513,9 @@ fn deviceRequest(
                 });
                 mgr.events.selection_set.emit(mgr);
             } else {
-                // Null source: clear the selection.
-                if (mgr.selection_source) |old| old.resource.sendCancelled();
+                // Null source — or a cancelled (inert) source: clear the
+                // selection.
+                if (mgr.selection_source) |old| cancelSource(mgr, old);
                 mgr.selection_source = null;
                 mgr.selection_serial = r.serial;
                 log.debug("primary selection cleared", mgr.io, mgr.log_cfg, "primary_selection", .{});
@@ -432,6 +524,22 @@ fn deviceRequest(
             deliverToFocusedClient(mgr, caller);
         },
         .destroy => dev_res.destroy(),
+    }
+}
+
+/// Request handler for inerted (dead) primary selection devices: no
+/// struct exists, so every request is a no-op. The destroy callback is
+/// null, so client teardown cannot call into a freed struct.
+fn deadDeviceHandler(
+    resource: *server.zwp.PrimarySelectionDeviceV1,
+    request: server.zwp.PrimarySelectionDeviceV1.Request,
+    data: ?*PrimarySelectionDevice,
+) void {
+    _ = resource;
+    _ = data;
+    switch (request) {
+        .set_selection => {},
+        .destroy => {},
     }
 }
 
@@ -542,6 +650,30 @@ fn offerRequest(
                 _ = std.os.linux.close(r.fd);
                 return;
             };
+            // F-SEL-6: smithay hardening (selection/offer.rs:177 — the
+            // receive dispatch covers DataDeviceKind::Primary at
+            // offer.rs:148-152): a mime the source never offered is
+            // denied — the fd is closed and no send is relayed (mirrors
+            // the DD-7 check in data_device.zig; wlroots relays blindly).
+            const mime = std.mem.span(r.mime_type);
+            var offered = false;
+            for (src.mime_types.items) |m| {
+                if (std.mem.eql(u8, m, mime)) {
+                    offered = true;
+                    break;
+                }
+            }
+            if (!offered) {
+                log.debug(
+                    "primary selection offer.receive denied: mime '{s}' was not offered",
+                    offer.manager.io,
+                    offer.manager.log_cfg,
+                    "primary_selection",
+                    .{mime},
+                );
+                _ = std.os.linux.close(r.fd);
+                return;
+            }
             src.resource.sendSend(r.mime_type, r.fd);
             _ = std.os.linux.close(r.fd);
             log.debug(
@@ -549,7 +681,7 @@ fn offerRequest(
                 offer.manager.io,
                 offer.manager.log_cfg,
                 "primary_selection",
-                .{std.mem.span(r.mime_type)},
+                .{mime},
             );
         },
         .destroy => offer_res.destroy(),
@@ -1327,4 +1459,216 @@ test "primary selection: focus change delivers selection(NULL) to the previous f
     try testing.expect(events_a.last_selection_null);
     try testing.expectEqual(@as(usize, 1), events_b.selection_count);
     try testing.expect(!events_b.last_selection_null);
+}
+
+test "primary selection: a cancelled source is inert; re-passing it clears" {
+    // F-SEL-3: a replaced primary selection's source is cancelled AND
+    // inerted — the struct is freed and the wire resource's requests
+    // become no-ops (wlroots nulls the source resource's user data on
+    // cancel, wlr_primary_selection_v1.c:110-121). Re-passing the
+    // cancelled source to set_selection behaves exactly like passing
+    // NULL: the selection is cleared and the current owner is cancelled
+    // (the null-tolerant extraction must not deref the freed struct).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    const a = &ts.client_a.?;
+
+    focusClient(ts, a);
+    const device = try a.wl_manager.getDevice(a.wl_seat);
+    var events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &events);
+    const src_a = try a.wl_manager.createSource();
+    src_a.offer("text/plain");
+    var events_a: SourceEvents = .{};
+    src_a.setListener(*SourceEvents, SourceEvents.listener, &events_a);
+    try ts.pump();
+
+    device.setSelection(src_a, 0);
+    try ts.pump();
+    try testing.expectEqual(src_a.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    // src_b is created only after the first set: the sources list holds
+    // exactly the live sources, so with a single source it is [src_a]
+    // (len 1) here. The unlink is covered below — replacing A with B
+    // frees A and drops the list to [src_b] (len 1).
+    const src_b = try a.wl_manager.createSource();
+    src_b.offer("text/plain");
+    var events_b: SourceEvents = .{};
+    src_b.setListener(*SourceEvents, SourceEvents.listener, &events_b);
+    try ts.pump();
+
+    // Replacing with B cancels A and inerts it (struct freed, unlinked).
+    device.setSelection(src_b, 0);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_a.cancelled_count);
+    try testing.expectEqual(src_b.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.sources.items.len);
+
+    // Re-passing the cancelled source behaves like NULL: cleared, the
+    // current owner is cancelled, no crash on the freed struct.
+    device.setSelection(src_a, 0);
+    try ts.pump();
+    try testing.expectEqual(@as(?*PrimarySelectionSource, null), ts.mgr.?.selection_source);
+    try testing.expect(events.last_selection_null);
+    try testing.expectEqual(@as(usize, 1), events_b.cancelled_count);
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.sources.items.len);
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.offers.items.len);
+}
+
+test "primary selection: re-setting the current source updates the serial only" {
+    // F-SEL-4: wlroots wlr_seat_set_primary_selection early-returns when
+    // the incoming source is already the selection, updating only the
+    // serial (wlr_primary_selection.c:81-86) — no cancel, no
+    // re-delivery, and the used-once denial does not fire. Observable
+    // via the superseded gate: after the silent re-set advances the
+    // serial to 2, a set with serial 1 is denied and the selection
+    // stays A.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    const a = &ts.client_a.?;
+
+    var capture: SelectionEventCapture = .{
+        .listener_set = wire.Listener(*PrimarySelection).init(SelectionEventCapture.onSet),
+        .listener_cleared = wire.Listener(*PrimarySelection).init(SelectionEventCapture.onCleared),
+    };
+    ts.mgr.?.events.selection_set.add(&capture.listener_set);
+    ts.mgr.?.events.selection_cleared.add(&capture.listener_cleared);
+
+    focusClient(ts, a);
+    const device = try a.wl_manager.getDevice(a.wl_seat);
+    var events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &events);
+    const src_a = try a.wl_manager.createSource();
+    src_a.offer("text/plain");
+    const src_b = try a.wl_manager.createSource();
+    src_b.offer("text/plain");
+    var events_a: SourceEvents = .{};
+    src_a.setListener(*SourceEvents, SourceEvents.listener, &events_a);
+    try ts.pump();
+
+    // Set A with serial 1.
+    device.setSelection(src_a, 1);
+    try ts.pump();
+    try testing.expectEqual(src_a.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    try testing.expectEqual(@as(u32, 1), ts.mgr.?.selection_serial);
+    try testing.expectEqual(@as(usize, 1), capture.set_count);
+    const selection_count = events.selection_count;
+
+    // Re-set A with serial 2: silent serial update — no new selection
+    // events, no cancel, no selection_set signal.
+    device.setSelection(src_a, 2);
+    try ts.pump();
+    try testing.expectEqual(@as(u32, 2), ts.mgr.?.selection_serial);
+    try testing.expectEqual(@as(usize, 1), capture.set_count);
+    try testing.expectEqual(selection_count, events.selection_count);
+    try testing.expectEqual(@as(usize, 0), events_a.cancelled_count);
+
+    // The advanced serial now supersedes older requests: set B with
+    // serial 1 is denied silently (1 -% 2 > maxInt/2) and the selection
+    // stays A.
+    device.setSelection(src_b, 1);
+    try ts.pump();
+    try testing.expectEqual(src_a.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    try testing.expectEqual(@as(u32, 2), ts.mgr.?.selection_serial);
+    try testing.expectEqual(@as(usize, 1), capture.set_count);
+    try testing.expectEqual(selection_count, events.selection_count);
+    // The denied source was still burned (finalize before the gates).
+    try testing.expect(ts.mgr.?.sources.items[1].finalized);
+}
+
+test "primary selection: get_device with an inert seat yields a dead device" {
+    // F-SEL-5: the seat argument must map to a live seat (the XA-5
+    // pattern, xdg_activation.zig:369-380). An inert seat still yields
+    // a device resource — the client's object id must stay valid — but
+    // the device is dead: no struct, no list entry, every request a
+    // no-op.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    const a = &ts.client_a.?;
+
+    // Inert the server-side wl_seat resource (the XA-5 recipe,
+    // xdg_activation.zig:1003-1006).
+    const seat_res = a.client.getObject(a.wl_seat.getId()).?;
+    seat_res.setDispatcher(null, null, null, null);
+
+    const device = try a.wl_manager.getDevice(a.wl_seat);
+    const src = try a.wl_manager.createSource();
+    src.offer("text/plain");
+    var events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &events);
+    try ts.pump();
+
+    // The inert path wires a dead handler without appending to the
+    // manager's device list.
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.devices.items.len);
+
+    // set_selection on the dead device is a silent no-op: nothing is
+    // stored, nothing is delivered, no protocol error, no crash. The
+    // source stays unfinalized (the request never reaches the gates).
+    device.setSelection(src, 0);
+    try ts.pump();
+    try testing.expectEqual(@as(?*PrimarySelectionSource, null), ts.mgr.?.selection_source);
+    try testing.expectEqual(@as(usize, 0), events.selection_count);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.sources.items.len);
+    try testing.expect(!ts.mgr.?.sources.items[0].finalized);
+
+    // destroy on the dead device works (the object id stays valid).
+    device.destroy();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.devices.items.len);
+}
+
+test "primary selection: offer.receive with an unoffered mime closes the fd and relays nothing" {
+    // F-SEL-6: mirrors the DD-7 check in data_device.zig — receive()
+    // validates the mime against the offered list; an unknown mime
+    // closes the fd and never relays a send (smithay selection/
+    // offer.rs:177 validates for ALL offer kinds including primary,
+    // offer.rs:148-152; wlroots relays blindly).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    const a = &ts.client_a.?;
+
+    focusClient(ts, a);
+    const device = try a.wl_manager.getDevice(a.wl_seat);
+    const src = try a.wl_manager.createSource();
+    src.offer("text/plain");
+    var src_events: SourceEvents = .{};
+    src.setListener(*SourceEvents, SourceEvents.listener, &src_events);
+    var events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &events);
+    try ts.pump();
+
+    device.setSelection(src, 0);
+    try ts.pump();
+    const offer = events.last_offer.?;
+
+    var fds: [2]posix.socket_t = undefined;
+    const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+    offer.receive("application/x-unknown", fds[0]);
+    try ts.pump();
+    // No send relayed to the source...
+    try testing.expectEqual(@as(usize, 0), src_events.send_count);
+    // The client transfers ownership of its copy (protocol semantics);
+    // libwayland-client does not close it for us.
+    _ = std.os.linux.close(fds[0]);
+    // ...and the server closed ITS copy too: with both copies of the
+    // peer end gone, sending on the other end is EPIPE (raw syscall
+    // with MSG_NOSIGNAL keeps it an error instead of a SIGPIPE).
+    const send_rc = std.os.linux.sendto(fds[1], "x", 1, std.os.linux.MSG.NOSIGNAL, null, 0);
+    try testing.expectEqual(std.os.linux.E.PIPE, std.os.linux.errno(send_rc));
+    _ = std.os.linux.close(fds[1]);
+
+    // An offered mime still relays.
+    var fds2: [2]posix.socket_t = undefined;
+    const rc2 = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds2);
+    if (posix.errno(rc2) != .SUCCESS) return error.SocketpairFailed;
+    offer.receive("text/plain", fds2[0]);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), src_events.send_count);
+    _ = std.os.linux.close(fds2[0]);
+    _ = std.os.linux.close(fds2[1]);
 }

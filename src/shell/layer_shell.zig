@@ -17,8 +17,12 @@
 //! - A NULL-buffer commit unmaps the surface and RESETS it to the state it
 //!   had right after get_layer_surface: a fresh buffer-less commit +
 //!   configure + ack are required to map again (spec: reset).
-//! - destroy sends `closed` first, then destroys the object (requests after
-//!   that are gone with the resource).
+//! - destroy/close sends `closed`, then makes the wire resource inert
+//!   (later client requests are silent no-ops; the client's own destroy
+//!   destroys the wire resource — wlroots wlr_layer_surface_v1_destroy:
+//!   closed first, then layer_surface_destroy inerts the resource) and
+//!   tears the object down; the resource stays alive until the client
+//!   disconnects.
 //!
 //! The layer state (size, anchor, exclusive zone, margin, keyboard
 //! interactivity, layer, exclusive edge) is double-buffered: requests write
@@ -79,6 +83,14 @@ pub const LayerShell = struct {
     events: struct {
         /// A new layer surface role object was created.
         new_layer_surface: wire.Signal(*LayerSurface),
+        /// An xdg_popup was parented to a layer surface via get_popup. The
+        /// popup is fully parented when the signal fires (layer_parent set,
+        /// list insert + destroy listener attached) — listeners may touch
+        /// it safely (wlroots: insert into parent->popups then
+        /// wl_signal_emit_mutable(&parent->events.new_popup, popup),
+        /// wlr_layer_shell_v1.c:256-257). Distinct from the xdg-shell
+        /// shell.events.new_popup signal (different type, different path).
+        new_popup: wire.Signal(*xdg_mod.XdgPopup),
     },
 
     pub fn init(
@@ -102,6 +114,7 @@ pub const LayerShell = struct {
         };
         errdefer shell.layer_surfaces.deinit(allocator);
         shell.events.new_layer_surface.init();
+        shell.events.new_popup.init();
 
         // Register zwlr_layer_shell_v1 at the maximum version we implement.
         shell.global = try display.addGlobal(
@@ -407,14 +420,26 @@ pub const LayerSurface = struct {
         surface.events.unmap.emit(surface);
     }
 
-    /// Destroy the layer surface from the compositor side: send `closed`
-    /// first, then destroy the wire resource (cascades through
-    /// layerSurfaceDestroy). Idempotent.
+    /// Destroy the layer surface from the compositor side: send `closed`,
+    /// then make the wire resource inert (later client requests are silent
+    /// no-ops, wlroots parity: wlr_layer_shell_v1.c:331-337 then :58
+    /// wl_resource_set_user_data(resource, NULL)) and tear the object down
+    /// directly. The resource stays alive on the wire until the client
+    /// disconnects; layerSurfaceDestroy never destroys it (it is the
+    /// handler body). Idempotent.
     pub fn close(ls: *LayerSurface) void {
         if (ls.closed) return;
         ls.closed = true;
         ls.resource.sendClosed();
-        ls.resource.destroy();
+        // Inert with a live no-op handler, not a null dispatcher: the
+        // struct is freed below, so no request may dereference it, while
+        // the client's own destroy must still destroy the wire resource.
+        // A null dispatcher makes libwayland abort the compositor on the
+        // next request (wayland-server.c wl_closure_invoke). The destroy
+        // callback stays null so resource teardown cannot call into the
+        // freed struct.
+        ls.resource.setHandler(?*LayerSurface, deadLayerSurfaceHandler, null, null);
+        layerSurfaceDestroy(ls.resource, ls); // teardown + free, resource stays alive
     }
 
     /// The single output edge this surface occupies with its exclusive zone,
@@ -476,6 +501,12 @@ pub const LayerSurface = struct {
         };
         const raw_popup: *wire.Resource = @ptrCast(popup_res);
         raw_popup.addDestroyListener(&link.destroy_listener);
+        // The popup is fully parented (layer_parent set, list insert +
+        // destroy listener attached): emit the compositor signal (wlroots
+        // layer_surface_handle_get_popup emits after inserting into
+        // parent->popups, wlr_layer_shell_v1.c:256-257; smithay
+        // WlrLayerShellHandler::new_popup; KWin popupPrivate->attachTo).
+        ls.shell.events.new_popup.emit(popup);
         log.info("xdg_popup {*} parented to layer surface on wl_surface {*}", ls.io, ls.log_cfg, log_tag, .{
             popup,
             ls.surface,
@@ -500,6 +531,34 @@ fn deducedEdge(zone: i32, anchor: u32, exclusive_edge: u32) ?Edge {
     return null;
 }
 
+/// Request handler for inerted (closed) layer surfaces: the LayerSurface
+/// struct is freed, so nothing is dereferenced — every request is a silent
+/// no-op (wlroots: wl_resource_set_user_data(resource, NULL) on close).
+/// The destroy callback is null, so client teardown cannot call into the
+/// freed struct; the client's own destroy destroys the wire resource
+/// (libwayland dispatches the destructor like any other request — a NULL
+/// dispatcher would abort the compositor, wayland-server.c
+/// wl_closure_invoke).
+fn deadLayerSurfaceHandler(
+    ls_res: *server.zwlr.LayerSurfaceV1,
+    request: server.zwlr.LayerSurfaceV1.Request,
+    data: ?*LayerSurface,
+) void {
+    _ = data;
+    switch (request) {
+        .destroy => ls_res.destroy(),
+        .set_size => {},
+        .set_anchor => {},
+        .set_exclusive_zone => {},
+        .set_margin => {},
+        .set_keyboard_interactivity => {},
+        .get_popup => {},
+        .ack_configure => {},
+        .set_layer => {},
+        .set_exclusive_edge => {},
+    }
+}
+
 fn layerSurfaceRequest(
     ls_res: *server.zwlr.LayerSurfaceV1,
     request: server.zwlr.LayerSurfaceV1.Request,
@@ -509,14 +568,17 @@ fn layerSurfaceRequest(
     switch (request) {
         .destroy => ls.close(),
         .set_size => |r| {
-            // wlroots rejects sizes beyond INT32_MAX with an implementation
-            // error (wlr_layer_shell_v1.c:128-151; the XML defines no error
-            // code for it) and skips the state write when nothing changed.
-            // wlroots posts client-level; ours posts raw -1 on the surface
-            // resource (the codebase's implementation-error pattern).
+            // wlroots rejects sizes beyond INT32_MAX with a client-level
+            // implementation error (wl_client_post_implementation_error,
+            // wlr_layer_shell_v1.c:128-151; the XML defines no error code
+            // for it) — libwayland delivers it as the global
+            // WL_DISPLAY_ERROR_IMPLEMENTATION error on the wl_display
+            // resource (never a layer-shell error code, L4) — and skips the
+            // state write when nothing changed.
             if (r.width > std.math.maxInt(i32) or r.height > std.math.maxInt(i32)) {
-                const raw: *wire.Resource = @ptrCast(ls.resource);
-                raw.postError(@bitCast(@as(i32, -1)), "size out of bounds");
+                ls.resource.getClient().postImplementationError(
+                    "zwlr_layer_surface_v1.set_size: width/height exceed INT32_MAX",
+                );
                 return;
             }
             if (ls.pending.desired_width == r.width and ls.pending.desired_height == r.height) return;
@@ -766,6 +828,18 @@ const NewLayerSurfaceCapture = struct {
     fn notify(listener: *wire.Listener(*LayerSurface), layer_surface: *LayerSurface) void {
         _ = layer_surface;
         @as(*NewLayerSurfaceCapture, @fieldParentPtr("listener", listener)).count += 1;
+    }
+};
+
+const NewLayerPopupCapture = struct {
+    count: usize = 0,
+    popup: ?*xdg_mod.XdgPopup = null,
+    listener: wire.Listener(*xdg_mod.XdgPopup),
+
+    fn notify(listener: *wire.Listener(*xdg_mod.XdgPopup), popup: *xdg_mod.XdgPopup) void {
+        const cap: *NewLayerPopupCapture = @fieldParentPtr("listener", listener);
+        cap.count += 1;
+        cap.popup = popup;
     }
 };
 
@@ -1202,6 +1276,48 @@ test "layer surface v3 client: legacy flow, set_layer, keyboard interactivity co
     try std.testing.expectEqual(@as(usize, 1), ls_events.configure_count);
 }
 
+test "layer surface: close inerts the resource; post-close requests are no-ops" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell.?.getLayerSurface(wl_surface, null, .top, "test");
+    var ls_events: LayerSurfaceEvents = .{};
+    layer_surface.setListener(*LayerSurfaceEvents, LayerSurfaceEvents.listener, &ls_events);
+    layer_surface.setAnchor(@bitCast(anchor_top | anchor_bottom | anchor_left | anchor_right));
+    try ts.pump();
+    const ls = ts.shell.?.layer_surfaces.items[0];
+
+    // Map the layer surface normally (configure + ack + buffer commit).
+    wl_surface.commit();
+    try ts.pump();
+    layer_surface.ackConfigure(ls.configure_serial);
+    const buffer = try createShmBuffer(ts);
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(ls.surface.mapped);
+
+    // Compositor close: `closed` is sent, then the resource is inerted and
+    // the object torn down (wlroots parity, L3).
+    ls.close();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ls_events.closed_count);
+    try std.testing.expectEqual(@as(usize, 0), ts.shell.?.layer_surfaces.items.len);
+
+    // A post-close set_size on the inert resource is a silent no-op (the
+    // connection stays healthy).
+    layer_surface.setSize(200, 100);
+    try ts.pump();
+
+    // The client's own destroy destroys the wire resource via the dead
+    // handler: no abort (the resource keeps a real dispatcher), no protocol
+    // error, the connection stays healthy.
+    layer_surface.destroy();
+    try ts.pump();
+}
+
 test "layer surface: get_popup parents a NULL-parent xdg_popup; layer unmap dismisses it" {
     const allocator = std.testing.allocator;
     var ts = try TestServer.init(allocator);
@@ -1236,6 +1352,11 @@ test "layer surface: get_popup parents a NULL-parent xdg_popup; layer unmap dism
     popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
     var xdg_events: XdgSurfaceEvents = .{};
     xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xdg_events);
+    // L1: the compositor signal fires with the parented popup.
+    var new_popup_capture: NewLayerPopupCapture = .{
+        .listener = wire.Listener(*xdg_mod.XdgPopup).init(NewLayerPopupCapture.notify),
+    };
+    ts.shell.?.events.new_popup.add(&new_popup_capture.listener);
     try ts.pump();
 
     layer_surface.getPopup(popup);
@@ -1248,6 +1369,12 @@ test "layer surface: get_popup parents a NULL-parent xdg_popup; layer unmap dism
     try std.testing.expect(server_popup.parent == null);
     try std.testing.expect(server_popup.layer_parent != null);
     try std.testing.expectEqual(ls.surface, server_popup.layer_parent.?);
+
+    // The new_popup signal observed the creation with the SAME, fully
+    // parented object (L1; wlroots emits after the list insert).
+    try std.testing.expectEqual(@as(usize, 1), new_popup_capture.count);
+    try std.testing.expectEqual(server_popup, new_popup_capture.popup.?);
+    try std.testing.expectEqual(ls.surface, new_popup_capture.popup.?.layer_parent.?);
 
     // The popup's first buffer-less commit triggers popup.configure (with the
     // positioner geometry) + xdg_surface.configure.
@@ -1343,9 +1470,17 @@ test "layer surface: set_size beyond INT32_MAX is an implementation error" {
     const too_big: u32 = @as(u32, @intCast(std.math.maxInt(i32))) + 1;
     layer_surface.setSize(too_big, 0);
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    // wlroots parity (L4): the oversized size kills the client via a
+    // SERVER-side implementation error (wl_client_post_implementation_error,
+    // wlr_layer_shell_v1.c:137-141). libwayland delivers it as the global
+    // WL_DISPLAY_ERROR_IMPLEMENTATION (3) error on the wl_display resource
+    // (verified in wayland-server.c: wl_client_post_implementation_error ->
+    // wl_resource_post_error_vargs(display_resource, ...)) — not the raw -1
+    // on the layer-surface resource the old code posted, and never a
+    // layer-shell error code.
     const err = protocolError(ts);
-    try std.testing.expectEqual(@as(c_int, -1), err.code);
-    try std.testing.expectEqualStrings("zwlr_layer_surface_v1", err.interface);
+    try std.testing.expectEqual(@as(c_int, 3), err.code); // WL_DISPLAY_ERROR_IMPLEMENTATION
+    try std.testing.expectEqualStrings("wl_display", err.interface);
     // The error fires before any state write (the guard returns first), and
     // posting it destroys the client (libwayland-server tears down errored
     // clients after the dispatch), so no server-side state survives to read.

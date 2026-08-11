@@ -26,9 +26,13 @@
 //!   the zxdg_toplevel_decoration_v1.configure event rides the same
 //!   xdg_surface.configure/ack_configure cycle (sent during the configure
 //!   emission, applied when the client acks the matching xdg configure;
-//!   wlroots XD:93-146). No initial configure is sent: a client that never
-//!   sets a mode draws client-side (the XML's default; wlroots' pending ==
-//!   scheduled initially).
+//!   wlroots XD:93-146). No initial configure is sent BY THE MODULE: a
+//!   client that never sets a mode draws client-side (the XML's default;
+//!   wlroots' pending == scheduled initially) unless the compositor
+//!   announces one — every decoration creation fires
+//!   `events.new_toplevel_decoration` (L2, wlroots XD:237) so the
+//!   compositor can call sendConfigure(mode) for a compositor-decided
+//!   initial mode.
 //! - (f) creation errors (unconfigured_buffer, already_constructed) are
 //!   posted on the MANAGER resource (XD-2; wlroots XD:181, XD:190,
 //!   smithay smXD:229-243, KWin KWXD:54-65), not on the new decoration.
@@ -127,6 +131,12 @@ pub const XdgDecoration = struct {
     decorations: std.ArrayList(*Decoration),
     events: struct {
         request_mode: wire.Signal(*RequestMode),
+        /// A decoration was created and inserted into `decorations`
+        /// (wlroots manager->events.new_toplevel_decoration,
+        /// wlr_xdg_decoration_v1.c:237; smithay new_decoration; KWin
+        /// decorationCreated). The compositor can announce a
+        /// compositor-decided initial mode via Decoration.sendConfigure.
+        new_toplevel_decoration: wire.Signal(*Decoration),
     },
 
     pub fn init(
@@ -150,6 +160,7 @@ pub const XdgDecoration = struct {
         };
         errdefer deco.decorations.deinit(allocator);
         deco.events.request_mode.init();
+        deco.events.new_toplevel_decoration.init();
 
         // Register zxdg_decoration_manager_v1 at the maximum version we
         // implement (v1: the strict unconfigured_buffer rule).
@@ -288,6 +299,11 @@ fn getToplevelDecoration(
         manager_res.postNoMemory();
         return;
     };
+    // L2: the decoration is live (inserted + listeners attached) — notify
+    // the compositor so it can announce a compositor-decided initial mode
+    // (wlroots emits after inserting into manager->decorations,
+    // wlr_xdg_decoration_v1.c:237).
+    deco.events.new_toplevel_decoration.emit(dec);
     log.debug("new toplevel decoration (mode unset; client-side default)", deco.io, deco.log_cfg, log_tag, .{});
 }
 
@@ -474,6 +490,18 @@ const RequestModeCapture = struct {
     }
 };
 
+const NewDecorationCapture = struct {
+    count: usize = 0,
+    decoration: ?*Decoration = null,
+    listener: wire.Listener(*Decoration),
+
+    fn notify(listener: *wire.Listener(*Decoration), dec: *Decoration) void {
+        const cap: *NewDecorationCapture = @fieldParentPtr("listener", listener);
+        cap.count += 1;
+        cap.decoration = dec;
+    }
+};
+
 /// A full compositor + shell + decoration manager + in-memory client, for
 /// wire roundtrips.
 const TestServer = struct {
@@ -623,6 +651,32 @@ test "decoration happy path: get -> set_mode -> request_mode -> configure" {
     dec.destroy();
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 0), ts.decoration.?.decorations.items.len);
+}
+
+test "decoration new_toplevel_decoration fires at creation; module sends no configure" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // L2: the compositor hook fires with the inserted Decoration.
+    var capture: NewDecorationCapture = .{
+        .listener = wire.Listener(*Decoration).init(NewDecorationCapture.notify),
+    };
+    ts.decoration.?.events.new_toplevel_decoration.add(&capture.listener);
+
+    const tl = try ts.createToplevel();
+    const dec = try ts.decoration_client.?.getToplevelDecoration(tl.toplevel);
+    var dec_events: DecorationEvents = .{};
+    dec.setListener(*DecorationEvents, DecorationEvents.listener, &dec_events);
+    try ts.pump();
+
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(ts.decoration.?.decorations.items[0], capture.decoration.?);
+    // The module alone never self-configures: without a compositor
+    // sendConfigure (the announce is the compositor's job via the signal),
+    // no zxdg configure is sent — the existing happy-path tests keep their
+    // client-driven configures.
+    try std.testing.expectEqual(@as(usize, 0), dec_events.configure_count);
 }
 
 test "decoration second decoration on a toplevel -> already_constructed" {

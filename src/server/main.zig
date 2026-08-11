@@ -193,6 +193,9 @@ const ServerState = struct {
     toplevels: std.ArrayList(*wayland.shell.XdgToplevel) = .empty,
     /// Layer surfaces created by clients (tracked for observability).
     layer_surfaces: std.ArrayList(*wayland.layer_shell.LayerSurface) = .empty,
+    /// xdg_popups parented to layer surfaces via get_popup (tracked for
+    /// observability; L1).
+    layer_popups: std.ArrayList(*wayland.shell.XdgPopup) = .empty,
     frames_rendered: u32 = 0,
     /// Idle-frame skip: a frame only renders when something changed this
     /// cycle (a surface commit, a camera move, a cursor move). Cleared
@@ -297,8 +300,10 @@ const ServerState = struct {
     new_popup_listener: wire.Listener(*wayland.shell.XdgPopup),
     new_activation_token_listener: wire.Listener(*wayland.xdg_activation.ActivationToken),
     new_layer_surface_listener: wire.Listener(*wayland.layer_shell.LayerSurface),
+    new_layer_popup_listener: wire.Listener(*wayland.shell.XdgPopup),
     request_activate_listener: wire.Listener(*wayland.xdg_activation.ActivateRequest),
     request_mode_listener: wire.Listener(*wayland.xdg_decoration.RequestMode),
+    new_decoration_listener: wire.Listener(*wayland.xdg_decoration.Decoration),
     seat_key_listener: wire.Listener(*wayland.seat.Seat),
     /// M4 Phase B camera controls: seat listeners for the drag-pan
     /// (button + pointer_move signals) and the wheel-zoom (axis signal).
@@ -410,6 +415,10 @@ pub fn main(init: std.process.Init) !void {
     // wp_fractional_scale_manager_v1 (staging): the preferred scale.
     const fractional_scale = try wayland.fractional_scale.FractionalScale.init(allocator, io, &log_cfg, display);
     defer fractional_scale.deinit();
+    // Advertise the preferred scale now (scale 1: 120/120). The value is
+    // a settable API — a future scale path calls setPreferredScale on
+    // output-scale change (wlroots refines to per-surface notify_scale).
+    fractional_scale.setPreferredScale(120);
     // wp_viewporter (stable): crop/scale surface content (foot needs it).
     const viewporter = try wayland.viewporter.Viewporter.init(allocator, io, &log_cfg, display);
     defer viewporter.deinit();
@@ -553,6 +562,7 @@ pub fn main(init: std.process.Init) !void {
         .presentation = presentation,
         .toplevels = .empty,
         .layer_surfaces = .empty,
+        .layer_popups = .empty,
         .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
         .new_input_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onNewInput),
         .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
@@ -560,8 +570,10 @@ pub fn main(init: std.process.Init) !void {
         .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
         .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
         .new_layer_surface_listener = wire.Listener(*wayland.layer_shell.LayerSurface).init(onNewLayerSurface),
+        .new_layer_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewLayerPopup),
         .request_activate_listener = wire.Listener(*wayland.xdg_activation.ActivateRequest).init(onRequestActivate),
         .request_mode_listener = wire.Listener(*wayland.xdg_decoration.RequestMode).init(onDecorationMode),
+        .new_decoration_listener = wire.Listener(*wayland.xdg_decoration.Decoration).init(onNewDecoration),
         .new_activation_token_listener = wire.Listener(*wayland.xdg_activation.ActivationToken)
             .init(onNewActivationToken),
         .seat_key_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKey),
@@ -572,6 +584,7 @@ pub fn main(init: std.process.Init) !void {
     if (backend_is_drm) state.drm_backend = backend;
     defer state.toplevels.deinit(allocator);
     defer state.layer_surfaces.deinit(allocator);
+    defer state.layer_popups.deinit(allocator);
     // Scene teardown (LIFO): drop the per-surface scene state first, then
     // the scene output view, then the scene tree itself. The compositor
     // (deferred earlier in main) destroys its surfaces afterwards; the
@@ -597,6 +610,9 @@ pub fn main(init: std.process.Init) !void {
     shell.events.new_toplevel.add(&state.new_toplevel_listener);
     shell.events.new_popup.add(&state.new_popup_listener);
     layer_shell.events.new_layer_surface.add(&state.new_layer_surface_listener);
+    // L1: layer-popup parenting (get_popup) is observable; no anchoring or
+    // placement policy here (out of scope, same as layer-surface layout).
+    layer_shell.events.new_popup.add(&state.new_layer_popup_listener);
     seat.events.key.add(&state.seat_key_listener);
     // M4 Phase B camera controls: wheel zoom + drag pan hook the seat's
     // existing event surface (button, pointer_move, axis). The raylib
@@ -613,8 +629,11 @@ pub fn main(init: std.process.Init) !void {
     xdg_activation.events.request_activate.add(&state.request_activate_listener);
     xdg_activation.events.new_token.add(&state.new_activation_token_listener);
     // zxdg_decoration_manager_v1: mode requests; the handler replies with
-    // the effective mode via sendConfigure.
+    // the effective mode via sendConfigure. New decorations announce the
+    // compositor's initial mode the same way, so a client that never sends
+    // set_mode still draws the policy chrome (L2).
     xdg_decoration.events.request_mode.add(&state.request_mode_listener);
+    xdg_decoration.events.new_toplevel_decoration.add(&state.new_decoration_listener);
     // The compositor hit-tests over the scene graph: surfaces map to
     // scene nodes through the surface entries.
     seat.setPick(pickSurface, &state);
@@ -1043,6 +1062,22 @@ fn onNewLayerSurface(
     });
 }
 
+/// zwlr_layer_shell_v1 events.new_popup (L1): an xdg_popup was parented to
+/// a layer surface via get_popup. Tracked for observability only — NO
+/// anchoring or placement policy here (layer-popup layout is compositor
+/// policy, out of scope like layer-surface layout; see
+/// notes/129-layer-shell-impl.md). Mirrors onNewLayerSurface.
+fn onNewLayerPopup(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.shell.XdgPopup) void {
+    const self: *ServerState = @fieldParentPtr("new_layer_popup_listener", listener);
+    self.layer_popups.append(self.allocator, p) catch |err| {
+        log.warn("failed to track layer popup: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+    };
+    log.info("new layer popup on wl_surface {*} total={d}", self.io, self.log_cfg, "server", .{
+        p.xdg_surface.surface,
+        self.layer_popups.items.len,
+    });
+}
+
 fn onNewPopup(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.shell.XdgPopup) void {
     const self: *ServerState = @fieldParentPtr("new_popup_listener", listener);
     // F1: the compositor supplies the usable area for popup placement —
@@ -1090,29 +1125,54 @@ fn onNewActivationToken(
     });
 }
 
+/// The compositor's decoration-mode policy (placeholder — the compositor
+/// has no real decorations): server-side for the focused toplevel,
+/// client-side otherwise. See notes/129-shell-protocols-impl.md.
+fn decorationModeFor(
+    self: *ServerState,
+    dec: *wayland.xdg_decoration.Decoration,
+) wayland.server.zxdg.ToplevelDecorationV1.Mode {
+    const toplevel = dec.toplevel orelse return .client_side;
+    return if (self.seat.keyboard_focus == toplevel.xdg_surface.surface)
+        .server_side
+    else
+        .client_side;
+}
+
 fn onDecorationMode(
     listener: *wire.Listener(*wayland.xdg_decoration.RequestMode),
     req: *wayland.xdg_decoration.RequestMode,
 ) void {
     const self: *ServerState = @fieldParentPtr("request_mode_listener", listener);
-    // Placeholder policy (the compositor has no real decorations):
-    // server-side for the focused toplevel, client-side otherwise. See
-    // notes/129-shell-protocols-impl.md.
     // XD-1: sendConfigure schedules a toplevel configure; the
     // zxdg_toplevel_decoration_v1.configure event rides that
     // xdg_surface.configure/ack_configure cycle (the client applies the
     // mode when it acks).
-    const mode: wayland.server.zxdg.ToplevelDecorationV1.Mode = blk: {
-        const toplevel = req.decoration.toplevel orelse break :blk .client_side;
-        break :blk if (self.seat.keyboard_focus == toplevel.xdg_surface.surface)
-            .server_side
-        else
-            .client_side;
-    };
+    const mode = decorationModeFor(self, req.decoration);
     log.info("xdg_decoration: request_mode {s} -> {s}", self.io, self.log_cfg, "server", .{
         modeLabel(req.mode), modeLabel(mode),
     });
     req.decoration.sendConfigure(mode);
+}
+
+/// zxdg_decoration_manager_v1 events.new_toplevel_decoration (L2): a
+/// client created a decoration. Announce the compositor's initial mode so
+/// a client that never sends set_mode still draws the policy chrome
+/// (wlroots emits after inserting into manager->decorations,
+/// wlr_xdg_decoration_v1.c:237). The announce is idempotent: sendConfigure
+/// only schedules the mode; the onSurfaceConfigure dedupe
+/// (pending_mode == scheduled_mode) guards repeated configures, and
+/// creation fires the signal exactly once per decoration.
+fn onNewDecoration(
+    listener: *wire.Listener(*wayland.xdg_decoration.Decoration),
+    dec: *wayland.xdg_decoration.Decoration,
+) void {
+    const self: *ServerState = @fieldParentPtr("new_decoration_listener", listener);
+    const mode = decorationModeFor(self, dec);
+    log.info("xdg_decoration: new decoration, announced {s}", self.io, self.log_cfg, "server", .{
+        modeLabel(mode),
+    });
+    dec.sendConfigure(mode);
 }
 
 /// Short label for a decoration mode (or unset) for logging.
