@@ -289,6 +289,14 @@ pub const Seat = struct {
     pick_fn: ?*const fn (ctx: *anyopaque, x: i32, y: i32) ?PickResult = null,
     pick_ctx: ?*anyopaque = null,
 
+    /// The compositor's implicit pointer grab is active (a camera drag /
+    /// interactive move): pointer motion and buttons are delivered to the
+    /// compositor's listeners only — the client under the pointer sees
+    /// nothing, so it cannot start a text selection or other gesture
+    /// while the user pans the canvas (wlroots' interactive-move grab
+    /// keeps the pointer out of the client's hands the same way).
+    pointer_grab: bool = false,
+
     events: struct {
         /// A key was pressed/released. The seat state (last_keysym,
         /// mods) is already updated; read it in the handler.
@@ -527,11 +535,25 @@ pub const Seat = struct {
         };
     }
 
+    /// Start/stop the compositor's implicit pointer grab (see
+    /// pointer_grab). The seat keeps delivering motion/buttons to the
+    /// compositor listeners so the gesture keeps working.
+    pub fn setPointerGrab(self: *Seat, grabbed: bool) void {
+        self.pointer_grab = grabbed;
+    }
+
     /// Move the pointer to output coords (x, y): hit-test, deliver
     /// enter/leave/motion to the focused client, move the cursor.
     pub fn pointerMotion(self: *Seat, x: i32, y: i32) void {
         self.pointer_x = x;
         self.pointer_y = y;
+        // Under the compositor's grab: no pick, no enter/leave, no client
+        // motion — only the compositor's listeners (the camera pan). The
+        // client must not see the pointer during the gesture.
+        if (self.pointer_grab) {
+            self.events.pointer_move.emit(self);
+            return;
+        }
         const pick = if (self.pick_fn) |f| f(self.pick_ctx.?, x, y) else null;
         if (pick) |p| {
             if (p.surface != self.pointer_focus) self.pointerEnter(p.surface, p.sx, p.sy);
@@ -623,17 +645,23 @@ pub const Seat = struct {
         const state: server.wl.Pointer.ButtonState = if (pressed) .pressed else .released;
         // Button goes only to the focused client's pointer resources
         // (wlroots: wlr_seat_pointer_send_button iterates
-        // focused_client->pointers, wlr_seat_pointer.c:274-295).
-        if (self.pointer_focus) |focus| {
-            const focus_client = focus.resource.getClient();
-            const serial = serialFor(self, focus_client);
-            var delivered = false;
-            for (self.pointers.items) |ptr| {
-                if (ptr.getClient() != focus_client) continue;
-                ptr.sendButton(serial, time, button, state);
-                delivered = true;
+        // focused_client->pointers, wlr_seat_pointer.c:274-295). Under
+        // the compositor's grab the client sees no presses; a RELEASE is
+        // always delivered so the client can clear its own gesture state
+        // (the terminal's text-selection drag ends on the release — a
+        // swallowed release would leave it extending the selection).
+        if (!self.pointer_grab or !pressed) {
+            if (self.pointer_focus) |focus| {
+                const focus_client = focus.resource.getClient();
+                const serial = serialFor(self, focus_client);
+                var delivered = false;
+                for (self.pointers.items) |ptr| {
+                    if (ptr.getClient() != focus_client) continue;
+                    ptr.sendButton(serial, time, button, state);
+                    delivered = true;
+                }
+                if (delivered) self.markFramePending(focus_client);
             }
-            if (delivered) self.markFramePending(focus_client);
         }
         self.events.button.emit(self);
     }

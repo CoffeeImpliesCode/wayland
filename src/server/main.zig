@@ -1950,6 +1950,7 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
         self.camera_drag = null;
         self.drag_active = false;
         self.fast_render = false;
+        seat.setPointerGrab(false);
     }
 }
 
@@ -1972,9 +1973,13 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
             requestRender(self);
             return;
         }
-        // Above the threshold (or already dragging): pan the camera.
+        // Above the threshold (or already dragging): pan the camera. The
+        // implicit pointer grab starts here: the client under the pointer
+        // must not see the motion (it would extend a text selection while
+        // the user pans the canvas).
         self.drag_active = true;
         self.fast_render = true;
+        seat.setPointerGrab(true);
         self.camera.center_x -= @as(f64, @floatFromInt(dx)) / self.camera.zoom;
         self.camera.center_y -= @as(f64, @floatFromInt(dy)) / self.camera.zoom;
         self.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };

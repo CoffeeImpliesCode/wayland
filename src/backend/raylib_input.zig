@@ -147,6 +147,11 @@ pub const RaylibInput = struct {
     prev_down: [512]bool = [_]bool{false} ** 512,
     pending_up: [512]bool = [_]bool{false} ** 512,
     release_age: [512]u8 = [_]u8{255} ** 512,
+    /// Last sampled button states (0=left, 1=right, 2=middle): the poll
+    /// diffs IsMouseButtonDown against these instead of raylib's
+    /// press/release transitions, so a button release can never be
+    /// missed (a stuck camera-drag "move state" after the release).
+    prev_button: [3]bool = [_]bool{false} ** 3,
 };
 
 pub fn create(allocator: std.mem.Allocator, seat: *seat_mod.Seat) error{OutOfMemory}!*RaylibInput {
@@ -209,12 +214,10 @@ pub fn poll(ctx: *anyopaque) bool {
     }
 
     inline for (.{ 0, 1, 2 }) |b| {
-        if (raylib.IsMouseButtonPressed(b)) {
-            seat.pointerButton(@intCast(seat_mod.btn_left + b), true);
-            fed = true;
-        }
-        if (raylib.IsMouseButtonReleased(b)) {
-            seat.pointerButton(@intCast(seat_mod.btn_left + b), false);
+        const down = raylib.IsMouseButtonDown(b);
+        if (down != input.prev_button[b]) {
+            seat.pointerButton(@intCast(seat_mod.btn_left + b), down);
+            input.prev_button[b] = down;
             fed = true;
         }
     }
