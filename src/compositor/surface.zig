@@ -256,6 +256,10 @@ pub const Surface = struct {
     /// Whether the surface currently presents content (buffer with a
     /// positive size; see the map transition in commit).
     mapped: bool = false,
+    /// wp_viewport destination size (set_destination), null = unset (the
+    /// surface keeps its buffer-derived size). Written by the viewporter
+    /// module; the scene node size honors it.
+    viewport_dst: ?geom.Size = null,
     /// Deferred-commit lock (mirrors wlroots' pending.cached_state_locks,
     /// wlr_compositor.c:942-945): while set, commit() keeps the pending
     /// state accumulating instead of applying it (wlr_compositor.c:594-598).

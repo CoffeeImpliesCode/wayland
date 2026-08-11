@@ -116,6 +116,10 @@ const ServerState = struct {
     xdg_activation: *wayland.xdg_activation.XdgActivation,
     /// zxdg_decoration_manager_v1 (server-side decorations).
     xdg_decoration: *wayland.xdg_decoration.XdgDecoration,
+    /// wp_fractional_scale_manager_v1 (the preferred fractional scale).
+    fractional_scale: *wayland.fractional_scale.FractionalScale,
+    /// wp_viewporter (crop/scale surface content).
+    viewporter: *wayland.viewporter.Viewporter,
     renderer: *wayland.renderer.Renderer,
     backend: *wayland.backend.Backend,
     framebuffer: *pixman.Framebuffer,
@@ -403,6 +407,12 @@ pub fn main(init: std.process.Init) !void {
     // zxdg_decoration_manager_v1 (unstable): server-side decorations.
     const xdg_decoration = try wayland.xdg_decoration.XdgDecoration.init(allocator, io, &log_cfg, display, shell);
     defer xdg_decoration.deinit();
+    // wp_fractional_scale_manager_v1 (staging): the preferred scale.
+    const fractional_scale = try wayland.fractional_scale.FractionalScale.init(allocator, io, &log_cfg, display);
+    defer fractional_scale.deinit();
+    // wp_viewporter (stable): crop/scale surface content (foot needs it).
+    const viewporter = try wayland.viewporter.Viewporter.init(allocator, io, &log_cfg, display);
+    defer viewporter.deinit();
     // Subcompositor (foot needs wl_subcompositor).
     const subcompositor = try wayland.subsurface.Subcompositor.init(allocator, io, &log_cfg, display, compositor);
     defer subcompositor.deinit();
@@ -527,6 +537,8 @@ pub fn main(init: std.process.Init) !void {
         .renderer = renderer,
         .xdg_activation = xdg_activation,
         .xdg_decoration = xdg_decoration,
+        .fractional_scale = fractional_scale,
+        .viewporter = viewporter,
         .backend = backend,
         .framebuffer = framebuffer,
         .camera = Camera{

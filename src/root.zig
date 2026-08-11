@@ -85,6 +85,11 @@ pub const layer_shell = @import("shell/layer_shell.zig");
 pub const xdg_activation = @import("shell/xdg_activation.zig");
 /// zxdg_decoration_manager_v1 (unstable/xdg-decoration): server-side decorations.
 pub const xdg_decoration = @import("shell/xdg_decoration.zig");
+/// wp_fractional_scale_manager_v1 (staging/fractional-scale-v1): the
+/// compositor's preferred fractional scale.
+pub const fractional_scale = @import("shell/fractional_scale.zig");
+/// wp_viewporter (stable/viewporter): crop/scale surface content.
+pub const viewporter = @import("shell/viewporter.zig");
 pub const scene = @import("scene/scene.zig");
 /// Surface→scene binding (scene/surface_node.zig): the library's
 /// wl_surface→scene-node table. Tracks a surface through its
@@ -136,6 +141,8 @@ comptime {
     _ = layer_shell;
     _ = xdg_activation;
     _ = xdg_decoration;
+    _ = fractional_scale;
+    _ = viewporter;
     _ = scene;
     _ = surface_node;
     _ = camera;

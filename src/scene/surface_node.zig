@@ -526,7 +526,13 @@ fn surfaceSize(s: *Surface, buf: *Buffer) geom.Size {
         buf.width,
         buf.height,
     );
-    return .{ .w = @divExact(rect.width, s.current.scale), .h = @divExact(rect.height, s.current.scale) };
+    const size: geom.Size = .{
+        .w = @divExact(rect.width, s.current.scale),
+        .h = @divExact(rect.height, s.current.scale),
+    };
+    // A wp_viewport destination overrides the surface size (the source is
+    // scaled to it); foot at scale 1 sets dst == buffer size, a no-op.
+    return s.viewport_dst orelse size;
 }
 
 // --- Tests --------------------------------------------------------------
