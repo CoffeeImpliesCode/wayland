@@ -605,15 +605,17 @@ pub const Seat = struct {
         self.last_button = button;
         self.last_button_pressed = pressed;
         if (pressed) {
-            // Keyboard focus follows the click. The pointer focus is
-            // normally current via motion, but a click at the pointer's
-            // initial position (no motion yet) leaves it null — hit-test
-            // fresh so the first click always focuses.
-            if (self.pointer_focus) |focus| {
-                self.setKeyboardFocus(focus);
-            } else if (self.pick_fn) |f| {
+            // Keyboard focus follows the click. Hit-test the pointer
+            // position fresh: the cached pointer focus may be stale at
+            // the pointer's initial position (no motion yet), and a
+            // click on the empty canvas must clear the focus so it can
+            // leave (the canvas is the focus sink, like the desktop in
+            // a conventional compositor).
+            if (self.pick_fn) |f| {
                 if (f(self.pick_ctx.?, self.pointer_x, self.pointer_y)) |p| {
                     self.setKeyboardFocus(p.surface);
+                } else {
+                    self.setKeyboardFocus(null);
                 }
             }
         }
