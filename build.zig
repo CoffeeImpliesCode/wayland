@@ -243,6 +243,27 @@ pub fn build(b: *Build) void {
     });
     b.installArtifact(client_exe);
 
+    // Adversarial protocol roundtrip probe: deliberately triggers
+    // protocol violations and verifies the compositor's error responses.
+    // A test tool; run against a live server (zig build run-rtprobe).
+    const probe_exe = b.addExecutable(.{
+        .name = "rtprobe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/server/rtprobe.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "protocol", .module = protocol },
+            },
+        }),
+    });
+    b.installArtifact(probe_exe);
+    const probe_run_step = b.step("run-rtprobe", "Run the adversarial protocol probe");
+    const probe_run_cmd = b.addRunArtifact(probe_exe);
+    probe_run_step.dependOn(&probe_run_cmd.step);
+    probe_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| probe_run_cmd.addArgs(args);
+
     const client_run_step = b.step("run-client", "Run the M1 test client");
     const client_run_cmd = b.addRunArtifact(client_exe);
     client_run_step.dependOn(&client_run_cmd.step);
