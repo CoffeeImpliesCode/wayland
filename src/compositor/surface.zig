@@ -444,30 +444,25 @@ pub const Surface = struct {
         s.allocator.destroy(s);
     }
 
-    /// Set the pending buffer (from wl_surface.attach). attachBuffer takes
-    /// a lock unless it is a lockless re-attach of the current buffer (the
-    /// current state already holds the surface's reference); the lock is
-    /// released at the end of the commit that applies it (step 10), and
-    /// the buffer is dropped when the surface stops using it (replacement
-    /// or destroy). A null buffer removes the surface content at the next
-    /// commit.
+    /// Set the pending buffer (from wl_surface.attach). Every attach takes
+    /// a lock — including a re-attach of the current buffer: the commit's
+    /// final unlock (step 11) releases each use, so the client receives a
+    /// wl_buffer.release per attach. That per-use release is required:
+    /// weston's shm_surface keeps a leaf busy until the release arrives
+    /// and exit(1)s when its whole pool is busy ("all buffers are held by
+    /// the server", clients/window.c shm_surface_prepare) — a lockless
+    /// re-attach leaves the leaf stuck forever. A re-attach of the SAME
+    /// pending buffer (no commit in between) undoes the redundant lock
+    /// instead.
     pub fn attachBuffer(s: *Surface, buffer: ?*Buffer) void {
         if (buffer) |b| {
-            // Re-attaching the CURRENT buffer: the current state already
-            // holds the surface's reference. Taking another lock would
-            // strand the buffer — the commit sees old == new and never
-            // releases it (weston-simple-shm hits this on resize).
-            if (s.pending.buffer == null and s.current.buffer == b) {
-                s.pending_locked = false;
-            } else {
-                b.lock() catch {
-                    // Could not take a reference; nothing to present.
-                    b.drop();
-                    s.resource.postNoMemory();
-                    return;
-                };
-                s.pending_locked = true;
-            }
+            b.lock() catch {
+                // Could not take a reference; nothing to present.
+                b.drop();
+                s.resource.postNoMemory();
+                return;
+            };
+            s.pending_locked = true;
         } else {
             s.pending_locked = false;
         }
@@ -1630,11 +1625,11 @@ test "re-attach of the current buffer does not double-lock" {
     s.commit();
     try testing.expectEqual(@as(u32, 0), b.n_locks);
 
-    // Lockless re-attach of the current buffer (weston-simple-shm resize
-    // pattern): no new lock is taken, and the commit-end unlock must not
-    // underflow a zero-count buffer.
+    // Re-attach of the current buffer (weston double-buffering pattern):
+    // a fresh lock is taken per attach so the commit-end unlock releases
+    // each use (the client keeps a leaf busy until wl_buffer.release).
     s.attachBuffer(&b);
-    try testing.expect(!s.pending_locked);
+    try testing.expect(s.pending_locked);
     s.commit();
     try testing.expectEqual(@as(u32, 0), b.n_locks);
     try testing.expect(s.current.buffer == &b);

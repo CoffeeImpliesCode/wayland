@@ -141,6 +141,12 @@ const specials = [_]Entry{
 /// seat. `ctx` is the RaylibInput (see poll below).
 pub const RaylibInput = struct {
     seat: *seat_mod.Seat,
+    /// Per-key poll state, persistent across polls (the arrays would
+    /// reset every call otherwise and the release debounce could never
+    /// confirm — keys stuck down forever).
+    prev_down: [512]bool = [_]bool{false} ** 512,
+    pending_up: [512]bool = [_]bool{false} ** 512,
+    release_age: [512]u8 = [_]u8{255} ** 512,
 };
 
 pub fn create(allocator: std.mem.Allocator, seat: *seat_mod.Seat) error{OutOfMemory}!*RaylibInput {
@@ -158,16 +164,39 @@ pub fn poll(ctx: *anyopaque) bool {
     const seat = input.seat;
     var fed = false;
 
+    // Key state is diffed against the seat's pressed set (single source of
+    // truth), NOT raylib's press/release transitions: the X server's
+    // autorepeat emits [release, press] pairs ~5ms apart which GLFW 3.4
+    // discards only when both are already queued (x11_window.c KeyRelease
+    // peek); a split socket read leaks both as real transitions, leaving
+    // keys stuck or dropped. A press is fed when the seat does not hold the
+    // key AND no release was fed for it within the last two polls (a
+    // delayed autorepeat press cannot re-arm the seat); a release needs the
+    // key up for a full poll window (autorepeat releases are momentary).
+    // The seat's repeat timer feeds held-key repeats. The per-key arrays
+    // live in the input struct: they must survive across polls.
     inline for (.{ letters, digits, specials }) |table| {
         for (table) |e| {
-            if (raylib.IsKeyPressed(e.raylib_key)) {
-                seat.keyEvent(e.xkb, true);
-                fed = true;
+            const down = raylib.IsKeyDown(e.raylib_key);
+            const key_idx: usize = @intCast(e.raylib_key);
+            if (down) {
+                if (!seat.isKeyDown(e.xkb) and input.release_age[key_idx] >= 2) {
+                    seat.keyEvent(e.xkb, true);
+                    fed = true;
+                }
+                input.pending_up[key_idx] = false;
+            } else if (seat.isKeyDown(e.xkb)) {
+                if (input.prev_down[key_idx] and !input.pending_up[key_idx]) {
+                    input.pending_up[key_idx] = true;
+                } else if (!input.prev_down[key_idx] and input.pending_up[key_idx]) {
+                    input.pending_up[key_idx] = false;
+                    input.release_age[key_idx] = 0;
+                    seat.keyEvent(e.xkb, false);
+                    fed = true;
+                }
             }
-            if (raylib.IsKeyReleased(e.raylib_key)) {
-                seat.keyEvent(e.xkb, false);
-                fed = true;
-            }
+            input.prev_down[key_idx] = down;
+            if (input.release_age[key_idx] < 255) input.release_age[key_idx] += 1;
         }
     }
 

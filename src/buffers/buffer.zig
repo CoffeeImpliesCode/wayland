@@ -108,31 +108,38 @@ pub const Buffer = struct {
     /// The producer is done with the buffer. Cycle-idempotent: a client
     /// may re-attach a released buffer (double buffering), so the same
     /// Buffer is dropped once per replace and can be dropped many times
-    /// across its lifetime. The release signal fires when no consumer lock
-    /// remains (n_locks == 0) — at most once per buffer lifetime (the
-    /// `released` guard).
+    /// across its lifetime. The release signal itself fires from unlock()
+    /// only — the consumer's done — so a bare (re-)drop stays silent and
+    /// cannot duplicate the release.
     ///
     /// F53: this is deliberately more lenient than wlroots, where
     /// wlr_buffer_drop asserts !dropped and the refcount freeing at zero
     /// makes a double drop a bug (types/buffer/buffer.c:45-56). Our
-    /// once-only release guard keeps the repeated drop harmless, and the
+    /// cycle-idempotent drop keeps the repeated drop harmless, and the
     /// commit path relies on it (a replaced buffer is re-dropped at the
     /// next commit). Keep the leniency; do not add the assert.
     pub fn drop(buf: *Buffer) void {
         buf.dropped = true;
-        buf.maybeRelease();
     }
 
     /// A consumer starts reading the buffer. Must be paired with unlock().
+    /// Re-arms the release: a client may re-attach the SAME buffer after
+    /// the release (weston double-buffering reuses buffers) and needs a
+    /// wl_buffer.release for every use — the weston shm_surface marks the
+    /// leaf busy until the release arrives, and a missed release leaves
+    /// the leaf stuck, exhausting the pool ("all buffers are held by the
+    /// server", weston clients/window.c shm_surface_prepare exit(1)).
     pub fn lock(buf: *Buffer) !void {
         buf.n_locks += 1;
+        buf.released = false;
     }
 
     /// A consumer is done reading. Unlocking an unlocked buffer is a
     /// programmer error. Dropping the last lock fires the release signal
-    /// (once per buffer lifetime) even if the buffer was never dropped
-    /// (wlroots types/buffer/buffer.c:50-61): the client learns it may
-    /// reuse the buffer as soon as the compositor is done reading it.
+    /// (once per lock cycle, re-armed by the next lock) even if the
+    /// buffer was never dropped (wlroots types/buffer/buffer.c:50-61):
+    /// the client learns it may reuse the buffer as soon as the
+    /// compositor is done reading it.
     pub fn unlock(buf: *Buffer) void {
         assert(buf.n_locks > 0);
         buf.n_locks -= 1;
@@ -140,9 +147,8 @@ pub const Buffer = struct {
     }
 
     fn maybeRelease(buf: *Buffer) void {
-        // Exactly-once: a replaced buffer is re-dropped at the next commit
-        // (surface.zig commit step 3) and re-attached buffers cycle through
-        // drop/unlock again; only the first n_locks == 0 transition emits.
+        // Once per lock cycle: the next lock() re-arms. The surface's
+        // re-drops of replaced buffers (drop only) never fire it.
         if (!buf.released and buf.n_locks == 0) {
             buf.released = true;
             buf.events.release.emit(buf);
@@ -187,7 +193,7 @@ test "lock drop unlock release ordering" {
     try std.testing.expectEqual(@as(u32, 1), observer.release_count);
 }
 
-test "release fires exactly once across re-attach cycles" {
+test "release fires per re-attach cycle, re-drops stay silent" {
     const allocator = std.testing.allocator;
     var data: TestBufferData = .{};
     var observer: TestObserver = .{
@@ -206,22 +212,20 @@ test "release fires exactly once across re-attach cycles" {
     try std.testing.expectEqual(@as(u32, 1), observer.release_count);
 
     // Cycle 2: the client re-attaches the SAME buffer (double buffering).
-    // drop/unlock repeat, but wl_buffer.release must fire exactly once per
-    // buffer lifetime — a second drop with n_locks == 0 no longer emits
-    // (the replace commit re-drops the old current buffer, surface.zig
-    // commit step 3; without the released guard that would duplicate the
-    // release sent at the buffer's own commit).
+    // The lock re-arms the release, so the second use emits again — a
+    // client like weston reuses released buffers and needs a release per
+    // use (its leaf stays busy until the release arrives).
     try buf.lock();
     buf.drop();
     buf.unlock();
-    try std.testing.expectEqual(@as(u32, 1), observer.release_count);
+    try std.testing.expectEqual(@as(u32, 2), observer.release_count);
 
     // A bare re-drop of the released (unlocked) buffer is silent too.
     buf.drop();
-    try std.testing.expectEqual(@as(u32, 1), observer.release_count);
+    try std.testing.expectEqual(@as(u32, 2), observer.release_count);
 }
 
-test "drop with no locks releases immediately" {
+test "drop with no locks stays silent; unlock fires the release" {
     const allocator = std.testing.allocator;
     var data: TestBufferData = .{};
     var observer: TestObserver = .{
@@ -233,7 +237,16 @@ test "drop with no locks releases immediately" {
     defer buf.destroy();
     buf.events.release.add(&observer.release_listener);
 
+    // A bare producer drop must not release: the compositor (consumer)
+    // still holds the lock, and the surface re-drops replaced buffers at
+    // the next commit — a release from the drop would duplicate the
+    // consumer's unlock release.
     buf.drop();
+    try std.testing.expectEqual(@as(u32, 0), observer.release_count);
+
+    try buf.lock();
+    buf.drop();
+    buf.unlock();
     try std.testing.expectEqual(@as(u32, 1), observer.release_count);
 }
 

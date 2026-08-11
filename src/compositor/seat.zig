@@ -605,7 +605,17 @@ pub const Seat = struct {
         self.last_button = button;
         self.last_button_pressed = pressed;
         if (pressed) {
-            if (self.pointer_focus) |focus| self.setKeyboardFocus(focus);
+            // Keyboard focus follows the click. The pointer focus is
+            // normally current via motion, but a click at the pointer's
+            // initial position (no motion yet) leaves it null — hit-test
+            // fresh so the first click always focuses.
+            if (self.pointer_focus) |focus| {
+                self.setKeyboardFocus(focus);
+            } else if (self.pick_fn) |f| {
+                if (f(self.pick_ctx.?, self.pointer_x, self.pointer_y)) |p| {
+                    self.setKeyboardFocus(p.surface);
+                }
+            }
         }
         const time = nowMs(self);
         const state: server.wl.Pointer.ButtonState = if (pressed) .pressed else .released;
@@ -908,6 +918,16 @@ pub const Seat = struct {
             self.repeat_next_at = now + @as(i64, @intCast(self.repeatIntervalMs()));
             self.keyEvent(kc, true);
         }
+    }
+
+    /// True while the key (xkb code) is held per the seat's pressed set.
+    /// The raylib poll diffs its CURRENT key state against this instead
+    /// of raylib's press/release transitions: the X server's autorepeat
+    /// press/release pairs corrupt the transition flags (stuck keys,
+    /// dropped events), while the seat's pressed set is the single source
+    /// of truth fed by keyEvent.
+    pub fn isKeyDown(self: *Seat, keycode: u32) bool {
+        return std.mem.indexOfScalar(u32, self.pressed.items, keycode) != null;
     }
 
     /// Current cursor surface resource (client-set via
