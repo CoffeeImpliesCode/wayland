@@ -1074,6 +1074,17 @@ pub const Seat = struct {
         }
         if (delivered) self.markFramePending(old_client);
         self.pointer_focus = null;
+        // The client cursor (wl_pointer.set_cursor) applies only while
+        // the pointer is over the client's surfaces: on leave, drop it
+        // so the compositor's fallback cursor shows over the canvas
+        // (the Cursor listens to cursor_surface and re-imports on the
+        // next update).
+        if (self.cursor_surface_resource != null) {
+            self.cursor_surface_resource = null;
+            self.cursor_hotspot_x = 0;
+            self.cursor_hotspot_y = 0;
+            self.events.cursor_surface.emit(self);
+        }
         log.debug("pointer leave surface@{d}", self.io, self.log_cfg, "seat", .{res.getId()});
     }
 
@@ -1972,14 +1983,17 @@ test "set_cursor requires focus, a valid serial and the cursor role (F9)" {
     // WL_POINTER_ERROR_ROLE on the pointer resource (wlroots
     // pointer_set_cursor, wlr_seat_pointer.c:96-100), which kills the
     // client connection; the cursor keeps its previous image (the
-    // handler returns before touching the seat state).
+    // handler returns before touching the seat state). The client's
+    // teardown then destroys the focused surface, whose pointerLeave
+    // clears the client cursor (the fallback shows).
     var fake_role: role_mod.SurfaceRole = .{ .name = "fake-role" };
     surface_a.role = &fake_role;
     surface_a.role_resource = null;
     a.pointer.setCursor(valid_serial, a.surface, 0, 0);
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
-    try std.testing.expectEqual(@as(i32, 5), seat.cursor_hotspot_x);
-    try std.testing.expectEqual(@as(usize, 1), test_cursor_surface_count);
+    try std.testing.expect(seat.cursorSurface() == null);
+    try std.testing.expectEqual(@as(i32, 0), seat.cursor_hotspot_x);
+    try std.testing.expectEqual(@as(usize, 2), test_cursor_surface_count);
 }
 
 test "keymap change re-broadcasts to all clients (F10)" {
