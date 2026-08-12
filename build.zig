@@ -155,7 +155,11 @@ pub fn build(b: *Build) void {
     // visualization for the test server. ON by default. When disabled the
     // server builds without raylib (main.zig guards the import through the
     // build_options module below).
-    const enable_raylib = b.option(bool, "enable_raylib", "Link the raylib debug backend into wayland-server") orelse true;
+    const enable_raylib = b.option(
+        bool,
+        "enable_raylib",
+        "Link the raylib debug backend into wayland-server",
+    ) orelse true;
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_raylib", enable_raylib);

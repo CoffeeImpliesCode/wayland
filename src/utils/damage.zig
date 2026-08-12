@@ -128,7 +128,10 @@ pub const DamageRing = struct {
         oldest.deinit();
         // Age the current frame into the newest slot. Capacity for
         // num_buffers - 1 entries was reserved by init, so the shift never
-        // allocates.
+        // allocates. `current` is MOVED by the insert (ownership transfers
+        // into the history slot) — overwriting it with a fresh Damage
+        // below does not leak (zbc's overwrite-without-deinit flag is a
+        // false positive here; the move is value-semantic).
         r.history.insertAssumeCapacity(0, r.current);
         r.current = Damage.init(r.allocator);
     }

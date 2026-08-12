@@ -427,7 +427,8 @@ pub fn trackSurface(
         .leave_listener = wire.Listener(*output_mod.Output).init(onLeave),
     };
     scene.surface_nodes.put(surface, sn) catch |err| {
-        scene.allocator.destroy(sn);
+        // errdefer above destroys sn on this error return — no manual
+        // destroy here (that would double-free).
         return err;
     };
     surface.events.commit.add(&sn.commit_listener);
@@ -485,7 +486,7 @@ pub fn untrackAll(scene: *Scene) void {
     // remove shifts).
     while (scene.surface_nodes.count() > 0) {
         var it = scene.surface_nodes.keyIterator();
-        const surface = it.next().?.*;
+        const surface = (it.next() orelse break).*;
         scene.surface_nodes.get(surface).?.destroy();
     }
 }
@@ -575,13 +576,18 @@ fn surfaceSize(s: *Surface, buf: *Buffer) geom.Size {
     };
     // A wp_viewport overrides the surface size (F-AX-11): the destination
     // size when set; else the source rect size when a crop is set (crop
-    // without scaling); else the buffer-derived size. The @intFromFloat
-    // is exact: F-AX-12's bad_size validation guarantees an integral src
-    // when no destination is set. foot at scale 1 sets dst == buffer
-    // size, a no-op.
+    // without scaling); else the buffer-derived size. lossyCast is exact
+    // here: F-AX-12's bad_size validation guarantees an integral src when
+    // no destination is set. foot at scale 1 sets dst == buffer size, a
+    // no-op.
     const vp = s.current.viewport;
     if (vp.has_dst) return vp.dst;
-    if (vp.has_src) return .{ .w = @intFromFloat(vp.src.width), .h = @intFromFloat(vp.src.height) };
+    if (vp.has_src) {
+        return .{
+            .w = std.math.lossyCast(i32, vp.src.width),
+            .h = std.math.lossyCast(i32, vp.src.height),
+        };
+    }
     return size;
 }
 

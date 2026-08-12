@@ -733,10 +733,16 @@ pub const Seat = struct {
                     self.held_button_count += 1;
                 }
             } else {
-                const idx = std.mem.indexOfScalar(u32, self.held_buttons[0..self.held_button_count], button) orelse 0;
-                if (idx < self.held_button_count and self.held_buttons[idx] == button) {
-                    self.held_buttons[idx] = self.held_buttons[self.held_button_count - 1];
-                    self.held_button_count -= 1;
+                if (self.held_button_count > 0) {
+                    const idx = std.mem.indexOfScalar(
+                        u32,
+                        self.held_buttons[0..self.held_button_count],
+                        button,
+                    ) orelse 0;
+                    if (idx < self.held_button_count and self.held_buttons[idx] == button) {
+                        self.held_buttons[idx] = self.held_buttons[self.held_button_count - 1];
+                        self.held_button_count -= 1;
+                    }
                 }
             }
         }

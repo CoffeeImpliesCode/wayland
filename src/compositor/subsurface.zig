@@ -712,6 +712,8 @@ const SubsurfaceTest = struct {
         self.comp.surfaces.deinit(self.allocator);
         self.allocator.destroy(self.sc);
         self.allocator.destroy(self.comp);
+        // Z030: caller-owned receiver — invalidate to catch use-after-free.
+        self.* = undefined;
     }
 };
 

@@ -723,7 +723,7 @@ fn invertTransform(t: geom.Transform) geom.Transform {
 /// Scale a coordinate by the output scale, truncating toward zero like
 /// wlroots' C int *= double (wlr_screencopy_v1.c:578-581).
 fn scaleCoord(v: i32, scale: f32) i32 {
-    return @intFromFloat(@as(f64, v) * @as(f64, scale));
+    return std.math.lossyCast(i32, @as(f64, v) * @as(f64, scale));
 }
 
 // ---------------------------------------------------------------------------

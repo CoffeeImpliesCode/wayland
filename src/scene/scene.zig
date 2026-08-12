@@ -240,6 +240,12 @@ pub const SceneNode = struct {
     /// from its parent first.
     pub fn destroy(node: *SceneNode, allocator: std.mem.Allocator) void {
         if (node.parent) |p| p.removeChild(node);
+        // Recursive drain: child.destroy() removes itself from this
+        // node's children (via its parent link), so items[0] is a fresh
+        // node each iteration and the loop ends with an empty list — the
+        // deinit below then frees only the (empty) backing buffer.
+        // (zbc's heap-double-free flag here is a false positive: it does
+        // not model the removeChild-through-parent-pointer mutation.)
         while (node.children.items.len > 0) {
             node.children.items[0].destroy(allocator);
         }
@@ -527,6 +533,8 @@ const Recorder = struct {
     fn deinit(r: *Recorder) void {
         r.rects.deinit(r.allocator);
         r.textures.deinit(r.allocator);
+        // Z030: caller-owned receiver — invalidate to catch use-after-free.
+        r.* = undefined;
     }
 };
 

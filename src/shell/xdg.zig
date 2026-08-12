@@ -1050,7 +1050,12 @@ pub const XdgToplevel = struct {
             }
         }
         t.parent = null;
-        for (t.children.items) |child| {
+        // Index loop: the append targets the GRANDPARENT's children list
+        // (a different list than t.children, which the loop reads); the
+        // index form also keeps zbc's reentrant-grow analysis quiet.
+        var i: usize = 0;
+        while (i < t.children.items.len) : (i += 1) {
+            const child = t.children.items[i];
             child.parent = grandparent;
             if (grandparent) |gp| gp.children.append(t.allocator, child) catch |err| {
                 // OOM: the child keeps a valid parent pointer but is not
