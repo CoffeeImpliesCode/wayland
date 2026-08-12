@@ -50,6 +50,8 @@ in
     udev
     pixman
     systemd
+    libglvnd # EGL + GLES2 dev headers + libEGL/libGLESv2 (gles2 renderer)
+    mesa # software GL (llvmpipe) so the gles2 renderer works headless
     (raylib.overrideAttrs {
       enableDebugging = true;
       dontStrip = true;

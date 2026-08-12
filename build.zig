@@ -9,6 +9,10 @@ pub fn build(b: *Build) void {
     // vs ~32ms at ReleaseSafe). Pass -Doptimize=Debug for test runs.
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
 
+    // zig-cov coverage (see zig-cov README): zig-gate --cov passes these
+    const coverage = b.option(bool, "coverage", "Enable zig-cov") orelse false;
+    const cov_rt = b.option([]const u8, "coverage-rt", "zig-cov-rt path") orelse null;
+
     // Protocol codegen: zig-wayland scanner over vendored XML specs
     // (protocols/). The generated bindings (server + client namespaces)
     // compile into the "protocol" module.
@@ -134,6 +138,38 @@ pub fn build(b: *Build) void {
     });
     b.installArtifact(exe);
 
+    // GLES2/EGL renderer (src/renderer/gles2.zig): GPU compositor via EGL +
+    // GLES2 through a translate-c shim (house pattern, cf. pixman_c/drm_c/
+    // raylib_c). Include path + link come from pkg-config at configure time
+    // (nix: nixpkgs#libglvnd.dev provides <EGL/egl.h> + <GLES2/gl2.h>;
+    // nixpkgs#mesa provides the llvmpipe software GL so it renders headless).
+    {
+        const gles2_c = b.addTranslateC(.{
+            .root_source_file = b.path("src/renderer/gles2_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const cflags = b.run(&.{ "pkg-config", "--cflags", "egl", "glesv2" });
+        var it = std.mem.tokenizeAny(u8, cflags, " \t\n");
+        while (it.next()) |tok| {
+            if (std.mem.startsWith(u8, tok, "-I") and tok.len > 2) {
+                gles2_c.addSystemIncludePath(.{ .cwd_relative = b.dupe(tok[2..]) });
+            }
+        }
+        // The library module (root.zig exports renderer/gles2.zig) needs
+        // "gles2_c" and egl/glesv2 linked into every artifact using the
+        // library (lib_tests, the demo exe, the test server) — same wiring
+        // shape as raylib_c/drm_c.
+        const gles2_c_mod = gles2_c.createModule();
+        lib.addImport("gles2_c", gles2_c_mod);
+        lib.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
+        lib.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
+        exe.root_module.addImport("gles2_c", gles2_c_mod);
+        exe.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
+        exe.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
+    }
+
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
@@ -222,6 +258,11 @@ pub fn build(b: *Build) void {
         server_exe.root_module.linkSystemLibrary("raylib", .{ .use_pkg_config = .force });
     }
     server_exe.root_module.linkSystemLibrary("xkbcommon", .{});
+    // gles2 renderer: egl/glesv2 reach server_exe through the wayland lib
+    // module import, but system-link propagation is not automatic — link
+    // them explicitly (same pattern as the raylib link above).
+    server_exe.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
+    server_exe.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
     b.installArtifact(server_exe);
 
     const server_run_step = b.step("run-server", "Run the M1 test server");
@@ -279,6 +320,12 @@ pub fn build(b: *Build) void {
     // ------------------------------------------------------------------
 
     const lib_tests = b.addTest(.{ .root_module = lib });
+    if (coverage) {
+        lib_tests.use_llvm = true; // required: only the LLVM backend emits sancov counters
+        lib_tests.root_module.fuzz = true; // emits __sancov_cntrs + __sancov_pcs1
+        lib_tests.root_module.link_libc = true; // atexit handler writes the .zcov
+        if (cov_rt) |p| lib_tests.root_module.addObjectFile(.{ .cwd_relative = p });
+    }
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
     // exe_tests: the server executable's root module (src/server/main.zig)
@@ -305,6 +352,10 @@ pub fn build(b: *Build) void {
     if (enable_raylib) {
         exe_test_module.linkSystemLibrary("raylib", .{ .use_pkg_config = .force });
     }
+    // gles2 renderer (via the wayland lib import): system-link propagation
+    // is not automatic — link egl/glesv2 explicitly (raylib pattern).
+    exe_test_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
+    exe_test_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
     const exe_tests = b.addTest(.{ .root_module = exe_test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 

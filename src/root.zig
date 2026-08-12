@@ -103,6 +103,12 @@ pub const camera = @import("scene/camera.zig");
 pub const presentation = @import("presentation.zig");
 /// zwlr_screencopy_manager_v1 (screencopy.zig): shm-based output capture.
 pub const screencopy = @import("screencopy.zig");
+/// gles2/EGL renderer (renderer/gles2.zig): GPU compositor via EGL + GLES2
+/// through the gles2_c translate-c shim (wired in build.zig).
+pub const gles2 = @import("renderer/gles2.zig");
+/// Nested-wayland backend (backend/wayland.zig): our compositor acts as a
+/// wayland CLIENT of a parent compositor (M5 real-session testing).
+pub const wayland_backend = @import("backend/wayland.zig");
 
 // zig 0.16 collects `test` blocks only from analyzed declarations;
 // force analysis of every module so `zig build test` runs all tests.
@@ -149,6 +155,8 @@ comptime {
     _ = canvas;
     _ = presentation;
     _ = screencopy;
+    _ = gles2;
+    _ = wayland_backend;
 }
 
 test "generated server bindings compile" {

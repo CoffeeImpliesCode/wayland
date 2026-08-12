@@ -16,7 +16,10 @@
 //!   WAYLAND_RUN_FRAMES   stop after N rendered frames (0/absent = run forever)
 //!   WAYLAND_BACKEND      "raylib" selects the windowed raylib debug backend
 //!                        (falls back to headless if the window cannot open);
-//!                        anything else selects the headless backend
+//!                        "nested" selects the nested-wayland backend (our
+//!                        compositor as a client of a parent compositor, M5);
+//!                        "drm" selects the DRM/KMS backend; anything else
+//!                        selects the headless backend
 //!
 //! The socket name is printed on its own stdout line as
 //! `WAYLAND_SOCKET=<name>` (flushed) so test harnesses can read it.
@@ -446,12 +449,28 @@ pub fn main(init: std.process.Init) !void {
     // only reachable when built with -Denable_raylib (default on).
     var backend_is_raylib = false;
     var backend_is_drm = false;
+    var backend_is_nested = false;
     const backend = blk: {
         // DRM/KMS native output (tested in the NixOS VM on virtio-gpu).
         if (wantDrmBackend(init.environ_map)) {
             const device = init.environ_map.get("WAYLAND_DRM_DEVICE");
             const b = try drm_mod.DrmBackend.create(allocator, io, &log_cfg, device);
             backend_is_drm = true;
+            break :blk b;
+        }
+        // Nested-wayland backend (M5): our compositor acts as a client of
+        // a parent compositor (WAYLAND_DISPLAY), presenting its framebuffer
+        // into a parent wl_surface. Real-session testing without DRM.
+        if (wantNestedBackend(init.environ_map)) {
+            const b = try wayland.wayland_backend.WaylandBackend.create(
+                allocator,
+                io,
+                &log_cfg,
+                display.getServer().getEventLoop(),
+                .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
+                "wayland-compositor",
+            );
+            backend_is_nested = true;
             break :blk b;
         }
         if (build_options.enable_raylib and wantRaylibBackend(init.environ_map)) {
@@ -486,6 +505,7 @@ pub fn main(init: std.process.Init) !void {
         // window-open failure logs its own warning above.
         if (init.environ_map.get("WAYLAND_BACKEND")) |v| {
             const known = std.mem.eql(u8, v, "drm") or
+                std.mem.eql(u8, v, "nested") or
                 (build_options.enable_raylib and std.mem.eql(u8, v, "raylib"));
             if (!known) {
                 log.warn("WAYLAND_BACKEND '{s}' unknown; using headless backend", io, &log_cfg, "server", .{v});
@@ -1939,6 +1959,15 @@ fn wantDrmBackend(environ_map: *std.process.Environ.Map) bool {
 fn wantRaylibBackend(environ_map: *std.process.Environ.Map) bool {
     const v = environ_map.get("WAYLAND_BACKEND") orelse return false;
     return std.mem.eql(u8, v, "raylib");
+}
+
+/// WAYLAND_BACKEND=nested selects the nested-wayland backend (M5): our
+/// compositor acts as a client of a parent compositor. Requires a
+/// WAYLAND_DISPLAY socket (the parent's); the backend fails to create if
+/// absent.
+fn wantNestedBackend(environ_map: *std.process.Environ.Map) bool {
+    const v = environ_map.get("WAYLAND_BACKEND") orelse return false;
+    return std.mem.eql(u8, v, "nested");
 }
 
 // ---------------------------------------------------------------------------
