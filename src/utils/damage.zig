@@ -76,14 +76,13 @@ pub const DamageRing = struct {
     history: std.ArrayList(Damage),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, num_buffers: u32) DamageRing {
+    pub fn init(allocator: std.mem.Allocator, num_buffers: u32) error{OutOfMemory}!DamageRing {
         std.debug.assert(num_buffers >= 1);
         // Reserve the ring slots up front so rotate() (frame-paced) never
         // allocates. The reservation is num_buffers - 1 structs — bounded
-        // and tiny; failing it means the allocator is exhausted, which is
-        // fatal for a compositor, so fail loudly here rather than per frame.
-        var history = std.ArrayList(Damage).initCapacity(allocator, num_buffers - 1) catch |err|
-            std.debug.panic("DamageRing.init: reserving history: {s}", .{@errorName(err)});
+        // and tiny; propagate the failure so the caller can unwind (the
+        // compositor handles OOM at setup like any other error).
+        var history = try std.ArrayList(Damage).initCapacity(allocator, num_buffers - 1);
         // Pre-fill the ring with empty slots: rotate() then only moves
         // Damage values (no growth, no allocation).
         var i: usize = 0;
@@ -128,12 +127,12 @@ pub const DamageRing = struct {
         oldest.deinit();
         // Age the current frame into the newest slot. Capacity for
         // num_buffers - 1 entries was reserved by init, so the shift never
-        // allocates. `current` is MOVED by the insert (ownership transfers
-        // into the history slot) — overwriting it with a fresh Damage
-        // below does not leak (zbc's overwrite-without-deinit flag is a
-        // false positive here; the move is value-semantic).
-        r.history.insertAssumeCapacity(0, r.current);
-        r.current = Damage.init(r.allocator);
+        // allocates. The swap is the ownership transfer: the old
+        // `current` (with its rects buffer) lands in the history slot,
+        // and `current` takes the slot's fresh empty Damage — no handle
+        // is dropped without its owner.
+        r.history.insertAssumeCapacity(0, Damage.init(r.allocator));
+        std.mem.swap(Damage, &r.history.items[0], &r.current);
     }
 
     /// True when no damage is tracked at all (neither current nor history).
@@ -185,7 +184,7 @@ test "damage accumulate and clear" {
 }
 
 test "damage ring accumulate and renderDamage bounding" {
-    var ring = DamageRing.init(std.testing.allocator, 3);
+    var ring = try DamageRing.init(std.testing.allocator, 3);
     defer ring.deinit();
 
     try std.testing.expect(ring.isEmpty());
@@ -209,7 +208,7 @@ test "damage ring accumulate and renderDamage bounding" {
 }
 
 test "damage ring rotate ages damage" {
-    var ring = DamageRing.init(std.testing.allocator, 2);
+    var ring = try DamageRing.init(std.testing.allocator, 2);
     defer ring.deinit();
 
     // Frame A is the current damage.
@@ -227,7 +226,7 @@ test "damage ring rotate ages damage" {
 }
 
 test "damage ring addWhole dominates" {
-    var ring = DamageRing.init(std.testing.allocator, 2);
+    var ring = try DamageRing.init(std.testing.allocator, 2);
     defer ring.deinit();
 
     ring.addWhole();
@@ -248,7 +247,7 @@ test "damage ring addWhole dominates" {
 }
 
 test "damage ring num_buffers=1" {
-    var ring = DamageRing.init(std.testing.allocator, 1);
+    var ring = try DamageRing.init(std.testing.allocator, 1);
     defer ring.deinit();
 
     try ring.add(.{ .x = 0, .y = 0, .width = 4, .height = 4 });
@@ -264,7 +263,7 @@ test "damage ring num_buffers=1" {
 }
 
 test "damage ring rotate stress" {
-    var ring = DamageRing.init(std.testing.allocator, 4);
+    var ring = try DamageRing.init(std.testing.allocator, 4);
     defer ring.deinit();
 
     // 500 frames mixing whole and partial damage; the allocator detects any

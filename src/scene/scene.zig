@@ -240,14 +240,14 @@ pub const SceneNode = struct {
     /// from its parent first.
     pub fn destroy(node: *SceneNode, allocator: std.mem.Allocator) void {
         if (node.parent) |p| p.removeChild(node);
-        // Recursive drain: child.destroy() removes itself from this
-        // node's children (via its parent link), so items[0] is a fresh
-        // node each iteration and the loop ends with an empty list — the
-        // deinit below then frees only the (empty) backing buffer.
-        // (zbc's heap-double-free flag here is a false positive: it does
-        // not model the removeChild-through-parent-pointer mutation.)
-        while (node.children.items.len > 0) {
-            node.children.items[0].destroy(allocator);
+        // Explicit drain: pop each child off the list (detaching it),
+        // then destroy it. Destroying a child re-enters the parent
+        // through its link, so the pop-destroy form keeps the list
+        // mutation visible to static analysis — no child is freed while
+        // still referenced by node.children.
+        while (node.children.pop()) |child| {
+            child.parent = null;
+            child.destroy(allocator);
         }
         node.children.deinit(allocator);
         switch (node.kind) {
@@ -338,7 +338,7 @@ pub const SceneOutput = struct {
         self.* = .{
             .output = output,
             .scene = scene,
-            .damage_ring = damage_mod.DamageRing.init(allocator, 2),
+            .damage_ring = try damage_mod.DamageRing.init(allocator, 2),
             .x = 0,
             .y = 0,
         };
