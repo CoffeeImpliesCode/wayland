@@ -338,6 +338,33 @@ pub const Seat = struct {
     /// cannot extend into the compositor's grab (S2).
     held_buttons: [16]u32 = undefined,
     held_button_count: usize = 0,
+    /// Physical pointer buttons currently held down: incremented on
+    /// every press, decremented on every release (never below 0).
+    /// Distinct from held_buttons — that set tracks what the focused
+    /// client believes is held (delivered presses without delivered
+    /// releases, so grab-gated events never touch it); pressed_count
+    /// counts the physical buttons whether or not a client saw them
+    /// (wlroots button_count, wlr_seat_pointer.c:471-517) and feeds
+    /// the DnD origin check (validatePointerGrabSerial).
+    pressed_count: u32 = 0,
+    /// Serial minted on the 0→1 pressed-count transition: the serial
+    /// the press event was delivered with (wlroots
+    /// wlr_seat_pointer.c:509-517 mints grab_serial from the grab
+    /// handler's returned serial when button_count == 1). A 0→1 press
+    /// that delivered no serial — no focus, or a grab gated it — clears
+    /// it: a client that never saw the press cannot start a drag from
+    /// it (wlroots keeps the stale value; we choose the stricter
+    /// "0/empty" the task specifies). start_drag (F-SEL-1) validates
+    /// the client's serial against this via validatePointerGrabSerial
+    /// (wlr_seat_validate_pointer_grab_serial, wlr_seat_pointer.c:603-617).
+    grab_serial: u32 = 0,
+    /// The button code of the press that minted grab_serial (wlroots
+    /// pointer_state.grab_button, wlr_seat_pointer.c:509-517). The DnD
+    /// state machine (F-SEL-1) compares the release against this: only
+    /// releasing the ORIGIN button ends the drag (wlroots
+    /// drag_handle_pointer_button, wlr_drag.c:113-125). Minted on the
+    /// 0→1 pressed-count transition, alongside grab_serial.
+    grab_button: u32 = 0,
     /// The most recent scroll axis event: the axis + discrete notch
     /// count (compositor bindings; mirrors last_keysym — the axis signal
     /// is the notification, these fields carry the payload).
@@ -455,6 +482,13 @@ pub const Seat = struct {
         /// already updated). The cursor compositor hooks this to know
         /// when the client cursor image changed.
         cursor_surface: wire.Signal(*Seat),
+        /// The seat is being destroyed (emitted at the top of deinit,
+        /// while the seat memory is still valid). Subscribers that hold
+        /// a seat pointer — the xdg popup grab (which must stop calling
+        /// into the seat when it dies before the popup) — drop their
+        /// reference here (wlroots wlr_seat events.destroy,
+        /// wlr_seat.c:181-196).
+        destroy: wire.Signal(*Seat),
     },
 
     /// Result of a hit test: the surface and the pointer position in
@@ -511,12 +545,19 @@ pub const Seat = struct {
         self.events.keyboard_focus.init();
         self.events.axis.init();
         self.events.cursor_surface.init();
+        self.events.destroy.init();
         self.global = try display.addGlobal(server.wl.Seat, *Seat, bindSeat, seat_version, self);
         log.debug("seat created (keyboard + pointer)", io, log_cfg, "seat", .{});
         return self;
     }
 
     pub fn deinit(self: *Seat) void {
+        // Subscribers holding a seat reference (the xdg popup grab) drop
+        // it first: the seat may die before the shell's popups (main.zig
+        // frees the seat before the shell), and their teardown must not
+        // call into the freed seat (wlroots emits events.destroy the same
+        // way, wlr_seat_destroy, wlr_seat.c:181-196).
+        self.events.destroy.emit(self);
         // Best-effort orderly shutdown (F11): wlroots clears focus with
         // leave on the way out (wlr_seat_destroy, wlr_seat.c:181-196);
         // the display teardown kills client connections right after. The
@@ -625,7 +666,9 @@ pub const Seat = struct {
     /// RECEIVING client). Serial recording is per client, so a client
     /// may echo any serial it was recently handed — an event to client B
     /// must not invalidate client A's serials (F2).
-    fn serialFor(self: *Seat, wl_client: *wire.Client) u32 {
+    /// Public: grab handlers outside the seat (xdg popup grabs) mint
+    /// serials for their routing target the same way.
+    pub fn serialFor(self: *Seat, wl_client: *wire.Client) u32 {
         const serial = self.nextSerial();
         if (self.seatClient(wl_client)) |sc| sc.serials.add(serial);
         return serial;
@@ -744,6 +787,25 @@ pub const Seat = struct {
         self.pointer_grab = null;
     }
 
+    /// Validate a drag's origin (wlroots wlr_seat_validate_pointer_grab_serial,
+    /// wlr_seat_pointer.c:603-617): true only while exactly one physical
+    /// button is held, `serial` is the one minted for that press (the
+    /// stored grab_serial), and — when `origin` is given — the pointer
+    /// is still over the drag's origin surface. This is the DnD origin
+    /// check F-SEL-1's start_drag calls: a drag may only start from the
+    /// press that armed it, on the surface that press landed on. The
+    /// grab_serial != 0 guard rejects a press that delivered no serial
+    /// (no focus, or a grab gated it) — stricter than wlroots, which
+    /// would accept a matching 0 serial.
+    pub fn validatePointerGrabSerial(self: *Seat, origin: ?*Surface, serial: u32) bool {
+        if (self.pressed_count != 1 or self.grab_serial == 0) return false;
+        if (self.grab_serial != serial) return false;
+        if (origin) |o| {
+            if (self.pointer_focus != o) return false;
+        }
+        return true;
+    }
+
     /// Install a keyboard grab (wlroots wlr_seat_keyboard_start_grab,
     /// wlr_seat_keyboard.c:110-114).
     pub fn startKeyboardGrab(self: *Seat, grab: *const KeyboardGrab) void {
@@ -814,7 +876,9 @@ pub const Seat = struct {
 
     /// A pointer event was delivered to `client` without a closing frame:
     /// the batch closes at the next pointerFrame() (F7).
-    fn markFramePending(self: *Seat, wl_client: *wire.Client) void {
+    /// Public: grab handlers outside the seat (xdg popup grabs) route
+    /// pointer events to a specific client and must join the same batch.
+    pub fn markFramePending(self: *Seat, wl_client: *wire.Client) void {
         if (self.seatClient(wl_client)) |sc| sc.frame_pending = true;
     }
 
@@ -846,6 +910,18 @@ pub const Seat = struct {
         // signal.
         self.last_button = button;
         self.last_button_pressed = pressed;
+        // Physical pressed count: every press increments, every release
+        // decrements (never below 0). Distinct from held_buttons (what
+        // the focused client believes is held — gated events never
+        // touch it): pressed_count tracks the physical buttons whether
+        // or not a client saw them (wlroots button_count,
+        // wlr_seat_pointer.c:471-517) and feeds the grab_serial mint
+        // below.
+        if (pressed) {
+            self.pressed_count += 1;
+        } else if (self.pressed_count > 0) {
+            self.pressed_count -= 1;
+        }
         if (pressed) {
             // Keyboard focus follows the click. Hit-test the pointer
             // position fresh: the cached pointer focus may be stale at
@@ -873,11 +949,17 @@ pub const Seat = struct {
         // startPointerGrab sends — a swallowed release cannot leave it
         // extending a text selection). The button signal still fires for
         // compositor listeners (main.zig's drag arming reads it).
+        // The serial the event was delivered with, if any. Under a grab
+        // the grab's handler owns delivery (a swallow grab sends
+        // nothing), so no serial is minted for the event; the
+        // grab_serial mint below sees 0.
+        var delivered_serial: u32 = 0;
         if (self.pointer_grab) |grab| {
             grab.button(self, grab, button, pressed);
         } else if (self.pointer_focus) |focus| {
             const focus_client = focus.resource.getClient();
             const serial = serialFor(self, focus_client);
+            delivered_serial = serial;
             var delivered = false;
             for (self.pointers.items) |ptr| {
                 if (ptr.getClient() != focus_client) continue;
@@ -910,6 +992,18 @@ pub const Seat = struct {
                     }
                 }
             }
+        }
+        // Mint the grab serial on the 0→1 pressed-count transition: the
+        // serial the press event was delivered with (wlroots
+        // wlr_seat_pointer.c:509-517 mints grab_serial from the grab
+        // handler's returned serial when button_count == 1; ours has no
+        // grab-returned serial, so the focus-path serialFor stands in).
+        // A 0→1 press that delivered no serial — no focus, or a grab
+        // gated it — clears the serial: the client never saw the press,
+        // so no drag can legitimately start from it.
+        if (pressed and self.pressed_count == 1) {
+            self.grab_serial = delivered_serial;
+            self.grab_button = button;
         }
         self.events.button.emit(self);
     }
@@ -2409,6 +2503,154 @@ test "implicit pointer grab gates axis and button release (S2)" {
     seat.pointerButton(btn_right, false);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+}
+
+test "press mints a grab_serial on the 0->1 transition, release closes it (S-F5)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, ts.a.server);
+
+    // Focus A so the press is delivered (with a serial).
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 0), seat.pressed_count);
+    try std.testing.expectEqual(@as(u32, 0), seat.grab_serial);
+
+    // First press: the 0->1 transition mints the delivered serial and
+    // the press validates against the focused surface.
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 1), seat.pressed_count);
+    const serial1 = seat.grab_serial;
+    try std.testing.expect(serial1 != 0);
+    try std.testing.expect(seat.validatePointerGrabSerial(surface_a, serial1));
+
+    // Release: the count drops back and the window closes (a client
+    // holding no button cannot start a drag).
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 0), seat.pressed_count);
+    try std.testing.expect(!seat.validatePointerGrabSerial(surface_a, serial1));
+}
+
+test "two held buttons invalidate the grab serial (S-F5)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, ts.a.server);
+
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+
+    // The first press mints; a second held button closes the window
+    // (wlroots: button_count != 1).
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    const serial1 = seat.grab_serial;
+    seat.pointerButton(btn_right, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 2), seat.pressed_count);
+    try std.testing.expect(!seat.validatePointerGrabSerial(surface_a, serial1));
+
+    // Releasing back to one held button re-opens the window for the
+    // ORIGINAL serial: grab_serial is minted only on a 0->1 press, so
+    // the arming press's serial stays valid while exactly one button is
+    // held (wlroots parity — the 2->1 release does not re-mint).
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 1), seat.pressed_count);
+    try std.testing.expect(seat.validatePointerGrabSerial(surface_a, serial1));
+
+    seat.pointerButton(btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(u32, 0), seat.pressed_count);
+    try std.testing.expect(!seat.validatePointerGrabSerial(surface_a, serial1));
+}
+
+test "a re-press mints a fresh grab serial (S-F5)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, ts.a.server);
+
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+
+    // Click: press mints, release closes the window.
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    const serial1 = seat.grab_serial;
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+
+    // Second click: the 0->1 press mints a NEW serial (each event mints
+    // a fresh display serial), so the first click's serial no longer
+    // validates (wlroots: grab_serial overwritten on each 0->1 press).
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    const serial2 = seat.grab_serial;
+    try std.testing.expect(serial2 != serial1);
+    try std.testing.expectEqual(@as(u32, 1), seat.pressed_count);
+    try std.testing.expect(seat.validatePointerGrabSerial(surface_a, serial2));
+    try std.testing.expect(!seat.validatePointerGrabSerial(surface_a, serial1));
+
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+}
+
+test "click-to-focus arms the grab serial against the focused surface (S-F5)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, ts.a.server);
+    const surface_b = surfaceForClient(ts, ts.b.server);
+
+    // Pointer over A (enter sets the pointer focus); keyboard focus
+    // still elsewhere.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == surface_a);
+
+    // The click focuses the picked surface AND mints the grab serial
+    // against it: a drag from A validates with A as the origin...
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+    const serial1 = seat.grab_serial;
+    try std.testing.expect(serial1 != 0);
+    try std.testing.expect(seat.validatePointerGrabSerial(surface_a, serial1));
+    // ... but not from a different origin (the origin must be the
+    // pointer focus, wlr_seat_pointer.c:611-616).
+    try std.testing.expect(!seat.validatePointerGrabSerial(surface_b, serial1));
+    // A serial echoed while no button is held is rejected too.
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+    try std.testing.expect(!seat.validatePointerGrabSerial(surface_a, serial1));
 }
 
 /// Cancel-capturing grab for the lifecycle test: counts endPointerGrab

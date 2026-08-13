@@ -1,11 +1,13 @@
 //! xdg-shell: the xdg_wm_base global plus the XdgSurface / XdgToplevel /
 //! XdgPopup state machines (stable/xdg-shell protocol).
 //!
-//! Scope: xdg_wm_base global, XdgSurface (toplevel + popup roles),
+//! scope: xdg_wm_base global, XdgSurface (toplevel + popup roles),
 //! configure / ack_configure with a payload model (F6/F7), map/unmap,
 //! popup constraint adjustment (F1), ping/pong tracking (F3),
-//! parenting (F16). Popup grabs (F2) and popup stacking/hit-testing
-//! (F12) are structural and tracked in notes/133.
+//! parenting (F16). Popup grabs (X04b: real seat-grab routing with
+//! serial validation + popup_done dismissal + teardown cleanup) and
+//! popup stacking/hit-testing (F12); reactive popup reconfigure (X05:
+//! compositor-initiated re-place for set_reactive v3+ popups).
 //!
 //! Mapping semantics: an xdg surface maps when the client commits a buffer
 //! after acking a configure. The compositor's commit pipeline performs the
@@ -1351,6 +1353,11 @@ pub const XdgPopup = struct {
     sent_payloads: std.ArrayList(PopupConfigurePayload) = .empty,
     /// Geometry of the last acked configure, if any (F7).
     acked_geometry: ?geom.Rect = null,
+    /// The active (or ended-but-not-yet-freed) popup seat grab, if this
+    /// popup ever called xdg_popup.grab (X04b). Non-null from grab
+    /// install until popupDestroy frees the state; `active` on the state
+    /// says whether the seat still carries the grabs.
+    grab_state: ?*PopupGrab = null,
     events: struct {
         destroy: wire.Signal(*XdgPopup),
     },
@@ -1413,7 +1420,235 @@ pub const XdgPopup = struct {
     pub fn sendPopupDone(p: *XdgPopup) void {
         p.resource.sendPopupDone();
     }
+
+    /// Compositor-initiated reactive reconfigure (X05): recompute the
+    /// geometry from the current positioner rules (reusing the F1
+    /// constraint machinery) and re-send the configure sequence with a
+    /// fresh reposition token.
+    ///
+    /// Re-configuration is only permitted for popups bound at v3+ whose
+    /// positioner requested `set_reactive` — the smithay model
+    /// (shell/xdg/mod.rs:1909-1923) checks the last-acked positioner's
+    /// reactive flag; our `positioner_rules` are the rules in effect
+    /// (they change only at get_popup/reposition, both of which are
+    /// followed by acks before a reconfigure), so the two agree. A
+    /// non-reactive or below-v3 popup is refused with `error.NotReactive`
+    /// — there is no `not_reactive` wire error in the protocol, so the
+    /// rejection is compositor-side (smithay returns
+    /// `PopupConfigureError::NotReactive` the same way). The v3 gate also
+    /// keeps `repositioned` (since v3) structurally unreachable below v3
+    /// (X09).
+    ///
+    /// The compositor-driven trigger (parent move/resize re-sends) is a
+    /// follow-up: XdgSurface has no move/resize signal, so the request
+    /// path (xdg_popup.reposition) is the only wired trigger; this is
+    /// the API the follow-up trigger will call.
+    pub fn reconfigure(p: *XdgPopup, token: u32) error{NotReactive}!void {
+        if (p.resource.getVersion() < 3 or !p.positioner_rules.reactive) {
+            return error.NotReactive;
+        }
+        p.recomputeGeometry();
+        // X09: repositioned is since v3; reconfigure already requires
+        // v3, so this is defense-in-depth (same pattern as the
+        // reposition handler).
+        if (p.resource.getVersion() >= 3) {
+            p.resource.sendRepositioned(token);
+        }
+        p.configure() catch p.resource.postNoMemory();
+    }
 };
+
+// ---------------------------------------------------------------------------
+// Popup seat grab (X04b): xdg_popup.grab installs pointer + keyboard grabs
+// that route input to the popup's client until the grab is dismissed.
+// ---------------------------------------------------------------------------
+
+/// Per-popup grab state (allocated on xdg_popup.grab, freed in
+/// popupDestroy). One allocation backs BOTH the pointer grab and the
+/// keyboard grab (`data` of each points here): a single `active` flag
+/// makes ending idempotent — the seat's end*Grab invokes the grab's
+/// cancel handler, and the cancel path must not recurse or dismiss
+/// twice (wlroots' xdg_popup_grab_end relies on the default-grab swap
+/// for the same property, wlr_xdg_popup.c:41-51).
+const PopupGrab = struct {
+    popup: *XdgPopup,
+    /// Null once the seat is gone (seat_destroy_listener): teardown must
+    /// not call into a freed seat (main.zig frees the seat BEFORE the
+    /// shell's popups, main.zig:446-453).
+    seat: ?*seat_mod.Seat,
+    /// The grabs are installed on the seat. Cleared exactly once, by
+    /// popupGrabEnd; every later end/cancel becomes a no-op.
+    active: bool = true,
+    /// The popup's client received a pointer enter for the popup surface
+    /// (the seat never hit-tests while a grab is installed, so the grab
+    /// delivers the enter itself on the first motion).
+    pointer_entered: bool = false,
+    pointer_grab: seat_mod.PointerGrab = undefined,
+    keyboard_grab: seat_mod.KeyboardGrab = undefined,
+    /// Fires when the seat dies first: clears the seat reference so
+    /// popupDestroy never touches freed seat memory.
+    seat_destroy_listener: wire.Listener(*seat_mod.Seat),
+};
+
+/// End the popup grab (dismiss or teardown). Sends popup_done when
+/// `dismiss` — a grab-owned dismissal (button press, or the grab being
+/// cancelled/replaced); teardown paths have already sent popup_done or
+/// need none. Idempotent: only the first call acts, so the cancel
+/// handlers that run inside end*Grab (which call back into this) cannot
+/// recurse.
+fn popupGrabEnd(g: *PopupGrab, dismiss: bool) void {
+    if (!g.active) return;
+    g.active = false;
+    if (dismiss) g.popup.sendPopupDone();
+    const seat = g.seat orelse return;
+    seat.endPointerGrab();
+    seat.endKeyboardGrab();
+}
+
+/// The pointer grab was cancelled (replaced by another grab or ended):
+/// dismiss the popup (wlroots xdg_pointer_grab_cancel ->
+/// xdg_popup_grab_end, wlr_xdg_popup.c:95-97). Also runs when the popup
+/// grab itself ends, where popupGrabEnd's active flag makes it a no-op.
+fn popupGrabPointerCancel(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab) void {
+    _ = seat;
+    const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
+    popupGrabEnd(g, true);
+}
+
+/// The keyboard grab was cancelled: same dismissal as the pointer
+/// cancel (wlroots xdg_keyboard_grab_cancel, wlr_xdg_popup.c:133-136).
+fn popupGrabKeyboardCancel(seat: *seat_mod.Seat, grab: *const seat_mod.KeyboardGrab) void {
+    _ = seat;
+    const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
+    popupGrabEnd(g, true);
+}
+
+/// Route pointer motion to the popup's client's pointer resources
+/// (wlroots xdg_pointer_grab_motion, wlr_xdg_popup.c:64-66). The seat
+/// never hit-tests under a grab, so the grab delivers the enter for the
+/// popup surface itself on the first motion. Surface-local coordinates
+/// are the raw seat coordinates: converting to popup-local needs the
+/// scene origin, which xdg.zig does not track (follow-up, same as the
+/// parent-motion trigger).
+fn popupGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i32, y: i32) void {
+    const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
+    if (!g.active) return;
+    const popup = g.popup;
+    const wl_client = popup.resource.getClient();
+    const fx = wire.wl.Fixed.fromInt(@intCast(x));
+    const fy = wire.wl.Fixed.fromInt(@intCast(y));
+    if (!g.pointer_entered) {
+        g.pointer_entered = true;
+        const serial = seat.serialFor(wl_client);
+        var delivered = false;
+        for (seat.pointers.items) |ptr| {
+            if (ptr.getClient() != wl_client) continue;
+            ptr.sendEnter(serial, popup.xdg_surface.surface.resource, fx, fy);
+            delivered = true;
+        }
+        if (delivered) seat.markFramePending(wl_client);
+    }
+    const time = seat.nowMs();
+    var delivered = false;
+    for (seat.pointers.items) |ptr| {
+        if (ptr.getClient() != wl_client) continue;
+        ptr.sendMotion(time, fx, fy);
+        delivered = true;
+    }
+    if (delivered) seat.markFramePending(wl_client);
+}
+
+/// Any button press while the popup owns the grab dismisses it —
+/// popup_done + grab end (X04b simplification; wlroots dismisses via
+/// xdg_popup_grab_end when the button cannot be delivered to the
+/// client, wlr_xdg_popup.c:72-80). Releases route to the popup's
+/// client.
+fn popupGrabButton(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, button: u32, pressed: bool) void {
+    const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
+    if (!g.active) return;
+    if (pressed) {
+        popupGrabEnd(g, true);
+        return;
+    }
+    const popup = g.popup;
+    const wl_client = popup.resource.getClient();
+    const serial = seat.serialFor(wl_client);
+    const time = seat.nowMs();
+    var delivered = false;
+    for (seat.pointers.items) |ptr| {
+        if (ptr.getClient() != wl_client) continue;
+        ptr.sendButton(serial, time, button, .released);
+        delivered = true;
+    }
+    if (delivered) seat.markFramePending(wl_client);
+}
+
+/// Axis events are swallowed during the popup grab: the X04b routing
+/// scope is enter/motion/button/frame, and the v120/source accumulation
+/// the seat does for the focused path is not replicated here (scroll
+/// during a menu grab is a compositor-policy follow-up, like wlroots'
+/// own axis forwarding).
+fn popupGrabAxis(
+    seat: *seat_mod.Seat,
+    grab: *const seat_mod.PointerGrab,
+    axis: server.wl.Pointer.Axis,
+    source: server.wl.Pointer.AxisSource,
+    value: f64,
+    discrete: i32,
+    direction: server.wl.Pointer.AxisRelativeDirection,
+) void {
+    _ = seat;
+    _ = grab;
+    _ = axis;
+    _ = source;
+    _ = value;
+    _ = discrete;
+    _ = direction;
+}
+
+/// Route a key event to the popup's client's keyboards (wlroots
+/// xdg_keyboard_grab_key, wlr_xdg_popup.c:121-125). The wire keycode is
+/// the evdev scancode (xkb keycode minus 8), same as the seat's own
+/// delivery.
+fn popupGrabKey(seat: *seat_mod.Seat, grab: *const seat_mod.KeyboardGrab, keycode: u32, pressed: bool) void {
+    const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
+    if (!g.active) return;
+    const popup = g.popup;
+    const wl_client = popup.resource.getClient();
+    const serial = seat.serialFor(wl_client);
+    const time = seat.nowMs();
+    const state: server.wl.Keyboard.KeyState = if (pressed) .pressed else .released;
+    for (seat.keyboards.items) |kbd| {
+        if (kbd.getClient() != wl_client) continue;
+        kbd.sendKey(serial, time, keycode - 8, state);
+    }
+}
+
+/// Route a modifier change to the popup's client's keyboards (wlroots
+/// xdg_keyboard_grab_modifiers, wlr_xdg_popup.c:127-131). The seat's
+/// modifier state is already updated before the grab runs.
+fn popupGrabModifiers(seat: *seat_mod.Seat, grab: *const seat_mod.KeyboardGrab) void {
+    const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
+    if (!g.active) return;
+    const popup = g.popup;
+    const wl_client = popup.resource.getClient();
+    const serial = seat.serialFor(wl_client);
+    for (seat.keyboards.items) |kbd| {
+        if (kbd.getClient() != wl_client) continue;
+        kbd.sendModifiers(serial, seat.mods_depressed, seat.mods_latched, seat.mods_locked, seat.mods_group);
+    }
+}
+
+/// The seat is being destroyed: its grab fields die with it, so the
+/// popup side must stop calling into it (the seat can die before the
+/// shell's popups at server shutdown). Detach the listener — the link
+/// would otherwise dangle into the freed signal list (wlroots
+/// xdg_popup_grab_handle_seat_destroy, wlr_xdg_popup.c:204-216).
+fn onPopupGrabSeatDestroy(listener: *wire.Listener(*seat_mod.Seat), _: *seat_mod.Seat) void {
+    const g: *PopupGrab = @fieldParentPtr("seat_destroy_listener", listener);
+    g.seat = null;
+    g.seat_destroy_listener.link.remove();
+}
 
 fn popupRequest(popup_res: *server.xdg.Popup, request: server.xdg.Popup.Request, popup: *XdgPopup) void {
     _ = popup_res;
@@ -1433,12 +1668,13 @@ fn popupRequest(popup_res: *server.xdg.Popup, request: server.xdg.Popup.Request,
             // Destructor: libwayland does not auto-destroy; we do (runs popupDestroy).
             popup.resource.destroy();
         },
-        // X04a: the grab error surface (wlroots xdg_popup_handle_grab,
-        // wlr_xdg_popup.c:288-301): a mapped popup cannot grab
-        // (invalid_grab on the popup) and a non-topmost popup cannot grab
-        // (not_the_topmost_popup on the wm_base). The real seat-grab
-        // machinery is F2 (tracked in notes/133).
-        .grab => {
+        // X04a error surface + X04b real grabs (wlroots
+        // xdg_popup_handle_grab, wlr_xdg_popup.c:288-313): a mapped
+        // popup cannot grab (invalid_grab on the popup), a non-topmost
+        // popup cannot grab (not_the_topmost_popup on the wm_base); a
+        // valid grab installs pointer + keyboard grabs routing to the
+        // popup's client.
+        .grab => |r| {
             if (popup.xdg_surface.surface.mapped) {
                 popup.resource.postError(.invalid_grab, "xdg_popup is already mapped");
                 return;
@@ -1450,13 +1686,55 @@ fn popupRequest(popup_res: *server.xdg.Popup, request: server.xdg.Popup.Request,
                 );
                 return;
             }
-            log.debug(
-                "xdg_popup.grab ignored (popup grabs are F2, structural)",
-                popup.io,
-                popup.log_cfg,
-                log_tag,
-                .{},
-            );
+            // X04b: the request must echo a serial the seat recently
+            // handed to THIS client (the XML: grab must be issued in
+            // response to a user action). Same validation as main.zig's
+            // move handler (main.zig:1055); an invalid serial ignores
+            // the request — never a protocol error (wlroots
+            // wlr_seat_client_validate_event_serial semantics).
+            const seat = seatFromResource(r.seat);
+            if (!seat.validateEventSerial(popup.resource.getClient(), r.serial)) {
+                log.debug(
+                    "xdg_popup.grab ignored: serial {d} not issued to this client",
+                    popup.io,
+                    popup.log_cfg,
+                    log_tag,
+                    .{r.serial},
+                );
+                return;
+            }
+            // A second grab on the same (unmapped) popup is a client
+            // bug: keep the first.
+            if (popup.grab_state != null) return;
+            const g = popup.allocator.create(PopupGrab) catch {
+                popup.resource.postNoMemory();
+                return;
+            };
+            g.* = .{
+                .popup = popup,
+                .seat = seat,
+                .pointer_grab = .{
+                    .data = g,
+                    .motion = popupGrabMotion,
+                    .button = popupGrabButton,
+                    .axis = popupGrabAxis,
+                    .cancel = popupGrabPointerCancel,
+                },
+                .keyboard_grab = .{
+                    .data = g,
+                    .key = popupGrabKey,
+                    .modifiers = popupGrabModifiers,
+                    .cancel = popupGrabKeyboardCancel,
+                },
+                .seat_destroy_listener = wire.Listener(*seat_mod.Seat).init(onPopupGrabSeatDestroy),
+            };
+            g.seat_destroy_listener.link.prev = null;
+            g.seat_destroy_listener.link.next = null;
+            seat.events.destroy.add(&g.seat_destroy_listener);
+            popup.grab_state = g;
+            seat.startPointerGrab(&g.pointer_grab);
+            seat.startKeyboardGrab(&g.keyboard_grab);
+            log.info("xdg_popup.grab installed serial={d}", popup.io, popup.log_cfg, log_tag, .{r.serial});
         },
         .reposition => |r| {
             // Per the XML, the positioner must be complete; an incomplete
@@ -1476,8 +1754,8 @@ fn popupRequest(popup_res: *server.xdg.Popup, request: server.xdg.Popup.Request,
             popup.recomputeGeometry();
             // X09: repositioned is since v3 (xdg-shell.xml:1398); a
             // below-v3 binding must never receive it. The request itself
-            // is also v3+, so this is defense-in-depth (load-bearing once
-            // the X05 reactive-reconfigure path reaches this handler).
+            // is also v3+, and X05's reconfigure requires v3 the same
+            // way, so this is defense-in-depth.
             if (popup.resource.getVersion() >= 3) {
                 popup.resource.sendRepositioned(r.token);
             }
@@ -1509,6 +1787,21 @@ fn popupDestroy(popup_res: *server.xdg.Popup, popup: *XdgPopup) void {
         if (std.mem.findScalar(*XdgPopup, parent_xdg.popups.items, popup)) |i| {
             _ = parent_xdg.popups.swapRemove(i);
         }
+    }
+    // X04b: end any active grab BEFORE freeing the popup — the seat's
+    // grab.data would dangle (wlroots reset_xdg_popup, wlr_xdg_popup.c:
+    // 444-464). `dismiss` is false: every path into popupDestroy has
+    // already sent popup_done (parent unmap) or needs none (client
+    // destroy / disconnect / teardown), so the grab end must not send a
+    // duplicate. When the seat died first, its grabs are gone and
+    // popupGrabEnd skips the seat calls (seat == null).
+    if (popup.grab_state) |g| {
+        popupGrabEnd(g, false);
+        // The seat-destroy listener may still be attached (seat alive);
+        // when the seat died, the handler already detached it.
+        if (g.seat_destroy_listener.link.prev != null) g.seat_destroy_listener.link.remove();
+        popup.allocator.destroy(g);
+        popup.grab_state = null;
     }
     popup.events.destroy.emit(popup);
     const xdg = popup.xdg_surface;
@@ -2296,6 +2589,8 @@ const PopupEvents = struct {
     width: i32 = 0,
     height: i32 = 0,
     done_count: usize = 0,
+    repositioned_count: usize = 0,
+    repositioned_token: u32 = 0,
 
     fn listener(popup: *client.xdg.Popup, event: client.xdg.Popup.Event, data: *PopupEvents) void {
         _ = popup;
@@ -2310,7 +2605,10 @@ const PopupEvents = struct {
             .popup_done => {
                 data.done_count += 1;
             },
-            .repositioned => {},
+            .repositioned => |r| {
+                data.repositioned_count += 1;
+                data.repositioned_token = r.token;
+            },
         }
     }
 };
@@ -4229,4 +4527,328 @@ test "popup reposition re-places and acknowledges the token (F1/F7)" {
     const err = protocolError(ts);
     try std.testing.expectEqual(@as(c_int, 5), err.code); // invalid_positioner
     try std.testing.expectEqualStrings("xdg_wm_base", err.interface);
+}
+
+// --- X04b: popup seat-grab routing -----------------------------------------
+
+/// Event counts for the popup client's wl_pointer during a grab.
+const PopupGrabPointerEvents = struct {
+    entered: bool = false,
+    motion: usize = 0,
+    button: usize = 0,
+    frame: usize = 0,
+
+    fn listener(pointer: *client.wl.Pointer, event: client.wl.Pointer.Event, data: *PopupGrabPointerEvents) void {
+        _ = pointer;
+        switch (event) {
+            .enter => data.entered = true,
+            .motion => data.motion += 1,
+            .button => data.button += 1,
+            .frame => data.frame += 1,
+            .leave, .axis, .axis_stop, .axis_discrete, .axis_source, .axis_value120, .axis_relative_direction => {
+                // Not routed by the popup grab (wlroots xdg_popup scope).
+            },
+            .warp => {},
+        }
+    }
+};
+
+/// Event counts for the popup client's wl_keyboard during a grab.
+const PopupGrabKeyboardEvents = struct {
+    key: usize = 0,
+    modifiers: usize = 0,
+
+    fn listener(keyboard: *client.wl.Keyboard, event: client.wl.Keyboard.Event, data: *PopupGrabKeyboardEvents) void {
+        _ = keyboard;
+        switch (event) {
+            .key => data.key += 1,
+            .modifiers => data.modifiers += 1,
+            .keymap => |e| {
+                // The fd is owned by the receiving client: close it.
+                _ = std.os.linux.close(e.fd);
+            },
+            .enter, .leave, .repeat_info => {},
+        }
+    }
+};
+
+test "xdg_popup.grab installs pointer + keyboard grabs routing to the popup client (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var popup_events: PopupEvents = .{};
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    positioner.destroy();
+    try ts.pump();
+
+    // The popup client's seat resources: the grab routes to these.
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    const wl_keyboard = try ts.wl_seat.?.getKeyboard();
+    var kbd_events: PopupGrabKeyboardEvents = .{};
+    wl_keyboard.setListener(*PopupGrabKeyboardEvents, PopupGrabKeyboardEvents.listener, &kbd_events);
+    try ts.pump();
+
+    // Mint a serial for the client (keyboard enter carries one) and grab
+    // the unmapped, topmost popup with it.
+    const p = ts.shell.?.popups.items[0];
+    ts.seat.?.setKeyboardFocus(p.xdg_surface.surface);
+    const serial = ts.seat.?.last_serial;
+    try std.testing.expect(ts.seat.?.validateEventSerial(ts.client.?, serial));
+
+    popup.grab(ts.wl_seat.?, serial);
+    try ts.pump();
+    // No protocol error; the grabs are installed.
+    try std.testing.expect(p.grab_state != null);
+    try std.testing.expect(ts.seat.?.pointer_grab != null);
+    try std.testing.expect(ts.seat.?.keyboard_grab != null);
+
+    // Motion routes to the popup client's pointer: the grab delivers the
+    // enter (the seat never picks under a grab) and then the motion. The
+    // xdg TestServer does not auto-flush pointer frames, so close the
+    // batch explicitly.
+    ts.seat.?.pointerMotion(100, 120);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expect(ptr_events.entered);
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.motion);
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.frame);
+
+    // A key event routes to the popup client's keyboard regardless of the
+    // seat's keyboard focus, and a modifier change routes too. (Reset
+    // first: the pre-grab setKeyboardFocus delivered its own modifiers
+    // event to this keyboard.)
+    kbd_events = .{};
+    ts.seat.?.keyEvent(38, true); // 'a'
+    ts.seat.?.keyEvent(50, true); // Shift_L: also a modifier change
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), kbd_events.key);
+    try std.testing.expectEqual(@as(usize, 1), kbd_events.modifiers);
+
+    // Any button press dismisses: popup_done, then both grabs end
+    // (X04b simplification).
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
+    try std.testing.expect(ts.seat.?.pointer_grab == null);
+    try std.testing.expect(ts.seat.?.keyboard_grab == null);
+    try std.testing.expect(!p.grab_state.?.active);
+
+    // After the grab ends the seat is back to default delivery: another
+    // press is not an error and sends no duplicate popup_done.
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
+}
+
+test "xdg_popup.grab with a serial the client never received is ignored (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    positioner.destroy();
+    try ts.pump();
+
+    // No serial was ever handed to this client: the grab is ignored —
+    // not a protocol error (the connection survives; same semantics as
+    // wl_pointer.set_cursor's serial check).
+    popup.grab(ts.wl_seat.?, 12345);
+    try ts.pump();
+    const p = ts.shell.?.popups.items[0];
+    try std.testing.expect(p.grab_state == null);
+    try std.testing.expect(ts.seat.?.pointer_grab == null);
+    try std.testing.expect(ts.seat.?.keyboard_grab == null);
+}
+
+test "popup destroy ends an active grab before freeing (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    positioner.destroy();
+    try ts.pump();
+
+    const p = ts.shell.?.popups.items[0];
+    ts.seat.?.setKeyboardFocus(p.xdg_surface.surface);
+    const serial = ts.seat.?.last_serial;
+    popup.grab(ts.wl_seat.?, serial);
+    try ts.pump();
+    try std.testing.expect(ts.seat.?.pointer_grab != null);
+
+    // Client-initiated destroy: the grab must be ended (the seat must
+    // not keep a dangling data pointer) before the popup is freed.
+    popup.destroy();
+    try ts.pump();
+    try std.testing.expect(ts.seat.?.pointer_grab == null);
+    try std.testing.expect(ts.seat.?.keyboard_grab == null);
+    try std.testing.expectEqual(@as(usize, 0), ts.shell.?.popups.items.len);
+}
+
+// --- X05: reactive popup reconfigure ----------------------------------------
+
+test "reactive popup reconfigure re-places and echoes the token (X05)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    var popup_events: PopupEvents = .{};
+
+    // Reactive slide_x popup: the raw geometry hangs off the left edge.
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(0, 100, 100, 100);
+    positioner.setAnchor(.top_left);
+    positioner.setGravity(.top_left);
+    positioner.setConstraintAdjustment(@bitCast(@as(u32, 1))); // slide_x
+    positioner.setReactive();
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    positioner.destroy();
+    try ts.pump();
+    const p = ts.shell.?.popups.items[0];
+    // set_reactive was captured into the positioner rules at get_popup.
+    try std.testing.expect(p.positioner_rules.reactive);
+    try std.testing.expectEqual(
+        geom.Rect{ .x = -100, .y = 50, .width = 100, .height = 50 },
+        p.geometry,
+    );
+
+    // Map the popup: initial configure at the raw (unconstrained) geometry.
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), popup_events.configure_count);
+    try std.testing.expectEqual(@as(i32, -100), popup_events.x);
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(p.xdg_surface.configured);
+
+    // Compositor-initiated reconfigure with a fresh constraint box:
+    // recomputed geometry, a fresh configure, and repositioned(token).
+    p.setConstraintBox(.{ .x = 0, .y = 0, .width = 200, .height = 200 });
+    try p.reconfigure(99);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), popup_events.configure_count);
+    try std.testing.expectEqual(@as(i32, 0), popup_events.x);
+    try std.testing.expectEqual(@as(i32, 50), popup_events.y);
+    try std.testing.expectEqual(@as(usize, 1), popup_events.repositioned_count);
+    try std.testing.expectEqual(@as(u32, 99), popup_events.repositioned_token);
+    try std.testing.expectEqual(
+        geom.Rect{ .x = 0, .y = 50, .width = 100, .height = 50 },
+        p.geometry,
+    );
+}
+
+test "non-reactive popup reconfigure returns NotReactive (X05)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var popup_events: PopupEvents = .{};
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    positioner.destroy();
+    try ts.pump();
+
+    // No set_reactive: the compositor may not re-place the popup. The
+    // rejection is compositor-side (error.NotReactive) — there is no
+    // not_reactive wire error in the protocol (smithay returns
+    // PopupConfigureError::NotReactive the same way).
+    const p = ts.shell.?.popups.items[0];
+    try std.testing.expectError(error.NotReactive, p.reconfigure(7));
+    try ts.pump();
+    // Nothing was sent: no configure, no repositioned.
+    try std.testing.expectEqual(@as(usize, 0), popup_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.repositioned_count);
+}
+
+test "reconfigure on a v2-bound popup returns NotReactive (X05 version gate)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.initAtVersion(allocator, 2);
+    defer ts.deinit();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    _ = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    positioner.destroy();
+    try ts.pump();
+
+    // xdg_popup.configure's re-send and xdg_popup.repositioned are both
+    // since v3, and there is no xdg_popup.reconfigure REQUEST in the
+    // protocol at all (reposition, since 3, is the only client re-place
+    // path), so the wire is unreachable below v3 by construction. The
+    // compositor-facing reconfigure enforces the same gate: a v2 popup
+    // is refused and nothing is marshalled.
+    const p = ts.shell.?.popups.items[0];
+    try std.testing.expectEqual(@as(u32, 2), p.resource.getVersion());
+    try std.testing.expectError(error.NotReactive, p.reconfigure(3));
 }

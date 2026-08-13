@@ -87,6 +87,7 @@ const surface_mod = @import("surface.zig");
 
 const server = @import("protocol").server;
 const client = @import("protocol").client;
+const Fixed = wire.wl.Fixed;
 
 /// wl_data_device_manager protocol version this library implements.
 pub const data_device_version: u32 = 3;
@@ -125,6 +126,9 @@ pub const DataDeviceManager = struct {
     /// seat_client_send_selection, wlr_data_device.c; an offer dies with
     /// its source, wlr_data_offer.c data_offer_handle_source_destroy).
     offers: std.ArrayList(*DataOffer) = .empty,
+    /// The in-flight drag, or null. One drag at a time per seat
+    /// (wlroots seat->drag, wlr_drag.c:145).
+    drag: ?*Drag = null,
     focus_listener: wire.Listener(*seat_mod.Seat),
 
     pub fn init(
@@ -166,6 +170,11 @@ pub const DataDeviceManager = struct {
         self.focus_listener.link.remove();
         if (self.global) |g| g.remove();
         const allocator = self.allocator;
+        // End any in-flight drag first: its grab sits on the seat and
+        // its end() clears the pointer grab + frees the drag (the
+        // source destruction below would otherwise hit the
+        // source-dies-mid-drag path).
+        if (self.drag) |drag| drag.end(false);
         // Clients outlive the manager at shutdown (main.zig defers the
         // manager before display.deinit, which tears down the clients),
         // so destroy every resource this manager owns while the manager
@@ -236,6 +245,240 @@ const DataSource = struct {
 /// drag offers.
 const OfferType = enum { selection, drag };
 
+/// A drag-and-drop operation (wlroots wlr_drag, wlr_drag.c). Lives on
+/// the manager (one per seat); installed as a pointer grab on the seat
+/// for its lifetime. The grab's data points at this struct; the grab is
+/// ended (endPointerGrab) before the struct is freed, so cancel never
+/// runs against freed memory (the ended flag also makes the
+/// endPointerGrab→cancel→dragEnd recursion safe).
+const Drag = struct {
+    manager: *DataDeviceManager,
+    /// The drag source: finalized at start_drag, never cancelled while
+    /// the drag lives (a denied serial keeps it finalized-but-alive,
+    /// wlr_data_device.c:82-85).
+    source: *DataSource,
+    /// The surface the drag started on (validates via
+    /// validatePointerGrabSerial against the seat's grab_serial).
+    origin: *surface_mod.Surface,
+    /// The drag icon surface (wl_data_device.start_drag icon arg), or
+    /// null. Positioned by the compositor's scene path; the drag tracks
+    /// it for the role name only.
+    icon: ?*surface_mod.Surface = null,
+    /// The surface currently under the pointer (drag target).
+    focus: ?*surface_mod.Surface = null,
+    /// The drag offer delivered to the focus client (one offer; the
+    /// drag targets one client at a time).
+    offer: ?*DataOffer = null,
+    /// True once the drop ran: the offer outlives the drag for the data
+    /// transfer (wlroots keeps drag offers after drop,
+    /// drag_set_focus wlr_drag.c:47-61).
+    dropped: bool = false,
+    /// True once dragEnd ran: guards the endPointerGrab→cancel→dragEnd
+    /// recursion and the destroy-during-cancel ordering.
+    ended: bool = false,
+    /// The installed pointer grab.
+    grab: seat_mod.PointerGrab = undefined,
+
+    /// End the drag (wlroots drag_destroy, wlr_drag.c:115-145): send
+    /// leave, run the drop/finish protocol, end the grab, free.
+    fn end(drag: *Drag, drop: bool) void {
+        if (drag.ended) return;
+        drag.ended = true;
+        const mgr = drag.manager;
+        const seat = mgr.seat;
+
+        // The drop runs FIRST, against the live focus (wlroots
+        // drag_handle_pointer_button drops then destroys the drag,
+        // wlr_drag.c:113-125): only an accepted target with a negotiated
+        // action gets the drop; anything else is a cancelled drag
+        // (dnd_finished without dnd_drop_performed). The dropped offer
+        // survives for the transfer (drag_set_focus keeps it,
+        // wlr_drag.c:47-61).
+        if (drop) {
+            if (drag.targetClient() != null and
+                drag.source.current_dnd_action != 0 and
+                drag.source.accepted)
+            {
+                drag.dropped = true;
+                const target_client = drag.targetClient().?;
+                for (mgr.devices.items) |dev| {
+                    if (dev.resource.getClient() != target_client) continue;
+                    dev.resource.sendDrop();
+                }
+                if (drag.source.resource.getVersion() >= 3) {
+                    drag.source.resource.sendDndDropPerformed();
+                }
+            }
+            // dnd_finished always follows (accepted drop or not).
+            if (drag.source.resource.getVersion() >= 3) {
+                drag.source.resource.sendDndFinished();
+            }
+        }
+
+        // Leave the current target (wlroots drag_set_focus NULL path):
+        // the offer dies with the drag unless the drop already ran
+        // (dropped offers survive for the transfer).
+        if (drag.focus) |focus| {
+            const target = focus.resource.getClient();
+            for (mgr.devices.items) |dev| {
+                if (dev.resource.getClient() != target) continue;
+                dev.resource.sendLeave();
+            }
+            if (!drag.dropped) {
+                if (drag.offer) |offer| destroyOffer(mgr, offer);
+            }
+        }
+        drag.focus = null;
+
+        // End the grab: cancel runs dragGrabCancel → drag.end (no-op via
+        // the ended flag), then the seat clears the grab.
+        if (seat.pointer_grab == &drag.grab) seat.endPointerGrab();
+
+        if (mgr.drag == drag) mgr.drag = null;
+        const allocator = mgr.allocator;
+        allocator.destroy(drag);
+    }
+
+    /// The drag target's client (the client of the focused surface), or
+    /// null when the pointer is over no surface.
+    fn targetClient(drag: *const Drag) ?*wire.Client {
+        const focus = drag.focus orelse return null;
+        return focus.resource.getClient();
+    }
+};
+
+/// The drag grab's pointer motion: hit-test, enter/leave the target's
+/// data device, send motion. Mirrors wlroots drag_handle_pointer_motion
+/// + drag_set_focus (wlr_drag.c:47-87, 126-133): the compositor's pick
+/// callback answers the hit test; the seat's default grab does the same
+/// for normal pointer motion.
+fn dragGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i32, y: i32) void {
+    const drag: *Drag = @ptrCast(@alignCast(grab.data.?));
+    const pick = if (seat.pick_fn) |f| f(seat.pick_ctx.?, x, y) else null;
+
+    if (pick) |p| {
+        if (drag.focus != p.surface) {
+            // Target changed: leave the old, enter the new.
+            dragSetFocus(drag, p.surface, p.sx, p.sy);
+        } else {
+            // Same target: motion.
+            const target = drag.targetClient() orelse return;
+            const time = seat.nowMs();
+            for (drag.manager.devices.items) |dev| {
+                if (dev.resource.getClient() != target) continue;
+                dev.resource.sendMotion(@intCast(time), Fixed.fromInt(@intCast(p.sx)), Fixed.fromInt(@intCast(p.sy)));
+            }
+        }
+    } else {
+        dragSetFocus(drag, null, 0, 0);
+    }
+}
+
+/// Set (or clear) the drag target (wlroots drag_set_focus,
+/// wlr_drag.c:28-112): leave the old target's device, create a fresh
+/// drag offer for the new target's device, enter it.
+fn dragSetFocus(drag: *Drag, surface: ?*surface_mod.Surface, sx: i32, sy: i32) void {
+    const mgr = drag.manager;
+    const seat = mgr.seat;
+    if (drag.focus == surface) return;
+
+    // Leave the old target; the offer dies with the focus change unless
+    // the drop already ran (the dropped offer stays for the transfer).
+    if (drag.focus) |old| {
+        const old_client = old.resource.getClient();
+        for (mgr.devices.items) |dev| {
+            if (dev.resource.getClient() != old_client) continue;
+            dev.resource.sendLeave();
+        }
+        if (!drag.dropped) {
+            if (drag.offer) |offer| destroyOffer(mgr, offer);
+            drag.offer = null;
+        }
+    }
+    drag.focus = null;
+
+    const s = surface orelse return;
+    // A drag source only targets its own client's surfaces? No — the
+    // drag can move to any client; only the source client is special
+    // (it cannot receive its own drag? wlroots allows it). Deliver to
+    // the surface's client.
+    const target_client = s.resource.getClient();
+    // Create the drag offer for the target's device (wlroots
+    // drag_set_focus wlr_drag.c:78-101): the offer is introduced per
+    // device, mimes + source_actions + enter in order.
+    for (mgr.devices.items) |dev| {
+        if (dev.resource.getClient() != target_client) continue;
+        const offer_res = server.wl.DataOffer.create(target_client, dev.resource.getVersion(), 0) catch return;
+        const offer = mgr.allocator.create(DataOffer) catch {
+            offer_res.destroy();
+            return;
+        };
+        offer.* = .{
+            .manager = mgr,
+            .resource = offer_res,
+            .source = drag.source,
+            .offer_type = .drag,
+        };
+        offer_res.setHandler(*DataOffer, offerRequest, offerDestroy, offer);
+        mgr.offers.append(mgr.allocator, offer) catch {
+            offer_res.destroy();
+            return;
+        };
+        // Order: data_offer, per-mime offer, source_actions (v3+),
+        // then enter (wlroots wlr_drag.c:93-101).
+        dev.resource.sendDataOffer(offer_res);
+        for (drag.source.mime_types.items) |m| offer_res.sendOffer(m.ptr);
+        if (offer_res.getVersion() >= 3) {
+            offer_res.sendSourceActions(@bitCast(drag.source.actions orelse 0));
+        }
+        const serial = seat.serialFor(target_client);
+        dev.resource.sendEnter(serial, s.resource, Fixed.fromInt(@intCast(sx)), Fixed.fromInt(@intCast(sy)), offer_res);
+        drag.offer = offer;
+        log.debug("drag entered surface@{d}", mgr.io, mgr.log_cfg, "data_device", .{s.resource.getId()});
+    }
+    drag.focus = s;
+}
+
+/// The drag grab's button: releasing the ORIGIN button ends the drag —
+/// drop when the target accepted + an action is negotiated, else
+/// dnd_finished without drop (wlroots drag_handle_pointer_button,
+/// wlr_drag.c:113-125).
+fn dragGrabButton(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, button: u32, pressed: bool) void {
+    const drag: *Drag = @ptrCast(@alignCast(grab.data.?));
+    if (pressed) return;
+    // Only the origin button's release ends the drag.
+    if (button != seat.grab_button and seat.pressed_count > 0) return;
+    drag.end(true);
+}
+
+/// The drag swallow for axis events (wlroots blanks the axis handler,
+/// wlr_drag.c:133-137).
+fn dragGrabAxis(
+    seat: *seat_mod.Seat,
+    grab: *const seat_mod.PointerGrab,
+    axis: server.wl.Pointer.Axis,
+    source: server.wl.Pointer.AxisSource,
+    value: f64,
+    discrete: i32,
+    direction: server.wl.Pointer.AxisRelativeDirection,
+) void {
+    _ = seat;
+    _ = grab;
+    _ = axis;
+    _ = source;
+    _ = value;
+    _ = discrete;
+    _ = direction;
+}
+
+/// The drag grab was replaced or the seat ended it: end the drag
+/// without a drop (wlroots drag_handle_pointer_cancel, wlr_drag.c:141).
+fn dragGrabCancel(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab) void {
+    _ = seat;
+    const drag: *Drag = @ptrCast(@alignCast(grab.data.?));
+    drag.end(false);
+}
+
 /// A data offer delivered to a target client.
 const DataOffer = struct {
     manager: *DataDeviceManager,
@@ -252,6 +495,13 @@ const DataOffer = struct {
     /// The destination's preferred action
     /// (wl_data_offer.set_actions; wlroots data_offer->preferred_action).
     preferred_action: u32 = 0,
+    /// The negotiated action is .ask (F-SEL-7): while an ask
+    /// negotiation is pending, action events are suppressed on both
+    /// sides (wlroots data_offer->in_ask, wlr_data_device.h:43 — the
+    /// field exists but is never set in 0.20.2; smithay models the
+    /// suppression). The client resolves ask by sending a follow-up
+    /// set_actions with a concrete action.
+    in_ask: bool = false,
 };
 
 /// wl_data_device_manager.dnd_action bits (wayland.xml).
@@ -479,6 +729,12 @@ fn deadSourceHandler(resource: *server.wl.DataSource, request: server.wl.DataSou
 fn sourceDestroy(src_res: *server.wl.DataSource, src: *DataSource) void {
     _ = src_res;
     const mgr = src.manager;
+    // F-SEL-1: a drag source dying mid-drag ends the drag (its offer
+    // would reference the freed source; end() destroys the offer via
+    // the focus-clear path).
+    if (mgr.drag) |drag| {
+        if (drag.source == src) drag.end(false);
+    }
     if (mgr.selection_source == src) {
         // The selected source died: clear the seat-wide selection and
         // cancel the (already dying) source. The re-delivery below
@@ -604,36 +860,79 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
             // null-tolerant (F-SEL-3): a selection-cancelled source is
             // inert, so start_drag on it no-ops instead of crashing on
             // the freed struct.
-            if (r.source) |src_res| {
-                if (src_res.getUserData()) |ud| {
-                    const src: *DataSource = @ptrCast(@alignCast(ud));
-                    src.finalized = true;
-                }
-            }
-            // The drag serial must have been handed to THIS client
-            // (wlroots validates the pointer grab serial via the
-            // per-client ring, wlr_seat_pointer.c:603-617).
-            if (!mgr.seat.validateEventSerial(dev_res.getClient(), r.serial)) {
+            const src: ?*DataSource = if (r.source) |src_res|
+                if (src_res.getUserData()) |ud|
+                    @ptrCast(@alignCast(ud))
+                else
+                    null
+            else
+                null;
+            if (src) |s| s.finalized = true;
+
+            // The drag origin: the surface the pointer was over when the
+            // press happened (wlroots validates the pointer grab serial
+            // against the seat's grab state, wlr_seat_pointer.c:603-617).
+            const origin_ud = r.origin.getUserData() orelse return;
+            const origin: *surface_mod.Surface = @ptrCast(@alignCast(origin_ud));
+
+            // F-SEL-1: validate via the seat's grab serial (S-F5): the
+            // client must be holding exactly one button, the serial must
+            // be the one minted for that press, and the pointer must
+            // still be over the origin surface.
+            if (!mgr.seat.validatePointerGrabSerial(origin, r.serial)) {
                 log.debug(
-                    "rejecting start_drag: serial {d} was never given to this client",
+                    "rejecting start_drag: no valid pointer grab serial",
                     mgr.io,
                     mgr.log_cfg,
                     "data_device",
-                    .{r.serial},
+                    .{},
                 );
                 return;
             }
-            // No DnD in M3: the source is cancelled. The stub cancel is
-            // deliberately NOT converted to cancelSource — F-SEL-1
-            // reworks this block, and converting it would flip the
-            // "source finalized at start_drag" test (a later set_actions
-            // must still raise invalid_action_mask) to a silent no-op.
-            if (r.source) |src_res| {
-                if (src_res.getUserData()) |ud| {
-                    const src: *DataSource = @ptrCast(@alignCast(ud));
-                    src.resource.sendCancelled();
-                }
+
+            const drag = mgr.allocator.create(Drag) catch {
+                dev_res.getClient().postNoMemory();
+                return;
+            };
+            errdefer mgr.allocator.destroy(drag);
+            drag.* = .{
+                .manager = mgr,
+                .source = src.?,
+                .origin = origin,
+                .icon = if (r.icon) |icon_res| blk: {
+                    if (icon_res.getUserData()) |ud| {
+                        break :blk @as(*surface_mod.Surface, @ptrCast(@alignCast(ud)));
+                    }
+                    break :blk null;
+                } else null,
+            };
+            drag.grab = .{
+                .data = drag,
+                .motion = dragGrabMotion,
+                .button = dragGrabButton,
+                .axis = dragGrabAxis,
+                .cancel = dragGrabCancel,
+            };
+
+            // Install the grab BEFORE exposing the drag: the grab's
+            // cancel path (a pre-existing grab being replaced) ends the
+            // drag cleanly. One drag at a time (wlroots seat->drag).
+            if (mgr.drag) |old| old.end(false);
+            mgr.drag = drag;
+            mgr.seat.startPointerGrab(&drag.grab);
+
+            // A drag icon surface has the drag-icon role name (wlroots
+            // wlr_drag.c:402-442); role enforcement is surface.zig's
+            // validatePending — assign nothing here, the role name is
+            // cosmetic until a scene policy claims it.
+            if (drag.icon) |icon| {
+                log.debug("drag icon surface@{d}", mgr.io, mgr.log_cfg, "data_device", .{
+                    icon.resource.getId(),
+                });
             }
+            log.info("start_drag: grab installed (origin surface@{d})", mgr.io, mgr.log_cfg, "data_device", .{
+                origin.resource.getId(),
+            });
         },
         .release => dev_res.destroy(),
     }
@@ -798,8 +1097,16 @@ fn chooseAction(offer: *DataOffer) u32 {
 fn updateAction(offer: *DataOffer) void {
     const src = offer.source orelse return;
     const action = chooseAction(offer);
+    // F-SEL-7: while the negotiation is in ask, neither side sees
+    // action events — the destination resolves ask with a follow-up
+    // set_actions carrying a concrete action (wlroots data_offer->in_ask
+    // suppression, wlr_data_device.h:43; smithay models the same). The
+    // STATE still updates so the drop/finish path reads the resolved
+    // action.
+    offer.in_ask = action == dnd_action_ask;
     if (src.current_dnd_action == action) return;
     src.current_dnd_action = action;
+    if (offer.in_ask) return;
     if (src.resource.getVersion() >= 3) {
         src.resource.sendAction(@bitCast(action));
     }
@@ -865,10 +1172,15 @@ fn offerRequest(offer_res: *server.wl.DataOffer, request: server.wl.DataOffer.Re
         .finish => {
             // wayland.xml: "If wl_data_offer.finish request is received
             // for a non drag and drop operation, the invalid_finish
-            // protocol error is raised." Our offers are always clipboard
-            // offers (DnD is not implemented), so finish is never
-            // eligible.
-            offer_res.postError(.invalid_finish, "wl_data_offer.finish: not a drag-and-drop offer");
+            // protocol error is raised." Drag offers (F-SEL-1) accept
+            // finish: the target declares the transfer complete and the
+            // offer is destroyed client-side (wlroots
+            // data_offer_handle_finish, wlr_data_offer.c).
+            if (offer.offer_type != .drag) {
+                offer_res.postError(.invalid_finish, "wl_data_offer.finish: not a drag-and-drop offer");
+                return;
+            }
+            offer_res.destroy();
         },
         .set_actions => |r| {
             // wayland.xml wl_data_offer.set_actions (wlroots
@@ -922,7 +1234,12 @@ fn offerDestroy(offer_res: *server.wl.DataOffer, offer: *DataOffer) void {
     _ = offer_res;
     const mgr = offer.manager;
     // The client destroyed its offer (or the offer's resource died with
-    // the client): unlink and free.
+    // the client): unlink and free. If this was the drag's current
+    // offer, clear the drag's pointer — a later drag.end() (source
+    // teardown) must never destroyOffer a freed struct (double free).
+    if (mgr.drag) |drag| {
+        if (drag.offer == offer) drag.offer = null;
+    }
     if (std.mem.findScalar(*DataOffer, mgr.offers.items, offer)) |idx| {
         _ = mgr.offers.orderedRemove(idx);
     }
@@ -1002,6 +1319,19 @@ const RegistryCapture = struct {
         }
     }
 };
+
+/// The seat hit-test context: which surface the pick returns (DnD drag
+/// enter/motion routing + the S-F5 grab_serial mint need a pick that
+/// answers).
+const PickState = struct {
+    surface: ?*surface_mod.Surface = null,
+};
+
+fn testPick(ctx: *anyopaque, x: i32, y: i32) ?seat_mod.Seat.PickResult {
+    const st: *PickState = @ptrCast(@alignCast(ctx));
+    if (st.surface) |s| return .{ .surface = s, .sx = x, .sy = y };
+    return null;
+}
 
 /// Counts the cancelled events delivered to a wl_data_source.
 const SourceEvents = struct {
@@ -1184,6 +1514,11 @@ const TestServer = struct {
     /// per client surface.
     surface_listener: wire.Listener(*surface_mod.Surface),
     surface_listener_b: wire.Listener(*surface_mod.Surface),
+    /// The seat hit-test context for DnD tests: which surface the pick
+    /// returns (drag enter/motion routing + the S-F5 grab_serial mint
+    /// need a pick that answers).
+    pick_state: PickState = .{},
+    pick_fn: *const fn (ctx: *anyopaque, x: i32, y: i32) ?seat_mod.Seat.PickResult = testPick,
 
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, seat and manager all store it).
@@ -1251,6 +1586,9 @@ const TestServer = struct {
         // (same effect: the focus never outlives its surface).
         const srv_surface = surfaceForClient(ts, ts.client.?);
         srv_surface.events.destroy.add(&ts.surface_listener);
+        // The seat's hit-test callback (DnD tests: drag enter/motion
+        // routing + the S-F5 grab_serial mint need a pick that answers).
+        ts.seat.?.setPick(ts.pick_fn, &ts.pick_state);
 
         // Second client: B binds the same globals on its own socketpair
         // and creates its own focusable surface. Connected before the
@@ -1655,6 +1993,17 @@ const FocusEvents = struct {
     last_selection_null: bool = false,
     mime_count: usize = 0,
     has_text_plain: bool = false,
+    /// DnD routing counters (F-SEL-1 drag over a target surface).
+    enter_count: usize = 0,
+    motion_count: usize = 0,
+    leave_count: usize = 0,
+    drop_count: usize = 0,
+    /// The offer of the most recent enter (the drag offer the target
+    /// accepts/negotiates on).
+    last_offer_id: ?*client.wl.DataOffer = null,
+    /// The offer proxy a listener was last registered on (ids are
+    /// reused after inerting; register once per proxy).
+    listened_offer: ?*client.wl.DataOffer = null,
 
     fn listener(device: *client.wl.DataDevice, event: client.wl.DataDevice.Event, data: *FocusEvents) void {
         _ = device;
@@ -1663,13 +2012,27 @@ const FocusEvents = struct {
                 data.selection_count += 1;
                 data.last_selection_null = e.id == null;
             },
-            .data_offer => |e| e.id.setListener(*FocusEvents, FocusEvents.offerListener, data),
-            // DnD events: the test client never drags; the arms exist for
-            // exhaustive switch over the wire event enum.
-            .enter => {},
-            .leave => {},
-            .motion => {},
-            .drop => {},
+            .data_offer => |e| {
+                // The server inerts (frees the id of) the old drag offer
+                // on leave; libwayland reuses freed ids, so a later drag
+                // offer can arrive on a proxy that already has a
+                // listener. addDispatcher asserts on double-registration,
+                // so register once per proxy.
+                const offer: ?*client.wl.DataOffer = e.id;
+                if (offer) |o| {
+                    if (data.listened_offer != offer) {
+                        o.setListener(*FocusEvents, FocusEvents.offerListener, data);
+                        data.listened_offer = o;
+                    }
+                }
+            },
+            .enter => |e| {
+                data.enter_count += 1;
+                if (e.id) |offer| data.last_offer_id = offer;
+            },
+            .leave => data.leave_count += 1,
+            .motion => data.motion_count += 1,
+            .drop => data.drop_count += 1,
         }
     }
 
@@ -1824,9 +2187,10 @@ test "source finalized at set_selection: later set_actions raises invalid_action
 }
 
 test "source finalized at start_drag: later set_actions raises invalid_action_mask" {
-    // DD-3: start_drag finalizes the source too (wlroots
-    // wlr_data_device.c:82-85), even though our start_drag is a stub
-    // that cancels the source.
+    // DD-3: start_drag finalizes the source (wlroots
+    // wlr_data_device.c:82-85). F-SEL-1: with the DnD state machine the
+    // drag runs for real — a valid grab serial installs the pointer
+    // grab and the source is NOT cancelled.
     const allocator = testing.allocator;
     var ts = try TestServer.init(allocator);
     defer ts.deinit();
@@ -1836,18 +2200,136 @@ test "source finalized at start_drag: later set_actions raises invalid_action_ma
     var src_events: SourceEvents = .{};
     src.setListener(*SourceEvents, SourceEvents.listener, &src_events);
     try ts.pump();
-    const serial = focusAndMintSerial(ts);
+
+    // A valid drag origin: the pointer presses over the origin surface
+    // (minting grab_serial), then start_drag validates against it.
+    const origin = surfaceForClient(ts, ts.client.?);
+    ts.pick_state.surface = origin;
+    ts.seat.?.setPick(ts.pick_fn, &ts.pick_state);
+    ts.seat.?.pointerMotion(10, 10);
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    try ts.pump();
+    try testing.expectEqual(@as(u32, 1), ts.seat.?.pressed_count);
+    const serial = ts.seat.?.last_serial;
 
     device.startDrag(src, ts.surface.?, null, serial);
     try ts.pump();
     try testing.expect(ts.mgr.?.sources.items[0].finalized);
-    // The M3 stub cancels the (accepted) drag source.
-    try testing.expectEqual(@as(usize, 1), src_events.cancelled_count);
+    try testing.expect(ts.mgr.?.drag != null);
+    // The real drag does NOT cancel the source.
+    try testing.expectEqual(@as(usize, 0), src_events.cancelled_count);
 
     const DndAction = client.wl.DataDeviceManager.DndAction;
     src.setActions(@as(DndAction, @bitCast(@as(u32, 1))));
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "start_drag with a stale serial installs no drag and keeps the source" {
+    // F-SEL-1: the origin check (S-F5 grab_serial) rejects a drag whose
+    // serial was never minted for a held button — no grab, no offer,
+    // and the source stays finalized-but-alive (wlroots denies the
+    // drag, wlr_data_device.c:47-87).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    var src_events: SourceEvents = .{};
+    src.setListener(*SourceEvents, SourceEvents.listener, &src_events);
+    try ts.pump();
+
+    const origin = surfaceForClient(ts, ts.client.?);
+    ts.pick_state.surface = origin;
+    ts.seat.?.setPick(ts.pick_fn, &ts.pick_state);
+    ts.seat.?.pointerMotion(10, 10);
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    try ts.pump();
+    const serial = ts.seat.?.last_serial;
+    // Release the button: the grab_serial window closes (pressed_count
+    // 0), so the echo of the press serial no longer validates.
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+
+    device.startDrag(src, ts.surface.?, null, serial);
+    try ts.pump();
+    try testing.expect(ts.mgr.?.sources.items[0].finalized);
+    try testing.expectEqual(@as(?*Drag, null), ts.mgr.?.drag);
+    try testing.expectEqual(@as(usize, 0), src_events.cancelled_count);
+}
+
+test "drag enter/motion/leave/drop routes to the target's data device (F-SEL-1)" {
+    // The observable DnD contract: a drag over client B's surface
+    // delivers enter (with the offer + mimes), motion, then leave when
+    // the pointer leaves; releasing the origin button over an accepted
+    // target with a negotiated action drops.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // Client A starts the drag; client B is the drop target.
+    const device_a = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const device_b = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var events_b: FocusEvents = .{};
+    device_b.setListener(*FocusEvents, FocusEvents.listener, &events_b);
+    try ts.pump();
+
+    // Press over A's surface (origin): mints grab_serial.
+    const origin = surfaceForClient(ts, ts.client.?);
+    ts.pick_state.surface = origin;
+    ts.seat.?.setPick(ts.pick_fn, &ts.pick_state);
+    ts.seat.?.pointerMotion(10, 10);
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    try ts.pump();
+    const serial = ts.seat.?.last_serial;
+
+    // The source advertises copy BEFORE the drag (set_actions after
+    // start_drag is a protocol error); the target negotiates it.
+    src.setActions(@bitCast(@as(u32, 1)));
+    device_a.startDrag(src, ts.surface.?, null, serial);
+    try ts.pump();
+    try testing.expect(ts.mgr.?.drag != null);
+
+    // Move over B's surface: enter with the offer + mimes.
+    const target = surfaceForClient(ts, ts.client_b.?);
+    ts.pick_state.surface = target;
+    ts.seat.?.pointerMotion(50, 60);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_b.enter_count);
+    try testing.expectEqual(@as(usize, 1), events_b.mime_count);
+    try testing.expect(events_b.has_text_plain);
+    try testing.expectEqual(@as(?*DataOffer, ts.mgr.?.drag.?.offer), ts.mgr.?.drag.?.offer);
+
+    // Motion within the target: motion events.
+    ts.seat.?.pointerMotion(55, 65);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_b.motion_count);
+
+    // Leave the target (pick null): leave, offer destroyed.
+    ts.pick_state.surface = null;
+    ts.seat.?.pointerMotion(200, 200);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_b.leave_count);
+
+    // Back over the target + accept + actions + release the origin
+    // button: the drop runs (drop_performed + drop + finished).
+    ts.pick_state.surface = target;
+    ts.seat.?.pointerMotion(50, 60);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 2), events_b.enter_count);
+    // The target accepts and negotiates copy (the source already
+    // advertised copy before the drag).
+    const offer = events_b.last_offer_id.?;
+    offer.setActions(@bitCast(@as(u32, 1)), @bitCast(@as(u32, 1)));
+    offer.accept(0, "text/plain");
+    try ts.pump();
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_b.drop_count);
+    try testing.expectEqual(@as(?*Drag, null), ts.mgr.?.drag);
 }
 
 test "a serial-rejected set_selection still finalizes the source" {
