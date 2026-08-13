@@ -256,6 +256,28 @@ M8 — extras: data-control, screencopy, foreign-toplevel, tearing,
 
 Each milestone ends green: `zig build test` + a runnable example.
 
+### M7 design decisions (2026-08-13, user quiz)
+
+- **Scope: incremental.** Land f64 node coords + per-output camera +
+  world-space damage + input remapping first; z-axis rotation deferred
+  (needs the GL matrix pass; pixman has no rotation path).
+- **Scene representation: migrate SceneNode to f64 in place.** No
+  parallel canvas tree — one tree, f64 x/y throughout; int consumers
+  (damage ring, rect math) apply rounding discipline.
+- **Camera: OutputView owns it (per spec §5).** center/zoom/rotation on
+  OutputView; identity degrades to int-snapped direct compositing,
+  non-identity uses the canvas pass. main.zig's camera moves into it.
+- **Damage: plan rule.** Camera changed → damage the whole output;
+  camera static → map world rects to screen, round outward, clip.
+  Buffer-age partial tracking under camera motion is a later
+  optimization, not M7.
+- **Rotation (deferred): gles2 shader matrix; pixman snaps to 90° steps**
+  (0/90/180/270 only). Fidelity split accepted between renderers.
+- **Input remapping: seat keeps screen coords.** pick applies inverse
+  camera then inverse node transform to hit transformed quads; the
+  compositor's existing pick callback owns it. Seat world coords are
+  not introduced.
+
 ## 7. Grounding
 
 All claims verified in local clones 2026-08-07:
