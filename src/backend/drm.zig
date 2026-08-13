@@ -153,6 +153,10 @@ const DrmOutput = struct {
     mode_blob: u32 = 0,
     /// One flip in flight (guarded by the frame-event pacing).
     flip_pending: bool = false,
+    /// The connector mode's actual refresh interval (ns), carried by the
+    /// presented event (the vblank interval of the mode being scanned
+    /// out — wlroots drm.c handle_page_flip's refresh).
+    refresh_ns: u64 = 0,
 };
 
 const DrmBackendData = struct {
@@ -339,6 +343,7 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
         .plane_id = plane_id,
         .props = plane,
         .mode = modeToOutput(found.mode),
+        .refresh_ns = modeRefreshNs(found.mode),
     };
     // Owned by self from here on: a start() failure releases the device
     // resources via drmTeardown (errdefer below) and the caller's
@@ -581,6 +586,10 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
         drm_out.mode,
     );
     drm_out.out = out;
+    // The page-flip completion IS the real present: presentation
+    // feedback gates on this output's presented event instead of
+    // synthesizing.
+    out.emits_present = true;
     base.emitNewOutput(out);
     out.sendFrame();
     log_mod.info("drm: modeset ok, output live", self.io, self.log_cfg, "drm", .{});
@@ -1086,9 +1095,40 @@ fn drmTeardown(self: *DrmBackendData) void {
     self.fd = null;
 }
 
+/// wp_presentation_feedback.presented flags for a DRM page flip
+/// (wayland.xml: VSYNC=1, HW_CLOCK=2, HW_COMPLETION=4): the kernel's
+/// flip-completion event is a hardware clock + hardware completion, and
+/// the flip is vsync'd — the same set wlroots reports
+/// (drm.c handle_page_flip, presentation_time.c:287-301).
+const drm_present_flags: u32 = 0x1 | 0x2 | 0x4;
+
+/// The connector mode's presented refresh interval (ns): 1e9 / vrefresh,
+/// computed the same way modeToOutput derives refresh_msec (with the
+/// pixel-clock fallback when vrefresh is 0). The presented event carries
+/// this so presentation feedback reports the real display refresh.
+fn modeRefreshNs(mode: c.drmModeModeInfo) u64 {
+    var hz: u64 = mode.vrefresh;
+    if (hz == 0 and mode.htotal != 0 and mode.vtotal != 0) {
+        // clock is in kHz: refresh = pixel clock / (htotal * vtotal)
+        // (wlroots calculate_refresh_rate). u64 math avoids overflow on
+        // exotic modes.
+        const clock: u64 = mode.clock;
+        const total: u64 = @as(u64, mode.htotal) * @as(u64, mode.vtotal);
+        hz = (clock * 1000) / total;
+    }
+    if (hz == 0) return 16 * std.time.ns_per_ms;
+    return @intCast(std.time.ns_per_s / hz);
+}
+
 /// DRM_EVENT_FLIP_COMPLETE handler (wlroots drm.c handle_page_flip): the
-/// flip for our crtc has completed — the buffer is now visible, so wake
-/// the output for the next frame.
+/// flip for our crtc has completed — the buffer is now visible. Fire the
+/// output's presented event FIRST (this completion IS the real present,
+/// with the kernel's vblank time and the mode's refresh), then wake the
+/// output for the next frame — the wlroots handle_page_flip order
+/// (wlr_output_send_present before wlr_output_send_frame). The seq is
+/// the output's commit sequence: flips are serialized (a commit while
+/// one is in flight fails), so at completion it is the flipped frame's
+/// seq.
 fn pageFlipHandler(
     fd: c_int,
     sequence: c_uint,
@@ -1099,12 +1139,17 @@ fn pageFlipHandler(
 ) callconv(.c) void {
     _ = fd;
     _ = sequence;
-    _ = tv_sec;
-    _ = tv_usec;
     const drm_out: *DrmOutput = @ptrCast(@alignCast(user_data.?));
     if (crtc_id != drm_out.crtc_id) return;
     drm_out.flip_pending = false;
-    if (drm_out.out) |out| out.sendFrame();
+    if (drm_out.out) |out| {
+        // The kernel's tv is the vblank time (CLOCK_MONOTONIC-family:
+        // seconds + microseconds since boot).
+        const when_ns: u64 = @as(u64, tv_sec) * std.time.ns_per_s +
+            @as(u64, tv_usec) * std.time.ns_per_us;
+        out.firePresented(out.commit_seq, drm_present_flags, drm_out.refresh_ns, when_ns);
+        out.sendFrame();
+    }
 }
 
 // ---------------------------------------------------------------------------

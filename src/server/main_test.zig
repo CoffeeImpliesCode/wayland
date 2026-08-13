@@ -30,6 +30,42 @@ test {
 }
 
 // ---------------------------------------------------------------------------
+// L-D7: layer keyboard-interactivity focus policy — the pure decision
+// function (main.zig layerFocusDecision) drives the routing in
+// applyLayerKeyboardFocus; the full matrix is tested here.
+// ---------------------------------------------------------------------------
+
+test "layerFocusDecision: layer keyboard-interactivity policy table (L-D7)" {
+    const Action = main_mod.LayerFocusAction;
+    const decide = main_mod.layerFocusDecision;
+
+    // none (0): the layer never takes keyboard focus; a grab ending over
+    // it (or a layer that dropped exclusive) is released.
+    try std.testing.expectEqual(Action.keep, decide(false, 0, false));
+    try std.testing.expectEqual(Action.keep, decide(true, 0, false));
+    try std.testing.expectEqual(Action.restore_previous, decide(false, 0, true));
+    try std.testing.expectEqual(Action.restore_previous, decide(true, 0, true));
+
+    // exclusive (1): focus while the pointer is over it; the grab is
+    // released (previous focus restored) when the pointer leaves.
+    try std.testing.expectEqual(Action.keep, decide(false, 1, false));
+    try std.testing.expectEqual(Action.focus_layer, decide(true, 1, false));
+    try std.testing.expectEqual(Action.restore_previous, decide(false, 1, true));
+    try std.testing.expectEqual(Action.focus_layer, decide(true, 1, true));
+
+    // on_demand (2): focus while the pointer is over it, no grab — on
+    // leave the focus is free (no forced restore).
+    try std.testing.expectEqual(Action.keep, decide(false, 2, false));
+    try std.testing.expectEqual(Action.focus_layer, decide(true, 2, false));
+    try std.testing.expectEqual(Action.restore_previous, decide(false, 2, true));
+    try std.testing.expectEqual(Action.focus_layer, decide(true, 2, true));
+
+    // Unknown interactivity values: conservative (keep the current focus).
+    try std.testing.expectEqual(Action.keep, decide(true, 3, false));
+    try std.testing.expectEqual(Action.keep, decide(false, 3, false));
+}
+
+// ---------------------------------------------------------------------------
 // E2E: full server wiring (mirrors main()'s module stack + listeners) with
 // an in-memory client. Pattern: src/shell/xdg_decoration.zig TestServer,
 // with the compositor policy listeners main() registers.

@@ -10,8 +10,15 @@
 //!
 //! Frame pacing is a wire event-loop timer at mode.refresh_msec (same
 //! pattern as headless/raylib); the parent's frame callbacks are NOT used
-//! for pacing. The parent's events (configure, frame done) are dispatched
-//! through an fd source on the same wire loop: every configure is acked.
+//! for pacing. They ARE the real present: the backend requests a
+//! wl_surface.frame callback on every committed buffer, and the parent's
+//! wl_callback.done (the parent actually displaying the buffer) fires the
+//! output's presented event with the commit's seq, the parent's present
+//! time, HW_CLOCK|HW_COMPLETION flags and the mode refresh — so
+//! presentation feedback is gated on the real display, exactly like the
+//! DRM page flip. The parent's events (configure, frame done) are
+//! dispatched through an fd source on the same wire loop: every configure
+//! is acked.
 //!
 //! Pixel format: the pixman framebuffer is ARGB8888 little-endian (BGRA
 //! bytes in memory), which is exactly the byte layout a wl_shm argb8888
@@ -93,6 +100,17 @@ const WaylandOutputData = struct {
     xdg_state: XdgState,
     /// The wl_shm buffer presented to the parent.
     shm_buf: ShmBuffer = .{},
+    /// The compositor Output wrapper (set right after creation), for
+    /// firing the presented event from the parent's frame callback.
+    out: ?*output.Output = null,
+    /// The pending wl_surface.frame callback: the parent's done event is
+    /// the present of the buffer it was requested with. One in flight at
+    /// a time (a new commit while one is pending reuses it).
+    frame_cb: ?*wl.Callback = null,
+    /// The output commit seq of the frame the pending callback was
+    /// requested for: a late done (after a later commit) must still
+    /// report the frame it actually displayed.
+    frame_seq: u64 = 0,
 };
 
 /// xdg_surface listener state. One listener for the object's lifetime: the
@@ -247,6 +265,11 @@ pub const WaylandBackend = struct {
 
         const out = try output.Output.create(allocator, io, log_cfg, base, &output_impl, od, mode);
         nested.out = out;
+        // The parent's wl_surface.frame done IS the real present: the
+        // frame callback fires the presented event, so presentation
+        // feedback gates on it instead of synthesizing.
+        od.out = out;
+        out.emits_present = true;
         return base;
     }
 };
@@ -355,6 +378,18 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
             ensureShmBuffer(od, fb.width, fb.height) catch return error.CommitFailed;
         }
         copyToShmBuffer(fb, &od.shm_buf);
+        // Request the parent's frame callback for THIS commit: its done
+        // event is the parent's present of this buffer. Captured with
+        // the commit seq (Output.commit_seq, incremented before this
+        // impl commit) so a done arriving after a later commit still
+        // reports the frame it actually displayed. One callback in
+        // flight at a time: a commit while one is pending rides it.
+        if (od.frame_cb == null) {
+            const cb = od.surface.?.frame() catch return error.CommitFailed;
+            cb.setListener(*WaylandOutputData, onFrameDone, od);
+            od.frame_cb = cb;
+            od.frame_seq = out.commit_seq;
+        }
         od.surface.?.attach(od.shm_buf.buffer.?, 0, 0);
         od.surface.?.damage(0, 0, fb.width, fb.height);
         od.surface.?.commit();
@@ -369,6 +404,36 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
             },
         );
     }
+}
+
+/// wp_presentation_feedback.presented flags for the nested backend
+/// (wayland.xml: HW_CLOCK=2, HW_COMPLETION=4): the parent's frame
+/// callback reports a frame the parent's display hardware completed, and
+/// its time comes from the parent's presentation clock. No VSYNC: the
+/// parent may present without vsync. The same set KWin uses for its
+/// nested/offscreen paths (presentationtime.cpp:109-115).
+const nested_present_flags: u32 = 0x2 | 0x4;
+
+/// The parent presented our buffer (wl_callback.done, the frame callback
+/// requested in commit): fire the output's presented event — the parent's
+/// done time IS the display present (the parent's CLOCK_MONOTONIC, ms;
+/// the protocol gives no finer resolution). The refresh is our mode's
+/// refresh — the parent exposes no interval, and we present at our mode's
+/// rate.
+fn onFrameDone(callback: *wl.Callback, event: wl.Callback.Event, od: *WaylandOutputData) void {
+    switch (event) {
+        .done => |d| {
+            od.frame_cb = null;
+            if (od.out) |out| {
+                const when_ns: u64 = @as(u64, d.callback_data) * std.time.ns_per_ms;
+                const refresh_ns: u64 = @as(u64, @intCast(out.mode.refresh_msec)) * std.time.ns_per_ms;
+                out.firePresented(od.frame_seq, nested_present_flags, refresh_ns, when_ns);
+            }
+        },
+    }
+    // The done event is final; the parent destroyed its side. Dropping
+    // the proxy keeps the per-frame callbacks from accumulating.
+    callback.destroy();
 }
 
 /// Copy the compositor's framebuffer into the shm mapping. Both sides are
@@ -446,7 +511,10 @@ fn destroyOutput(allocator: std.mem.Allocator, data: *anyopaque) void {
     const od: *WaylandOutputData = @ptrCast(@alignCast(data));
     // Protocol teardown order: role object before the xdg_surface (a live
     // role would make the parent post defunct_role_object), xdg_surface
-    // before the wl_surface, shm objects before the mapping.
+    // before the wl_surface, shm objects before the mapping. A pending
+    // frame callback goes first: its done could otherwise fire against
+    // the freed od (the proxy drop makes the client skip its events).
+    if (od.frame_cb) |cb| cb.destroy();
     if (od.toplevel) |t| t.destroy();
     if (od.xdg_surface) |x| x.destroy();
     if (od.surface) |s| s.destroy();
@@ -533,6 +601,11 @@ fn configured(od: *WaylandOutputData) bool {
 // captures the bytes of every committed wl_shm buffer. Its own event loop
 // is embedded in the backend's wire loop via an fd source, so one thread
 // drives both sides (no real compositor needed).
+
+/// The serial the mock parent puts in wl_callback.done (the parent's
+/// present time in ms). Fixed nonzero so tests can assert the backend
+/// passes the parent's time through to the presented event.
+const mock_done_time_ms: u32 = 12345;
 
 const MockParent = struct {
     allocator: std.mem.Allocator,
@@ -755,9 +828,12 @@ fn surfaceRequest(surface: *server.wl.Surface, request: server.wl.Surface.Reques
             if (surf.frame_cb) |cb| {
                 // wl_callback.done (opcode 0, one u32 serial arg): the
                 // generated binding has no sendDone wrapper, so emit via
-                // the generic Resource.postEvent.
+                // the generic Resource.postEvent. The serial is the
+                // parent's present time in ms (CLOCK_MONOTONIC); a fixed
+                // nonzero value lets the test assert the backend passes
+                // the parent's time through to the presented event.
                 const raw: *wire.Resource = @ptrCast(cb);
-                var args = [_]server.wl.Argument{.{ .u = 0 }};
+                var args = [_]server.wl.Argument{.{ .u = mock_done_time_ms }};
                 raw.postEvent(0, &args);
                 cb.destroy();
                 surf.frame_cb = null;
@@ -860,6 +936,19 @@ const FrameRecorder = struct {
     fn onFrame(listener: *wire.Listener(*output.Output), _: *output.Output) void {
         const self: *FrameRecorder = @fieldParentPtr("frame_listener", listener);
         self.frames += 1;
+    }
+};
+
+const PresentRecorder = struct {
+    presents: usize = 0,
+    /// Last presented event payload (a plain copy of scalars).
+    last: ?output.Output.PresentEvent = null,
+    listener: wire.Listener(*output.Output.PresentEvent),
+
+    fn onPresented(listener: *wire.Listener(*output.Output.PresentEvent), ev: *output.Output.PresentEvent) void {
+        const self: *PresentRecorder = @fieldParentPtr("listener", listener);
+        self.presents += 1;
+        self.last = ev.*;
     }
 };
 
@@ -1015,6 +1104,82 @@ test "nested backend maps a parent surface and uploads committed framebuffers" {
     try std.testing.expectEqual(@as(i32, 32), harness.mock.capture_height);
     const total2 = @as(usize, 32 * 32 * 4);
     try std.testing.expectEqualSlices(u8, fb2.data[0..total2], harness.mock.capture[0..total2]);
+}
+
+test "parent frame done fires the output presented event" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+
+    const loop = try wire.EventLoop.create();
+    defer loop.destroy();
+
+    const mode: output.Mode = .{ .width = 64, .height = 48, .refresh_msec = 10 };
+    var harness = try TestHarness.init(allocator, &io, &log_cfg, loop, mode);
+    defer harness.deinit();
+
+    var rec: FrameRecorder = .{
+        .listener = wire.Listener(*output.Output).init(FrameRecorder.onNewOutput),
+        .frame_listener = wire.Listener(*output.Output).init(FrameRecorder.onFrame),
+    };
+    var prec: PresentRecorder = .{
+        .listener = wire.Listener(*output.Output.PresentEvent).init(PresentRecorder.onPresented),
+    };
+    harness.base.events.new_output.add(&rec.listener);
+    try harness.base.start();
+    const out = rec.out.?;
+    // The nested backend emits real presents (the parent's frame done).
+    try std.testing.expect(out.emits_present);
+    out.events.presented.add(&prec.listener);
+
+    // Enable the output (no buffer: no frame callback, no present).
+    var enable = output.Output.State.init(allocator);
+    defer enable.deinit();
+    enable.committed = output.Output.State.committed_enabled |
+        output.Output.State.committed_mode;
+    enable.enabled = true;
+    enable.mode = mode;
+    try out.commitState(&enable);
+    try loop.dispatch(100);
+    try std.testing.expectEqual(@as(usize, 0), prec.presents);
+
+    // Commit a buffer (output seq 1): the backend requests a frame
+    // callback; the mock parent answers it with done in the same
+    // roundtrip — the parent DID display the buffer. The presented event
+    // must carry the committed seq, the nested flags, the mode refresh
+    // and the parent's present time.
+    const fb = try pixman.Framebuffer.create(allocator, mode.width, mode.height);
+    defer fb.deinit();
+    fillPattern(fb);
+    var state = output.Output.State.init(allocator);
+    defer state.deinit();
+    state.committed = output.Output.State.committed_buffer;
+    state.buffer = fb;
+    try out.commitState(&state);
+    try std.testing.expectEqual(@as(u64, 1), out.commit_seq);
+
+    // Dispatch 1: the mock processes the commit and answers the frame
+    // callback; dispatch 2: the done reaches the backend's display fd
+    // (it became readable only after the first poll).
+    try loop.dispatch(100);
+    try loop.dispatch(100);
+    try std.testing.expectEqual(@as(usize, 1), prec.presents);
+    const ev = prec.last orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(out, ev.output);
+    try std.testing.expectEqual(@as(u64, 1), ev.seq);
+    // HW_CLOCK | HW_COMPLETION (the parent's frame is hardware-completed
+    // on the parent's display); no VSYNC, no ZERO_COPY.
+    try std.testing.expectEqual(@as(u32, 0x2 | 0x4), ev.flags);
+    try std.testing.expectEqual(
+        @as(u64, @intCast(mode.refresh_msec)) * std.time.ns_per_ms,
+        ev.refresh_ns,
+    );
+    // The parent's present time (its done serial, ms -> ns).
+    try std.testing.expectEqual(
+        @as(u64, mock_done_time_ms) * std.time.ns_per_ms,
+        ev.when_ns,
+    );
 }
 
 test "nested backend rejects scale and transform commits" {

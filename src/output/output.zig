@@ -38,6 +38,17 @@ pub const Output = struct {
     /// buffer commit; cleared by sendFrame. Callers check it before
     /// starting a new frame so two frames are never in flight.
     frame_pending: bool = false,
+    /// Per-output commit sequence number: incremented on every enabled
+    /// buffer commit. It identifies the committed frame: the presented
+    /// event carries the seq of the frame the backend displayed, and
+    /// presentation feedback matches its queued commit seq against it
+    /// (wlroots wlr_output.commit_seq + presentation_time.c:277-301).
+    commit_seq: u64 = 0,
+    /// True when the backend fires `presented` on real display
+    /// completion (DRM page-flip completion, nested-wayland parent frame
+    /// callback). Headless/raylib have no display to observe and keep
+    /// this false: the compositor synthesizes presents for them.
+    emits_present: bool = false,
 
     impl: *const Impl,
     data: *anyopaque,
@@ -51,6 +62,12 @@ pub const Output = struct {
         frame: wire.Signal(*Output),
         /// A committed state has been applied (payload: CommitEvent).
         commit: wire.Signal(*CommitEvent),
+        /// The backend actually displayed a committed frame (payload:
+        /// PresentEvent). Only fired by backends with a real display to
+        /// observe (DRM flip completion, nested-wayland parent frame
+        /// callback); headless/raylib never fire it — the compositor
+        /// synthesizes presents for them instead.
+        presented: wire.Signal(*PresentEvent),
         /// The output is being destroyed.
         destroy: wire.Signal(*Output),
     },
@@ -63,6 +80,25 @@ pub const Output = struct {
         /// commitState; listeners must not retain it.
         state: *const State,
         /// Monotonic commit timestamp (ns), for present/ready events.
+        when_ns: u64,
+    };
+
+    /// Payload of the presented signal: the frame the backend displayed
+    /// and when (wlroots wlr_output_event_present). The backend fires it
+    /// at scanout/flip completion — the actual present, not the commit.
+    pub const PresentEvent = struct {
+        output: *Output,
+        /// The output's commit sequence number of the displayed frame
+        /// (the seq that was committed when the backend bound the frame
+        /// to the flip/scanout).
+        seq: u64,
+        /// Presentation flags (wp_presentation_feedback.presented kind
+        /// bits: 1=VSYNC, 2=HW_CLOCK, 4=HW_COMPLETION, 8=ZERO_COPY).
+        flags: u32,
+        /// Actual presented refresh interval (ns).
+        refresh_ns: u64,
+        /// Backend display/scanout completion timestamp
+        /// (CLOCK_MONOTONIC, ns).
         when_ns: u64,
     };
 
@@ -143,6 +179,7 @@ pub const Output = struct {
         };
         self.events.frame.init();
         self.events.commit.init();
+        self.events.presented.init();
         self.events.destroy.init();
         return self;
     }
@@ -183,6 +220,23 @@ pub const Output = struct {
         if (output.impl.@"test") |t| {
             if (pending.committed != 0) try t(output, &pending);
         }
+
+        // A buffer commit for an enabled output advances the commit
+        // sequence: the seq identifies THIS frame for the presented
+        // event. Incremented BEFORE the impl commit so the backend's
+        // commit can bind the frame's seq to the flip/scanout it starts
+        // (the nested backend captures it with the parent frame callback;
+        // the DRM flip handler reads the output's seq at completion).
+        // A failed commit leaves a gap in the sequence — harmless, the
+        // seq is opaque to clients.
+        const new_enabled = if (pending.committed & State.committed_enabled != 0)
+            pending.enabled
+        else
+            output.enabled;
+        if (new_enabled and (pending.committed & State.committed_buffer != 0)) {
+            output.commit_seq += 1;
+        }
+
         try output.impl.commit(output, &pending);
 
         // Apply only the changed fields.
@@ -220,6 +274,25 @@ pub const Output = struct {
     pub fn sendFrame(output: *Output) void {
         output.frame_pending = false;
         if (output.enabled) output.events.frame.emit(output);
+    }
+
+    /// The backend displayed the committed frame `seq` at `when_ns`:
+    /// emit the presented signal. Only real-display backends call this —
+    /// DRM fires it from the page-flip completion handler, the
+    /// nested-wayland backend from the parent's wl_surface.frame done
+    /// (the parent's frame_done IS the display present). The kernel/scanout
+    /// time, flags and refresh travel in the payload so presentation
+    /// feedback reports the actual display, not the commit (wlroots
+    /// wlr_output_send_present, output.c:813-830).
+    pub fn firePresented(output: *Output, seq: u64, flags: u32, refresh_ns: u64, when_ns: u64) void {
+        var ev: PresentEvent = .{
+            .output = output,
+            .seq = seq,
+            .flags = flags,
+            .refresh_ns = refresh_ns,
+            .when_ns = when_ns,
+        };
+        output.events.presented.emit(&ev);
     }
 };
 
@@ -329,6 +402,19 @@ const SignalRecorder = struct {
     fn onDestroy(listener: *wire.Listener(*Output), _: *Output) void {
         const self: *SignalRecorder = @fieldParentPtr("destroy_listener", listener);
         self.destroys += 1;
+    }
+};
+
+const PresentRecorder = struct {
+    presents: usize = 0,
+    /// Last presented event payload (a plain copy of scalars).
+    last: ?Output.PresentEvent = null,
+    listener: wire.Listener(*Output.PresentEvent),
+
+    fn onPresented(listener: *wire.Listener(*Output.PresentEvent), ev: *Output.PresentEvent) void {
+        const self: *PresentRecorder = @fieldParentPtr("listener", listener);
+        self.presents += 1;
+        self.last = ev.*;
     }
 };
 
@@ -580,6 +666,92 @@ test "rejected state is not applied" {
     try std.testing.expect(!out.enabled); // nothing applied
     try std.testing.expectEqual(@as(usize, 0), fake.commits);
     try std.testing.expectEqual(@as(usize, 0), rec.commits); // no commit signal
+
+    out.destroy();
+}
+
+test "commit seq advances per enabled buffer commit" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+
+    var fake: FakeImpl = .{};
+    const created = try makeOutput(allocator, &io, &log_cfg, &fake);
+    const out = created[0];
+    defer created[1].destroy();
+
+    // No commits yet: seq 0.
+    try std.testing.expectEqual(@as(u64, 0), out.commit_seq);
+
+    // Enable-only commit (setup) owes no frame: no seq advance.
+    var enable = Output.State.init(allocator);
+    defer enable.deinit();
+    enable.committed = Output.State.committed_enabled;
+    enable.enabled = true;
+    try out.commitState(&enable);
+    try std.testing.expectEqual(@as(u64, 0), out.commit_seq);
+
+    // A buffer commit advances the seq — the frame's identity.
+    var state = Output.State.init(allocator);
+    defer state.deinit();
+    state.committed = Output.State.committed_buffer;
+    const dummy: u8 = 0;
+    state.buffer = @ptrCast(@constCast(&dummy));
+    try out.commitState(&state);
+    try std.testing.expectEqual(@as(u64, 1), out.commit_seq);
+    try out.commitState(&state);
+    try std.testing.expectEqual(@as(u64, 2), out.commit_seq);
+
+    // Disabled output: a buffer commit (would be) rejected by backends,
+    // but the seq gate itself must not advance while disabled.
+    var disable = Output.State.init(allocator);
+    defer disable.deinit();
+    disable.committed = Output.State.committed_enabled;
+    disable.enabled = false;
+    try out.commitState(&disable);
+    try out.commitState(&state);
+    try std.testing.expectEqual(@as(u64, 2), out.commit_seq);
+
+    out.destroy();
+}
+
+test "backend-fired presented event carries seq flags refresh" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+
+    var fake: FakeImpl = .{};
+    const created = try makeOutput(allocator, &io, &log_cfg, &fake);
+    const out = created[0];
+    defer created[1].destroy();
+
+    var rec: PresentRecorder = .{ .listener = wire.Listener(*Output.PresentEvent).init(PresentRecorder.onPresented) };
+    out.events.presented.add(&rec.listener);
+
+    // The backend fires presented at scanout completion, after a commit:
+    // the event must carry that frame's seq plus the backend's flags,
+    // refresh and scanout time.
+    var state = Output.State.init(allocator);
+    defer state.deinit();
+    state.committed = Output.State.committed_enabled | Output.State.committed_buffer;
+    state.enabled = true;
+    const dummy: u8 = 0;
+    state.buffer = @ptrCast(@constCast(&dummy));
+    try out.commitState(&state);
+    try std.testing.expectEqual(@as(u64, 1), out.commit_seq);
+
+    const when_ns: u64 = 1234 * std.time.ns_per_s + 567_000_000;
+    out.firePresented(out.commit_seq, 0x1 | 0x2 | 0x4, 8_333_333, when_ns);
+
+    try std.testing.expectEqual(@as(usize, 1), rec.presents);
+    const ev = rec.last orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(out, ev.output);
+    try std.testing.expectEqual(@as(u64, 1), ev.seq);
+    try std.testing.expectEqual(@as(u32, 0x1 | 0x2 | 0x4), ev.flags);
+    try std.testing.expectEqual(@as(u64, 8_333_333), ev.refresh_ns);
+    try std.testing.expectEqual(when_ns, ev.when_ns);
 
     out.destroy();
 }

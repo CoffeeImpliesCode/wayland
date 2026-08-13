@@ -46,6 +46,7 @@ const compositor_mod = @import("compositor.zig");
 const surface_mod = @import("surface.zig");
 const role_mod = @import("role.zig");
 const xkb_mod = @import("xkb.zig");
+const buffer_mod = @import("../buffers/buffer.zig");
 
 const server = @import("protocol").server;
 const client = @import("protocol").client;
@@ -155,7 +156,9 @@ const SeatClient = struct {
 
 /// wl_pointer.set_cursor role (wlroots pointer_cursor_surface_role,
 /// wlr_seat_pointer.c:85-90): a cursor surface may carry only this role;
-/// F9 enforces it in set_cursor.
+/// F9 enforces it in set_cursor. C9: surface.zig's validatePending
+/// recognizes this role BY NAME ("wl_pointer-cursor") and exempts cursor
+/// surfaces from the non-divisible-size error (warn, not reject).
 const cursor_role: role_mod.SurfaceRole = .{ .name = "wl_pointer-cursor" };
 
 /// Seat configuration. Only optional/defaulted arguments live here;
@@ -308,6 +311,13 @@ pub const Seat = struct {
     /// pointer (surface-local coords). Null when nothing is hit.
     pick_fn: ?*const fn (ctx: *anyopaque, x: i32, y: i32) ?PickResult = null,
     pick_ctx: ?*anyopaque = null,
+    /// Optional compositor gate for click-to-focus (L-D7): consulted by
+    /// the built-in click-to-focus before it gives a picked surface
+    /// keyboard focus. Return false to leave the current focus unchanged.
+    /// main.zig uses it to keep layer surfaces with
+    /// keyboard_interactivity=none unfocused.
+    focus_gate_fn: ?*const fn (ctx: *anyopaque, surface: *Surface) bool = null,
+    focus_gate_ctx: ?*anyopaque = null,
 
     /// The compositor's implicit pointer grab is active (a camera drag /
     /// interactive move): pointer motion and buttons are delivered to the
@@ -476,6 +486,25 @@ pub const Seat = struct {
     ) void {
         self.pick_fn = pick_fn;
         self.pick_ctx = ctx;
+    }
+
+    /// Register the click-to-focus gate (see focus_gate_fn): `gate_fn`
+    /// decides whether a picked surface may take keyboard focus on a
+    /// button press. No gate registered: every surface may.
+    pub fn setKeyboardFocusGate(
+        self: *Seat,
+        gate_fn: *const fn (ctx: *anyopaque, surface: *Surface) bool,
+        ctx: *anyopaque,
+    ) void {
+        self.focus_gate_fn = gate_fn;
+        self.focus_gate_ctx = ctx;
+    }
+
+    /// Whether click-to-focus may give `surface` keyboard focus (the
+    /// compositor gate, L-D7). No gate registered: allowed.
+    fn focusAllowed(self: *Seat, surface: *Surface) bool {
+        const gate = self.focus_gate_fn orelse return true;
+        return gate(self.focus_gate_ctx.?, surface);
     }
 
     /// Next seat serial: wraps the display counter and records the value,
@@ -690,10 +719,13 @@ pub const Seat = struct {
             // the pointer's initial position (no motion yet), and a
             // click on the empty canvas must clear the focus so it can
             // leave (the canvas is the focus sink, like the desktop in
-            // a conventional compositor).
+            // a conventional compositor). The compositor's focus gate
+            // (L-D7) can refuse the surface — layer surfaces with
+            // keyboard_interactivity=none must never take focus — in
+            // which case the current focus is left unchanged.
             if (self.pick_fn) |f| {
                 if (f(self.pick_ctx.?, self.pointer_x, self.pointer_y)) |p| {
-                    self.setKeyboardFocus(p.surface);
+                    if (self.focusAllowed(p.surface)) self.setKeyboardFocus(p.surface);
                 } else {
                     self.setKeyboardFocus(null);
                 }
@@ -1744,6 +1776,16 @@ fn testPick(ctx: *anyopaque, x: i32, y: i32) ?Seat.PickResult {
     return null;
 }
 
+/// The click-to-focus gate context: the surface the gate denies.
+const TestGateState = struct {
+    denied: ?*Surface = null,
+};
+
+fn testGate(ctx: *anyopaque, surface: *Surface) bool {
+    const st: *TestGateState = @ptrCast(@alignCast(ctx));
+    return st.denied != surface;
+}
+
 /// cursor_surface signal test fixtures (the F9 test): how many times a
 /// set_cursor was accepted.
 var test_cursor_surface_count: usize = 0;
@@ -1990,6 +2032,42 @@ test "keyboard and pointer events reach only the focused client" {
     try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis); // unchanged
     try std.testing.expectEqual(@as(usize, 1), a.ptr_events.axis_value120); // unchanged
     try std.testing.expectEqual(@as(usize, 0), b.ptr_events.axis_stop);
+}
+
+test "click-to-focus gate: a denied surface keeps the current focus (L-D7)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, ts.a.server);
+    const surface_b = surfaceForClient(ts, ts.b.server);
+
+    // No gate registered: a click over A's surface moves keyboard focus
+    // to it (the seat's built-in click-to-focus).
+    ts.pick_state.surface = surface_a;
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+
+    // Register the gate denying B: a click over B leaves A focused (the
+    // gate refused the surface, so the current focus is unchanged).
+    var gate_state: TestGateState = .{ .denied = surface_b };
+    seat.setKeyboardFocusGate(testGate, &gate_state);
+    ts.pick_state.surface = surface_b;
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+    try std.testing.expect(!ts.b.kbd_events.entered);
+
+    // Un-denied surfaces still take focus on click.
+    gate_state.denied = null;
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_b);
 }
 
 test "server-side key repeat: press, delay, repeat, release stops" {
@@ -2482,6 +2560,21 @@ test "set_cursor requires focus, a valid serial and the cursor role (F9)" {
     try std.testing.expectEqual(@as(i32, 5), seat.cursor_hotspot_x);
     try std.testing.expectEqual(@as(i32, 6), seat.cursor_hotspot_y);
     try std.testing.expectEqual(@as(usize, 1), test_cursor_surface_count);
+
+    // C9: the accepted set_cursor assigned the pointer-cursor role to
+    // the surface, so its commits may carry a buffer size not divisible
+    // by scale — the compositor warns instead of rejecting (wlroots
+    // surface_finalize_pending, wlr_compositor.c:211-226). The role is
+    // assigned here, before the client's first attach+commit, so the
+    // commit's validation sees it.
+    try std.testing.expect(surface_a.role == &cursor_role);
+    var cursor_buf: buffer_mod.Buffer = undefined;
+    surface_mod.testBuffer(allocator, &cursor_buf); // 10x10
+    surface_a.pending.scale = 3; // 10 % 3 != 0 -> non-divisible
+    surface_a.attachBuffer(&cursor_buf);
+    surface_a.commit();
+    try std.testing.expect(surface_a.current.buffer == &cursor_buf);
+    try std.testing.expect(surface_a.mapped);
 
     // Role conflict: a surface with a different role posts
     // WL_POINTER_ERROR_ROLE on the pointer resource (wlroots

@@ -42,7 +42,7 @@ pub fn build(b: *Build) void {
     scanner.generate("wl_output", 4);
     scanner.generate("xdg_wm_base", 7);
     scanner.generate("xdg_activation_v1", 1);
-    scanner.generate("zxdg_decoration_manager_v1", 1);
+    scanner.generate("zxdg_decoration_manager_v1", 2);
     scanner.generate("zwp_primary_selection_device_manager_v1", 1);
     scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("zwlr_screencopy_manager_v1", 3);

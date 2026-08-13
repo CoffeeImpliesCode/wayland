@@ -727,6 +727,27 @@ pub const Surface = struct {
         // divided by the pending scale; it must be integral (invalid_size).
         const size = s.pending.transform.transformedSize(buf.width, buf.height);
         if (@rem(size.w, s.pending.scale) != 0 or @rem(size.h, s.pending.scale) != 0) {
+            // C9: a cursor surface may commit a non-integral size — the
+            // client bug is logged, not fatal (wlroots
+            // surface_finalize_pending, wlr_compositor.c:211-226; the
+            // error is blocked upstream on wayland/wayland#194). Role
+            // identity by name matches wlroots' strcmp against the cursor
+            // role names; the seat assigns "wl_pointer-cursor" at
+            // wl_pointer.set_cursor (seat.zig cursor_role). Deliberate
+            // divergence: wlroots also warns for rol-less surfaces; every
+            // other role (and no role) keeps the hard error here.
+            if (s.role) |r| {
+                if (std.mem.eql(u8, r.name, "wl_pointer-cursor")) {
+                    log.warn(
+                        "Client bug: wl_surface@{d} ({s}) committed a buffer size not divisible by scale; accepted",
+                        s.io,
+                        s.log_cfg,
+                        "surface",
+                        .{ s.resource.getId(), r.name },
+                    );
+                    return true;
+                }
+            }
             s.resource.postError(.invalid_size, "attached buffer size is not divisible by buffer scale");
             return false;
         }
@@ -1785,6 +1806,50 @@ test "commit validation rejects a buffer not divisible by scale" {
     // The commit was discarded: nothing swapped, surface unmapped.
     try testing.expect(s.current.buffer == null);
     try testing.expect(!s.mapped);
+}
+
+test "cursor-role surfaces may commit non-divisible sizes; others are rejected (C9)" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+
+    // A cursor-role surface (the seat assigns this role name at
+    // wl_pointer.set_cursor, seat.zig cursor_role): a non-divisible size
+    // is accepted with a warning, not rejected (wlroots
+    // surface_finalize_pending, wlr_compositor.c:211-226). The role is
+    // assigned at set_cursor, BEFORE the cursor surface's first commit,
+    // so the commit's validation sees it.
+    const cursor_s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+    var cursor_role: SurfaceRole = .{ .name = "wl_pointer-cursor" };
+    try role_mod.assignRole(cursor_s, &cursor_role, null);
+    var cursor_buf: Buffer = undefined;
+    testBuffer(allocator, &cursor_buf); // 10x10
+    cursor_s.handleSetBufferScale(3); // 10 % 3 != 0 -> non-divisible
+    cursor_s.attachBuffer(&cursor_buf);
+    cursor_s.commit();
+
+    // The commit proceeded past validation: the buffer swapped and the
+    // surface mapped (a rejected commit would leave both untouched).
+    try testing.expect(cursor_s.current.buffer == &cursor_buf);
+    try testing.expect(cursor_s.mapped);
+
+    // Any non-cursor surface keeps the hard error: invalid_size is
+    // posted and the commit is discarded (the discard is the posted
+    // error's observable, same as the test above).
+    const plain_s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+    var plain_buf: Buffer = undefined;
+    testBuffer(allocator, &plain_buf); // 10x10
+    plain_s.handleSetBufferScale(3);
+    plain_s.attachBuffer(&plain_buf);
+    plain_s.commit();
+    try testing.expect(plain_s.current.buffer == null);
+    try testing.expect(!plain_s.mapped);
 }
 
 test "set_buffer_scale rejects non-positive scale" {

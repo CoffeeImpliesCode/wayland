@@ -89,6 +89,56 @@ const Subsurface = std.meta.Child(std.meta.Child(
 const Camera = wayland.camera.Camera;
 const CanvasItem = wayland.canvas.CanvasItem;
 
+/// L-D7: EXCLUSIVE layer keyboard grab state (see
+/// ServerState.layer_kbd_grab). The `layer` pointer is compared for
+/// identity only and never dereferenced: a destroyed surface clears the
+/// seat's pointer focus, so the next pointer move releases the grab
+/// before the surface could free.
+const LayerKbdGrab = struct {
+    /// The grabbed layer surface's wl_surface.
+    layer: *Surface,
+    /// The keyboard focus held before the grab; restored on release.
+    previous: ?*Surface,
+};
+
+/// L-D7: layer keyboard-interactivity focus decision (spec
+/// fix-layer-deco-act.md L7, wlroots keyboard_interactivity model).
+/// The layer protocol only stores the value; routing keyboard focus is
+/// compositor policy. Per the model:
+///   - none (0):      the layer surface never receives keyboard focus;
+///   - exclusive (1): receives focus while the pointer is over it and
+///                    HOLDS it (a keyboard grab — no other surface can
+///                    take focus while the grab is live); on pointer
+///                    leave the previous focus is restored;
+///   - on_demand (2): receives focus while the pointer is over it; on
+///                    leave the focus is free to move (no grab).
+/// `grab_active` is whether the exclusive grab is currently live.
+pub const LayerFocusAction = enum {
+    /// No focus change.
+    keep,
+    /// Give keyboard focus to the layer surface under the pointer.
+    focus_layer,
+    /// Release the exclusive grab and restore the pre-grab focus.
+    restore_previous,
+};
+
+/// The per-pointer-move keyboard focus choice for a layer surface.
+pub fn layerFocusDecision(
+    pointer_over_layer: bool,
+    interactive: u32,
+    grab_active: bool,
+) LayerFocusAction {
+    if (pointer_over_layer) {
+        switch (interactive) {
+            0 => return if (grab_active) .restore_previous else .keep, // none: never
+            1, 2 => return .focus_layer, // exclusive / on_demand: focus while over
+            else => return .keep, // unknown value: keep the current focus
+        }
+    }
+    // Pointer not over the layer: an active grab ends here.
+    return if (grab_active) .restore_previous else .keep;
+}
+
 const output_width: i32 = 1280;
 const output_height: i32 = 720;
 const output_refresh_msec: i32 = 16;
@@ -199,6 +249,12 @@ const ServerState = struct {
     /// xdg_popups parented to layer surfaces via get_popup (tracked for
     /// observability; L1).
     layer_popups: std.ArrayList(*wayland.shell.XdgPopup) = .empty,
+    /// L-D7: the live EXCLUSIVE layer keyboard grab (see
+    /// applyLayerKeyboardFocus). While the pointer is over an
+    /// exclusive-interactivity layer surface, the seat's keyboard focus
+    /// is grabbed by it and the pre-grab focus is restored when the
+    /// pointer leaves. Null while no grab is active.
+    layer_kbd_grab: ?LayerKbdGrab = null,
     frames_rendered: u32 = 0,
     /// Idle-frame skip: a frame only renders when something changed this
     /// cycle (a surface commit, a camera move, a cursor move). Cleared
@@ -657,6 +713,11 @@ pub fn main(init: std.process.Init) !void {
     // The compositor hit-tests over the scene graph: surfaces map to
     // scene nodes through the surface entries.
     seat.setPick(pickSurface, &state);
+    // L-D7: layer keyboard-interactivity focus policy — the seat's
+    // built-in click-to-focus must never give keyboard focus to a layer
+    // surface with keyboard_interactivity=none (the move-based routing
+    // in applyLayerKeyboardFocus enforces the same for hover).
+    seat.setKeyboardFocusGate(layerKeyboardFocusAllowed, &state);
 
     // zwlr_screencopy_v1: captures the compositor framebuffer (shm only).
     // The copy is deferred to the next output commit; requestFrame wakes
@@ -1584,10 +1645,24 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         });
     }
 
-    // wp_presentation: every surface drawn this frame was presented. The
-    // output's wl_output global names the output for sync_output, and the
-    // output's own refresh drives the protocol refresh value.
-    self.presentation.present(self.scene.?.presented.items, self.wl_output, @intCast(out.mode.refresh_msec), 0);
+    // wp_presentation: every surface drawn this frame awaits its present.
+    // The output's wl_output global names the output for sync_output. For
+    // real-display backends (DRM/nested — Output.emits_present) present()
+    // QUEUES the feedbacks on the output's commit seq (out.commit_seq,
+    // the seq of the frame just committed): the output's presented event
+    // — the actual scanout/flip completion — delivers them with the
+    // backend's timestamp, flags and refresh; a frame that never presents
+    // is never reported. Headless/raylib have no present event:
+    // present() synthesizes immediately (the refresh/flags args are
+    // theirs alone — a synthetic present is the only path that uses
+    // them).
+    self.presentation.present(
+        self.scene.?.presented.items,
+        self.wl_output,
+        out.commit_seq,
+        @intCast(out.mode.refresh_msec),
+        0,
+    );
 
     self.frames_rendered += 1;
     // The frame was rendered + committed (the flip is in flight): clear
@@ -2004,6 +2079,92 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     };
 }
 
+/// L-D7: the live layer surface whose wl_surface is `surface`, or null.
+/// Iterates the module's own registry (shell.layer_surfaces is pruned
+/// on destroy) — the observability copy in ServerState.layer_surfaces
+/// is append-only and can hold freed entries.
+fn layerSurfaceForSurface(self: *const ServerState, surface: ?*Surface) ?*wayland.layer_shell.LayerSurface {
+    const s = surface orelse return null;
+    for (self.layer_shell.layer_surfaces.items) |ls| {
+        if (ls.surface == s) return ls;
+    }
+    return null;
+}
+
+/// L-D7: give keyboard focus back to the surface focused before the
+/// exclusive grab (wlroots: the grab ends when the pointer leaves the
+/// layer surface). The saved surface may have been destroyed during the
+/// grab — only a surface still alive in the compositor registry is
+/// restored (compositor.surfaces is pruned on destroy, so membership is
+/// the liveness check); otherwise the focus falls back to null.
+fn restoreLayerFocus(self: *ServerState, seat: *wayland.seat.Seat, previous: ?*Surface) void {
+    if (previous) |s| {
+        if (std.mem.indexOfScalar(*Surface, self.compositor.surfaces.items, s) != null) {
+            seat.setKeyboardFocus(s);
+            return;
+        }
+    }
+    seat.setKeyboardFocus(null);
+}
+
+/// L-D7: layer keyboard-interactivity focus routing. Runs on every
+/// pointer move, after the seat has already updated its pointer focus
+/// for the move: the layer surface under the pointer takes keyboard
+/// focus per its committed keyboard_interactivity value (read from
+/// current, layer_shell.zig applies pending at commit); the EXCLUSIVE
+/// grab is released — and the pre-grab focus restored — the moment the
+/// pointer is no longer over the grabbed layer.
+fn applyLayerKeyboardFocus(self: *ServerState, seat: *wayland.seat.Seat) void {
+    const over_ls = layerSurfaceForSurface(self, seat.pointer_focus);
+    const interactive: u32 = if (over_ls) |ls| ls.current.keyboard_interactive else 0;
+
+    switch (layerFocusDecision(over_ls != null, interactive, self.layer_kbd_grab != null)) {
+        .keep => {},
+        .focus_layer => {
+            const ls = over_ls.?;
+            // The pointer moved from a grabbed exclusive layer onto this
+            // one: release the old grab first (restoring its previous
+            // focus) so a fresh grab captures the correct previous focus.
+            if (self.layer_kbd_grab) |g| {
+                if (g.layer != ls.surface) {
+                    self.layer_kbd_grab = null;
+                    restoreLayerFocus(self, seat, g.previous);
+                }
+            }
+            // Start the exclusive grab, remembering the focus to restore
+            // on pointer leave; a live grab on this layer stays untouched.
+            if (interactive == 1 and self.layer_kbd_grab == null) {
+                // If the layer already holds keyboard focus (a click gave
+                // it focus before any pointer move — the initial pointer
+                // position), the pre-grab focus is unrecoverable: the
+                // grab then releases to null on leave instead of
+                // restoring a stale surface.
+                const previous: ?*Surface = if (seat.keyboard_focus == ls.surface) null else seat.keyboard_focus;
+                self.layer_kbd_grab = .{ .layer = ls.surface, .previous = previous };
+            }
+            seat.setKeyboardFocus(ls.surface);
+        },
+        .restore_previous => {
+            // The pointer is no longer over the grabbed layer (or the
+            // layer no longer requests focus): release the grab and
+            // restore the previous focus.
+            const g = self.layer_kbd_grab orelse return;
+            self.layer_kbd_grab = null;
+            restoreLayerFocus(self, seat, g.previous);
+        },
+    }
+}
+
+/// L-D7: click-to-focus gate for the seat. Layer surfaces with
+/// keyboard_interactivity=none must never receive keyboard focus: the
+/// move-based policy never gives it to them, so the seat's built-in
+/// click-to-focus must not either.
+fn layerKeyboardFocusAllowed(ctx: *anyopaque, surface: *Surface) bool {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    const ls = layerSurfaceForSurface(self, surface) orelse return true;
+    return ls.current.keyboard_interactive != 0;
+}
+
 /// Capture source for zwlr_screencopy: the display framebuffer (cursor
 /// composited in) for overlay_cursor=1; the base framebuffer (canvas
 /// without the cursor, current because it is recomposited before the
@@ -2117,6 +2278,12 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
 /// not jump.
 fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_pointer_move_listener", listener);
+    // L-D7: layer keyboard-interactivity focus routing. The seat already
+    // updated its pointer focus for this move; apply the layer policy on
+    // top (exclusive grab / on_demand focus / none exclusion). During a
+    // compositor grab (camera drag, interactive move) the seat froze the
+    // pointer focus, so this is a no-op there.
+    applyLayerKeyboardFocus(self, seat);
     // Interactive move: the toplevel's node follows the pointer delta
     // (world coords — the screen delta divided by the zoom, matching the
     // pick transform). The whole output is damaged so the partial upload

@@ -8,7 +8,12 @@
 //! protocols/wayland-protocols/unstable/xdg-decoration/
 //! xdg-decoration-unstable-v1.xml):
 //! - (a) get_toplevel_decoration on a toplevel that already committed a
-//!   buffer posts unconfigured_buffer=0 (v1 behavior; v2+ relaxes this).
+//!   buffer posts unconfigured_buffer=0 for v1 objects; for v2+ objects
+//!   the XML allows it ("creating an xdg_toplevel_decoration from an
+//!   xdg_toplevel which has a buffer attached or committed is allowed").
+//!   The initial mode of a v2 decoration created on such a toplevel is the
+//!   retained mode if a previous decoration was destroyed without a
+//!   surface commit in between, else client-side (D3, see (h)).
 //! - (b) a second decoration object on the same toplevel posts
 //!   already_constructed=1.
 //! - (c) a toplevel destroyed before its decoration posts orphaned=2 on
@@ -38,6 +43,16 @@
 //!   smithay smXD:229-243, KWin KWXD:54-65), not on the new decoration.
 //! - (g) an orphaned decoration (toplevel destroyed first) posts orphaned
 //!   AND destroys the decoration resource (XD-4; wlroots XD:81-91).
+//! - (h) v2 mode retention (D3): destroying a decoration that has an
+//!   effective (acked) mode records that mode against the toplevel
+//!   (RetainedMode). A v2 re-create on the same toplevel seeds the new
+//!   decoration's current/pending/scheduled state with it — no configure
+//!   is re-sent, the client is already drawing that mode (the XML: "the
+//!   previous decoration mode is retained"). The next wl_surface.commit
+//!   after the destroy reverts to client-side (the XML's destroy text:
+//!   "Switch back to a mode without any server-side decorations at the
+//!   next commit, unless a new xdg_toplevel_decoration is created for the
+//!   surface first"), and the toplevel's death drops the retention.
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
@@ -48,6 +63,7 @@ const client = protocol.client;
 
 const display_mod = @import("../core/display.zig");
 const compositor_mod = @import("../compositor/compositor.zig");
+const surface_mod = @import("../compositor/surface.zig");
 const xdg_mod = @import("xdg.zig");
 
 const log_tag = "xdg_decoration";
@@ -113,6 +129,25 @@ pub const Decoration = struct {
     }
 };
 
+/// v2 mode retention (D3, XML get_toplevel_decoration): a decoration
+/// destroyed with an effective mode leaves this entry keyed by its
+/// toplevel; a re-created v2 decoration inherits the mode. The entry dies
+/// on the next wl_surface.commit after the destroy (the XML's destroy
+/// text: "Switch back to a mode without any server-side decorations at the
+/// next commit, unless a new xdg_toplevel_decoration is created for the
+/// surface first"), or with the toplevel (no re-create can follow).
+const RetainedMode = struct {
+    manager: *XdgDecoration,
+    toplevel: *xdg_mod.XdgToplevel,
+    mode: Mode,
+    /// Fires on the next surface commit after the destroy: the retention
+    /// expires and the mode reverts to client-side.
+    commit_listener: wire.Listener(*surface_mod.Surface),
+    /// The toplevel died with the retention pending: drop the entry so it
+    /// cannot outlive its key (the surface may be reused by another role).
+    destroy_listener: wire.Listener(*xdg_mod.XdgToplevel),
+};
+
 // ---------------------------------------------------------------------------
 // XdgDecoration: the zxdg_decoration_manager_v1 global.
 // ---------------------------------------------------------------------------
@@ -129,6 +164,10 @@ pub const XdgDecoration = struct {
     global: ?*wire.Global = null,
     /// All live decorations, in creation order.
     decorations: std.ArrayList(*Decoration),
+    /// v2 mode retention (D3): pending retained modes keyed by toplevel —
+    /// a destroyed decoration's effective mode awaiting a re-create. See
+    /// RetainedMode.
+    retained_modes: std.AutoHashMap(*xdg_mod.XdgToplevel, *RetainedMode),
     events: struct {
         request_mode: wire.Signal(*RequestMode),
         /// A decoration was created and inserted into `decorations`
@@ -155,15 +194,19 @@ pub const XdgDecoration = struct {
             .display = display,
             .shell = shell,
             .decorations = .empty,
+            .retained_modes = std.AutoHashMap(*xdg_mod.XdgToplevel, *RetainedMode).init(allocator),
             // SAFETY: initialized via .init() immediately after construction, before any emit.
             .events = undefined,
         };
         errdefer deco.decorations.deinit(allocator);
+        errdefer deco.retained_modes.deinit();
         deco.events.request_mode.init();
         deco.events.new_toplevel_decoration.init();
 
         // Register zxdg_decoration_manager_v1 at the maximum version we
-        // implement (v1: the strict unconfigured_buffer rule).
+        // implement (v2: creation on a committed toplevel is allowed, with
+        // mode retention across a re-create — D3; the unconfigured_buffer
+        // error survives for v1 objects).
         deco.global = try display.addGlobal(
             server.zxdg.DecorationManagerV1,
             *XdgDecoration,
@@ -181,6 +224,14 @@ pub const XdgDecoration = struct {
         // handlers, which remove entries from the list and free the objects
         // (and detach their toplevel destroy listeners).
         while (self.decorations.items.len > 0) self.decorations.items[0].resource.destroy();
+        // v2: the destroyed decorations may have left retention entries
+        // (each with live surface-commit/toplevel-destroy listeners); drop
+        // them all before the map dies.
+        while (self.retained_modes.count() > 0) {
+            var it = self.retained_modes.keyIterator();
+            retainedClear(self, it.next().?.*);
+        }
+        self.retained_modes.deinit();
         self.decorations.deinit(allocator);
         // The decoration global itself is owned by the display's registry.
         allocator.destroy(self);
@@ -247,17 +298,21 @@ fn getToplevelDecoration(
         return;
     };
     const toplevel: *xdg_mod.XdgToplevel = @ptrCast(@alignCast(toplevel_ud));
-    // Model decision (a), v1 semantics: a toplevel that already committed a
-    // buffer must not be decorated (wlroots posts unconfigured_buffer on
-    // the manager resource; v2+ allows it).
-    if (toplevel.xdg_surface.surface.buffer != null) {
-        managerPostError(
-            manager_res,
-            .unconfigured_buffer,
-            "xdg_toplevel_decoration must not be created after a buffer was committed",
-        );
-        res.destroy();
-        return;
+    // Model decision (a), version-gated (D3): at v1 a toplevel that
+    // already committed a buffer must not be decorated (wlroots posts
+    // unconfigured_buffer on the manager resource); at v2+ the XML allows
+    // it ("creating an xdg_toplevel_decoration from an xdg_toplevel which
+    // has a buffer attached or committed is allowed").
+    if (res.getVersion() < 2) {
+        if (toplevel.xdg_surface.surface.buffer != null) {
+            managerPostError(
+                manager_res,
+                .unconfigured_buffer,
+                "xdg_toplevel_decoration must not be created after a buffer was committed",
+            );
+            res.destroy();
+            return;
+        }
     }
     // Model decision (b): one decoration per toplevel.
     for (deco.decorations.items) |existing| {
@@ -299,12 +354,35 @@ fn getToplevelDecoration(
         manager_res.postNoMemory();
         return;
     };
+    // v2 mode retention (D3): a decoration destroyed without a surface
+    // commit leaves its effective mode; the re-created decoration inherits
+    // it (the XML: "the previous decoration mode is retained"). The client
+    // is already drawing that mode, so the state is seeded as
+    // current/pending/scheduled — a same-mode compositor announce
+    // dedupes (onSurfaceConfigure), a different one reconfigures.
+    if (res.getVersion() >= 2) {
+        if (deco.retained_modes.fetchRemove(toplevel)) |kv| {
+            const ret = kv.value;
+            const mode = ret.mode;
+            ret.commit_listener.link.remove();
+            ret.destroy_listener.link.remove();
+            deco.allocator.destroy(ret);
+            dec.scheduled_mode = mode;
+            dec.pending_mode = mode;
+            dec.current_mode = mode;
+        }
+    }
     // L2: the decoration is live (inserted + listeners attached) — notify
     // the compositor so it can announce a compositor-decided initial mode
     // (wlroots emits after inserting into manager->decorations,
     // wlr_xdg_decoration_v1.c:237).
     deco.events.new_toplevel_decoration.emit(dec);
-    log.debug("new toplevel decoration (mode unset; client-side default)", deco.io, deco.log_cfg, log_tag, .{});
+    if (dec.current_mode) |mode| {
+        const mode_desc = if (mode == .server_side) "server-side" else "client-side";
+        log.debug("new toplevel decoration (mode retained: {s})", deco.io, deco.log_cfg, log_tag, .{mode_desc});
+    } else {
+        log.debug("new toplevel decoration (mode unset; client-side default)", deco.io, deco.log_cfg, log_tag, .{});
+    }
 }
 
 fn decorationRequest(
@@ -342,6 +420,14 @@ fn emitRequestMode(dec: *Decoration, mode: ?Mode) void {
 fn decorationDestroy(dec_res: *server.zxdg.ToplevelDecorationV1, dec: *Decoration) void {
     _ = dec_res;
     const deco = dec.manager;
+    // v2 mode retention (D3): a decoration destroyed with an effective
+    // mode leaves it for a v2 re-create, until the next surface commit or
+    // the toplevel's death (the XML: destroyed "without a surface commit,
+    // the previous decoration mode is retained"). Orphaned decorations
+    // (toplevel == null) cannot be re-created, so nothing is recorded.
+    if (dec.toplevel != null and dec.resource.getVersion() >= 2) {
+        if (dec.current_mode) |mode| retainedRecord(deco, dec.toplevel.?, mode);
+    }
     if (std.mem.findScalar(*Decoration, deco.decorations.items, dec)) |i| {
         _ = deco.decorations.swapRemove(i);
     }
@@ -369,6 +455,61 @@ fn onToplevelDestroy(listener: *wire.Listener(*xdg_mod.XdgToplevel), toplevel: *
     _ = toplevel;
     dec.resource.postError(.orphaned, "xdg_toplevel_decoration must be destroyed before its xdg_toplevel");
     dec.resource.destroy();
+}
+
+/// The next wl_surface.commit after a decoration destroy (D3): the
+/// retention expires and the mode reverts to client-side (the XML's
+/// destroy text).
+fn onRetainedCommit(listener: *wire.Listener(*surface_mod.Surface), surface: *surface_mod.Surface) void {
+    const ret: *RetainedMode = @fieldParentPtr("commit_listener", listener);
+    _ = surface;
+    retainedClear(ret.manager, ret.toplevel);
+}
+
+/// The toplevel died with retention pending (D3): no re-create can follow,
+/// drop the entry so it cannot outlive its key. Fires after the surviving
+/// decoration's onToplevelDestroy (listener insertion order), while the
+/// xdg_surface is still being reset — detaching the commit listener is
+/// safe.
+fn onRetainedToplevelDestroy(listener: *wire.Listener(*xdg_mod.XdgToplevel), toplevel: *xdg_mod.XdgToplevel) void {
+    const ret: *RetainedMode = @fieldParentPtr("destroy_listener", listener);
+    _ = toplevel;
+    retainedClear(ret.manager, ret.toplevel);
+}
+
+/// Drop and free the retention entry for `toplevel`, if any (detaches its
+/// surface-commit/toplevel-destroy listeners). Called from the entry's own
+/// handlers, from a re-create, and from teardown.
+fn retainedClear(deco: *XdgDecoration, toplevel: *xdg_mod.XdgToplevel) void {
+    const kv = deco.retained_modes.fetchRemove(toplevel) orelse return;
+    kv.value.commit_listener.link.remove();
+    kv.value.destroy_listener.link.remove();
+    deco.allocator.destroy(kv.value);
+}
+
+/// Record the effective mode of a destroyed decoration for a v2 re-create
+/// (D3). A stale entry cannot normally exist (one decoration per toplevel;
+/// the entry is consumed at re-create and cleared by commit/toplevel
+/// death), but replace defensively.
+fn retainedRecord(deco: *XdgDecoration, toplevel: *xdg_mod.XdgToplevel, mode: Mode) void {
+    retainedClear(deco, toplevel);
+    const ret = deco.allocator.create(RetainedMode) catch return;
+    ret.* = .{
+        .manager = deco,
+        .toplevel = toplevel,
+        .mode = mode,
+        .commit_listener = wire.Listener(*surface_mod.Surface).init(onRetainedCommit),
+        .destroy_listener = wire.Listener(*xdg_mod.XdgToplevel).init(onRetainedToplevelDestroy),
+    };
+    toplevel.xdg_surface.surface.events.commit.add(&ret.commit_listener);
+    toplevel.events.destroy.add(&ret.destroy_listener);
+    deco.retained_modes.put(toplevel, ret) catch {
+        // OOM: drop the retention (detach + free); the mode reverts to
+        // client-side, which the XML allows as the fallback.
+        ret.commit_listener.link.remove();
+        ret.destroy_listener.link.remove();
+        deco.allocator.destroy(ret);
+    };
 }
 
 /// The toplevel's xdg_surface.configure was sent (XD-1): if the compositor
@@ -610,6 +751,18 @@ const TestServer = struct {
         try ts.pump();
         return .{ .surface = wl_surface, .xdg_surface = xdg_surface, .toplevel = toplevel };
     }
+
+    /// Bind the decoration manager at an explicit version (init binds v1;
+    /// the v2 tests re-bind the global at 2). A second registry is fine —
+    /// wl_display.get_registry is repeatable.
+    fn bindDecorationManager(ts: *TestServer, version: u32) !*client.zxdg.DecorationManagerV1 {
+        const registry = try ts.c_display.?.getRegistry();
+        var capture: RegistryCapture = .{};
+        registry.setListener(*RegistryCapture, RegistryCapture.listener, &capture);
+        try ts.pump();
+        if (capture.decoration_manager_name == null) return error.GlobalMissing;
+        return registry.bind(capture.decoration_manager_name.?, client.zxdg.DecorationManagerV1, version);
+    }
 };
 
 test "decoration happy path: get -> set_mode -> request_mode -> configure" {
@@ -760,6 +913,125 @@ test "decoration on a toplevel with a committed buffer -> unconfigured_buffer" {
     try std.testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, &err_id));
     // XD-2: the error posts on the manager resource (wlroots XD:181).
     try std.testing.expectEqual(ts.decoration_client.?.getId(), err_id);
+}
+
+test "decoration v2: get_toplevel_decoration on a committed toplevel is allowed" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // D3: the v2 relaxations apply to v2-bound clients. The default init
+    // bind is v1; re-bind the global at 2.
+    const deco_client = try ts.bindDecorationManager(2);
+    const tl = try ts.createToplevel();
+
+    // White-box (same as the v1 test): the client has no buffer machinery
+    // here, so set the server-side committed-buffer mirror directly.
+    const srv_surface = ts.shell.?.toplevels.items[0].xdg_surface.surface;
+    const fake: *anyopaque = @ptrFromInt(@as(usize, 0x1000));
+    srv_surface.buffer = @ptrCast(@alignCast(fake));
+
+    // v2: creation on a committed toplevel succeeds — no
+    // unconfigured_buffer error (the XML: "creating an
+    // xdg_toplevel_decoration from an xdg_toplevel which has a buffer
+    // attached or committed is allowed"). A protocol error would fail the
+    // pump with ClientDispatchFailed.
+    _ = try deco_client.getToplevelDecoration(tl.toplevel);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ts.decoration.?.decorations.items.len);
+}
+
+test "decoration v2: mode retained across destroy/re-create" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var capture: RequestModeCapture = .{
+        .listener = wire.Listener(*RequestMode).init(RequestModeCapture.notify),
+    };
+    ts.decoration.?.events.request_mode.add(&capture.listener);
+
+    const deco_client = try ts.bindDecorationManager(2);
+    const tl = try ts.createToplevel();
+    var xs_events: XdgSurfaceEvents = .{};
+    tl.xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    const dec = try deco_client.getToplevelDecoration(tl.toplevel);
+    var dec_events: DecorationEvents = .{};
+    dec.setListener(*DecorationEvents, DecorationEvents.listener, &dec_events);
+    try ts.pump();
+
+    // Establish server_side: set_mode -> compositor reply (capture) ->
+    // configure -> ack.
+    dec.setMode(.server_side);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), xs_events.configure_count);
+    tl.xdg_surface.ackConfigure(xs_events.serial);
+    try ts.pump();
+    try std.testing.expectEqual(@as(?Mode, .server_side), ts.decoration.?.decorations.items[0].current_mode);
+
+    // Destroy WITHOUT a surface commit: the mode is retained (D3).
+    dec.destroy();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ts.decoration.?.decorations.items.len);
+
+    // Re-create: the new decoration inherits the retained mode — the
+    // current/pending/scheduled state is seeded, so no configure is
+    // re-sent (the client already draws the retained mode).
+    const dec2 = try deco_client.getToplevelDecoration(tl.toplevel);
+    var dec2_events: DecorationEvents = .{};
+    dec2.setListener(*DecorationEvents, DecorationEvents.listener, &dec2_events);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ts.decoration.?.decorations.items.len);
+    const dec_obj2 = ts.decoration.?.decorations.items[0];
+    try std.testing.expectEqual(@as(?Mode, .server_side), dec_obj2.current_mode);
+    try std.testing.expectEqual(@as(?Mode, .server_side), dec_obj2.pending_mode);
+    try std.testing.expectEqual(@as(?Mode, .server_side), dec_obj2.scheduled_mode);
+    try std.testing.expectEqual(@as(usize, 0), dec2_events.configure_count);
+}
+
+test "decoration v2: a commit after destroy clears the retained mode" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var capture: RequestModeCapture = .{
+        .listener = wire.Listener(*RequestMode).init(RequestModeCapture.notify),
+    };
+    ts.decoration.?.events.request_mode.add(&capture.listener);
+
+    const deco_client = try ts.bindDecorationManager(2);
+    const tl = try ts.createToplevel();
+    var xs_events: XdgSurfaceEvents = .{};
+    tl.xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    const dec = try deco_client.getToplevelDecoration(tl.toplevel);
+    var dec_events: DecorationEvents = .{};
+    dec.setListener(*DecorationEvents, DecorationEvents.listener, &dec_events);
+    try ts.pump();
+
+    // Establish server_side, then destroy (retention recorded).
+    dec.setMode(.server_side);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), dec_events.configure_count);
+    tl.xdg_surface.ackConfigure(xs_events.serial);
+    try ts.pump();
+    try std.testing.expectEqual(@as(?Mode, .server_side), ts.decoration.?.decorations.items[0].current_mode);
+    dec.destroy();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ts.decoration.?.decorations.items.len);
+
+    // The next surface commit after the destroy reverts to client-side
+    // (the XML's destroy text) — the retention expires.
+    tl.surface.commit();
+    try ts.pump();
+
+    // Re-create: no retained mode — the decoration starts unset.
+    _ = try deco_client.getToplevelDecoration(tl.toplevel);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ts.decoration.?.decorations.items.len);
+    const dec_obj2 = ts.decoration.?.decorations.items[0];
+    try std.testing.expectEqual(@as(?Mode, null), dec_obj2.current_mode);
+    try std.testing.expectEqual(@as(?Mode, null), dec_obj2.pending_mode);
+    try std.testing.expectEqual(@as(?Mode, null), dec_obj2.scheduled_mode);
 }
 
 test "decoration mode configure rides the xdg configure/ack cycle (XD-1)" {

@@ -86,6 +86,10 @@ pub const Presentation = struct {
     /// Fallback sequence counter for present() calls without an output
     /// (tests); keeps the per-output invariant when no output is known.
     seq_fallback: u64 = 0,
+    /// Per-output presented-event state (one entry per output with a
+    /// real present source). Created lazily on the first queued present;
+    /// removed by the output's destroy listener.
+    present_states: std.AutoHashMap(*output_mod.Output, *OutputPresentState),
 
     /// Register the wp_presentation global (version 2).
     pub fn init(
@@ -105,9 +109,11 @@ pub const Presentation = struct {
             .feedbacks = .empty,
             .output_seq = std.AutoHashMap(*output_mod.Output, u64).init(allocator),
             .seq_fallback = 0,
+            .present_states = std.AutoHashMap(*output_mod.Output, *OutputPresentState).init(allocator),
         };
         errdefer p.feedbacks.deinit(allocator);
         errdefer p.output_seq.deinit();
+        errdefer p.present_states.deinit();
         p.global = try display.addGlobal(
             server.wp.Presentation,
             *Presentation,
@@ -131,6 +137,17 @@ pub const Presentation = struct {
         // Destroy outstanding feedback resources: each destroy handler
         // removes its bookkeeping from the list and frees it.
         while (p.feedbacks.items.len > 0) p.feedbacks.items[0].resource.destroy();
+        // Per-output present state: detach the listeners from the still
+        // live outputs' signals, then free. (Destroyed outputs already
+        // removed their entries via the destroy listener.)
+        var it = p.present_states.iterator();
+        while (it.next()) |entry| {
+            const st = entry.value_ptr.*;
+            st.presented_listener.link.remove();
+            st.destroy_listener.link.remove();
+            allocator.destroy(st);
+        }
+        p.present_states.deinit();
         p.feedbacks.deinit(allocator);
         p.output_seq.deinit();
         allocator.destroy(p);
@@ -196,31 +213,50 @@ pub const Presentation = struct {
         }
     }
 
-    /// The given surfaces were presented on an output: every feedback
-    /// bound to one of them delivers presented (destructor event) and is
-    /// freed. The timestamp is taken once, from the monotonic io clock;
-    /// refresh_msec becomes the protocol refresh (nanoseconds till the
-    /// next refresh); the seq is the OUTPUT's counter, advancing once per
-    /// present on that output. `wl_output` names the compositor's
-    /// wl_output global for the output: each feedback's client receives a
-    /// sync_output for its own wl_output resource before presented
-    /// (wlroots presentation_time.c:27-40). flags may carry
-    /// WP_PRESENTATION_FEEDBACK_KIND_*; ZERO_COPY is cleared because the
-    /// pixman path composites (textured) rather than scanning out
-    /// directly (wlroots clears it for textured feedback,
-    /// presentation_time.c:296-298).
+    /// A frame was committed for an output and the surfaces drawn in it
+    /// are known. Two delivery modes, selected by the output:
+    ///
+    /// - Real-present output (Output.emits_present, DRM/nested): every
+    ///   committed feedback bound to a surface of this frame is queued on
+    ///   the output with `commit_seq` (the output's commit sequence of
+    ///   this frame) and delivered ONLY by the output's `presented`
+    ///   event when its seq matches — the backend actually displayed the
+    ///   frame (wlroots presentation_surface_queued_on_output +
+    ///   commit_seq check, presentation_time.c:277-301). A frame that
+    ///   never presents (dropped/superseded) is discarded, never
+    ///   reported as presented. The timestamp, refresh and flags come
+    ///   from the present event, not the commit.
+    /// - Headless/raylib (no real display): delivered synchronously here,
+    ///   as before — the timestamp is taken once from the monotonic io
+    ///   clock, refresh_msec becomes the protocol refresh, the seq is
+    ///   the output's own counter advancing per present.
+    ///
+    /// `wl_output` names the compositor's wl_output global for the
+    /// output: each feedback's client receives a sync_output for its own
+    /// wl_output resource before presented (wlroots presentation_time.c:
+    /// 27-40). flags may carry WP_PRESENTATION_FEEDBACK_KIND_*; ZERO_COPY
+    /// is cleared because the pixman path composites (textured) rather
+    /// than scanning out directly (wlroots clears it for textured
+    /// feedback, presentation_time.c:296-298).
     pub fn present(
         p: *Presentation,
         presented: []const *Surface,
         wl_output: ?*WlOutput,
+        commit_seq: u64,
         refresh_msec: u32,
         flags: u32,
     ) void {
+        const out = if (wl_output) |wo| wo.output else null;
+        if (out != null and out.?.emits_present) {
+            queueForPresent(p, presented, out.?, wl_output, commit_seq);
+            return;
+        }
+
         const now_ns: u64 = @intCast(std.Io.Clock.now(.awake, p.io.*).nanoseconds);
         const tv_sec: u64 = now_ns / std.time.ns_per_s;
         const tv_nsec: u64 = now_ns % std.time.ns_per_s;
         const refresh_ns: u64 = @as(u64, refresh_msec) * std.time.ns_per_ms;
-        const seq = nextSeq(p, if (wl_output) |wo| wo.output else null);
+        const seq = nextSeq(p, out);
         var kind: server.wp.PresentationFeedback.Kind = @bitCast(flags);
         kind.zero_copy = false;
         // Iterate backwards: each presented feedback destroys its own
@@ -251,6 +287,139 @@ pub const Presentation = struct {
         );
     }
 };
+
+/// Per-output presented-event state: the listeners wired to the output's
+/// signals (attached once per output, on the first queued present) and
+/// the back-pointer to run delivery.
+const OutputPresentState = struct {
+    presentation: *Presentation,
+    /// The output's presented event: deliver seq-matched queued feedbacks.
+    presented_listener: wire.Listener(*output_mod.Output.PresentEvent),
+    /// The output's destroy event: drop this output's state (the signal
+    /// lists die with the output; the listeners never fire again).
+    destroy_listener: wire.Listener(*output_mod.Output),
+};
+
+/// Attach the output's presented listener (once per output): feedback
+/// delivery rides the real present event for real-display backends. On
+/// allocation failure there is no listener, so the frame's feedbacks stay
+/// queued until a later commit supersedes them — never falsely presented
+/// (a catastrophic-memory path, matching nextSeq's handling).
+fn ensureOutputPresentState(p: *Presentation, out: *output_mod.Output) void {
+    if (p.present_states.contains(out)) return;
+    const st = p.allocator.create(OutputPresentState) catch return;
+    st.* = .{
+        .presentation = p,
+        .presented_listener = wire.Listener(*output_mod.Output.PresentEvent).init(onOutputPresented),
+        .destroy_listener = wire.Listener(*output_mod.Output).init(onOutputDestroyed),
+    };
+    p.present_states.put(out, st) catch {
+        p.allocator.destroy(st);
+        return;
+    };
+    out.events.presented.add(&st.presented_listener);
+    out.events.destroy.add(&st.destroy_listener);
+}
+
+/// Real-present path: attach this frame's committed feedbacks to the
+/// output's next present (wlroots presentation_surface_queued_on_output).
+/// The seq is the output's commit sequence of this frame — main.zig
+/// passes out.commit_seq right after commitState.
+fn queueForPresent(
+    p: *Presentation,
+    presented: []const *Surface,
+    out: *output_mod.Output,
+    wl_output: ?*WlOutput,
+    commit_seq: u64,
+) void {
+    ensureOutputPresentState(p, out);
+    var i = p.feedbacks.items.len;
+    while (i > 0) {
+        i -= 1;
+        const fb = p.feedbacks.items[i];
+        if (!fb.committed) continue;
+        if (std.mem.indexOfScalar(*Surface, presented, fb.surface) == null) continue;
+        fb.queued_output = out;
+        fb.wl_output = wl_output;
+        fb.commit_seq = commit_seq;
+    }
+    log.debug(
+        "queued {d} surface(s) for output present seq={d}",
+        p.io,
+        p.log_cfg,
+        log_tag,
+        .{ presented.len, commit_seq },
+    );
+}
+
+/// The output displayed a frame: deliver every feedback queued for it
+/// whose commit seq matches the presented frame, with the presented
+/// event's timestamp, flags and refresh (wlroots presentation_time.c:
+/// feedback_handle_output_present, 311-339). A feedback whose frame was
+/// NOT this present (seq mismatch — the output displayed another frame)
+/// is left waiting: it is never presented for the wrong frame, and is
+/// destroyed only by its surface's next commit (supersede, the synced
+/// move), the surface dying, or the output dying — a dropped frame is
+/// never reported as presented.
+fn deliverPresented(p: *Presentation, ev: *output_mod.Output.PresentEvent) void {
+    const out = ev.output;
+    var i = p.feedbacks.items.len;
+    while (i > 0) {
+        i -= 1;
+        const fb = p.feedbacks.items[i];
+        if (fb.queued_output != out) continue;
+        if (fb.commit_seq != ev.seq) continue;
+        var kind: server.wp.PresentationFeedback.Kind = @bitCast(ev.flags);
+        kind.zero_copy = false;
+        if (fb.wl_output) |wo| sendSyncOutput(wo, fb);
+        fb.resource.destroySendPresented(
+            @truncate(ev.when_ns / std.time.ns_per_s >> 32),
+            @truncate(ev.when_ns / std.time.ns_per_s),
+            @truncate(ev.when_ns % std.time.ns_per_s),
+            @truncate(ev.refresh_ns),
+            @truncate(ev.seq >> 32),
+            @truncate(ev.seq),
+            kind,
+        );
+    }
+    log.debug(
+        "output present seq={d}: delivered seq-matched feedbacks, {d} pending",
+        p.io,
+        p.log_cfg,
+        log_tag,
+        .{ ev.seq, p.feedbacks.items.len },
+    );
+}
+
+fn onOutputPresented(
+    listener: *wire.Listener(*output_mod.Output.PresentEvent),
+    ev: *output_mod.Output.PresentEvent,
+) void {
+    const st: *OutputPresentState = @fieldParentPtr("presented_listener", listener);
+    deliverPresented(st.presentation, ev);
+}
+
+/// The output died: its queued feedbacks can never present — discard
+/// them (wlroots feedback_handle_output_destroy, presentation_time.c:
+/// 301-308), then drop the present state. Freeing the listener struct
+/// inside its own notify is safe — the emit cursor has moved past it
+/// (same pattern as wl_output's onOutputDestroy). The presented listener
+/// is still linked into the dying signal's list, which is never
+/// traversed again.
+fn onOutputDestroyed(listener: *wire.Listener(*output_mod.Output), out: *output_mod.Output) void {
+    const st: *OutputPresentState = @fieldParentPtr("destroy_listener", listener);
+    const p = st.presentation;
+    // Iterate backwards: each destroyed feedback removes itself from the
+    // list (swapRemove) and is freed by its destroy handler.
+    var i = p.feedbacks.items.len;
+    while (i > 0) {
+        i -= 1;
+        const fb = p.feedbacks.items[i];
+        if (fb.queued_output == out) fb.resource.destroySendDiscarded();
+    }
+    _ = p.present_states.remove(out);
+    p.allocator.destroy(st);
+}
 
 /// Per-output sequence: the output's counter, advanced once per present
 /// on it. Falls back to a global counter when no output is given. On
@@ -328,6 +497,17 @@ pub const Feedback = struct {
     /// the feedback describes that committed frame and awaits its
     /// present. A further commit supersedes it (discard).
     committed: bool = false,
+    /// Real-present path (outputs with a presented event source): the
+    /// output this feedback was queued on, awaiting the seq-matched
+    /// present. Null while unqueued or on the synthetic (headless) path.
+    queued_output: ?*output_mod.Output = null,
+    /// The compositor's wl_output of the queued frame, for sync_output
+    /// at delivery (wlroots presentation_surface_queued_on_output).
+    wl_output: ?*WlOutput = null,
+    /// The output's commit sequence number the queued feedback rode on:
+    /// delivered only by the presented event carrying this seq
+    /// (presentation_time.c:277-301).
+    commit_seq: u64 = 0,
     /// Surface commit listener: supersede an un-presented feedback when
     /// the surface commits again.
     commit_listener: wire.Listener(*Surface),
@@ -653,7 +833,7 @@ test "get_feedback then present delivers presented" {
     // Present with a 60 Hz refresh (16.67 ms -> 16,666,667 ns). Capture
     // the clock window: the presented timestamp must fall inside it.
     const t0_ns: u64 = @intCast(std.Io.Clock.now(.awake, ts.io).nanoseconds);
-    ts.presentation.?.present(&[_]*Surface{surface}, null, 16, 0);
+    ts.presentation.?.present(&[_]*Surface{surface}, null, 0, 16, 0);
     const t1_ns: u64 = @intCast(std.Io.Clock.now(.awake, ts.io).nanoseconds);
     try ts.pump();
 
@@ -694,7 +874,7 @@ test "present only affects the listed surfaces" {
     const surface_b = ts.compositor.?.surfaces.items[1];
     try std.testing.expectEqual(@as(usize, 2), ts.presentation.?.feedbacks.items.len);
 
-    ts.presentation.?.present(&[_]*Surface{surface_a}, null, 16, 0);
+    ts.presentation.?.present(&[_]*Surface{surface_a}, null, 0, 16, 0);
     try ts.pump();
 
     try std.testing.expect(fe_a.presented);
@@ -705,7 +885,7 @@ test "present only affects the listed surfaces" {
     try std.testing.expectEqual(surface_b, ts.presentation.?.feedbacks.items[0].surface);
 
     // A later present covers it too (seq advances per present).
-    ts.presentation.?.present(&[_]*Surface{surface_b}, null, 16, 0);
+    ts.presentation.?.present(&[_]*Surface{surface_b}, null, 0, 16, 0);
     try ts.pump();
     try std.testing.expect(fe_b.presented);
     try std.testing.expectEqual(@as(u64, 2), fe_b.seq);
@@ -805,7 +985,7 @@ test "presented feedback carries sync_output for the client's wl_output" {
     // Present with the compositor's wl_output: the feedback's client (the
     // same in-memory client, which bound wl_output) gets one sync_output
     // before presented (wlroots presentation_time.c:27-40).
-    ts.presentation.?.present(&[_]*Surface{surface}, ts.wl_output, 16, 0);
+    ts.presentation.?.present(&[_]*Surface{surface}, ts.wl_output, 0, 16, 0);
     try ts.pump();
 
     try std.testing.expect(fe.presented);
@@ -819,7 +999,7 @@ test "presented feedback carries sync_output for the client's wl_output" {
     c_fb_b.setListener(*FeedbackEvents, FeedbackEvents.listener, &fe_b);
     try ts.pump();
     const surface_b = ts.compositor.?.surfaces.items[1];
-    ts.presentation.?.present(&[_]*Surface{surface_b}, ts.wl_output, 16, 0);
+    ts.presentation.?.present(&[_]*Surface{surface_b}, ts.wl_output, 0, 16, 0);
     try ts.pump();
     try std.testing.expectEqual(@as(u64, 2), fe_b.seq);
 }
@@ -857,7 +1037,7 @@ test "commit supersedes an un-presented feedback" {
     try std.testing.expectEqual(@as(usize, 1), ts.presentation.?.feedbacks.items.len);
 
     // The surviving feedback presents normally.
-    ts.presentation.?.present(&[_]*Surface{surface}, null, 16, 0);
+    ts.presentation.?.present(&[_]*Surface{surface}, null, 0, 16, 0);
     try ts.pump();
     try std.testing.expect(fe2.presented);
     try std.testing.expectEqual(@as(usize, 0), ts.presentation.?.feedbacks.items.len);
@@ -888,4 +1068,167 @@ test "surface destroy auto-discards its feedbacks (no manual discard)" {
     try std.testing.expect(!fe_b.discarded);
     try std.testing.expectEqual(@as(usize, 1), ts.presentation.?.feedbacks.items.len);
     try std.testing.expectEqual(@as(usize, 1), ts.compositor.?.surfaces.items.len);
+}
+
+test "real-present output: feedbacks deliver only on the seq-matched presented event" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    // The DRM/nested backends set this: the output's presented event is
+    // the real present source.
+    ts.output.?.emits_present = true;
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const c_fb1 = try ts.wp_presentation.?.feedback(wl_surface);
+    var fe1: FeedbackEvents = .{};
+    c_fb1.setListener(*FeedbackEvents, FeedbackEvents.listener, &fe1);
+    try ts.pump();
+    const surface = ts.compositor.?.surfaces.items[0];
+
+    // Frame 1: commit + present (output seq 1). Queued, NOT delivered:
+    // the output has not presented yet (no synthesized timestamp).
+    wl_surface.commit();
+    try ts.pump();
+    ts.presentation.?.present(&[_]*Surface{surface}, ts.wl_output, 1, 16, 0);
+    try ts.pump();
+    try std.testing.expect(!fe1.presented);
+    try std.testing.expect(!fe1.discarded);
+    try std.testing.expectEqual(@as(usize, 1), ts.presentation.?.feedbacks.items.len);
+
+    // Frame 2: a second feedback; the commit supersedes fb1 (its frame
+    // was never presented), fb2 becomes current.
+    const c_fb2 = try ts.wp_presentation.?.feedback(wl_surface);
+    var fe2: FeedbackEvents = .{};
+    c_fb2.setListener(*FeedbackEvents, FeedbackEvents.listener, &fe2);
+    try ts.pump();
+    wl_surface.commit();
+    try ts.pump();
+    ts.presentation.?.present(&[_]*Surface{surface}, ts.wl_output, 2, 16, 0);
+    try ts.pump();
+    try std.testing.expect(fe1.discarded);
+    try std.testing.expect(!fe1.presented);
+
+    // The backend displays frame 2 (page flip / parent frame done) with
+    // ITS flags, refresh and scanout time: only fb2 delivers, carrying
+    // the presented event's data — not the commit-time synthesis.
+    const when_ns: u64 = 1234 * std.time.ns_per_s + 567_000_000;
+    ts.output.?.firePresented(2, 0x1 | 0x2 | 0x4, 8_333_333, when_ns);
+    try ts.pump();
+
+    try std.testing.expect(fe2.presented);
+    try std.testing.expect(!fe2.discarded);
+    try std.testing.expectEqual(@as(u64, 1234), fe2.tv_sec);
+    try std.testing.expectEqual(@as(u32, 567_000_000), fe2.tv_nsec);
+    try std.testing.expectEqual(@as(u32, 8_333_333), fe2.refresh);
+    try std.testing.expectEqual(@as(u64, 2), fe2.seq);
+    // The backend's flags pass through with ZERO_COPY cleared (0x8): the
+    // pixman composite is textured, not zero-copy scanned out.
+    try std.testing.expectEqual(@as(u32, 0x1 | 0x2 | 0x4), fe2.flags);
+    // The feedback's client bound wl_output: one sync_output precedes
+    // presented (wlroots presentation_time.c:27-40).
+    try std.testing.expectEqual(@as(usize, 1), fe2.sync_output_count);
+    try std.testing.expectEqual(@as(usize, 0), ts.presentation.?.feedbacks.items.len);
+}
+
+test "real-present output: a dropped frame's feedback is never presented" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    ts.output.?.emits_present = true;
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const c_fb = try ts.wp_presentation.?.feedback(wl_surface);
+    var fe: FeedbackEvents = .{};
+    c_fb.setListener(*FeedbackEvents, FeedbackEvents.listener, &fe);
+    try ts.pump();
+    const surface = ts.compositor.?.surfaces.items[0];
+
+    // Commit + present (seq 1): queued, awaiting the real present.
+    wl_surface.commit();
+    try ts.pump();
+    ts.presentation.?.present(&[_]*Surface{surface}, ts.wl_output, 1, 16, 0);
+    try ts.pump();
+    try std.testing.expect(!fe.presented);
+    try std.testing.expect(!fe.discarded);
+
+    // The frame never presents (dropped): the next commit supersedes the
+    // queued feedback — discarded, never reported as presented.
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(fe.discarded);
+    try std.testing.expect(!fe.presented);
+    try std.testing.expectEqual(@as(usize, 0), ts.presentation.?.feedbacks.items.len);
+}
+
+test "real-present output: a newer present leaves the older feedback waiting, never presented" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    ts.output.?.emits_present = true;
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const c_fb = try ts.wp_presentation.?.feedback(wl_surface);
+    var fe: FeedbackEvents = .{};
+    c_fb.setListener(*FeedbackEvents, FeedbackEvents.listener, &fe);
+    try ts.pump();
+    const surface = ts.compositor.?.surfaces.items[0];
+
+    // Commit + present (seq 1); then the output presents seq 2 — the
+    // displayed frame is NOT the one the feedback rode on. wlroots
+    // behavior (presentation_time.c:311-339): the feedback is left
+    // waiting — never presented for the wrong frame, not discarded
+    // either. The next surface commit supersedes it (synced move).
+    wl_surface.commit();
+    try ts.pump();
+    ts.presentation.?.present(&[_]*Surface{surface}, ts.wl_output, 1, 16, 0);
+    try ts.pump();
+
+    ts.output.?.firePresented(2, 0x2 | 0x4, 16_666_667, 2 * std.time.ns_per_s);
+    try ts.pump();
+    try std.testing.expect(!fe.presented);
+    try std.testing.expect(!fe.discarded);
+    try std.testing.expectEqual(@as(usize, 1), ts.presentation.?.feedbacks.items.len);
+
+    // A matching present would deliver it; a newer commit supersedes.
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(fe.discarded);
+    try std.testing.expect(!fe.presented);
+    try std.testing.expectEqual(@as(usize, 0), ts.presentation.?.feedbacks.items.len);
+}
+
+test "real-present output teardown: output destroy drops the present state" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    ts.output.?.emits_present = true;
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const c_fb = try ts.wp_presentation.?.feedback(wl_surface);
+    var fe: FeedbackEvents = .{};
+    c_fb.setListener(*FeedbackEvents, FeedbackEvents.listener, &fe);
+    try ts.pump();
+    const surface = ts.compositor.?.surfaces.items[0];
+
+    // Queue on the output: attaches the presented + destroy listeners.
+    wl_surface.commit();
+    try ts.pump();
+    ts.presentation.?.present(&[_]*Surface{surface}, ts.wl_output, 1, 16, 0);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ts.presentation.?.present_states.count());
+
+    // The output dies (deinit order in TestServer: presentation first —
+    // so destroy the output manually here, then re-init the server state
+    // so deinit skips it). The destroy listener removes the state AND
+    // discards the queued feedback — its frame can never present now
+    // (wlroots feedback_handle_output_destroy).
+    const out = ts.output.?;
+    ts.output = null;
+    ts.wl_output = null;
+    out.destroy();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ts.presentation.?.present_states.count());
+    try std.testing.expectEqual(@as(usize, 0), ts.presentation.?.feedbacks.items.len);
+    try std.testing.expect(fe.discarded);
+    try std.testing.expect(!fe.presented);
 }
