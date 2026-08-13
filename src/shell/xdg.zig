@@ -1489,6 +1489,17 @@ fn popupRequest(popup_res: *server.xdg.Popup, request: server.xdg.Popup.Request,
 fn popupDestroy(popup_res: *server.xdg.Popup, popup: *XdgPopup) void {
     _ = popup_res;
     const shell = popup.xdg_surface.shell;
+    // F12: destroy descendant popups first (wlroots wlr_xdg_popup_destroy
+    // recurses children before the parent, wlr_xdg_popup.c:485-499 — the
+    // compositor-side teardown; the client-side destroy REQUEST rejects
+    // non-topmost popups via the X04a check). A child popup Q created on
+    // top of P is tracked in P.xdg_surface.popups (Q's parent IS P's
+    // xdg_surface); each child's destructor recurses in turn, deepest
+    // first. The loop drains the list because each child's destructor
+    // detaches it.
+    while (popup.xdg_surface.popups.items.len > 0) {
+        popup.xdg_surface.popups.items[0].resource.destroy();
+    }
     if (std.mem.findScalar(*XdgPopup, shell.popups.items, popup)) |i| {
         _ = shell.popups.swapRemove(i);
     }
@@ -2023,6 +2034,17 @@ fn xdgSurfaceMap(surface: *surface_mod.Surface) void {
 fn xdgSurfaceUnmap(surface: *surface_mod.Surface) void {
     const xdg = xdgFromSurface(surface) orelse return;
     xdg.resetConfigureState();
+    // F12: parent unmap dismisses child popups (wlroots reset_xdg_surface
+    // destroys the popups in surface->popups, wlr_xdg_surface.c:26-45 —
+    // popup_done first, then the resource dies; wlr_xdg_popup_destroy
+    // recursion, wlr_xdg_popup.c:485-499). The client sees popup_done and
+    // then the object going away, so its popup state cannot survive a
+    // parent that unmaps (menus must not outlive their toplevel).
+    while (xdg.popups.items.len > 0) {
+        const child = xdg.popups.items[0];
+        child.sendPopupDone();
+        child.resource.destroy();
+    }
     // F14/F16: title/app_id are per-map and the parent link dies with the
     // map (wlroots reset_xdg_toplevel on unmap).
     if (xdg.role == .toplevel) if (xdg.toplevel) |t| t.resetOnUnmap();
@@ -2273,6 +2295,7 @@ const PopupEvents = struct {
     y: i32 = 0,
     width: i32 = 0,
     height: i32 = 0,
+    done_count: usize = 0,
 
     fn listener(popup: *client.xdg.Popup, event: client.xdg.Popup.Event, data: *PopupEvents) void {
         _ = popup;
@@ -2284,7 +2307,9 @@ const PopupEvents = struct {
                 data.width = c.width;
                 data.height = c.height;
             },
-            .popup_done => {},
+            .popup_done => {
+                data.done_count += 1;
+            },
             .repositioned => {},
         }
     }
@@ -2413,6 +2438,20 @@ const TestServer = struct {
         ts.shm_pool = try ts.shm.?.createPool(fd, @intCast(pool_size));
         ts.buffer = try ts.shm_pool.?.createBuffer(0, width, height, width * 4, .argb8888);
         return ts.buffer.?;
+    }
+
+    /// A second independent buffer (fresh pool) for tests that map two
+    /// surfaces with distinct content (F12: a popup over its parent).
+    fn createBuffer2(ts: *TestServer) !*client.wl.Buffer {
+        const width: i32 = 64;
+        const height: i32 = 64;
+        const fd = try std.posix.memfd_create("xdg-test-buffer-2", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(fd);
+        const pool_size = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+        const rc = std.os.linux.ftruncate(fd, @intCast(pool_size));
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
+        const pool = try ts.shm.?.createPool(fd, @intCast(pool_size));
+        return pool.createBuffer(0, width, height, width * 4, .argb8888);
     }
 
     /// Client flush -> server event loop dispatch -> server flush -> client
@@ -3241,6 +3280,67 @@ test "popup configure applies the constraint box (F1)" {
         geom.Rect{ .x = 0, .y = 50, .width = 100, .height = 50 },
         p.acked_geometry.?,
     );
+}
+
+test "parent unmap dismisses child popups with popup_done (F12)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // Map a toplevel.
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    var parent_events: XdgSurfaceEvents = .{};
+    parent_xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &parent_events);
+    const buffer = try ts.createBuffer();
+    // Map: initial commit -> configure, ack, attach buffer, commit.
+    try ts.pump();
+    parent_wl_surface.commit();
+    try ts.pump();
+    parent_xdg_surface.ackConfigure(parent_events.serial);
+    parent_wl_surface.attach(buffer, 0, 0);
+    parent_wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(ts.shell.?.toplevels.items[0].xdg_surface.surface.mapped);
+
+    // Create + map a popup on the toplevel.
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    var popup_events: PopupEvents = .{};
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    positioner.destroy();
+    const popup_buffer = try ts.createBuffer2();
+    try ts.pump();
+    wl_surface.commit();
+    try ts.pump();
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(popup_buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    const p = ts.shell.?.popups.items[0];
+    try std.testing.expect(p.xdg_surface.surface.mapped);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+
+    // Parent unmaps via NULL buffer: the child popup gets popup_done and
+    // is destroyed (wlroots reset_xdg_surface, wlr_xdg_surface.c:26-45;
+    // the client then destroys the object, so the role detaches too).
+    parent_wl_surface.attach(null, 0, 0);
+    parent_wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(!ts.shell.?.toplevels.items[0].xdg_surface.surface.mapped);
+    try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
+    try std.testing.expectEqual(@as(usize, 0), ts.shell.?.popups.items.len);
+    // Surface/role teardown runs in ts.deinit (the client destroys the
+    // wl_surface + xdg_surface; the server frees the rest).
 }
 
 const WmBasePingEvents = struct {

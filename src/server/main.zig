@@ -1060,7 +1060,7 @@ fn onToplevelMove(listener: *wire.Listener(*wayland.shell.MoveRequest), req: *wa
     self.moving_toplevel = req.toplevel;
     const wp = self.camera.screenToWorld(@floatFromInt(seat.pointer_x), @floatFromInt(seat.pointer_y));
     self.move_anchor = .{ .x = wp.x, .y = wp.y };
-    seat.setPointerGrab(true);
+    seat.startPointerGrab(&wayland.seat.swallow_pointer_grab);
     const surface_id = req.toplevel.xdg_surface.surface.resource.getId();
     log.info("interactive move start surface@{d}", self.io, self.log_cfg, "server", .{surface_id});
 }
@@ -1071,7 +1071,7 @@ fn onToplevelDestroy(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *w
     // grab so the pointer returns to the clients.
     if (tl.state.moving_toplevel == t) {
         tl.state.moving_toplevel = null;
-        tl.state.seat.setPointerGrab(false);
+        tl.state.seat.endPointerGrab();
         log.info("interactive move cancelled (toplevel destroyed)", tl.state.io, tl.state.log_cfg, "server", .{});
     }
     tl.state.allocator.destroy(tl);
@@ -1515,6 +1515,10 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     const perf_t_sync = perfNs(self);
     // Subsurfaces: position child nodes over their mapped parent.
     syncSubsurfaceNodes(self);
+    // F12: popups position over their parent at the geometry offset and
+    // stack above it (menus render where the positioner asked and
+    // hit-test there).
+    syncPopupNodes(self);
 
     const so = self.scene_output orelse {
         log.err("render: no scene output", self.io, self.log_cfg, "server", .{});
@@ -2266,7 +2270,7 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
             self.moving_toplevel = null;
             log.info("interactive move end", self.io, self.log_cfg, "server", .{});
         }
-        seat.setPointerGrab(false);
+        seat.endPointerGrab();
     }
 }
 
@@ -2324,7 +2328,7 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
         // the user pans the canvas).
         self.drag_active = true;
         self.fast_render = true;
-        seat.setPointerGrab(true);
+        seat.startPointerGrab(&wayland.seat.swallow_pointer_grab);
         self.camera.center_x -= @as(f64, @floatFromInt(dx)) / self.camera.zoom;
         self.camera.center_y -= @as(f64, @floatFromInt(dy)) / self.camera.zoom;
         self.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
@@ -2369,6 +2373,39 @@ fn onSeatAxis(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.
 /// (types/scene/subsurface_tree.c:238-304: children inside the parent's
 /// tree node). Pending restacks are applied here (request-time recording
 /// lives in the subsurface role state) and cleared.
+/// F12: position popup surface nodes over their parent (the subsurface
+/// pattern): a popup's tree becomes a child of the parent's tree,
+/// offset by the popup geometry (parent-surface-local). This gives
+/// popups their correct position, makes scene.pick hit-test them at
+/// their offset, and (child-after-parent append) stacks them above the
+/// parent's subsurfaces — the scene renders children in append order.
+/// Runs each frame, before damage translation; cheap (no-op when the
+/// tree is already placed).
+fn syncPopupNodes(self: *ServerState) void {
+    const scene = self.scene orelse return;
+    for (self.shell.popups.items) |p| {
+        // Layer-parented popups anchor to a layer surface (L1) — the
+        // parent's own tree is at the layer's position already; xdg
+        // popups anchor to the parent xdg surface.
+        const parent_surface = if (p.parent) |px| px.surface else p.layer_parent orelse continue;
+        const popup_sn = wayland.surface_node.surfaceNodeFor(scene, p.xdg_surface.surface) orelse continue;
+        const popup_tree = popup_sn.tree orelse continue;
+        const parent_sn = wayland.surface_node.surfaceNodeFor(scene, parent_surface) orelse continue;
+        if (parent_sn.tree) |parent_tree| {
+            if (popup_tree.parent != parent_tree) {
+                parent_tree.appendChild(scene.allocator, popup_tree) catch |err| {
+                    log.warn("popup parenting failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+                    popup_tree.enable(false);
+                    continue;
+                };
+            }
+            popup_tree.x = p.geometry.x;
+            popup_tree.y = p.geometry.y;
+            popup_tree.enable(true);
+        }
+    }
+}
+
 fn syncSubsurfaceNodes(self: *ServerState) void {
     const scene = self.scene orelse return;
     for (self.subcompositor.subsurfaces.items) |ss| {

@@ -161,6 +161,105 @@ const SeatClient = struct {
 /// surfaces from the non-divisible-size error (warn, not reject).
 const cursor_role: role_mod.SurfaceRole = .{ .name = "wl_pointer-cursor" };
 
+/// The compositor's swallow grab (camera drag / interactive move): all
+/// handlers are no-ops, so the client under the pointer sees nothing
+/// while the compositor owns the gesture. The seat's signals still fire
+/// for compositor listeners (main.zig's camera pan reads pointer_move /
+/// button / axis). The grab is stateless: cancel is a no-op.
+fn swallowGrabMotion(seat: *Seat, grab: *const PointerGrab, x: i32, y: i32) void {
+    _ = seat;
+    _ = grab;
+    _ = x;
+    _ = y;
+}
+fn swallowGrabButton(seat: *Seat, grab: *const PointerGrab, button: u32, pressed: bool) void {
+    _ = seat;
+    _ = grab;
+    _ = button;
+    _ = pressed;
+}
+fn swallowGrabAxis(
+    seat: *Seat,
+    grab: *const PointerGrab,
+    axis: server.wl.Pointer.Axis,
+    source: server.wl.Pointer.AxisSource,
+    value: f64,
+    discrete: i32,
+    direction: server.wl.Pointer.AxisRelativeDirection,
+) void {
+    _ = seat;
+    _ = grab;
+    _ = axis;
+    _ = source;
+    _ = value;
+    _ = discrete;
+    _ = direction;
+}
+fn swallowGrabCancel(seat: *Seat, grab: *const PointerGrab) void {
+    _ = seat;
+    _ = grab;
+}
+/// Shared swallow grab (see handlers above). Installed by main.zig for
+/// the camera drag and the interactive move; reused by seat tests.
+pub const swallow_pointer_grab: PointerGrab = .{
+    .motion = swallowGrabMotion,
+    .button = swallowGrabButton,
+    .axis = swallowGrabAxis,
+    .cancel = swallowGrabCancel,
+};
+
+/// A pointer grab (wlroots wlr_seat_pointer.c:19-53): while installed,
+/// pointer events (motion, button, axis) route through the grab's
+/// handlers instead of the focused client. The default grab (null on
+/// the seat) forwards to the focused client; the compositor installs a
+/// grab for interactive move, camera drag, popup grabs and drag-and-drop.
+/// The grab's handlers own CLIENT delivery only — the seat's own signals
+/// (pointer_move, button, axis) still fire, so compositor listeners
+/// (main.zig's camera pan) keep working during the grab.
+pub const PointerGrab = struct {
+    /// Grab-specific state (owned by the installer; freed in cancel).
+    data: ?*anyopaque = null,
+    /// Route a pointer motion (output coords). The default forwards to
+    /// the focused client.
+    motion: *const fn (seat: *Seat, grab: *const PointerGrab, x: i32, y: i32) void,
+    /// Route a button press/release. The default forwards to the
+    /// focused client.
+    button: *const fn (seat: *Seat, grab: *const PointerGrab, button: u32, pressed: bool) void,
+    /// Route an axis event. The default forwards to the focused client.
+    axis: *const fn (
+        seat: *Seat,
+        grab: *const PointerGrab,
+        axis: server.wl.Pointer.Axis,
+        source: server.wl.Pointer.AxisSource,
+        value: f64,
+        discrete: i32,
+        direction: server.wl.Pointer.AxisRelativeDirection,
+    ) void,
+    /// The grab ended (replaced by another grab or released): free grab
+    /// state.
+    cancel: *const fn (seat: *Seat, grab: *const PointerGrab) void,
+};
+
+/// A keyboard grab (wlroots wlr_seat_keyboard.c:19-57): while installed,
+/// key events and modifier changes route through the grab's handlers
+/// instead of the focused client. The default grab (null on the seat)
+/// forwards to the focused client. The seat's key signal still fires.
+pub const KeyboardGrab = struct {
+    /// Grab-specific state (owned by the installer; freed in cancel).
+    data: ?*anyopaque = null,
+    /// Route a key press/release (xkb keycode). The xkb state, pressed
+    /// set, repeat clock and last_keysym are already updated by the
+    /// time the grab runs; the grab decides the delivery target. The
+    /// default forwards to the focused client.
+    key: *const fn (seat: *Seat, grab: *const KeyboardGrab, keycode: u32, pressed: bool) void,
+    /// Route a modifier change (depressed/latched/locked/group already
+    /// stored on the seat). The default broadcasts to the focused
+    /// client's keyboards.
+    modifiers: *const fn (seat: *Seat, grab: *const KeyboardGrab) void,
+    /// The grab ended (replaced or released): free grab state.
+    cancel: *const fn (seat: *Seat, grab: *const KeyboardGrab) void,
+};
+
 /// Seat configuration. Only optional/defaulted arguments live here;
 /// allocator/io/log_cfg/display stay positional.
 pub const Options = struct {
@@ -319,13 +418,18 @@ pub const Seat = struct {
     focus_gate_fn: ?*const fn (ctx: *anyopaque, surface: *Surface) bool = null,
     focus_gate_ctx: ?*anyopaque = null,
 
-    /// The compositor's implicit pointer grab is active (a camera drag /
-    /// interactive move): pointer motion and buttons are delivered to the
-    /// compositor's listeners only — the client under the pointer sees
-    /// nothing, so it cannot start a text selection or other gesture
-    /// while the user pans the canvas (wlroots' interactive-move grab
-    /// keeps the pointer out of the client's hands the same way).
-    pointer_grab: bool = false,
+    /// The active pointer grab (wlroots wlr_seat_pointer.c:19-53): while
+    /// installed, pointer motion/buttons/axis route through the grab's
+    /// handlers instead of the focused client. Null = the default grab
+    /// (forward to the focused client). main.zig installs a swallow grab
+    /// for the camera drag / interactive move; popup grabs (X04b) and
+    /// DnD (F-SEL-1) install their own. The grab only gates CLIENT
+    /// delivery — the seat's pointer_move/button/axis signals still fire.
+    pointer_grab: ?*const PointerGrab = null,
+    /// The active keyboard grab (wlroots wlr_seat_keyboard.c:19-57):
+    /// while installed, key events route through the grab's handlers
+    /// instead of the focused client. Null = the default grab.
+    keyboard_grab: ?*const KeyboardGrab = null,
 
     events: struct {
         /// A key was pressed/released. The seat state (last_keysym,
@@ -598,17 +702,20 @@ pub const Seat = struct {
         };
     }
 
-    /// Start/stop the compositor's implicit pointer grab (see
-    /// pointer_grab). The seat keeps delivering motion/buttons to the
-    /// compositor listeners so the gesture keeps working. Starting the
-    /// grab synthesizes a release (+ closing frame) for every button the
-    /// client believes is held, with a fresh per-client serial (wlroots
-    /// reset_buttons on grab focus change, wlr_seat_pointer.c:435-437):
-    /// the client's own gesture state must not extend into the
-    /// compositor's gesture (S2).
-    pub fn setPointerGrab(self: *Seat, grabbed: bool) void {
-        self.pointer_grab = grabbed;
-        if (!grabbed or self.held_button_count == 0) return;
+    /// Install a pointer grab (wlroots wlr_seat_pointer_start_grab,
+    /// wlr_seat_pointer.c:563-576): ends the current grab (cancel),
+    /// installs the new one. Starting ANY grab synthesizes a release
+    /// (+ closing frame) for every button the client believes is held,
+    /// with a fresh per-client serial (wlroots reset_buttons on grab
+    /// focus change, wlr_seat_pointer.c:435-437): the client's own
+    /// gesture state must not extend into the compositor's gesture (S2).
+    /// The seat keeps delivering motion/buttons to the compositor
+    /// listeners so the gesture keeps working; the grab gates client
+    /// delivery only.
+    pub fn startPointerGrab(self: *Seat, grab: *const PointerGrab) void {
+        if (self.pointer_grab) |old| old.cancel(self, old);
+        self.pointer_grab = grab;
+        if (self.held_button_count == 0) return;
         if (self.pointer_focus) |focus| {
             const focus_client = focus.resource.getClient();
             const time = nowMs(self);
@@ -629,15 +736,41 @@ pub const Seat = struct {
         self.held_button_count = 0;
     }
 
+    /// End the current pointer grab and restore the default (forward to
+    /// the focused client). The grab's cancel runs first (wlroots
+    /// wlr_seat_pointer_end_grab, wlr_seat_pointer.c:583-586).
+    pub fn endPointerGrab(self: *Seat) void {
+        if (self.pointer_grab) |old| old.cancel(self, old);
+        self.pointer_grab = null;
+    }
+
+    /// Install a keyboard grab (wlroots wlr_seat_keyboard_start_grab,
+    /// wlr_seat_keyboard.c:110-114).
+    pub fn startKeyboardGrab(self: *Seat, grab: *const KeyboardGrab) void {
+        if (self.keyboard_grab) |old| old.cancel(self, old);
+        self.keyboard_grab = grab;
+    }
+
+    /// End the current keyboard grab and restore the default (forward to
+    /// the focused client).
+    pub fn endKeyboardGrab(self: *Seat) void {
+        if (self.keyboard_grab) |old| old.cancel(self, old);
+        self.keyboard_grab = null;
+    }
+
     /// Move the pointer to output coords (x, y): hit-test, deliver
     /// enter/leave/motion to the focused client, move the cursor.
     pub fn pointerMotion(self: *Seat, x: i32, y: i32) void {
         self.pointer_x = x;
         self.pointer_y = y;
-        // Under the compositor's grab: no pick, no enter/leave, no client
-        // motion — only the compositor's listeners (the camera pan). The
+        // Under a compositor grab: no pick, no enter/leave, no client
+        // motion — the grab's handler owns delivery (a swallow grab
+        // sends nothing). The seat's pointer_move signal still fires so
+        // the camera pan listener keeps working (the grab gates CLIENT
+        // delivery only, wlroots wlr_seat_pointer.c:563-620). The
         // client must not see the pointer during the gesture.
-        if (self.pointer_grab) {
+        if (self.pointer_grab) |grab| {
+            grab.motion(self, grab, x, y);
             self.events.pointer_move.emit(self);
             return;
         }
@@ -733,26 +866,26 @@ pub const Seat = struct {
         }
         const time = nowMs(self);
         const state: server.wl.Pointer.ButtonState = if (pressed) .pressed else .released;
-        // Button goes only to the focused client's pointer resources
-        // (wlroots: wlr_seat_pointer_send_button iterates
-        // focused_client->pointers, wlr_seat_pointer.c:274-295). Under
-        // the compositor's grab the client sees NEITHER press nor
-        // release (S2): the camera drag / interactive move owns the
-        // buttons, and the client's gesture state is cleared by the
-        // synthetic releases setPointerGrab(true) sends — a swallowed
-        // release cannot leave it extending a text selection.
-        if (!self.pointer_grab) {
-            if (self.pointer_focus) |focus| {
-                const focus_client = focus.resource.getClient();
-                const serial = serialFor(self, focus_client);
-                var delivered = false;
-                for (self.pointers.items) |ptr| {
-                    if (ptr.getClient() != focus_client) continue;
-                    ptr.sendButton(serial, time, button, state);
-                    delivered = true;
-                }
-                if (delivered) self.markFramePending(focus_client);
+        // Button delivery: under a compositor grab the grab's handler
+        // owns it (a swallow grab sends neither press nor release, S2 —
+        // the camera drag / interactive move owns the buttons, and the
+        // client's gesture state is cleared by the synthetic releases
+        // startPointerGrab sends — a swallowed release cannot leave it
+        // extending a text selection). The button signal still fires for
+        // compositor listeners (main.zig's drag arming reads it).
+        if (self.pointer_grab) |grab| {
+            grab.button(self, grab, button, pressed);
+        } else if (self.pointer_focus) |focus| {
+            const focus_client = focus.resource.getClient();
+            const serial = serialFor(self, focus_client);
+            var delivered = false;
+            for (self.pointers.items) |ptr| {
+                if (ptr.getClient() != focus_client) continue;
+                ptr.sendButton(serial, time, button, state);
+                delivered = true;
             }
+            if (delivered) self.markFramePending(focus_client);
+
             // Track what the client believes is held (delivered presses
             // without a delivered release) for the grab-start synthetic
             // releases. Gated events never touch the set — the client
@@ -826,13 +959,17 @@ pub const Seat = struct {
         self.last_axis_discrete = discrete;
         self.events.axis.emit(self);
 
-        // Under the compositor's grab (camera drag / interactive move)
-        // no axis reaches the focused client (S2): the client must not
-        // scroll while the compositor owns the gesture. The axis signal
-        // above still fired, so the compositor's zoom binding keeps
-        // working (suppressing wheel-zoom during a grab is compositor
-        // policy, out of scope here).
-        if (self.pointer_grab) return;
+        // Under a compositor grab (camera drag / interactive move) no
+        // axis reaches the focused client (S2): the client must not
+        // scroll while the compositor owns the gesture. The grab's
+        // handler owns delivery (a swallow grab sends nothing). The
+        // axis signal above still fired, so the compositor's zoom
+        // binding keeps working (suppressing wheel-zoom during a grab
+        // is compositor policy, out of scope here).
+        if (self.pointer_grab) |grab| {
+            grab.axis(self, grab, axis, source, value, discrete, direction);
+            return;
+        }
         const focus = self.pointer_focus orelse return;
         const focus_client = focus.resource.getClient();
         const time = nowMs(self);
@@ -1028,16 +1165,25 @@ pub const Seat = struct {
             self.mods_group = mods.group;
             // Modifier broadcasts go only to the focused client's
             // keyboards (wlroots: wlr_seat_keyboard_send_modifiers
-            // iterates focused_client->keyboards).
-            self.sendKeyboardModifiers();
+            // iterates focused_client->keyboards); under a keyboard
+            // grab the grab's handler decides the target.
+            if (self.keyboard_grab) |grab| {
+                grab.modifiers(self, grab);
+            } else {
+                self.sendKeyboardModifiers();
+            }
         }
 
         const state: server.wl.Keyboard.KeyState = if (pressed) .pressed else .released;
         const time = nowMs(self);
-        // Key events go only to the focused client's keyboards
-        // (wlroots: wlr_seat_keyboard_send_key iterates
-        // focused_client->keyboards, wlr_seat_keyboard.c:67-84).
-        if (self.keyboard_focus) |focus| {
+        // Key delivery: under a keyboard grab the grab's handler owns it
+        // (a popup grab routes keys to the popup's client instead of the
+        // keyboard focus). The seat state (xkb, pressed set, repeat) was
+        // updated above and the key signal fires below — the grab gates
+        // CLIENT delivery only (wlroots wlr_seat_keyboard.c:19-57).
+        if (self.keyboard_grab) |grab| {
+            grab.key(self, grab, keycode, pressed);
+        } else if (self.keyboard_focus) |focus| {
             const focus_client = focus.resource.getClient();
             const serial = serialFor(self, focus_client);
             for (self.keyboards.items) |kbd| {
@@ -1061,8 +1207,11 @@ pub const Seat = struct {
         const time = nowMs(self);
         // Same delivery shape as keyEvent: the focused client's keyboards
         // only (wlroots wlr_seat_keyboard_send_key iterates
-        // focused_client->keyboards, wlr_seat_keyboard.c:67-84).
-        if (self.keyboard_focus) |focus| {
+        // focused_client->keyboards, wlr_seat_keyboard.c:67-84); under a
+        // keyboard grab the grab's handler owns delivery.
+        if (self.keyboard_grab) |grab| {
+            grab.key(self, grab, keycode, true);
+        } else if (self.keyboard_focus) |focus| {
             const focus_client = focus.resource.getClient();
             const serial = serialFor(self, focus_client);
             for (self.keyboards.items) |kbd| {
@@ -2239,7 +2388,7 @@ test "implicit pointer grab gates axis and button release (S2)" {
     // Grab start synthesizes a release (+ closing frame) for the held
     // button so the client's gesture state cannot extend into the drag
     // (wlroots reset_buttons, wlr_seat_pointer.c:435-437).
-    seat.setPointerGrab(true);
+    seat.startPointerGrab(&swallow_pointer_grab);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
     try std.testing.expectEqual(@as(usize, 3), a.ptr_events.frame);
@@ -2260,6 +2409,158 @@ test "implicit pointer grab gates axis and button release (S2)" {
     seat.pointerButton(btn_right, false);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+}
+
+/// Cancel-capturing grab for the lifecycle test: counts endPointerGrab
+/// cancels. All other handlers forward to the swallow grab (no-ops).
+const CancelGrabState = struct {
+    cancels: usize = 0,
+};
+fn cancelGrabMotion(seat: *Seat, grab: *const PointerGrab, x: i32, y: i32) void {
+    swallowGrabMotion(seat, grab, x, y);
+}
+fn cancelGrabButton(seat: *Seat, grab: *const PointerGrab, button: u32, pressed: bool) void {
+    swallowGrabButton(seat, grab, button, pressed);
+}
+fn cancelGrabAxis(
+    seat: *Seat,
+    grab: *const PointerGrab,
+    axis: server.wl.Pointer.Axis,
+    source: server.wl.Pointer.AxisSource,
+    value: f64,
+    discrete: i32,
+    direction: server.wl.Pointer.AxisRelativeDirection,
+) void {
+    swallowGrabAxis(seat, grab, axis, source, value, discrete, direction);
+}
+fn cancelGrabCancel(seat: *Seat, grab: *const PointerGrab) void {
+    _ = seat;
+    const st: *CancelGrabState = @ptrCast(@alignCast(grab.data.?));
+    st.cancels += 1;
+}
+
+test "pointer grab lifecycle: start routes, end cancels and restores delivery (F2)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server);
+
+    // Focus A and press (delivered normally pre-grab).
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.button);
+
+    // Install a swallow grab: delivery stops, cancel is armed.
+    var gst: CancelGrabState = .{};
+    const grab: PointerGrab = .{
+        .data = &gst,
+        .motion = cancelGrabMotion,
+        .button = cancelGrabButton,
+        .axis = cancelGrabAxis,
+        .cancel = cancelGrabCancel,
+    };
+    seat.startPointerGrab(&grab);
+    try ts.pump();
+    seat.pointerMotion(30, 30);
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.motion); // frozen
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button); // synth release only
+
+    // Replacing a grab cancels the old one (wlroots
+    // wlr_seat_pointer_start_grab: pointer_grab_cancel on the old grab).
+    seat.startPointerGrab(&swallow_pointer_grab);
+    try std.testing.expectEqual(@as(usize, 1), gst.cancels);
+
+    // End restores default delivery: the client sees events again (the
+    // swallow grab's cancel is a no-op, so gst.cancels stays put).
+    seat.endPointerGrab();
+    try std.testing.expectEqual(@as(usize, 1), gst.cancels);
+    seat.pointerMotion(40, 40);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.motion);
+}
+
+/// Cancel-capturing keyboard grab for the F2 keyboard-grab test.
+const KbdGrabState = struct {
+    keys: usize = 0,
+    mods: usize = 0,
+    cancels: usize = 0,
+};
+fn kbdGrabOnKey(seat: *Seat, grab: *const KeyboardGrab, keycode: u32, pressed: bool) void {
+    _ = seat;
+    _ = keycode;
+    _ = pressed;
+    const st: *KbdGrabState = @ptrCast(@alignCast(grab.data.?));
+    st.keys += 1;
+}
+fn kbdGrabOnMods(seat: *Seat, grab: *const KeyboardGrab) void {
+    _ = seat;
+    const st: *KbdGrabState = @ptrCast(@alignCast(grab.data.?));
+    st.mods += 1;
+}
+fn kbdGrabOnCancel(seat: *Seat, grab: *const KeyboardGrab) void {
+    _ = seat;
+    const st: *KbdGrabState = @ptrCast(@alignCast(grab.data.?));
+    st.cancels += 1;
+}
+
+test "keyboard grab routes key events and modifiers, cancel on end (F2)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server);
+
+    // Focus A normally.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expect(a.kbd_events.entered);
+
+    // Install a swallow keyboard grab: key events reach the client no
+    // more (the grab's handler owns delivery), the seat state and key
+    // signal still fire.
+    var kst: KbdGrabState = .{};
+    const kgrab: KeyboardGrab = .{
+        .data = &kst,
+        .key = kbdGrabOnKey,
+        .modifiers = kbdGrabOnMods,
+        .cancel = kbdGrabOnCancel,
+    };
+    seat.startKeyboardGrab(&kgrab);
+    seat.keyEvent(38, true); // 'a' press routes to the grab
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), kst.keys);
+    try std.testing.expectEqual(@as(usize, 0), a.kbd_events.keys); // client frozen
+
+    // Modifier change under the grab routes to the grab's handler.
+    seat.keyEvent(50, true); // left shift
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), kst.mods);
+
+    // Cancel on end; default delivery restored.
+    seat.endKeyboardGrab();
+    try std.testing.expectEqual(@as(usize, 1), kst.cancels);
+    seat.keyEvent(50, false);
+    try ts.pump();
+    try std.testing.expect(a.kbd_events.keys > 0);
 }
 
 test "repeat tick before the deadline is a no-op, after it emits exactly once (S7)" {
