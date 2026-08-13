@@ -426,7 +426,9 @@ pub const Surface = struct {
         // Buffer may be destroyed by the buffers module — do not touch it.
         // Untracked wrappers (shm fromResource with no ShmState) are owned
         // by the surface: destroy them once the drop/unlock completes.
-        const current_buf = s.current.buffer;
+        // F32/C-CS-5: the presented content lives in `s.buffer` (the
+        // persistent cache); `s.current.buffer` is NULLed at commit end.
+        const current_buf = s.buffer;
         if (current_buf) |b| {
             b.drop();
             if (b.n_locks > 0) b.unlock();
@@ -560,7 +562,9 @@ pub const Surface = struct {
         // 4. Snapshot the previous committed geometry (F38, wlroots
         // wlr_compositor.c:523-528): consumers diff old vs new to damage
         // the OLD footprint when scale/transform/buffer size change.
-        const old_buffer = s.current.buffer;
+        // F32/C-CS-5: the previous presented content is `s.buffer` (the
+        // persistent cache) — `s.current.buffer` was NULLed last commit.
+        const old_buffer = s.buffer;
         s.previous.scale = s.current.scale;
         s.previous.transform = s.current.transform;
         s.previous.buffer_width = if (old_buffer) |b| b.width else 0;
@@ -588,6 +592,12 @@ pub const Surface = struct {
         s.translateDamage();
 
         // 7. Swap pending -> current.
+        // F32/C-CS-5: capture whether THIS commit carried a buffer. A
+        // commit without the buffer bit (damage-only, wlroots
+        // surface_state_move wlr_compositor.c:338-345) must NOT touch the
+        // presented content — `s.buffer` persists, and the previous
+        // buffer's drop is skipped.
+        const buffer_committed = s.pending.committed.buffer;
         swapState(&s.current, s.allocator, &s.pending);
         // The buffer resource moves with the buffer (F42): the destroy
         // listener now watches the current slot.
@@ -597,22 +607,28 @@ pub const Surface = struct {
         // 8. The surface stopped using the previous buffer. Its lock was
         // already released at the end of the previous commit, so this only
         // marks the producer done; the guard keeps a zero-count buffer
-        // (lockless re-attach) from being unlocked.
-        if (old_buffer) |old| {
-            if (old != s.current.buffer) {
-                old.drop();
-                if (old.n_locks > 0) old.unlock();
-                // Untracked wrappers are caller-owned: this was the
-                // surface's last reference, so free the wrapper (detaches
-                // its resource listeners). Tracked wrappers belong to
-                // ShmState, which frees them at deinit.
-                if (!old.tracked) old.destroy();
+        // (lockless re-attach) from being unlocked. Only a commit that
+        // replaced the buffer drops the old one (F32: a damage-only
+        // commit keeps the presented content).
+        if (buffer_committed) {
+            if (old_buffer) |old| {
+                if (old != s.current.buffer) {
+                    old.drop();
+                    if (old.n_locks > 0) old.unlock();
+                    // Untracked wrappers are caller-owned: this was the
+                    // surface's last reference, so free the wrapper (detaches
+                    // its resource listeners). Tracked wrappers belong to
+                    // ShmState, which frees them at deinit.
+                    if (!old.tracked) old.destroy();
+                }
             }
         }
         // Release callbacks ride along with the current buffer.
         std.mem.swap(std.ArrayList(*server.wl.Callback), &s.release_callbacks_current, &s.release_callbacks_pending);
         s.release_callbacks_pending.clearRetainingCapacity();
-        s.buffer = s.current.buffer;
+        // F32/C-CS-5: the mirror follows the swap only when the commit
+        // carried a buffer; otherwise the presented content persists.
+        if (buffer_committed) s.buffer = s.current.buffer;
 
         // 9. Role commit hook, then the commit signal. Frame callbacks
         // are not completed here: sendFrameDone fires them at present
@@ -638,18 +654,34 @@ pub const Surface = struct {
             if (b.n_locks > 0) b.unlock();
             s.fireReleaseCallbacksCurrent();
         }
+        // F32/C-CS-5: NULL the committed slot at commit end like wlroots
+        // (wlr_compositor.c:570-574 — current.buffer is not held across
+        // commits). The scene-facing `s.buffer` mirror (set above, step 8)
+        // is the per-surface cache that persists until the buffer is
+        // replaced or its resource dies (F42 clears it); consumers must
+        // read `s.buffer`, never `s.current.buffer`, for the presented
+        // content. current_resource is KEPT: the F42 resource-death
+        // listener matches it to clear the mirror when the client
+        // destroys the displayed buffer.
+        s.current.buffer = null;
     }
 
-    /// Whether the surface is effectively mapped: it has a current buffer
-    /// with a positive size AND its role's mapped gate passes. The gate
-    /// (SurfaceRole.mapped_gate) adds the role condition — the subsurface
-    /// role fails while any ancestor in the parent chain is unmapped
-    /// (wayland.xml:3254-3258: a sub-surface maps only when the parent
-    /// surface is mapped; the rules apply recursively). The scene uses
-    /// this for enter/present decisions; `mapped` (the transition) is
-    /// driven by updateMapped.
+    /// Whether the surface is effectively mapped: it has a presented
+    /// buffer with a positive size AND its role's mapped gate passes. The
+    /// gate (SurfaceRole.mapped_gate) adds the role condition — the
+    /// subsurface role fails while any ancestor in the parent chain is
+    /// unmapped (wayland.xml:3254-3258: a sub-surface maps only when the
+    /// parent surface is mapped; the rules apply recursively). The scene
+    /// uses this for enter/present decisions; `mapped` (the transition)
+    /// is driven by updateMapped.
+    ///
+    /// F32/C-CS-5: reads `s.buffer` (the persistent presented-content
+    /// cache), NOT `s.current.buffer` — the committed slot is NULLed at
+    /// the end of every commit (wlroots wlr_compositor.c:570-574), so
+    /// buffer presence is tracked by the mirror, which survives until the
+    /// buffer is replaced or its resource dies.
     pub fn isEffectivelyMapped(s: *Surface) bool {
-        const b = s.current.buffer orelse return false;
+        const b = s.buffer orelse return false;
         if (!(b.width > 0 and b.height > 0)) return false;
         if (s.role) |role| {
             if (role.mapped_gate) |gate| return gate(s);
@@ -1620,7 +1652,7 @@ test "attach, commit, map and unmap transitions" {
 
     try testing.expect(s.mapped);
     try testing.expect(s.buffer == &buffer);
-    try testing.expect(s.current.buffer == &buffer);
+    try testing.expect(s.buffer == &buffer);
     try testing.expect(s.pending.buffer == null);
     try testing.expectEqual(@as(usize, 1), test_map_count);
     try testing.expectEqual(@as(usize, 0), test_unmap_count);
@@ -1697,7 +1729,7 @@ test "commit unlocks the current buffer at commit end" {
     // release signal fired without any drop (fix 1).
     try testing.expectEqual(@as(u32, 0), b1.n_locks);
     try testing.expect(!b1.dropped);
-    try testing.expect(s.current.buffer == &b1);
+    try testing.expect(s.buffer == &b1);
 
     s.attachBuffer(&b2);
     s.commit();
@@ -1705,7 +1737,7 @@ test "commit unlocks the current buffer at commit end" {
     try testing.expect(b1.dropped);
     try testing.expectEqual(@as(u32, 0), b1.n_locks);
     try testing.expectEqual(@as(u32, 0), b2.n_locks);
-    try testing.expect(s.current.buffer == &b2);
+    try testing.expect(s.buffer == &b2);
 }
 
 test "re-attach of the current buffer does not double-lock" {
@@ -1733,7 +1765,7 @@ test "re-attach of the current buffer does not double-lock" {
     try testing.expect(s.pending_locked);
     s.commit();
     try testing.expectEqual(@as(u32, 0), b.n_locks);
-    try testing.expect(s.current.buffer == &b);
+    try testing.expect(s.buffer == &b);
     try testing.expect(!b.dropped);
 }
 
@@ -1836,7 +1868,7 @@ test "cursor-role surfaces may commit non-divisible sizes; others are rejected (
 
     // The commit proceeded past validation: the buffer swapped and the
     // surface mapped (a rejected commit would leave both untouched).
-    try testing.expect(cursor_s.current.buffer == &cursor_buf);
+    try testing.expect(cursor_s.buffer == &cursor_buf);
     try testing.expect(cursor_s.mapped);
 
     // Any non-cursor surface keeps the hard error: invalid_size is
@@ -2233,7 +2265,7 @@ test "OOM in the commit path aborts without applying partial state" {
     failing.fail_index = std.math.maxInt(usize);
     s.commit();
     try testing.expect(s.mapped);
-    try testing.expect(s.current.buffer == &buffer);
+    try testing.expect(s.buffer == &buffer);
     try testing.expectEqual(@as(u32, 0), buffer.n_locks);
     try testing.expectEqual(@as(usize, 0), s.pending.frame_callbacks.items.len);
     try testing.expectEqual(@as(usize, 1), s.current.frame_callbacks.items.len);

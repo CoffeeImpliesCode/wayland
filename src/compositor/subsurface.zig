@@ -813,7 +813,7 @@ test "synced child commits are deferred until the parent commits" {
     // pipeline (wlroots subsurface_handle_parent_commit, wlr_subcompositor.c:
     // 240-250): the child's state is applied and it maps.
     t.parent.commit();
-    try testing.expect(t.child.current.buffer == &buffer);
+    try testing.expect(t.child.buffer == &buffer);
     try testing.expect(t.child.mapped);
     try testing.expect(!ss.sync_cached);
     try testing.expect(!t.child.cached_state_locks);
@@ -847,7 +847,7 @@ test "a desync child commits immediately" {
     t.child.commit();
 
     // Desynced: applied immediately, like a plain surface.
-    try testing.expect(t.child.current.buffer == &buffer);
+    try testing.expect(t.child.buffer == &buffer);
     try testing.expect(t.child.mapped);
     try testing.expect(!ss.sync_cached);
     try testing.expect(!t.child.cached_state_locks);
@@ -872,7 +872,7 @@ test "set_desync flushes the cached commit" {
     // wlroots subsurface_handle_set_desync (wlr_subcompositor.c:195-207):
     // with no synced ancestor left, the cache is applied immediately.
     subsurfaceRequest(ss.resource, .set_desync, ss);
-    try testing.expect(t.child.current.buffer == &buffer);
+    try testing.expect(t.child.buffer == &buffer);
     try testing.expect(!ss.sync_cached);
     try testing.expect(!t.child.cached_state_locks);
 }
@@ -898,7 +898,7 @@ test "parent destroy applies the cached commit" {
     // death must make the child disappear (wayland.xml:3279-3280).
     t.parent.resource.destroy();
     try testing.expectEqual(@as(usize, 0), t.sc.subsurfaces.items.len);
-    try testing.expect(t.child.current.buffer == &buffer);
+    try testing.expect(t.child.buffer == &buffer);
     try testing.expect(!t.child.mapped);
     try testing.expect(t.child.role == null);
 }
@@ -933,7 +933,7 @@ test "multiple deferred commits merge into one flush commit" {
     // each cached state in sequence; merged is observationally equivalent
     // for buffer/damage/frame-callback behavior).
     t.parent.commit();
-    try testing.expect(t.child.current.buffer == &b2);
+    try testing.expect(t.child.buffer == &b2);
     try testing.expectEqual(@as(usize, 1), test_child_commit_count);
     try testing.expect(b1.dropped);
 }
@@ -1127,7 +1127,7 @@ test "desync child does not map while the parent is unmapped" {
     surface_mod.testBuffer(allocator, &buffer);
     t.child.attachBuffer(&buffer);
     t.child.commit();
-    try testing.expect(t.child.current.buffer == &buffer);
+    try testing.expect(t.child.buffer == &buffer);
     try testing.expect(!t.child.mapped);
 }
 
@@ -1189,7 +1189,7 @@ test "child unmaps when the parent unmaps" {
     try testing.expect(!t.parent.mapped);
     try testing.expect(!t.child.mapped);
     // The child's buffer stays committed; it remaps when the parent does.
-    try testing.expect(t.child.current.buffer == &buffer);
+    try testing.expect(t.child.buffer == &buffer);
 }
 
 test "grandchild hidden when the ancestor unmaps" {

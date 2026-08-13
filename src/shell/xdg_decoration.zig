@@ -64,6 +64,7 @@ const client = protocol.client;
 const display_mod = @import("../core/display.zig");
 const compositor_mod = @import("../compositor/compositor.zig");
 const surface_mod = @import("../compositor/surface.zig");
+const buffers = @import("../buffers/buffer.zig");
 const xdg_mod = @import("xdg.zig");
 
 const log_tag = "xdg_decoration";
@@ -904,8 +905,13 @@ test "decoration on a toplevel with a committed buffer -> unconfigured_buffer" {
     // directly (Surface.buffer mirrors current.buffer; the check only
     // tests presence).
     const srv_surface = ts.shell.?.toplevels.items[0].xdg_surface.surface;
-    const fake: *anyopaque = @ptrFromInt(@as(usize, 0x1000));
-    srv_surface.buffer = @ptrCast(@alignCast(fake));
+    // F32/C-CS-5: the unconfigured_buffer gate reads the persistent mirror
+    // (s.buffer); use a REAL fabricated buffer so the surface teardown in
+    // the error path drops it safely (a fake pointer would be dereferenced
+    // by the destroy path).
+    var committed: buffers.Buffer = undefined;
+    surface_mod.testBuffer(ts.allocator, &committed);
+    srv_surface.buffer = &committed;
 
     _ = try ts.decoration_client.?.getToplevelDecoration(tl.toplevel);
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
@@ -926,10 +932,12 @@ test "decoration v2: get_toplevel_decoration on a committed toplevel is allowed"
     const tl = try ts.createToplevel();
 
     // White-box (same as the v1 test): the client has no buffer machinery
-    // here, so set the server-side committed-buffer mirror directly.
+    // here, so set the server-side committed-buffer mirror directly. A
+    // REAL fabricated buffer — the teardown drops the mirror.
     const srv_surface = ts.shell.?.toplevels.items[0].xdg_surface.surface;
-    const fake: *anyopaque = @ptrFromInt(@as(usize, 0x1000));
-    srv_surface.buffer = @ptrCast(@alignCast(fake));
+    var committed: buffers.Buffer = undefined;
+    surface_mod.testBuffer(ts.allocator, &committed);
+    srv_surface.buffer = &committed;
 
     // v2: creation on a committed toplevel succeeds — no
     // unconfigured_buffer error (the XML: "creating an

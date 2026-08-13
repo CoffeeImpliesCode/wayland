@@ -665,7 +665,7 @@ test "out_of_buffer: source outside the buffer is rejected at commit" {
     s.commit();
     try std.testing.expect(!s.current.viewport.has_src);
     try std.testing.expect(!s.current.viewport.has_dst);
-    try std.testing.expect(s.current.buffer == &buffer);
+    try std.testing.expect(s.buffer == &buffer);
     try std.testing.expect(sn.node.?.kind.buffer.src == null);
 
     // The error is fatal: the next dispatch kills the client (error code

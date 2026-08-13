@@ -260,8 +260,9 @@ fn wmBaseGetXdgSurface(wm_base: *server.xdg.WmBase, state: *WmBaseState, r: anyt
     };
     // Creating an xdg_surface from a wl_surface with a buffer attached or
     // committed is a client error (unconfigured_buffer), caught at creation
-    // time rather than at the next commit.
-    if (surface.current.buffer != null or surface.pending.buffer != null) {
+    // time rather than at the next commit. F32/C-CS-5: the presented
+    // content is `surface.buffer` — `current.buffer` is NULLed at commit.
+    if (surface.buffer != null or surface.pending.buffer != null) {
         res.postError(.unconfigured_buffer, "wl_surface already has a buffer attached or committed");
         res.destroy();
         return;

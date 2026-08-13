@@ -3116,7 +3116,7 @@ test "set_cursor requires focus, a valid serial and the cursor role (F9)" {
     surface_a.pending.scale = 3; // 10 % 3 != 0 -> non-divisible
     surface_a.attachBuffer(&cursor_buf);
     surface_a.commit();
-    try std.testing.expect(surface_a.current.buffer == &cursor_buf);
+    try std.testing.expect(surface_a.buffer == &cursor_buf);
     try std.testing.expect(surface_a.mapped);
 
     // Role conflict: a surface with a different role posts
