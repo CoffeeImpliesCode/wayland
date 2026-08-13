@@ -27,6 +27,7 @@ pub fn build(b: *Build) void {
     scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/xdg-output/xdg-output-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-screencopy-unstable-v1.xml"));
 
@@ -44,6 +45,7 @@ pub fn build(b: *Build) void {
     scanner.generate("xdg_activation_v1", 1);
     scanner.generate("zxdg_decoration_manager_v1", 2);
     scanner.generate("zwp_primary_selection_device_manager_v1", 1);
+    scanner.generate("zxdg_output_manager_v1", 3);
     scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("zwlr_screencopy_manager_v1", 3);
     scanner.generate("wp_viewporter", 1);

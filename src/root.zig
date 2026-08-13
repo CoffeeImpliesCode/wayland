@@ -88,6 +88,9 @@ pub const xdg_decoration = @import("shell/xdg_decoration.zig");
 /// wp_fractional_scale_manager_v1 (staging/fractional-scale-v1): the
 /// compositor's preferred fractional scale.
 pub const fractional_scale = @import("shell/fractional_scale.zig");
+/// zxdg_output_manager_v1 (unstable/xdg-output): logical output geometry
+/// + stable name/description for clients (grim layout, screenshots).
+pub const xdg_output = @import("shell/xdg_output.zig");
 /// wp_viewporter (stable/viewporter): crop/scale surface content.
 pub const viewporter = @import("shell/viewporter.zig");
 pub const scene = @import("scene/scene.zig");
@@ -148,6 +151,7 @@ comptime {
     _ = xdg_activation;
     _ = xdg_decoration;
     _ = fractional_scale;
+    _ = xdg_output;
     _ = viewporter;
     _ = scene;
     _ = surface_node;

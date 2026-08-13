@@ -295,9 +295,13 @@ const ServerState = struct {
     run_frames: u32 = 0,
     watchdog_fired: bool = false,
     /// WAYLAND_SYNTH_INPUT=1: synthesize one pointer click + key press
-    /// once the first surface is mapped (headless input E2E).
+    /// per newly-mapped surface (headless input E2E). The first client
+    /// gets the original click+key; every later surface (a second
+    /// client, a popup) gets the same treatment so multi-client sessions
+    /// (selection roundtrips) also see focus + a serial. Tracked by
+    /// surface identity so re-maps of the same surface do not re-click.
     synth_input: bool = false,
-    synth_fired: bool = false,
+    synth_clicked: std.AutoHashMapUnmanaged(*Surface, void) = .{},
     /// M4 Phase B: the synth wheel-zoom step (one wheel-up notch once
     /// the client's FIRST screencopy capture has been served, plus a
     /// 2-frame grace) has been sent. Separate from synth_fired: the
@@ -474,6 +478,10 @@ pub fn main(init: std.process.Init) !void {
     // wp_fractional_scale_manager_v1 (staging): the preferred scale.
     const fractional_scale = try wayland.fractional_scale.FractionalScale.init(allocator, io, &log_cfg, display);
     defer fractional_scale.deinit();
+    // zxdg_output_manager_v1 (unstable/xdg-output): logical output
+    // geometry for clients (grim, region tools).
+    const xdg_output = try wayland.xdg_output.XdgOutput.init(allocator, io, &log_cfg, display);
+    defer xdg_output.deinit();
     // Advertise the preferred scale now (scale 1: 120/120). The value is
     // a settable API — a future scale path calls setPreferredScale on
     // output-scale change (wlroots refines to per-surface notify_scale).
@@ -658,6 +666,7 @@ pub fn main(init: std.process.Init) !void {
         .seat_axis_listener = wire.Listener(*wayland.seat.Seat).init(onSeatAxis),
     };
     if (backend_is_drm) state.drm_backend = backend;
+    defer state.synth_clicked.deinit(allocator);
     defer state.toplevels.deinit(allocator);
     defer state.layer_surfaces.deinit(allocator);
     defer state.layer_popups.deinit(allocator);
@@ -1508,28 +1517,37 @@ fn onRaylibPollTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
 /// zooms the camera (2 -> 2.5 under the E2E).
 fn maybeSynthInput(self: *ServerState) void {
     if (!self.synth_input) return;
-    if (!self.synth_fired) {
-        var any_mapped = false;
-        if (self.scene) |scene| {
-            var entry_it = scene.surface_nodes.valueIterator();
-            while (entry_it.next()) |sn| {
-                if (sn.*.node != null) {
-                    any_mapped = true;
-                    break;
-                }
+    // Target every NOT-yet-clicked mapped surface (see synth_clicked):
+    // the first client gets the original M3 click+key, later clients
+    // (selection roundtrips) get focus + a serial too.
+    var target: ?*wayland.scene.SceneNode = null;
+    var target_surface: ?*Surface = null;
+    if (self.scene) |scene| {
+        var entry_it = scene.surface_nodes.valueIterator();
+        while (entry_it.next()) |sn| {
+            if (sn.*.node != null and
+                !self.synth_clicked.contains(sn.*.surface))
+            {
+                target = sn.*.node;
+                target_surface = sn.*.surface;
+                break;
             }
         }
-        if (any_mapped) {
-            self.synth_fired = true;
-            const seat = self.seat;
-            seat.pointerMotion(50, 50);
-            seat.pointerButton(wayland.seat.btn_left, true);
-            seat.pointerButton(wayland.seat.btn_left, false);
-            seat.keyEvent(38, true); // 'a' (evdev A + 8)
-            seat.keyEvent(38, false);
-            log.info("synth input: pointer click + key 'a' at 50,50", self.io, self.log_cfg, "server", .{});
-        }
     }
+    const t = target orelse return;
+    const tsurf = target_surface.?;
+    const rect = t.absolutePosition();
+    const sx = rect.x + @divTrunc(rect.width, 2);
+    const sy = rect.y + @divTrunc(rect.height, 2);
+    self.synth_clicked.put(self.allocator, tsurf, {}) catch return;
+    const seat = self.seat;
+    seat.pointerMotion(sx, sy);
+    seat.pointerButton(wayland.seat.btn_left, true);
+    seat.pointerButton(wayland.seat.btn_left, false);
+    seat.keyEvent(38, true); // 'a' (evdev A + 8)
+    seat.keyEvent(38, false);
+    log.info("synth input: pointer click + key 'a' at {d},{d}", self.io, self.log_cfg, "server", .{ sx, sy });
+    // (the wheel-zoom step follows below, once the first capture is served)
     if (!self.synth_scrolled) {
         if (self.screencopy) |sc| {
             if (sc.captures_served >= 1) {
