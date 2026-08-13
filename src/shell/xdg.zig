@@ -519,6 +519,7 @@ fn xdgSurfaceGetToplevel(xdg: *XdgSurface, id: u32) void {
     t.events.request_show_window_menu.init();
     t.events.set_title.init();
     t.events.set_app_id.init();
+    t.events.initial_commit.init();
     t.events.destroy.init();
     res.setHandler(*XdgToplevel, toplevelRequest, toplevelDestroy, t);
     // F4: the first configure must carry wm_capabilities (wlroots seeds
@@ -600,6 +601,7 @@ fn xdgSurfaceGetPopup(xdg: *XdgSurface, r: anytype) void {
         .events = undefined,
     };
     popup.events.destroy.init();
+    popup.events.initial_commit.init();
     res.setHandler(*XdgPopup, popupRequest, popupDestroy, popup);
     xdg.popup = popup;
     xdg.role = .popup;
@@ -868,6 +870,14 @@ pub const XdgToplevel = struct {
         set_title: wire.Signal(*XdgToplevel),
         /// The client changed the app_id (F14).
         set_app_id: wire.Signal(*XdgToplevel),
+        /// The client performed the initial (buffer-less) commit after the
+        /// role object was created (X08): the compositor must reply with a
+        /// configure so the client can map (wlroots: tinywl's commit
+        /// listener checks base->initial_commit and calls
+        /// wlr_xdg_toplevel_set_size / schedule_configure). The module
+        /// never self-configures; the compositor calls scheduleConfigure
+        /// from this signal.
+        initial_commit: wire.Signal(*XdgToplevel),
         /// The role object was destroyed.
         destroy: wire.Signal(*XdgToplevel),
     },
@@ -946,6 +956,16 @@ pub const XdgToplevel = struct {
         log.info("toplevel configure serial={d} {d}x{d} states={d}", xdg.io, xdg.log_cfg, log_tag, .{
             serial, width, height, states.len,
         });
+    }
+
+    /// Compositor-driven configure (X08): send a configure with the
+    /// current scheduled size/states — the reply to the client's initial
+    /// commit, or a re-configure after a policy change. Called from the
+    /// initial_commit signal (or any arrange pass); the module never
+    /// self-configures (wlroots: the compositor drives
+    /// wlr_xdg_toplevel_configure / schedule_configure).
+    pub fn scheduleConfigure(t: *XdgToplevel) !void {
+        try t.configure(t.scheduled.width, t.scheduled.height);
     }
 
     /// Apply the acked configure payload to `current` (wlroots
@@ -1360,6 +1380,13 @@ pub const XdgPopup = struct {
     grab_state: ?*PopupGrab = null,
     events: struct {
         destroy: wire.Signal(*XdgPopup),
+        /// The client performed the initial (buffer-less) commit after the
+        /// role object was created (X08): the compositor must reply with a
+        /// configure so the client can map (wlroots: tinywl's popup commit
+        /// listener calls wlr_xdg_surface_schedule_configure). The module
+        /// never self-configures; the compositor calls scheduleConfigure
+        /// from this signal.
+        initial_commit: wire.Signal(*XdgPopup),
     },
 
     /// Recompute `geometry` from the positioner rules, applying the
@@ -1397,6 +1424,16 @@ pub const XdgPopup = struct {
             p.geometry.width,
             p.geometry.height,
         });
+    }
+
+    /// Compositor-driven configure (X08): re-place and re-send the
+    /// configure — the reply to the client's initial commit, or a
+    /// reactive re-configure after a constraint/positioner change.
+    /// Called from the initial_commit signal (or any arrange pass); the
+    /// module never self-configures (wlroots: the compositor drives
+    /// wlr_xdg_surface_schedule_configure).
+    pub fn scheduleConfigure(p: *XdgPopup) !void {
+        try p.configure();
     }
 
     /// Apply the acked configure's geometry (wlroots
@@ -2294,17 +2331,18 @@ fn xdgSurfaceCommit(surface: *surface_mod.Surface) void {
     switch (xdg.role) {
         .none => {},
         .toplevel => if (xdg.toplevel) |t| {
-            // Protocol: the initial configure is sent in reply to the client's
-            // first (buffer-less) commit after the role object exists.
+            // X08: the initial configure is compositor-driven (wlroots:
+            // tinywl's commit listener schedules it). The module emits
+            // initial_commit on the client's first (buffer-less) commit
+            // after the role exists; the compositor replies with
+            // scheduleConfigure so the client can map.
             if (!xdg.configure_sent) {
-                t.configure(t.scheduled.width, t.scheduled.height) catch {
-                    t.resource.postNoMemory();
-                };
+                t.events.initial_commit.emit(t);
             }
         },
         .popup => if (xdg.popup) |p| {
             if (!xdg.configure_sent) {
-                p.configure() catch p.resource.postNoMemory();
+                p.events.initial_commit.emit(p);
             }
         },
     }
@@ -2623,6 +2661,117 @@ const NewToplevelCapture = struct {
     }
 };
 
+/// Per-role auto-configure listeners (X08): the compositor's production
+/// replica — every new toplevel/popup replies to its initial commit with
+/// scheduleConfigure. One heap struct per role; freed by its destroy
+/// listener.
+pub const AutoConfigureListeners = struct {
+    initial_commit: wire.Listener(*XdgToplevel),
+    destroy: wire.Listener(*XdgToplevel),
+    popup_initial_commit: wire.Listener(*XdgPopup),
+    popup_destroy: wire.Listener(*XdgPopup),
+
+    fn onToplevelInitial(listener: *wire.Listener(*XdgToplevel), t: *XdgToplevel) void {
+        _ = listener;
+        t.scheduleConfigure() catch t.resource.postNoMemory();
+    }
+    fn onToplevelDestroy(listener: *wire.Listener(*XdgToplevel), t: *XdgToplevel) void {
+        const acl: *AutoConfigureListeners = @fieldParentPtr("destroy", listener);
+        const allocator = t.allocator;
+        allocator.destroy(acl);
+    }
+    fn onPopupInitial(listener: *wire.Listener(*XdgPopup), p: *XdgPopup) void {
+        _ = listener;
+        p.scheduleConfigure() catch p.resource.postNoMemory();
+    }
+    fn onPopupDestroy(listener: *wire.Listener(*XdgPopup), p: *XdgPopup) void {
+        const acl: *AutoConfigureListeners = @fieldParentPtr("popup_destroy", listener);
+        const allocator = p.allocator;
+        allocator.destroy(acl);
+    }
+};
+
+/// X08 compositor wiring: a watcher that subscribes to a shell's
+/// new_toplevel/new_popup and, for each role, installs per-role
+/// initial_commit → scheduleConfigure listeners (the module never
+/// self-configures). Each per-role listener struct is freed by the role's
+/// destroy listener. Test harnesses keep the watcher alive to replicate
+/// main.zig's production wiring.
+pub const AutoConfigureWatcher = struct {
+    new_toplevel: wire.Listener(*XdgToplevel),
+    new_popup: wire.Listener(*XdgPopup),
+
+    /// Wire `self` into `shell`'s new_toplevel/new_popup signals. The
+    /// watcher must live as long as the shell (its listeners sit in the
+    /// shell's signal lists); initialize in place — never by-value return
+    /// from a stack copy, or the signal lists dangle.
+    pub fn init(self: *AutoConfigureWatcher, shell: *XdgShell) void {
+        self.* = .{
+            .new_toplevel = wire.Listener(*XdgToplevel).init(onNewToplevel),
+            .new_popup = wire.Listener(*XdgPopup).init(onNewPopup),
+        };
+        shell.events.new_toplevel.add(&self.new_toplevel);
+        shell.events.new_popup.add(&self.new_popup);
+    }
+
+    fn onNewToplevel(listener: *wire.Listener(*XdgToplevel), t: *XdgToplevel) void {
+        _ = listener;
+        const acl = t.allocator.create(AutoConfigureListeners) catch return;
+        acl.* = .{
+            .initial_commit = wire.Listener(*XdgToplevel).init(AutoConfigureListeners.onToplevelInitial),
+            .destroy = wire.Listener(*XdgToplevel).init(AutoConfigureListeners.onToplevelDestroy),
+            .popup_initial_commit = wire.Listener(*XdgPopup).init(AutoConfigureListeners.onPopupInitial),
+            .popup_destroy = wire.Listener(*XdgPopup).init(AutoConfigureListeners.onPopupDestroy),
+        };
+        t.events.initial_commit.add(&acl.initial_commit);
+        t.events.destroy.add(&acl.destroy);
+    }
+
+    fn onNewPopup(listener: *wire.Listener(*XdgPopup), p: *XdgPopup) void {
+        _ = listener;
+        const acl = p.allocator.create(AutoConfigureListeners) catch return;
+        acl.* = .{
+            .initial_commit = wire.Listener(*XdgToplevel).init(AutoConfigureListeners.onToplevelInitial),
+            .destroy = wire.Listener(*XdgToplevel).init(AutoConfigureListeners.onToplevelDestroy),
+            .popup_initial_commit = wire.Listener(*XdgPopup).init(AutoConfigureListeners.onPopupInitial),
+            .popup_destroy = wire.Listener(*XdgPopup).init(AutoConfigureListeners.onPopupDestroy),
+        };
+        p.events.initial_commit.add(&acl.popup_initial_commit);
+        p.events.destroy.add(&acl.popup_destroy);
+    }
+};
+
+/// X08 harness wiring: a new toplevel role gets its initial_commit
+/// auto-configured (the module never self-configures; the harness
+/// mirrors main.zig's production listener).
+fn onTestNewToplevel(listener: *wire.Listener(*XdgToplevel), t: *XdgToplevel) void {
+    const ts: *TestServer = @fieldParentPtr("new_toplevel_auto", listener);
+    const acl = ts.allocator.create(AutoConfigureListeners) catch return;
+    acl.* = .{
+        .initial_commit = wire.Listener(*XdgToplevel).init(AutoConfigureListeners.onToplevelInitial),
+        .destroy = wire.Listener(*XdgToplevel).init(AutoConfigureListeners.onToplevelDestroy),
+        .popup_initial_commit = wire.Listener(*XdgPopup).init(AutoConfigureListeners.onPopupInitial),
+        .popup_destroy = wire.Listener(*XdgPopup).init(AutoConfigureListeners.onPopupDestroy),
+    };
+    t.events.initial_commit.add(&acl.initial_commit);
+    t.events.destroy.add(&acl.destroy);
+}
+
+/// X08 harness wiring: a new popup role gets its initial_commit
+/// auto-configured.
+fn onTestNewPopup(listener: *wire.Listener(*XdgPopup), p: *XdgPopup) void {
+    const ts: *TestServer = @fieldParentPtr("new_popup_auto", listener);
+    const acl = ts.allocator.create(AutoConfigureListeners) catch return;
+    acl.* = .{
+        .initial_commit = wire.Listener(*XdgToplevel).init(AutoConfigureListeners.onToplevelInitial),
+        .destroy = wire.Listener(*XdgToplevel).init(AutoConfigureListeners.onToplevelDestroy),
+        .popup_initial_commit = wire.Listener(*XdgPopup).init(AutoConfigureListeners.onPopupInitial),
+        .popup_destroy = wire.Listener(*XdgPopup).init(AutoConfigureListeners.onPopupDestroy),
+    };
+    p.events.initial_commit.add(&acl.popup_initial_commit);
+    p.events.destroy.add(&acl.popup_destroy);
+}
+
 const NewPopupCapture = struct {
     count: usize = 0,
     listener: wire.Listener(*XdgPopup),
@@ -2652,6 +2801,13 @@ const TestServer = struct {
     /// pool is retained so the buffer stays valid across re-attaches.
     shm_pool: ?*client.wl.ShmPool = null,
     buffer: ?*client.wl.Buffer = null,
+    /// X08: the harness replicates main.zig's production wiring — the
+    /// compositor drives the initial configure. Each new toplevel/popup
+    /// gets an initial_commit listener that calls scheduleConfigure (the
+    /// module never self-configures). The per-role listener structs are
+    /// freed by the role's own destroy listener (AutoConfigureListeners).
+    new_toplevel_auto: wire.Listener(*XdgToplevel),
+    new_popup_auto: wire.Listener(*XdgPopup),
 
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, compositor, shell and seat all store it).
@@ -2668,6 +2824,8 @@ const TestServer = struct {
             .allocator = allocator,
             .io = std.Io.Threaded.global_single_threaded.io(),
             .log_cfg = .{ .min_level = .err },
+            .new_toplevel_auto = wire.Listener(*XdgToplevel).init(onTestNewToplevel),
+            .new_popup_auto = wire.Listener(*XdgPopup).init(onTestNewPopup),
         };
         ts.display = try display_mod.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
         errdefer if (ts.display) |d| d.deinit();
@@ -2708,6 +2866,10 @@ const TestServer = struct {
         ts.shm = try registry.bind(capture.shm_name.?, client.wl.Shm, 1);
         ts.wl_seat = try registry.bind(capture.seat_name.?, client.wl.Seat, 7);
         try ts.pump();
+        // X08: replicate the production wiring — the compositor drives the
+        // initial configure (scheduleConfigure on initial_commit).
+        ts.shell.?.events.new_toplevel.add(&ts.new_toplevel_auto);
+        ts.shell.?.events.new_popup.add(&ts.new_popup_auto);
         return ts;
     }
 
@@ -2872,6 +3034,54 @@ test "xdg toplevel configure/ack roundtrip" {
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     // The client library records the protocol error code (invalid_serial = 4).
     try std.testing.expectEqual(@as(c_int, 4), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+/// initial_commit capture for the X08 contract test.
+const CommitCapture = struct {
+    count: usize = 0,
+    listener: wire.Listener(*XdgToplevel),
+    fn on(l: *wire.Listener(*XdgToplevel), t: *XdgToplevel) void {
+        _ = t;
+        @as(*CommitCapture, @fieldParentPtr("listener", l)).count += 1;
+    }
+};
+
+test "initial_commit drives exactly one compositor-scheduled configure (X08)" {
+    // X08: the module never self-configures — the first (buffer-less)
+    // commit emits initial_commit, and the compositor's listener
+    // (the TestServer's production replica) replies with scheduleConfigure.
+    // A role without a listener gets NO configure at all: the signal IS
+    // the contract.
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const toplevel = try xdg_surface.getToplevel();
+    var xs_events: XdgSurfaceEvents = .{};
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    var tl_events: ToplevelEvents = .{};
+    toplevel.setListener(*ToplevelEvents, ToplevelEvents.listener, &tl_events);
+    try ts.pump();
+    var capture: CommitCapture = .{ .listener = wire.Listener(*XdgToplevel).init(CommitCapture.on) };
+    const t = ts.shell.?.toplevels.items[0];
+    t.events.initial_commit.add(&capture.listener);
+
+    // First buffer-less commit: initial_commit fires; the harness's
+    // scheduleConfigure listener sends exactly one configure.
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(usize, 1), xs_events.configure_count);
+    try std.testing.expectEqual(@as(usize, 1), tl_events.configure_count);
+
+    // A second commit does NOT re-fire initial_commit (configure_sent
+    // gates it): the compositor schedules, the module never re-emits.
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(usize, 1), xs_events.configure_count);
 }
 
 test "xdg popup configure and positioner errors" {

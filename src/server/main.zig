@@ -1011,12 +1011,23 @@ const ToplevelListeners = struct {
     request_minimize: wire.Listener(*wayland.shell.XdgToplevel),
     request_fullscreen: wire.Listener(*wayland.shell.FullscreenRequest),
     request_move: wire.Listener(*wayland.shell.MoveRequest),
+    initial_commit: wire.Listener(*wayland.shell.XdgToplevel),
     destroy: wire.Listener(*wayland.shell.XdgToplevel),
 };
 
 fn onToplevelTitle(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
     const tl: *ToplevelListeners = @fieldParentPtr("set_title", listener);
     log.info("toplevel title changed: {s}", tl.state.io, tl.state.log_cfg, "server", .{t.title orelse "(none)"});
+}
+
+/// X08: the client performed the initial commit; the compositor replies
+/// with the configure (the module never self-configures). 0,0 = "client
+/// decides" (wlroots tinywl does the same on the initial commit).
+fn onToplevelInitialCommit(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
+    const tl: *ToplevelListeners = @fieldParentPtr("initial_commit", listener);
+    t.scheduleConfigure() catch {
+        log.warn("initial toplevel configure failed", tl.state.io, tl.state.log_cfg, "server", .{});
+    };
 }
 
 fn onToplevelAppId(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
@@ -1095,6 +1106,7 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
         .request_minimize = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelMinimize),
         .request_fullscreen = wire.Listener(*wayland.shell.FullscreenRequest).init(onToplevelFullscreen),
         .request_move = wire.Listener(*wayland.shell.MoveRequest).init(onToplevelMove),
+        .initial_commit = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelInitialCommit),
         .destroy = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelDestroy),
     };
     t.events.set_title.add(&tl.set_title);
@@ -1102,6 +1114,7 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
     t.events.request_minimize.add(&tl.request_minimize);
     t.events.request_fullscreen.add(&tl.request_fullscreen);
     t.events.request_move.add(&tl.request_move);
+    t.events.initial_commit.add(&tl.initial_commit);
     t.events.destroy.add(&tl.destroy);
     log.info("new toplevel (title={s} app_id={s}) total={d}", self.io, self.log_cfg, "server", .{
         t.title orelse "(none)",
@@ -1136,11 +1149,51 @@ fn onNewLayerSurface(
     if (self.output) |out| {
         ls.setFallbackSize(@intCast(out.mode.width), @intCast(out.mode.height));
     }
+    // L-D6: the compositor drives the initial configure. One heap struct
+    // per layer surface (freed by its destroy listener).
+    const ll = self.allocator.create(LayerListeners) catch |err| {
+        log.warn("failed to allocate layer listeners: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    ll.* = .{
+        .state = self,
+        .initial_commit = wire.Listener(*wayland.layer_shell.LayerSurface).init(onLayerInitialCommit),
+        .destroy = wire.Listener(*wayland.layer_shell.LayerSurface).init(onLayerDestroy),
+    };
+    ls.events.initial_commit.add(&ll.initial_commit);
+    ls.events.destroy.add(&ll.destroy);
     log.info("new layer surface (namespace={s} layer={d}) total={d}", self.io, self.log_cfg, "server", .{
         ls.namespace orelse "(none)",
         @intFromEnum(ls.current.layer),
         self.layer_surfaces.items.len,
     });
+}
+
+/// Per-layer-surface listeners (L-D6): heap-allocated in onNewLayerSurface,
+/// freed by onLayerDestroy.
+const LayerListeners = struct {
+    state: *ServerState,
+    initial_commit: wire.Listener(*wayland.layer_shell.LayerSurface),
+    destroy: wire.Listener(*wayland.layer_shell.LayerSurface),
+};
+
+fn onLayerInitialCommit(
+    listener: *wire.Listener(*wayland.layer_shell.LayerSurface),
+    ls: *wayland.layer_shell.LayerSurface,
+) void {
+    _ = listener;
+    // L-D6: the compositor replies to the initial commit with the arrange
+    // (the module never self-configures).
+    ls.arrange();
+}
+
+fn onLayerDestroy(
+    listener: *wire.Listener(*wayland.layer_shell.LayerSurface),
+    ls: *wayland.layer_shell.LayerSurface,
+) void {
+    _ = ls;
+    const ll: *LayerListeners = @fieldParentPtr("destroy", listener);
+    ll.state.allocator.destroy(ll);
 }
 
 /// zwlr_layer_shell_v1 events.new_popup (L1): an xdg_popup was parented to
@@ -1173,9 +1226,43 @@ fn onNewPopup(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.she
             .height = out.mode.height,
         });
     }
+    // X08: the compositor drives the initial configure. One heap struct
+    // per popup (freed by its destroy listener).
+    const pl = self.allocator.create(PopupListeners) catch |err| {
+        log.warn("failed to allocate popup listeners: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    pl.* = .{
+        .state = self,
+        .initial_commit = wire.Listener(*wayland.shell.XdgPopup).init(onPopupInitialCommit),
+        .destroy = wire.Listener(*wayland.shell.XdgPopup).init(onPopupDestroy),
+    };
+    p.events.initial_commit.add(&pl.initial_commit);
+    p.events.destroy.add(&pl.destroy);
     log.info("new popup at {d},{d} {d}x{d}", self.io, self.log_cfg, "server", .{
         p.geometry.x, p.geometry.y, p.geometry.width, p.geometry.height,
     });
+}
+
+/// Per-popup listeners (X08): heap-allocated in onNewPopup, freed by
+/// onPopupDestroy.
+const PopupListeners = struct {
+    state: *ServerState,
+    initial_commit: wire.Listener(*wayland.shell.XdgPopup),
+    destroy: wire.Listener(*wayland.shell.XdgPopup),
+};
+
+fn onPopupInitialCommit(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.shell.XdgPopup) void {
+    const pl: *PopupListeners = @fieldParentPtr("initial_commit", listener);
+    p.scheduleConfigure() catch {
+        log.warn("initial popup configure failed", pl.state.io, pl.state.log_cfg, "server", .{});
+    };
+}
+
+fn onPopupDestroy(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.shell.XdgPopup) void {
+    _ = p;
+    const pl: *PopupListeners = @fieldParentPtr("destroy", listener);
+    pl.state.allocator.destroy(pl);
 }
 
 fn onRequestActivate(

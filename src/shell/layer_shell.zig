@@ -192,6 +192,7 @@ fn layerShellGetLayerSurface(layer_shell: *server.zwlr.LayerShellV1, shell: *Lay
         .events = undefined,
     };
     ls.events.destroy.init();
+    ls.events.initial_commit.init();
     res.setHandler(*LayerSurface, layerSurfaceRequest, layerSurfaceDestroy, ls);
     ls.namespace = shell.allocator.dupe(u8, std.mem.span(r.namespace)) catch {
         res.destroy();
@@ -325,13 +326,23 @@ pub const LayerSurface = struct {
     closed: bool = false,
     events: struct {
         destroy: wire.Signal(*LayerSurface),
+        /// The client performed the initial (buffer-less) commit (L-D6):
+        /// the compositor must reply with a configure so the client can
+        /// map (wlroots: wlr_layer_surface_v1_configure asserts
+        /// initialized; the compositor drives it). The module never
+        /// self-configures; the compositor calls arrange from this signal.
+        initial_commit: wire.Signal(*LayerSurface),
     },
 
-    /// Send layer_surface.configure with the size the compositor assigns:
-    /// the desired size per axis, or the compositor-supplied fallback (the
-    /// output size from main.zig) where the client left the dimension 0.
-    /// The serial + size are recorded for ack_configure validation (L6).
-    fn sendConfigure(ls: *LayerSurface) void {
+    /// Compositor-driven configure (L-D6): send layer_surface.configure
+    /// with the size the compositor assigns — the desired size per axis,
+    /// or the compositor-supplied fallback (the output size from main.zig)
+    /// where the client left the dimension 0. Called from the
+    /// initial_commit signal (or any arrange pass); the module never
+    /// self-configures (wlroots: wlr_layer_surface_v1_configure asserts
+    /// initialized, wlr_layer_shell_v1.c:316-336 — the compositor calls
+    /// it). The serial + size are recorded for ack_configure validation.
+    pub fn arrange(ls: *LayerSurface) void {
         const serial = ls.shell.display.nextSerial();
         const width: u32 = if (ls.current.desired_width == 0) ls.fallback_width else ls.current.desired_width;
         const height: u32 = if (ls.current.desired_height == 0) ls.fallback_height else ls.current.desired_height;
@@ -718,7 +729,11 @@ fn layerSurfaceCommit(surface: *surface_mod.Surface) void {
     const ls = layerFromSurface(surface) orelse return;
     if (surface.current.buffer == null) {
         if (!ls.configure_sent) {
-            ls.sendConfigure();
+            // L-D6: the initial configure is compositor-driven (wlroots
+            // never self-configures); the module emits initial_commit on
+            // the first buffer-less commit and the compositor replies
+            // with arrange().
+            ls.events.initial_commit.emit(ls);
         } else {
             ls.reset();
             log.info("layer surface reset (unmapped)", ls.io, ls.log_cfg, log_tag, .{});
@@ -894,6 +909,47 @@ const PopupEvents = struct {
 };
 
 /// A full compositor + layer shell + in-memory client, for wire roundtrips.
+/// L-D6 harness wiring: subscribe to new_layer_surface and auto-arrange
+/// each new layer surface's initial commit (the module never
+/// self-configures; mirrors main.zig's production listener). The
+/// per-surface listener struct is freed by the surface's destroy.
+const LayerAutoArranger = struct {
+    new_surface: wire.Listener(*LayerSurface),
+
+    pub fn init(self: *LayerAutoArranger, shell: *LayerShell) void {
+        self.* = .{ .new_surface = wire.Listener(*LayerSurface).init(onNewSurface) };
+        shell.events.new_layer_surface.add(&self.new_surface);
+    }
+
+    fn onNewSurface(listener: *wire.Listener(*LayerSurface), ls: *LayerSurface) void {
+        _ = listener;
+        const holder = ls.allocator.create(ArrangerHolder) catch return;
+        holder.* = .{
+            .initial_commit = wire.Listener(*LayerSurface).init(onInitialCommit),
+            .destroy = wire.Listener(*LayerSurface).init(onDestroy),
+        };
+        ls.events.initial_commit.add(&holder.initial_commit);
+        ls.events.destroy.add(&holder.destroy);
+    }
+
+    fn onInitialCommit(listener: *wire.Listener(*LayerSurface), ls: *LayerSurface) void {
+        _ = listener;
+        ls.arrange();
+    }
+
+    fn onDestroy(listener: *wire.Listener(*LayerSurface), ls: *LayerSurface) void {
+        const holder: *ArrangerHolder = @fieldParentPtr("destroy", listener);
+        const allocator = ls.allocator;
+        allocator.destroy(holder);
+    }
+};
+
+/// Per-layer-surface arrange listeners (freed by the surface's destroy).
+const ArrangerHolder = struct {
+    initial_commit: wire.Listener(*LayerSurface),
+    destroy: wire.Listener(*LayerSurface),
+};
+
 const TestServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -909,6 +965,11 @@ const TestServer = struct {
     wl_shm: ?*client.wl.Shm = null,
     layer_shell: ?*client.zwlr.LayerShellV1 = null,
     wm_base: ?*client.xdg.WmBase = null,
+    /// X08: compositor-driven initial configure (production replica).
+    auto_configure: xdg_mod.AutoConfigureWatcher = undefined,
+    /// L-D6: harness replica of the production wiring — every new layer
+    /// surface replies to its initial commit with arrange().
+    auto_arrange: LayerAutoArranger = undefined,
 
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, compositor and shell all store it).
@@ -967,6 +1028,8 @@ const TestServer = struct {
         ts.layer_shell = try registry.bind(capture.layer_shell_name.?, client.zwlr.LayerShellV1, layer_shell_version);
         ts.wm_base = try registry.bind(capture.wm_base_name.?, client.xdg.WmBase, 7);
         try ts.pump();
+        xdg_mod.AutoConfigureWatcher.init(&ts.auto_configure, ts.xdg_shell.?);
+        LayerAutoArranger.init(&ts.auto_arrange, ts.shell.?);
         return ts;
     }
 
