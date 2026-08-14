@@ -1,6 +1,8 @@
 .zig-cache/
 zig-out/
+.zig-global-cache/
 codedb.snapshot
 .devenv/
 .direnv/
 .no-auto-demo
+/agent-notes

@@ -7,7 +7,30 @@ pub fn build(b: *Build) void {
     // The demo server runs at ReleaseSafe (house directive): Debug is the
     // slow mode (per-pixel loops with safety checks measured 55-70ms/frame
     // vs ~32ms at ReleaseSafe). Pass -Doptimize=Debug for test runs.
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
+    //
+    // Not standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe }):
+    // that path registers only -Drelease, so -Doptimize is rejected as an
+    // unknown option and an unflagged build lands in .Debug. Register the
+    // option here and default to the intended mode, mirroring the std
+    // switch for the --release=* spellings.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse switch (b.release_mode) {
+        .off => std.builtin.OptimizeMode.ReleaseSafe,
+        .fast => std.builtin.OptimizeMode.ReleaseFast,
+        .safe => std.builtin.OptimizeMode.ReleaseSafe,
+        .small => std.builtin.OptimizeMode.ReleaseSmall,
+        .any => {
+            std.debug.print(
+                "the project defaults to ReleaseSafe; pass " ++
+                    "-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall\n",
+                .{},
+            );
+            std.process.exit(1);
+        },
+    };
 
     // zig-cov coverage (see zig-cov README): zig-gate --cov passes these
     const coverage = b.option(bool, "coverage", "Enable zig-cov") orelse false;
@@ -371,4 +394,19 @@ pub fn build(b: *Build) void {
     check_step.dependOn(&exe.step);
     check_step.dependOn(&lib_tests.step);
     check_step.dependOn(&exe_tests.step);
+
+    // Docs: a static library compile over the compositor-core root module
+    // exists only as the autodoc source (the "wayland" library itself is
+    // a module wired into the exes/tests above, not an installed artifact).
+    const docs_lib = b.addLibrary(.{
+        .name = "wayland",
+        .root_module = lib,
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs_lib.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Generate documentation");
+    docs_step.dependOn(&install_docs.step);
 }

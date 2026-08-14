@@ -41,8 +41,8 @@
             .hash = "zio-0.17.0-xHbVVI_jJQC3YbgU7JydwAV7MuASkOTd73YqBaKlFFUz",
         },
         .tracy = .{
-            .url = "git+https://codeberg.org/CoffeeImpliesCode/tracy_zig#39cf5b557438bafb64513e4f02546daaa1240599",
-            .hash = "tracy-1.0.0+0.13.1-R7l8BWxQAQB36bRaCuUfFu77XFrBOE2rTMRYTOjX574F",
+            .url = "git+https://codeberg.org/CoffeeImpliesCode/tracy_zig#b2ea5bf4b8fe80f7cd9226d0c4af88dc04e1e07b",
+            .hash = "tracy-1.0.0+0.13.1-R7l8BUBWAQAD_78ohq3IXQ6Wv9CDm2KLAGdjbMmd4p8r",
         },
     },
     // Specifies the set of files and directories that are included in this package.

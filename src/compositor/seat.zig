@@ -730,8 +730,13 @@ pub const Seat = struct {
     /// wlr_seat_keyboard.c:234-273). The seat's `pressed` list keeps xkb
     /// keycodes (the state-machine space), so the conversion happens at
     /// the two send sites (F1).
-    fn pressedScancodeArray(self: *Seat) wire.wl.Array {
-        var buf: [128]u32 = undefined;
+    ///
+    /// `buf` belongs to the CALLER, not to this function: the returned
+    /// `wire.Array` only points at it, and `postEvent` reads that memory
+    /// when it marshals the event — after this frame has returned. A
+    /// buffer local to this function would be a dangling pointer (it read
+    /// back as 5 instead of 30 at ReleaseSafe, F1 test).
+    fn pressedScancodeArray(self: *Seat, buf: *[128]u32) wire.wl.Array {
         var n: usize = 0;
         for (self.pressed.items) |code| {
             if (n >= buf.len) break;
@@ -741,7 +746,7 @@ pub const Seat = struct {
         return .{
             .size = n * @sizeOf(u32),
             .alloc = 0,
-            .data = @ptrCast(&buf),
+            .data = @ptrCast(buf),
         };
     }
 
@@ -1197,7 +1202,8 @@ pub const Seat = struct {
             const s_res = s.resource;
             const s_client = s_res.getClient();
             const serial = serialFor(self, s_client);
-            var keys = self.pressedScancodeArray();
+            var key_buf: [128]u32 = undefined;
+            var keys = self.pressedScancodeArray(&key_buf);
             for (self.keyboards.items) |kbd| {
                 if (kbd.getClient() != s_client) continue;
                 kbd.sendEnter(serial, s_res, &keys);
@@ -1697,7 +1703,8 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
             // A foreign-surface enter is rejected by libwayland.
             if (seat.keyboard_focus) |s| {
                 if (kbd.getClient() == s.resource.getClient()) {
-                    var keys = seat.pressedScancodeArray();
+                    var key_buf: [128]u32 = undefined;
+                    var keys = seat.pressedScancodeArray(&key_buf);
                     kbd.sendEnter(seat.serialFor(kbd.getClient()), s.resource, &keys);
                     // wlroots sends enter then modifiers to the focused
                     // client's keyboards on bind (wlr_seat_keyboard.c:459-460).

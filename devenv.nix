@@ -86,6 +86,11 @@ in
     LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath config.packages}";
     # INCLUDE_DIRECTORIES = "${pkgs.lib.makeIncludePath [ pkgs.wayland pkgs.libxkbcommon (pkgs.raylib.overrideAttrs { enableDebugging = true; dontStrip = true; separateDebugInfo = true; platform = "SDL"; static = true; }) pkgs.xorg.libX11 pkgs.xorg.libXi pkgs.xorg.libXcursor pkgs.xorg.libXext ]}";
     INCLUDE_DIRECTORIES = "${pkgs.lib.makeIncludePath config.packages}";
+    # Private global cache. The shared ~/.cache/zig is a single lock domain
+    # for every Zig process on the host; a wedged zls build-runner convoy there
+    # blocks this project's builds with zero output. Relative path => resolves
+    # against the project cwd, which the build runner keeps.
+    ZIG_GLOBAL_CACHE_DIR = ".zig-global-cache";
   };
 
   scripts.gate.exec = "zig-gate";
