@@ -80,23 +80,41 @@ zwlr_screencopy_manager_v1 v3, wl_output v4.
 
 | Client | nested | headless | raylib |
 |---|---|---|---|
-| weston-terminal | Y (2f) | Y (2f) | Y (2f) |
-| weston-flower | Y (1f) | Y (1f) | Y (1f) |
-| weston-clickdot | Y (1f) | Y (1f) | Y (1f) |
-| weston-smoke | Y (117f) | Y (150f) | Y (148f) |
-| weston-dnd | Y (1f) | Y (1f) | Y (1f) |
-| weston-presentation-shm | Y (151f) | Y (175f) | Y (165f) |
-| wev | Y | Y | Y |
-| wayland-info | Y | Y | Y |
-| selection roundtrip | PASS | PASS | PASS |
-| grim capture | PASS | PASS | PASS |
+| weston-terminal | Y (2f) | Y (2f) | — |
+| weston-flower | Y (1f) | Y (1f) | — |
+| weston-clickdot | Y (1f) | Y (1f) | — |
+| weston-smoke | Y (117f) | Y (150f) | — |
+| weston-dnd | Y (1f) | Y (1f) | — |
+| weston-presentation-shm | Y (151f) | Y (175f) | — |
+| wev | Y | Y | — |
+| wayland-info | Y | Y | — |
+| selection roundtrip | PASS | PASS | — |
+| grim capture | PASS | PASS | — |
 
 (f = rendered frames in the 4-5s window; smoke/presentation are
 animation clients so their frame counts scale with the timer backend.)
 
-All three backends produce identical client-visible behavior: same
-global set, same configure/ack handshakes, same selection and capture
-paths. The frame-count differences are timer pacing, not behavioral.
+**raylib: NOT exercised in this environment.** Two attempts failed
+before any client could connect:
+- Without a display server (no `DISPLAY`/`WAYLAND_DISPLAY`), the raylib
+  backend reports `error.WindowInitFailed` and the server falls back to
+  the headless backend — the earlier "raylib" column in this table was
+  headless data relabeled (server log: `[INF headless] started`).
+- Under Xvfb (`Xvfb :96 -screen 0 1280x720x24 +extension GLX`,
+  `LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`), the server
+  hangs inside raylib InitWindow (GLFW): the log stops right before the
+  backend block, the event loop never starts, and the harness's
+  `WAYLAND_SOCKET` stdout line (written before backend init but queued
+  through the zio write path) never flushes. GLFW cannot complete
+  window/GL-context creation against this Xvfb setup.
+
+The verified parity claim is therefore **nested vs headless only**: both
+produce identical client-visible behavior — same global set, same
+configure/ack handshakes, same selection and capture paths. The
+frame-count differences are timer pacing, not behavioral. The raylib
+backend remains unverified against real clients; exercising it needs a
+working GL display (a real X session or Wayland compositor with GL),
+out of scope for the headless CI environment.
 
 ## Environment notes
 
