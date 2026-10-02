@@ -861,6 +861,10 @@ const TestClient = struct {
     surface: *client.wl.Surface,
 };
 
+/// The one definition of a test roundtrip (flush the client, dispatch the
+/// server's event loop, flush the replies back). See pump below.
+const test_pump = @import("../utils/test_pump.zig");
+
 /// A compositor + seat + primary selection manager + two in-memory
 /// clients, for wire roundtrips of the primary selection flow.
 const TestServer = struct {
@@ -967,13 +971,11 @@ const TestServer = struct {
         };
     }
 
-    /// Flush this client, dispatch the server, flush, then dispatch this
-    /// client's fd. Drives one roundtrip for a client that is still
-    /// connecting (not yet registered in the shared pump's list).
+    /// One shared roundtrip (utils/test_pump.zig) plus this client's own
+    /// poll and dispatch. Used while a client is still connecting, i.e.
+    /// before it is registered in the shared pump's list.
     fn connectPump(ts: *TestServer, c_display: *client.wl.Display) !void {
-        if (c_display.flush() != .SUCCESS) return error.ClientFlushFailed;
-        try ts.display.?.getServer().getEventLoop().dispatch(0);
-        ts.display.?.flushClients();
+        try test_pump.roundtrip(c_display, ts.display.?, 0);
         var fds = [_]posix.pollfd{
             .{ .fd = c_display.getFd(), .events = posix.POLL.IN, .revents = 0 },
         };
@@ -1001,10 +1003,13 @@ const TestServer = struct {
         allocator.destroy(ts);
     }
 
-    /// Client flush -> server event loop dispatch -> server flush ->
-    /// client dispatch. Drives one roundtrip without blocking. Tolerates
-    /// a client that has not connected yet (connectClient pumps with
-    /// only client A live) and a client dropped by a protocol error.
+    /// Roundtrip for both clients. The two client flushes and the poll
+    /// loop are this harness's own — they are per-client and tolerate a
+    /// client that has not connected yet (connectClient pumps with only
+    /// client A live) and one dropped by a protocol error. The server
+    /// half is the shared helper, called with a null client so it does
+    /// not re-flush: it must run only after every live client has
+    /// flushed (utils/test_pump.zig).
     fn pump(ts: *TestServer) !void {
         if (ts.client_a) |a| {
             if (a.c_display.flush() != .SUCCESS) return error.ClientFlushFailed;
@@ -1012,8 +1017,7 @@ const TestServer = struct {
         if (ts.client_b) |b| {
             if (b.c_display.flush() != .SUCCESS) return error.ClientFlushFailed;
         }
-        try ts.display.?.getServer().getEventLoop().dispatch(0);
-        ts.display.?.flushClients();
+        try test_pump.roundtrip(null, ts.display.?, 0);
         var fds: [2]posix.pollfd = undefined;
         var count: usize = 0;
         if (ts.client_a) |a| {

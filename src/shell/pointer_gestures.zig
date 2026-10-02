@@ -77,6 +77,7 @@
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
+const test_pump = @import("../utils/test_pump.zig");
 const wire = @import("../core/wire.zig");
 const protocol = @import("protocol");
 const server = protocol.server;
@@ -984,14 +985,15 @@ const TestServer = struct {
         allocator.destroy(ts);
     }
 
-    /// Client flush -> server dispatch -> seat batch close -> server flush
-    /// -> client dispatch. `timeout_ms` bounds the server dispatch, so a
-    /// test can wait for the hold timer.
+    /// `test_pump.dispatchOnce` (whose `timeout_ms` bounds the server
+    /// dispatch so a test can wait for the hold timer), then the seat batch
+    /// close, then the server flush — so the wl_pointer.frame the close
+    /// queues still reaches the client in this roundtrip, as it did before
+    /// the shared helper existed. Then a client dispatch.
     fn pumpWith(ts: *TestServer, timeout_ms: c_int) !void {
-        if (ts.c_display.?.flush() != .SUCCESS) return error.ClientFlushFailed;
-        try ts.display.?.getServer().getEventLoop().dispatch(timeout_ms);
+        try test_pump.dispatchOnce(ts.c_display.?, ts.display.?, timeout_ms);
         if (ts.seat) |s| s.pointerFrame();
-        ts.display.?.flushClients();
+        test_pump.flushServers(ts.display.?);
         var fds = [_]posix.pollfd{
             .{ .fd = ts.c_display.?.getFd(), .events = posix.POLL.IN, .revents = 0 },
         };

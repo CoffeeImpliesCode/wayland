@@ -734,6 +734,7 @@ const testing = std.testing;
 const posix = std.posix;
 const backend_mod = @import("./backend/backend.zig");
 const wl_output_mod = @import("./output/wl_output.zig");
+const test_pump = @import("./utils/test_pump.zig");
 
 const FakeBackendImpl = struct {
     fn start(_: *backend_mod.Backend) error{BackendFailed}!void {}
@@ -1036,12 +1037,13 @@ const TestServer = struct {
         return ts.buffer.?;
     }
 
-    /// Client flush -> server event loop dispatch -> server flush ->
-    /// client dispatch. Drives one roundtrip without blocking.
+    /// One shared roundtrip (utils/test_pump.zig) plus this harness's own
+    /// client-side poll and dispatch, so the server's replies reach the
+    /// test's listeners before the assertions run. A dispatch failure
+    /// nulls the client: the server already destroyed it, so deinit must
+    /// not destroy it again.
     fn pump(ts: *TestServer) !void {
-        if (ts.c_display.?.flush() != .SUCCESS) return error.ClientFlushFailed;
-        try ts.display.?.getServer().getEventLoop().dispatch(0);
-        ts.display.?.flushClients();
+        try test_pump.roundtrip(ts.c_display, ts.display.?, 0);
         var fds = [_]posix.pollfd{
             .{ .fd = ts.c_display.?.getFd(), .events = posix.POLL.IN, .revents = 0 },
         };

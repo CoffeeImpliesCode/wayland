@@ -390,6 +390,10 @@ fn onSeatCursorSurface(listener: *wire.Listener(*seat_mod.Seat), _: *seat_mod.Se
 const testing = std.testing;
 const posix = std.posix;
 
+/// The one definition of a test roundtrip (flush the client, dispatch the
+/// server's event loop, flush the replies back). See pumpClient below.
+const test_pump = @import("../utils/test_pump.zig");
+
 /// Registry names the S6 wire test needs (wl_compositor + wl_shm).
 const CursorRegistryCapture = struct {
     compositor_name: ?u32 = null,
@@ -637,12 +641,12 @@ test "scale-2 client cursor surface renders at its logical size (S6)" {
     ts.client = wire.Client.create(ts.display.?.getServer(), fds[0]) orelse return error.ClientCreateFailed;
     ts.c_display = client.wl.Display.connectToFd(fds[1]) catch return error.ClientConnectFailed;
 
+    // A local struct, not a TestCursorServer method: only this test has a
+    // live wire client, and the roundtrip it needs is the shared one.
     const pumpClient = struct {
         fn pump(ts2: *TestCursorServer) !void {
             const disp = ts2.c_display.?;
-            if (disp.flush() != .SUCCESS) return error.ClientFlushFailed;
-            try ts2.display.?.getServer().getEventLoop().dispatch(0);
-            ts2.display.?.flushClients();
+            try test_pump.roundtrip(disp, ts2.display.?, 0);
             var pfds = [_]posix.pollfd{
                 .{ .fd = disp.getFd(), .events = posix.POLL.IN, .revents = 0 },
             };

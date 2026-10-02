@@ -2103,6 +2103,10 @@ fn testCursorSurfaceNotify(_: *wire.Listener(*Seat), _: *Seat) void {
     test_cursor_surface_count += 1;
 }
 
+/// The one definition of a test roundtrip (flush the client, dispatch the
+/// server's event loop, flush the replies back). See pump and pumpOne.
+const test_pump = @import("../utils/test_pump.zig");
+
 /// A full compositor + seat + two in-memory clients, for wire
 /// roundtrips. `clients` tracks how many clients are connected so a
 /// failed init can tear down safely.
@@ -2157,11 +2161,18 @@ const TestServer = struct {
         allocator.destroy(ts);
     }
 
-    /// Client flush -> server event loop dispatch -> server flush ->
-    /// client dispatch for every connected client. Drives one roundtrip
-    /// without blocking. Closes the seat's input batch first (the
-    /// server's render loop does this too, main.zig renderFrame): the
-    /// deferred wl_pointer.frame events flush with the batch.
+    /// Roundtrip for every connected client. The per-client flushes and
+    /// the client dispatch are this harness's own; the server half comes
+    /// from the shared helper, called with a null client so it does not
+    /// re-flush — it must run only after every live client has flushed.
+    ///
+    /// This harness needs the SPLIT pair, not roundtrip: the seat's input
+    /// batch closes between the dispatch and the flush, and
+    /// `pointerFrame` sends real wl_pointer.frame events (wlroots
+    /// wlr_seat_pointer_send_frame, wlr_seat_pointer.c:394-402 — one frame
+    /// per input batch, not per event). Those must leave in the same
+    /// roundtrip the batch was closed in; a roundtrip would hold them in
+    /// the server buffer and delay them by one.
     fn pump(ts: *TestServer) !void {
         if (ts.clients >= 1) {
             if (ts.a.display.flush() != .SUCCESS) return error.ClientFlushFailed;
@@ -2169,9 +2180,9 @@ const TestServer = struct {
         if (ts.clients >= 2) {
             if (ts.b.display.flush() != .SUCCESS) return error.ClientFlushFailed;
         }
-        try ts.display.?.getServer().getEventLoop().dispatch(0);
+        try test_pump.dispatchOnce(null, ts.display.?, 0);
         if (ts.seat) |s| s.pointerFrame();
-        ts.display.?.flushClients();
+        test_pump.flushServers(ts.display.?);
         if (ts.clients >= 1) try dispatchDisplay(ts.a.display);
         if (ts.clients >= 2) try dispatchDisplay(ts.b.display);
     }
@@ -2180,9 +2191,7 @@ const TestServer = struct {
 /// Flush + roundtrip for one client display. Used while a client is
 /// still connecting, i.e. before it is registered in ts.a/ts.b.
 fn pumpOne(ts: *TestServer, c_display: *client.wl.Display) !void {
-    if (c_display.flush() != .SUCCESS) return error.ClientFlushFailed;
-    try ts.display.?.getServer().getEventLoop().dispatch(0);
-    ts.display.?.flushClients();
+    try test_pump.roundtrip(c_display, ts.display.?, 0);
     try dispatchDisplay(c_display);
 }
 

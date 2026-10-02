@@ -1702,6 +1702,10 @@ const SourceActionsSequence = struct {
     }
 };
 
+/// The one definition of a test roundtrip (flush the client, dispatch the
+/// server's event loop, flush the replies back). See pump below.
+const test_pump = @import("../utils/test_pump.zig");
+
 /// A compositor + seat + data device manager + in-memory client, for wire
 /// roundtrips of the selection flow.
 const TestServer = struct {
@@ -1891,10 +1895,13 @@ const TestServer = struct {
         allocator.destroy(ts);
     }
 
-    /// Client flush -> server event loop dispatch -> server flush ->
-    /// client dispatch. Drives one roundtrip without blocking. Tolerates
-    /// a client that has not connected yet (initAtVersion connects B
-    /// with only client A live) and a client dropped by a protocol error.
+    /// Roundtrip for both clients. The two client flushes and the poll
+    /// loop are this harness's own — they are per-client and tolerate a
+    /// client that has not connected yet (initAtVersion connects B with
+    /// only client A live) and one dropped by a protocol error. The
+    /// server half is the shared helper, called with a null client so it
+    /// does not re-flush: it must run only after every live client has
+    /// flushed (utils/test_pump.zig).
     fn pump(ts: *TestServer) !void {
         if (ts.c_display) |d| {
             if (d.flush() != .SUCCESS) return error.ClientFlushFailed;
@@ -1902,8 +1909,7 @@ const TestServer = struct {
         if (ts.c_display_b) |d| {
             if (d.flush() != .SUCCESS) return error.ClientFlushFailed;
         }
-        try ts.display.?.getServer().getEventLoop().dispatch(0);
-        ts.display.?.flushClients();
+        try test_pump.roundtrip(null, ts.display.?, 0);
         var fds: [2]posix.pollfd = undefined;
         var count: usize = 0;
         if (ts.c_display) |d| {

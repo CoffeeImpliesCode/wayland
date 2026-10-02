@@ -2,8 +2,13 @@
 //!
 //! Wires the `wayland` library end to end on a zio event loop:
 //!   - CompositorDisplay + wl_shm + xdg-shell + wp_presentation + backend
-//!   - pixman CPU renderer + the scene graph: a background rect plus one
+//!   - the canvas renderer (WAYLAND_RENDERER: the pixman CPU rasterizer,
+//!     the default, or the GLES2/EGL one) plus the scene graph: one
 //!     SceneBufferNode per mapped surface (imported on commit)
+//!   - main() is a phase sequence (buildCore, buildSeatModules,
+//!     buildOutput, buildInputBackend, initServerState, subscribe,
+//!     applyEnvironment, armEventLoop, runEventLoop); the `defer`s stay
+//!     in main() because their LIFO order IS the teardown contract
 //!   - frame pacing by the backend's wire event loop timer (headless or
 //!     raylib), rendering inside display.dispatch on output.frame
 //!   - presentation feedback for every surface drawn in a frame
@@ -20,6 +25,10 @@
 //!                        compositor as a client of a parent compositor, M5);
 //!                        "drm" selects the DRM/KMS backend; anything else
 //!                        selects the headless backend
+//!   WAYLAND_RENDERER    "pixman" (the default) selects the CPU renderer;
+//!                        "gles2" selects the GLES2/EGL renderer, which
+//!                        composites the canvas through the camera on
+//!                        the GPU and reads the result back for scanout
 //!
 //! The socket name is printed on its own stdout line as
 //! `WAYLAND_SOCKET=<name>` (flushed) so test harnesses can read it.
@@ -69,6 +78,16 @@ const log = wayland.utils.log;
 const geom = wayland.utils.geom;
 const wire = wayland.wire;
 const pixman = wayland.pixman;
+/// The GLES2/EGL renderer (renderer/gles2.zig), selected by
+/// WAYLAND_RENDERER=gles2. Same module as pixman: both satisfy the
+/// renderer/renderer.zig Renderer contract, only the composite and the
+/// scanout read-back differ.
+const gles2 = wayland.gles2;
+/// The one definition of a test-server roundtrip, used by the
+/// PolicyServer harness below. Reached through the `wayland` module:
+/// Zig 0.16 forbids importing a library file into the server module
+/// (see the note below), so it comes in as `wayland.utils.test_pump`.
+const test_pump = wayland.utils.test_pump;
 
 // Library types not re-exported from root.zig. Zig 0.16 module ownership
 // forbids importing a library file into the server module, so the types
@@ -88,6 +107,100 @@ const Subsurface = std.meta.Child(std.meta.Child(
 /// camera-transformed compositing path replacing the scene-output render.
 const Camera = wayland.camera.Camera;
 const CanvasItem = wayland.canvas.CanvasItem;
+
+// ---------------------------------------------------------------------------
+// Renderer selection
+// ---------------------------------------------------------------------------
+
+/// Which renderer composites the canvas (WAYLAND_RENDERER).
+///
+/// `pixman` is the CPU path every pixel of today's server comes from:
+/// it is the DEFAULT and its output is byte-for-byte what this server
+/// has always presented. `gles2` composites the same canvas through
+/// `renderer/gles2.zig` on the GPU, with the camera uploaded as the
+/// renderer's scene -> target affine (`cameraAffine`).
+pub const RendererKind = enum { pixman, gles2 };
+
+/// Parse WAYLAND_RENDERER.
+///
+/// Unset is the normal default and maps to `.pixman` (no warning, the
+/// same rule WAYLAND_BACKEND follows). A value this server does not
+/// know returns null so the caller can WARN and fall back, rather than
+/// silently rendering with something the operator did not ask for.
+pub fn parseRendererEnv(value: ?[]const u8) ?RendererKind {
+    const v = value orelse return .pixman;
+    if (std.mem.eql(u8, v, "pixman")) return .pixman;
+    if (std.mem.eql(u8, v, "gles2")) return .gles2;
+    return null;
+}
+
+/// The renderer's scene -> target affine for `cam`: the camera's
+/// world -> screen map as the one `mat3` the GLES2 shader uploads, so
+/// a dst rect given in WORLD pixels lands exactly where
+/// `Camera.worldToScreen` puts it.
+///
+/// camera.zig defines
+///
+///     M = T(W/2, H/2) . S(zoom) . R(-rotation) . T(-center)
+///
+/// i.e. p_screen = zoom * R(-rotation) * (p_world - center) + (W/2, H/2).
+/// `Affine.m` is COLUMN-major (gles2.zig:188), so the linear part
+/// stores d x'/d x, d y'/d x, d x'/d y, d y'/d y in that order and the
+/// translation in indices 6 and 7. The arithmetic runs in f64 (the
+/// camera's own precision) and narrows once, to what the uniform takes.
+pub fn cameraAffine(cam: Camera) gles2.Affine {
+    const cos_r = @cos(cam.rotation);
+    const sin_r = @sin(cam.rotation);
+    // R(-rotation) * (p - center), then scaled, then centered on the
+    // viewport: the translation is (W/2, H/2) minus the scaled center.
+    const tx = cam.screen_w / 2 - cam.zoom * (cos_r * cam.center_x + sin_r * cam.center_y);
+    const ty = cam.screen_h / 2 - cam.zoom * (-sin_r * cam.center_x + cos_r * cam.center_y);
+    return .{ .m = .{
+        @floatCast(cam.zoom * cos_r),
+        @floatCast(-cam.zoom * sin_r),
+        0,
+        @floatCast(cam.zoom * sin_r),
+        @floatCast(cam.zoom * cos_r),
+        0,
+        @floatCast(tx),
+        @floatCast(ty),
+        1,
+    } };
+}
+
+/// The world rect that `cam` maps onto the whole output, rounded OUT to
+/// whole world pixels: the background fill's dst rect for the GLES2
+/// pass. It is `Camera.visibleWorldRect` — exact at rotation 0, the
+/// conservative AABB of the back-transformed screen corners otherwise —
+/// and because the map is affine, the forward image of a superset is
+/// still a superset, so the fill can never leave a bare corner.
+fn worldRectForOutput(cam: Camera) geom.Rect {
+    const fr = cam.visibleWorldRect();
+    const x0 = @floor(fr.x);
+    const y0 = @floor(fr.y);
+    const x1 = @ceil(fr.x + fr.width);
+    const y1 = @ceil(fr.y + fr.height);
+    return .{
+        .x = finiteI32(x0),
+        .y = finiteI32(y0),
+        // The width/height are a DIFFERENCE of two coordinates that are
+        // already representable, so the subtraction cannot overflow i32
+        // for any pair this function produces; the clamp only guards the
+        // non-finite case (a zoom of 0 maps the whole world into nothing).
+        .width = finiteI32(@min(x1 - x0, @as(f64, std.math.maxInt(i32)))),
+        .height = finiteI32(@min(y1 - y0, @as(f64, std.math.maxInt(i32)))),
+    };
+}
+
+/// `v` as an i32, or 0 when it is not finite (NaN/inf, e.g. a camera
+/// zoom of 0), clamped into i32 range otherwise. A degenerate fill
+/// rect is skipped by the pass; an out-of-range one would be undefined.
+fn finiteI32(v: f64) i32 {
+    if (std.math.isNan(v)) return 0;
+    if (v <= @as(f64, std.math.minInt(i32))) return std.math.minInt(i32);
+    if (v >= @as(f64, std.math.maxInt(i32))) return std.math.maxInt(i32);
+    return @intFromFloat(v);
+}
 
 // ---------------------------------------------------------------------------
 // zwp_linux_dmabuf_v1 -> wl_surface.attach
@@ -261,8 +374,31 @@ const ServerState = struct {
     /// backend's); null on every backend without one, which is also the
     /// documented "no global" state of the module.
     linux_dmabuf: ?*wayland.linux_dmabuf.LinuxDmabuf = null,
+    /// The renderer the surface textures are imported through and the
+    /// canvas is composited with (WAYLAND_RENDERER; see RendererKind).
     renderer: *wayland.renderer.Renderer,
+    /// The pixman renderer compositor/cursor.zig is handed: its draw
+    /// path takes a `*pixman.Framebuffer` and its textures are imported
+    /// through `PixmanRenderer.importMemory` whatever `renderer` is
+    /// (cursor.zig:260, :337), so a pixman renderer always exists and
+    /// is always the one the cursor uses. Identical to `renderer` when
+    /// pixman is selected.
+    pixman_renderer: *wayland.renderer.Renderer,
+    /// Which renderer `compositeBase` composites with.
+    renderer_kind: RendererKind = .pixman,
+    /// The GLES2 FBO the canvas is composited into (null unless
+    /// `renderer_kind` is `.gles2`). Created at the framebuffer's size
+    /// on first use and re-created after an output resize; destroyed
+    /// with the rest of the render targets. GL objects need the
+    /// renderer's EGL context current, which it is for the whole life
+    /// of the process (Gles2Renderer.create leaves it bound and every
+    /// composite runs on this thread).
+    gles2_target: ?*gles2.Gles2Target = null,
     backend: *wayland.backend.Backend,
+    /// The display framebuffer the backends scan out, the cursor draws
+    /// into and screencopy reads (all three are CPU-side, see
+    /// compositeCanvas): with WAYLAND_RENDERER=gles2 the CANVAS is
+    /// composited on the GPU and read back into this buffer.
     framebuffer: *pixman.Framebuffer,
     /// M4 camera: the world→screen mapping for the canvas pass. Parsed
     /// from WAYLAND_CAMERA in onNewOutput once the real output size is
@@ -542,6 +678,162 @@ fn endPointerGestures(seat: *wayland.seat.Seat, g: *PointerGestures) bool {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Startup phases
+// ---------------------------------------------------------------------------
+//
+// main() is the phase sequence and nothing else. Every `defer` stays in
+// main's own scope because Zig runs them LIFO, and THAT ORDER IS THE
+// TEARDOWN CONTRACT: wl_shm outlives the compositor, every seat-attached
+// module dies before the seat, the clients die before any module their
+// destroy handlers call into, and the dmabuf resolver is cleared before
+// the module it points at dies. Each defer below says which of those it
+// is. The phase functions only build and hand back what main registers.
+
+/// What every wiring phase takes: the allocator, the runtime io, the log
+/// config and the process environment. A WAYLAND_* knob is read by the
+/// phase that applies it, so no knob is read twice and none is read by a
+/// phase that does not use it.
+const Startup = struct {
+    allocator: std.mem.Allocator,
+    io: *std.Io,
+    log_cfg: *const log.Config,
+    env: *std.process.Environ.Map,
+};
+
+/// The display, wl_shm, the compositor, the shell and everything built
+/// on top of them, in buildCore's construction order.
+const CoreModules = struct {
+    display: *wayland.core.display.CompositorDisplay,
+    presentation: *wayland.presentation.Presentation,
+    shm_state: *wayland.shm.ShmState,
+    compositor: *wayland.compositor.Compositor,
+    shell: *wayland.shell.XdgShell,
+    layer_shell: *wayland.layer_shell.LayerShell,
+    seat: *wayland.seat.Seat,
+    xdg_activation: *wayland.xdg_activation.XdgActivation,
+    xdg_decoration: *wayland.xdg_decoration.XdgDecoration,
+    fractional_scale: *wayland.fractional_scale.FractionalScale,
+    xdg_output: *wayland.xdg_output.XdgOutput,
+    viewporter: *wayland.viewporter.Viewporter,
+    subcompositor: *wayland.subsurface.Subcompositor,
+    data_device: *wayland.data_device.DataDeviceManager,
+    primary_selection: *wayland.primary_selection.PrimarySelection,
+
+    /// Destroy in the exact reverse of buildCore's construction order —
+    /// the sequence main's per-module `defer`s used to produce. The
+    /// display dies last (every global is removed into it), wl_shm dies
+    /// just before it so the compositor's surfaces can still unmap, and
+    /// the seat dies before every module attached to it.
+    fn deinit(self: *const CoreModules) void {
+        self.primary_selection.deinit();
+        self.data_device.deinit();
+        self.subcompositor.deinit();
+        self.viewporter.deinit();
+        self.xdg_output.deinit();
+        self.fractional_scale.deinit();
+        self.xdg_decoration.deinit();
+        self.xdg_activation.deinit();
+        self.seat.deinit();
+        self.layer_shell.deinit();
+        self.shell.deinit();
+        self.compositor.deinit();
+        self.shm_state.deinit();
+        self.presentation.deinit();
+        self.display.deinit();
+    }
+};
+
+/// The nine modules constructed AFTER the seat, so their teardown (which
+/// runs first) can never reach a freed seat.
+const SeatModules = struct {
+    pointer_gestures: *wayland.pointer_gestures.PointerGestures,
+    relative_pointer: *wayland.relative_pointer.RelativePointer,
+    pointer_constraints: *wayland.pointer_constraints.PointerConstraints,
+    tablet: *wayland.tablet.Tablet,
+    cursor_shape: *wayland.cursor_shape.CursorShape,
+    tearing_control: *wayland.tearing_control.TearingControl,
+    session_lock: *wayland.session_lock.SessionLock,
+    data_control: *wayland.data_control.DataControlManager,
+    foreign_toplevel: *wayland.foreign_toplevel.ForeignToplevelManager,
+
+    /// Reverse construction order: the modules built last (which
+    /// subscribe to the earlier ones' signals) are destroyed first.
+    fn deinit(self: *const SeatModules) void {
+        self.foreign_toplevel.deinit();
+        self.data_control.deinit();
+        self.session_lock.deinit();
+        self.tearing_control.deinit();
+        self.cursor_shape.deinit();
+        self.tablet.deinit();
+        self.pointer_constraints.deinit();
+        self.relative_pointer.deinit();
+        self.pointer_gestures.deinit();
+    }
+};
+
+/// Which backend the selection picked, plus the flags the later phases
+/// branch on: the dmabuf module needs the DRM backend's GBM device, the
+/// loop arms the DRM page-flip poller only for DRM, and the raylib input
+/// source only for the raylib window.
+const BackendChoice = struct {
+    backend: *wayland.backend.Backend,
+    is_raylib: bool = false,
+    is_drm: bool = false,
+    is_nested: bool = false,
+};
+
+/// The renderer, the backend and zwp_linux_dmabuf_v1. `pixman_renderer`
+/// is the renderer's cursor-side twin (see ServerState.pixman_renderer);
+/// in the default configuration it IS `renderer`.
+const OutputModules = struct {
+    renderer_kind: RendererKind,
+    renderer: *wayland.renderer.Renderer,
+    pixman_renderer: *wayland.renderer.Renderer,
+    backend: *wayland.backend.Backend,
+    is_raylib: bool,
+    is_drm: bool,
+    is_nested: bool,
+    linux_dmabuf: *wayland.linux_dmabuf.LinuxDmabuf,
+
+    /// The reverse of buildOutput's construction order, and still
+    /// load-bearing: the dmabuf resolver is cleared BEFORE the module
+    /// dies (no wl_surface.attach can then call into a freed module — the
+    /// window in between is unreachable in practice, the event loop has
+    /// stopped, but the ordering makes it impossible rather than merely
+    /// unlikely); the module dies before the backend (its GBM device
+    /// belongs to the DRM backend); the backend dies before the renderer;
+    /// the pixman renderer dies last.
+    fn deinit(self: *const OutputModules, compositor: *wayland.compositor.Compositor) void {
+        compositor.clearDmabufResolver();
+        self.linux_dmabuf.deinit();
+        self.backend.destroy();
+        if (self.renderer != self.pixman_renderer) self.renderer.destroy();
+        self.pixman_renderer.destroy();
+    }
+};
+
+/// The zio timers and fd pollers. They live in MAIN's scope because the
+/// ServerState keeps pointers into them; armEventLoop only writes them
+/// and adds them to the loop.
+const LoopTimers = struct {
+    /// One-shot watchdog, re-armed on every render.
+    watchdog: zio.ev.Timer,
+    /// Repeating xdg_wm_base ping (F3).
+    ping: zio.ev.Timer,
+    /// Server-side key repeat (seat key_repeat_delay/rate).
+    repeat: zio.ev.Timer,
+    /// raylib window input poll (~60 Hz); only armed for the raylib
+    /// backend, so it is written and read only in that branch.
+    raylib_poll: zio.ev.Timer,
+    /// The display fd (client requests + wire timers).
+    display_poll: zio.ev.PipePoll,
+    /// The libinput udev/evdev fd, when WAYLAND_LIBINPUT=1.
+    input_poll: zio.ev.PipePoll,
+    /// The DRM card fd (page-flip events), for the DRM backend.
+    drm_poll: zio.ev.PipePoll,
+};
+
 pub fn main(init: std.process.Init) !void {
     var debug_alloc = std.heap.DebugAllocator(.{}).init;
     defer _ = debug_alloc.deinit();
@@ -562,173 +854,373 @@ pub fn main(init: std.process.Init) !void {
     var io_value = runtime.io();
     const io: *std.Io = &io_value;
 
-    log.info("m1 test server starting (zio runtime, pixman)", io, &log_cfg, "server", .{});
+    log.info("m1 test server starting (zio runtime)", io, &log_cfg, "server", .{});
 
-    // --- library wiring ---------------------------------------------------
-    const display = try wayland.core.display.CompositorDisplay.init(allocator, io, &log_cfg);
-    defer display.deinit();
+    var start: Startup = .{
+        .allocator = allocator,
+        .io = io,
+        .log_cfg = &log_cfg,
+        .env = init.environ_map,
+    };
+
+    const core = try buildCore(&start);
+    defer core.deinit();
+
+    try announceSocket(&start, core.display);
+
+    const seat_mods = try buildSeatModules(&start, &core);
+    defer seat_mods.deinit();
+
+    const output = try buildOutput(&start, &core);
+    defer output.deinit(core.compositor);
+
+    const input_backend = try buildInputBackend(&start, core.seat);
+    defer if (input_backend) |ib| ib.destroy();
+
+    const framebuffer = try pixman.Framebuffer.create(allocator, output_width, output_height);
+    // NOTE: no defer framebuffer.deinit() here — the ServerState owns the
+    // framebuffer (state.framebuffer), and onNewOutput resizes it by
+    // freeing the old + assigning a new one. A defer on this local would
+    // point at the (possibly freed) original and double-free at shutdown
+    // (DebugAllocator segfault); freeRenderTargets frees the CURRENT one
+    // after the event loop instead.
+
+    var state = try initServerState(&start, &core, &seat_mods, &output, framebuffer);
+    defer freeStateResources(&state);
+    state.input_backend = input_backend;
+    subscribe(&state);
+    // Unlink before the module deinits run: their teardown emits
+    // lock_surface_gone, and these handlers dereference `state`, whose
+    // own teardown defer was registered earlier and has already run.
+    defer unlinkSessionLockListeners(&state);
+    try initScreencopy(&start, &state, &core);
+    defer if (state.screencopy) |sc| sc.deinit();
+    try applyEnvironment(&start, &state, &output);
+
+    // --- zio event loop ---------------------------------------------------
+    // SAFETY: initialized by loop.init() immediately below, before any use.
+    var loop: zio.ev.Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+    state.loop = &loop;
+    // SAFETY: `timers` has no default and is written field by field by
+    // armEventLoop before the loop is polled; the two conditional pollers
+    // are read only under the same condition that writes them.
+    var timers: LoopTimers = undefined;
+    armEventLoop(&start, &state, &output, &timers);
+
+    try output.backend.start(); // fires new_output; the headless timer paces frames
+    if (input_backend) |ib| try ib.start();
+    armBackendPollers(&state, &output, input_backend, &timers);
+
+    runEventLoop(&state);
+    freeRenderTargets(&state);
+}
+
+/// The ServerState's own resources, freed in the order main()'s `defer`s
+/// used to run them (reverse registration), and for the same reasons:
+/// the clients die FIRST, because their surface/buffer destroy signals
+/// must fire against LIVE modules (the shm map remove, shm.zig:223, the
+/// surface-node registry and the seat cleanup all touch module state);
+/// display.deinit ALSO calls destroyClients as idempotent safety (no
+/// clients are left here), which alone would run AFTER the shm deinit —
+/// the shutdown UAF a live client (e.g. foot at window close) hit. Then
+/// the per-surface scene state, the scene output view and the scene tree
+/// itself; the compositor (core.deinit, deferred earlier) destroys its
+/// surfaces afterwards, and the listeners were already removed, so no
+/// entry is freed twice.
+fn freeStateResources(state: *ServerState) void {
+    state.display.destroyClients();
+    cleanupSurfaceEntries(state);
+    if (state.scene_output) |so| so.destroy();
+    if (state.scene) |scene| scene.deinit();
+    state.layer_popups.deinit(state.allocator);
+    state.layer_surfaces.deinit(state.allocator);
+    state.toplevels.deinit(state.allocator);
+    state.synth_clicked.deinit(state.allocator);
+}
+
+/// zwlr_screencopy_v1: captures the compositor framebuffer (shm only).
+/// The copy is deferred to the next output commit; requestFrame wakes the
+/// renderer so a pending copy gets its commit. The three callbacks reach
+/// back into `state`, so the module is stored there, not in a local.
+fn initScreencopy(start: *Startup, state: *ServerState, core: *const CoreModules) !void {
+    state.screencopy = try wayland.screencopy.Screencopy.init(
+        start.allocator,
+        start.io,
+        start.log_cfg,
+        core.display,
+        core.shm_state,
+        getFramebuffer,
+        state,
+        outputFromResource,
+        state,
+        requestFrame,
+        state,
+    );
+}
+
+/// Phase 1: the display, wl_shm, the compositor, the shell, the seat and
+/// the modules that depend on them. The construction order IS the
+/// teardown order reversed (CoreModules.deinit), so it is a contract, not
+/// an accident; the two phases below fill ONE bundle so main registers
+/// ONE defer for the whole group and the order cannot drift between
+/// them.
+fn buildCore(start: *Startup) !CoreModules {
+    // SAFETY: written field by field by the two phases below; every
+    // field a phase sets is also errdefer'd by that phase, so a failure
+    // unwinds exactly what was built and the bundle is never read
+    // half-filled.
+    var core: CoreModules = undefined;
+    try buildCoreDisplay(start, &core);
+    try buildCoreModules(start, &core);
+    return core;
+}
+
+/// Phase 1a: the display, wl_shm, the compositor, the shell and the seat
+/// — the modules every later phase hangs off.
+fn buildCoreDisplay(start: *Startup, core: *CoreModules) !void {
+    const allocator = start.allocator;
+    const io = start.io;
+    const log_cfg = start.log_cfg;
+
+    const display = try wayland.core.display.CompositorDisplay.init(allocator, io, log_cfg);
+    errdefer display.deinit();
+    core.display = display;
     try display.initShm();
 
-    // wp_presentation (stable v2): one global, registered right after the
-    // display so feedback objects exist before any client commit.
-    const presentation = try wayland.presentation.Presentation.init(allocator, io, &log_cfg, display);
-    defer presentation.deinit();
-
-    if (init.environ_map.get("WAYLAND_PROTOCOL_LOG")) |v| {
+    if (start.env.get("WAYLAND_PROTOCOL_LOG")) |v| {
         if (std.mem.eql(u8, v, "1")) {
             display.attachProtocolLogger();
-            log.info("protocol logger attached (WAYLAND_PROTOCOL_LOG=1)", io, &log_cfg, "server", .{});
+            log.info("protocol logger attached (WAYLAND_PROTOCOL_LOG=1)", io, log_cfg, "server", .{});
         }
     }
 
-    const socket_name = try display.addSocketAuto();
-    log.info("created socket {s}", io, &log_cfg, "server", .{socket_name});
+    // wp_presentation (stable v2): one global, registered right after the
+    // display so feedback objects exist before any client commit.
+    const presentation = try wayland.presentation.Presentation.init(allocator, io, log_cfg, display);
+    errdefer presentation.deinit();
+    core.presentation = presentation;
 
-    // The socket name must be a single flushed stdout line, first thing
-    // harnesses read — BEFORE the backend init (the raylib window open can
-    // take seconds or fail on a headless/broken display). Logging goes to
-    // stderr, so stdout stays parseable.
-    {
-        const stdout_file = std.Io.File.stdout();
-        var buf: [128]u8 = undefined;
-        var w = stdout_file.writer(io.*, &buf);
-        w.interface.print("WAYLAND_SOCKET={s}\n", .{socket_name}) catch |err| {
-            log.err("failed to write socket name to stdout: {s}", io, &log_cfg, "server", .{@errorName(err)});
-            return err;
-        };
-        w.interface.flush() catch |err| {
-            log.err("failed to flush socket name to stdout: {s}", io, &log_cfg, "server", .{@errorName(err)});
-            return err;
-        };
-    }
-
-    // Teardown order (LIFO on the defers): wl_shm outlives the compositor,
-    // so shm_state.deinit is registered FIRST and runs LAST. Both inits
-    // only need the display; setShm wires them together after both exist.
-    const shm_state = try wayland.shm.ShmState.init(allocator, io, &log_cfg, display);
-    defer shm_state.deinit();
-    const compositor = try wayland.compositor.Compositor.init(allocator, io, &log_cfg, display);
-    defer compositor.deinit();
+    // wl_shm outlives the compositor: both inits only need the display,
+    // setShm wires them together after both exist, and CoreModules.deinit
+    // destroys the compositor's surfaces BEFORE wl_shm.
+    const shm_state = try wayland.shm.ShmState.init(allocator, io, log_cfg, display);
+    errdefer shm_state.deinit();
+    core.shm_state = shm_state;
+    const compositor = try wayland.compositor.Compositor.init(allocator, io, log_cfg, display);
+    errdefer compositor.deinit();
+    core.compositor = compositor;
     compositor.setShm(shm_state);
-    const shell = try wayland.shell.XdgShell.init(allocator, io, &log_cfg, display, compositor);
-    defer shell.deinit();
+    const shell = try wayland.shell.XdgShell.init(allocator, io, log_cfg, display, compositor);
+    errdefer shell.deinit();
+    core.shell = shell;
     // zwlr_layer_shell_v1: layer surfaces (panels, wallpapers, lock screens).
-    const layer_shell = try wayland.layer_shell.LayerShell.init(allocator, io, &log_cfg, display, compositor);
-    defer layer_shell.deinit();
+    const layer_shell = try wayland.layer_shell.LayerShell.init(allocator, io, log_cfg, display, compositor);
+    errdefer layer_shell.deinit();
+    core.layer_shell = layer_shell;
     // M3: the seat (keyboard + pointer) with the xkbcommon us keymap.
-    const seat = try wayland.seat.Seat.init(allocator, io, &log_cfg, display, .{});
-    defer seat.deinit();
+    const seat = try wayland.seat.Seat.init(allocator, io, log_cfg, display, .{});
+    errdefer seat.deinit();
+    core.seat = seat;
     // F10: runtime layout selection (WAYLAND_KEYBOARD_LAYOUT, default
     // "us" compiled by Seat.init) — recompiles the keymap and
     // re-broadcasts it before any client binds.
-    if (init.environ_map.get("WAYLAND_KEYBOARD_LAYOUT")) |layout| {
+    if (start.env.get("WAYLAND_KEYBOARD_LAYOUT")) |layout| {
         seat.setKeyboardLayout(layout);
     }
+}
+
+/// Phase 1b: the eight protocol modules built on top of the core, in the
+/// order CoreModules.deinit walks back through.
+fn buildCoreModules(start: *Startup, core: *CoreModules) !void {
+    const allocator = start.allocator;
+    const io = start.io;
+    const log_cfg = start.log_cfg;
+    const display = core.display;
+    const compositor = core.compositor;
+    const shell = core.shell;
+    const seat = core.seat;
+
     // xdg_activation_v1 (staging): activation tokens for focus requests
     // (needs the seat for serial/focus validation).
     const xdg_activation = try wayland.xdg_activation.XdgActivation.init(
         allocator,
         io,
-        &log_cfg,
+        log_cfg,
         display,
         seat,
         compositor,
     );
-    defer xdg_activation.deinit();
+    errdefer xdg_activation.deinit();
+    core.xdg_activation = xdg_activation;
     // zxdg_decoration_manager_v1 (unstable): server-side decorations.
-    const xdg_decoration = try wayland.xdg_decoration.XdgDecoration.init(allocator, io, &log_cfg, display, shell);
-    defer xdg_decoration.deinit();
+    const xdg_decoration = try wayland.xdg_decoration.XdgDecoration.init(allocator, io, log_cfg, display, shell);
+    errdefer xdg_decoration.deinit();
+    core.xdg_decoration = xdg_decoration;
     // wp_fractional_scale_manager_v1 (staging): the preferred scale.
-    const fractional_scale = try wayland.fractional_scale.FractionalScale.init(allocator, io, &log_cfg, display);
-    defer fractional_scale.deinit();
+    const fractional_scale = try wayland.fractional_scale.FractionalScale.init(allocator, io, log_cfg, display);
+    errdefer fractional_scale.deinit();
+    core.fractional_scale = fractional_scale;
     // zxdg_output_manager_v1 (unstable/xdg-output): logical output
     // geometry for clients (grim, region tools).
-    const xdg_output = try wayland.xdg_output.XdgOutput.init(allocator, io, &log_cfg, display);
-    defer xdg_output.deinit();
+    const xdg_output = try wayland.xdg_output.XdgOutput.init(allocator, io, log_cfg, display);
+    errdefer xdg_output.deinit();
+    core.xdg_output = xdg_output;
     // Advertise the preferred scale now (scale 1: 120/120). The value is
     // a settable API — a future scale path calls setPreferredScale on
     // output-scale change (wlroots refines to per-surface notify_scale).
     fractional_scale.setPreferredScale(120);
     // wp_viewporter (stable): crop/scale surface content (foot needs it).
-    const viewporter = try wayland.viewporter.Viewporter.init(allocator, io, &log_cfg, display);
-    defer viewporter.deinit();
+    const viewporter = try wayland.viewporter.Viewporter.init(allocator, io, log_cfg, display);
+    errdefer viewporter.deinit();
+    core.viewporter = viewporter;
     // Subcompositor (foot needs wl_subcompositor).
-    const subcompositor = try wayland.subsurface.Subcompositor.init(allocator, io, &log_cfg, display, compositor);
-    defer subcompositor.deinit();
+    const subcompositor = try wayland.subsurface.Subcompositor.init(allocator, io, log_cfg, display, compositor);
+    errdefer subcompositor.deinit();
+    core.subcompositor = subcompositor;
     // Data device manager (foot requires it; clipboard selection relay).
-    const data_device = try wayland.data_device.DataDeviceManager.init(allocator, io, &log_cfg, display, seat);
-    defer data_device.deinit();
+    const data_device = try wayland.data_device.DataDeviceManager.init(allocator, io, log_cfg, display, seat);
+    errdefer data_device.deinit();
+    core.data_device = data_device;
     // Primary selection (zwp_primary_selection_device_manager_v1, the
     // X11 PRIMARY analogue): per-seat, keyboard-focus-owned.
     const primary_selection = try wayland.primary_selection.PrimarySelection.init(
         allocator,
         io,
-        &log_cfg,
+        log_cfg,
         display,
         seat,
     );
-    defer primary_selection.deinit();
-    // --- the pointer-stream protocols ------------------------------------
-    // Dependency order: everything below is constructed AFTER the seat
-    // it may attach to, and each defer therefore runs BEFORE the seat's
-    // (LIFO), so no module can reach a freed seat during teardown.
-    //
+    errdefer primary_selection.deinit();
+    core.primary_selection = primary_selection;
+}
+
+/// Create the listening socket and print its name on its own flushed
+/// stdout line, the first thing a harness reads. It runs BEFORE the
+/// backend init (the raylib window open can take seconds or fail on a
+/// headless/broken display); logging goes to stderr, so stdout stays
+/// parseable.
+fn announceSocket(start: *Startup, display: *wayland.core.display.CompositorDisplay) !void {
+    const socket_name = try display.addSocketAuto();
+    log.info("created socket {s}", start.io, start.log_cfg, "server", .{socket_name});
+
+    const stdout_file = std.Io.File.stdout();
+    var buf: [128]u8 = undefined;
+    var w = stdout_file.writer(start.io.*, &buf);
+    w.interface.print("WAYLAND_SOCKET={s}\n", .{socket_name}) catch |err| {
+        log.err("failed to write socket name to stdout: {s}", start.io, start.log_cfg, "server", .{@errorName(err)});
+        return err;
+    };
+    w.interface.flush() catch |err| {
+        log.err("failed to flush socket name to stdout: {s}", start.io, start.log_cfg, "server", .{@errorName(err)});
+        return err;
+    };
+}
+
+/// Phase 2: the nine modules constructed after the seat.
+///
+/// Dependency order: everything below is constructed AFTER the seat it
+/// may attach to, and each module's teardown therefore runs BEFORE the
+/// seat's (SeatModules.deinit, then core.deinit), so no module can reach
+/// a freed seat during teardown. As in buildCore, the two phases fill ONE
+/// bundle so main registers one defer for the whole group.
+fn buildSeatModules(start: *Startup, core: *const CoreModules) !SeatModules {
+    // SAFETY: written field by field by the two phases below; every
+    // field a phase sets is also errdefer'd by that phase.
+    var mods: SeatModules = undefined;
+    try buildPointerModules(start, core, &mods);
+    try buildProtocolModules(start, core, &mods);
+    return mods;
+}
+
+/// Phase 2a: the pointer-stream modules — gestures, relative pointer and
+/// pointer constraints, then the tablet registry the cursor shapes
+/// resolve their serials through.
+fn buildPointerModules(start: *Startup, core: *const CoreModules, mods: *SeatModules) !void {
+    const allocator = start.allocator;
+    const io = start.io;
+    const log_cfg = start.log_cfg;
+    const display = core.display;
+    const compositor = core.compositor;
+    const seat = core.seat;
+
     // zwp_pointer_gestures_v1 (unstable): swipe/pinch/hold recognition.
     // The module installs its own seat listeners (setSeat), so main's
     // only job is handing it the seat.
     const pointer_gestures = try wayland.pointer_gestures.PointerGestures.init(
         allocator,
         io,
-        &log_cfg,
+        log_cfg,
         display,
         seat,
     );
-    defer pointer_gestures.deinit();
+    errdefer pointer_gestures.deinit();
+    mods.pointer_gestures = pointer_gestures;
     // zwp_relative_pointer_manager_v1 (unstable): unclaccelerated
     // relative motion (24.8 deltas + a 64-bit utime).
     const relative_pointer = try wayland.relative_pointer.RelativePointer.init(
         allocator,
         io,
-        &log_cfg,
+        log_cfg,
         display,
         seat,
     );
-    defer relative_pointer.deinit();
+    errdefer relative_pointer.deinit();
+    mods.relative_pointer = relative_pointer;
     // zwp_pointer_constraints_v1 (unstable): locked and confined
     // pointers. Needs the compositor to resolve a wl_surface for
     // lock_pointer / confine_pointer.
     const pointer_constraints = try wayland.pointer_constraints.PointerConstraints.init(
         allocator,
         io,
-        &log_cfg,
+        log_cfg,
         display,
         compositor,
         seat,
     );
-    defer pointer_constraints.deinit();
+    errdefer pointer_constraints.deinit();
+    mods.pointer_constraints = pointer_constraints;
     // zwp_tablet_manager_v2 (stable): the hardware registry. It needs no
     // seat — a tablet announces its own zwp_tablet_seat_v2 — and no
     // hardware is registered (this server has no tablet input backend),
     // which is the module's documented "correct with no hardware" state.
-    const tablet = try wayland.tablet.Tablet.init(allocator, io, &log_cfg, display);
-    defer tablet.deinit();
+    const tablet = try wayland.tablet.Tablet.init(allocator, io, log_cfg, display);
+    errdefer tablet.deinit();
+    mods.tablet = tablet;
+}
+
+/// Phase 2b: cursor shapes (which need the tablet above), the tearing
+/// hint, the session lock, the data-control manager and the foreign
+/// toplevel handles.
+fn buildProtocolModules(start: *Startup, core: *const CoreModules, mods: *SeatModules) !void {
+    const allocator = start.allocator;
+    const io = start.io;
+    const log_cfg = start.log_cfg;
+    const display = core.display;
+    const shell = core.shell;
+    const seat = core.seat;
+
     // wp_cursor_shape_manager_v1 (staging): per-device cursor shapes.
     // Built AFTER the tablet module: a tablet-tool cursor-shape device
     // resolves its serial through it (shell/cursor_shape.zig), and a
     // null tablet would make every such device permanently inert.
-    const cursor_shape = try wayland.cursor_shape.CursorShape.init(allocator, io, &log_cfg, display, tablet);
-    defer cursor_shape.deinit();
+    const cursor_shape = try wayland.cursor_shape.CursorShape.init(allocator, io, log_cfg, display, mods.tablet);
+    errdefer cursor_shape.deinit();
+    mods.cursor_shape = cursor_shape;
     // wp_tearing_control_manager_v1 (staging): the per-surface async
     // present hint. The present path reads it per surface per frame
     // (consultTearingHints); the module itself only records.
-    const tearing_control = try wayland.tearing_control.TearingControl.init(allocator, io, &log_cfg, display);
-    defer tearing_control.deinit();
+    const tearing_control = try wayland.tearing_control.TearingControl.init(allocator, io, log_cfg, display);
+    errdefer tearing_control.deinit();
+    mods.tearing_control = tearing_control;
     // ext_session_lock_manager_v1 (staging): the session-lock privilege
     // boundary. The module owns the protocol state; main owns the gates
     // (see lockedFrameFor, pickSurface, keyboardFocusAllowed and the
-    // session_lock_locked_listener handler below).
-    const session_lock = try wayland.session_lock.SessionLock.init(allocator, io, &log_cfg, display);
-    defer session_lock.deinit();
+    // session_locked listener handler).
+    const session_lock = try wayland.session_lock.SessionLock.init(allocator, io, log_cfg, display);
+    errdefer session_lock.deinit();
+    mods.session_lock = session_lock;
     // zwlr_data_control_manager_v1 (wlroots/unstable): the compositor as
     // data SOURCE. Needs the seat (a device is per seat), the ordinary
     // wl_data_device_manager it mirrors (the read side) and the primary
@@ -736,13 +1228,14 @@ pub fn main(init: std.process.Init) !void {
     const data_control = try wayland.data_control.DataControlManager.init(
         allocator,
         io,
-        &log_cfg,
+        log_cfg,
         display,
         seat,
-        data_device,
-        primary_selection,
+        core.data_device,
+        core.primary_selection,
     );
-    defer data_control.deinit();
+    errdefer data_control.deinit();
+    mods.data_control = data_control;
     // zwlr_foreign_toplevel_manager_v1 (wlroots/unstable): our own xdg
     // toplevels as client-visible handles. Built after the shell (it
     // subscribes to xdg_wm_base.new_toplevel) and after the seat (its
@@ -750,95 +1243,44 @@ pub fn main(init: std.process.Init) !void {
     const foreign_toplevel = try wayland.foreign_toplevel.ForeignToplevelManager.init(
         allocator,
         io,
-        &log_cfg,
+        log_cfg,
         display,
         shell,
         seat,
     );
-    defer foreign_toplevel.deinit();
-    const renderer = try pixman.PixmanRenderer.create(allocator, io, &log_cfg);
-    defer renderer.destroy();
-    // Backend selection: WAYLAND_BACKEND=raylib uses the windowed raylib
-    // debug backend (falling back to headless when the window cannot
-    // open); anything else uses the headless backend. The raylib path is
-    // only reachable when built with -Denable_raylib (default on).
-    var backend_is_raylib = false;
-    var backend_is_drm = false;
-    var backend_is_nested = false;
-    const backend = blk: {
-        // DRM/KMS native output (tested in the NixOS VM on virtio-gpu).
-        if (wantDrmBackend(init.environ_map)) {
-            const device = init.environ_map.get("WAYLAND_DRM_DEVICE");
-            const b = try drm_mod.DrmBackend.create(allocator, io, &log_cfg, device);
-            backend_is_drm = true;
-            break :blk b;
-        }
-        // Nested-wayland backend (M5): our compositor acts as a client of
-        // a parent compositor (WAYLAND_DISPLAY), presenting its framebuffer
-        // into a parent wl_surface. Real-session testing without DRM.
-        if (wantNestedBackend(init.environ_map)) {
-            const b = try wayland.wayland_backend.WaylandBackend.create(
-                allocator,
-                io,
-                &log_cfg,
-                display.getServer().getEventLoop(),
-                .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
-                "wayland-compositor",
-            );
-            backend_is_nested = true;
-            break :blk b;
-        }
-        if (build_options.enable_raylib and wantRaylibBackend(init.environ_map)) {
-            const b = raylib_mod.RaylibBackend.create(
-                allocator,
-                io,
-                &log_cfg,
-                display.getServer().getEventLoop(),
-                .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
-                "wayland-m2",
-            ) catch |err| {
-                log.warn(
-                    "raylib backend init failed ({s}); falling back to headless",
-                    io,
-                    &log_cfg,
-                    "server",
-                    .{@errorName(err)},
-                );
-                break :blk try wayland.headless.HeadlessBackend.create(
-                    allocator,
-                    io,
-                    &log_cfg,
-                    display.getServer().getEventLoop(),
-                    .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
-                );
-            };
-            backend_is_raylib = true;
-            break :blk b;
-        }
-        // Unknown WAYLAND_BACKEND value: headless fallback with a warning.
-        // An unset variable is the normal default (no warning); the raylib
-        // window-open failure logs its own warning above.
-        if (init.environ_map.get("WAYLAND_BACKEND")) |v| {
-            const known = std.mem.eql(u8, v, "drm") or
-                std.mem.eql(u8, v, "nested") or
-                (build_options.enable_raylib and std.mem.eql(u8, v, "raylib"));
-            if (!known) {
-                log.warn("WAYLAND_BACKEND '{s}' unknown; using headless backend", io, &log_cfg, "server", .{v});
-            }
-        }
-        break :blk try wayland.headless.HeadlessBackend.create(
-            allocator,
-            io,
-            &log_cfg,
-            display.getServer().getEventLoop(),
-            .{ .width = output_width, .height = output_height, .refresh_msec = output_refresh_msec },
-        );
+    errdefer foreign_toplevel.deinit();
+    mods.foreign_toplevel = foreign_toplevel;
+}
+
+/// Phase 3: the renderer (WAYLAND_RENDERER), the backend
+/// (WAYLAND_BACKEND) and zwp_linux_dmabuf_v1.
+fn buildOutput(start: *Startup, core: *const CoreModules) !OutputModules {
+    const allocator = start.allocator;
+    const io = start.io;
+    const log_cfg = start.log_cfg;
+    const display = core.display;
+
+    // The cursor always needs a pixman renderer of its own:
+    // compositor/cursor.zig draws into a `*pixman.Framebuffer` and
+    // imports its textures through `PixmanRenderer.importMemory` whatever
+    // renderer it is handed (cursor.zig:260, :337), so handing it a GLES2
+    // renderer would read a GL texture payload as pixman memory. The
+    // pixman renderer is therefore built either way, and the selected one
+    // is a second object only under WAYLAND_RENDERER=gles2.
+    const pixman_renderer = try pixman.PixmanRenderer.create(allocator, io, log_cfg);
+    errdefer pixman_renderer.destroy();
+    const renderer_kind = selectRendererKind(start);
+    const renderer = switch (renderer_kind) {
+        .pixman => pixman_renderer,
+        .gles2 => try gles2.Gles2Renderer.create(allocator, io, log_cfg),
     };
-    defer backend.destroy();
+    errdefer if (renderer != pixman_renderer) renderer.destroy();
+
+    const chosen = try buildBackend(start, display);
 
     // zwp_linux_dmabuf_v1 (stable/linux-dmabuf): DMA-BUF buffer import.
     // Constructed AFTER the backend because the module needs its GBM
-    // device, and its defer runs BEFORE backend.destroy(): the GBM device
+    // device, and it is destroyed BEFORE backend.destroy(): the GBM device
     // belongs to the DRM backend and must outlive the module.
     //
     // The module registers its global ONLY for a GBM device, and only the
@@ -849,88 +1291,200 @@ pub fn main(init: std.process.Init) !void {
     const linux_dmabuf = try wayland.linux_dmabuf.LinuxDmabuf.init(
         allocator,
         io,
-        &log_cfg,
+        log_cfg,
         display,
-        if (backend_is_drm) drm_mod.gbmDevice(drm_mod.DrmBackend.fromBackend(backend)) else null,
+        if (chosen.is_drm) drm_mod.gbmDevice(drm_mod.DrmBackend.fromBackend(chosen.backend)) else null,
     );
-    defer linux_dmabuf.deinit();
+    errdefer linux_dmabuf.deinit();
 
     // From here on wl_surface.attach resolves dmabuf buffers through the
-    // module. The clear is registered AFTER the deinit defer, so LIFO runs
-    // it BEFORE linux_dmabuf.deinit(): no attach can ever call into a
-    // freed module. The window in between is unreachable in practice
-    // (the event loop has stopped), but the ordering makes it impossible
-    // rather than merely unlikely.
+    // module. The clear is the FIRST statement of OutputModules.deinit,
+    // so it runs before linux_dmabuf.deinit(): no attach can ever call
+    // into a freed module.
     //
     // The resolver is set even with no GBM device: LinuxDmabuf.init
     // returns an inert module (no global, empty registry), so
     // fromResource answers null for every resource and the shm path runs
     // exactly as before on headless / raylib / nested.
-    wireDmabufResolver(compositor, linux_dmabuf);
-    defer compositor.clearDmabufResolver();
+    wireDmabufResolver(core.compositor, linux_dmabuf);
 
-    const framebuffer = try pixman.Framebuffer.create(allocator, output_width, output_height);
-    // NOTE: no defer framebuffer.deinit() here — the ServerState owns the
-    // framebuffer (state.framebuffer), and onNewOutput resizes it by
-    // freeing the old + assigning a new one. A defer on this local would
-    // point at the (possibly freed) original and double-free at shutdown
-    // (DebugAllocator segfault); main frees state.framebuffer instead.
-
-    // libinput input source (evdev devices; VM: virtio keyboard/mouse).
-    // A second Backend whose only role is announcing devices + the poll fd
-    // the zio loop watches; events flow into the seat via its dispatch.
-    var input_backend: ?*wayland.backend.Backend = null;
-    if (init.environ_map.get("WAYLAND_LIBINPUT")) |v| {
-        if (std.mem.eql(u8, v, "1")) {
-            input_backend = try libinput_mod.LibinputBackend.create(
-                allocator,
-                io,
-                &log_cfg,
-                seat,
-                "seat0",
-                output_width,
-                output_height,
-            );
-        } else {
-            log.warn("WAYLAND_LIBINPUT '{s}' ignored (expected \"1\")", io, &log_cfg, "server", .{v});
-        }
-    }
-    // Function-scope: the backend is used until the event loop exits.
-    defer if (input_backend) |ib| ib.destroy();
-
-    var state: ServerState = .{
-        .allocator = allocator,
-        .io = io,
-        .log_cfg = &log_cfg,
-        .display = display,
-        .compositor = compositor,
-        .shm_state = shm_state,
-        .shell = shell,
-        .layer_shell = layer_shell,
-        .seat = seat,
-        .subcompositor = subcompositor,
-        .data_device = data_device,
-        .primary_selection = primary_selection,
+    return .{
+        .renderer_kind = renderer_kind,
         .renderer = renderer,
-        .xdg_activation = xdg_activation,
-        .xdg_decoration = xdg_decoration,
-        .fractional_scale = fractional_scale,
-        .viewporter = viewporter,
-        .pointer_gestures = pointer_gestures,
-        .relative_pointer = relative_pointer,
-        .pointer_constraints = pointer_constraints,
-        .tablet = tablet,
-        .cursor_shape = cursor_shape,
-        .tearing_control = tearing_control,
-        .session_lock = session_lock,
-        .data_control = data_control,
-        .foreign_toplevel = foreign_toplevel,
+        .pixman_renderer = pixman_renderer,
+        .backend = chosen.backend,
+        .is_raylib = chosen.is_raylib,
+        .is_drm = chosen.is_drm,
+        .is_nested = chosen.is_nested,
         .linux_dmabuf = linux_dmabuf,
-        .backend = backend,
+    };
+}
+
+/// Backend selection: WAYLAND_BACKEND=raylib uses the windowed raylib
+/// debug backend (falling back to headless when the window cannot
+/// open); anything else uses the headless backend. The raylib path is
+/// only reachable when built with -Denable_raylib (default on).
+fn buildBackend(start: *Startup, display: *wayland.core.display.CompositorDisplay) !BackendChoice {
+    const mode: wayland.output.Mode = .{
+        .width = output_width,
+        .height = output_height,
+        .refresh_msec = output_refresh_msec,
+    };
+    return blk: {
+        // DRM/KMS native output (tested in the NixOS VM on virtio-gpu).
+        if (wantDrmBackend(start.env)) {
+            const device = start.env.get("WAYLAND_DRM_DEVICE");
+            break :blk .{
+                .backend = try drm_mod.DrmBackend.create(start.allocator, start.io, start.log_cfg, device),
+                .is_drm = true,
+            };
+        }
+        // Nested-wayland backend (M5): our compositor acts as a client of
+        // a parent compositor (WAYLAND_DISPLAY), presenting its framebuffer
+        // into a parent wl_surface. Real-session testing without DRM.
+        if (wantNestedBackend(start.env)) {
+            break :blk .{
+                .backend = try wayland.wayland_backend.WaylandBackend.create(
+                    start.allocator,
+                    start.io,
+                    start.log_cfg,
+                    display.getServer().getEventLoop(),
+                    mode,
+                    "wayland-compositor",
+                ),
+                .is_nested = true,
+            };
+        }
+        if (build_options.enable_raylib and wantRaylibBackend(start.env)) {
+            const b = raylib_mod.RaylibBackend.create(
+                start.allocator,
+                start.io,
+                start.log_cfg,
+                display.getServer().getEventLoop(),
+                mode,
+                "wayland-m2",
+            ) catch |err| {
+                log.warn(
+                    "raylib backend init failed ({s}); falling back to headless",
+                    start.io,
+                    start.log_cfg,
+                    "server",
+                    .{@errorName(err)},
+                );
+                break :blk .{ .backend = try wayland.headless.HeadlessBackend.create(
+                    start.allocator,
+                    start.io,
+                    start.log_cfg,
+                    display.getServer().getEventLoop(),
+                    mode,
+                ) };
+            };
+            break :blk .{ .backend = b, .is_raylib = true };
+        }
+        // Unknown WAYLAND_BACKEND value: headless fallback with a warning.
+        // An unset variable is the normal default (no warning); the raylib
+        // window-open failure logs its own warning above.
+        if (start.env.get("WAYLAND_BACKEND")) |v| {
+            const known = std.mem.eql(u8, v, "drm") or
+                std.mem.eql(u8, v, "nested") or
+                (build_options.enable_raylib and std.mem.eql(u8, v, "raylib"));
+            if (!known) {
+                log.warn("WAYLAND_BACKEND '{s}' unknown; using headless backend", start.io, start.log_cfg, "server", .{v});
+            }
+        }
+        break :blk .{ .backend = try wayland.headless.HeadlessBackend.create(
+            start.allocator,
+            start.io,
+            start.log_cfg,
+            display.getServer().getEventLoop(),
+            mode,
+        ) };
+    };
+}
+
+/// The libinput input source (evdev devices; VM: virtio keyboard/mouse).
+/// A second Backend whose only role is announcing devices + the poll fd
+/// the zio loop watches; events flow into the seat via its dispatch.
+/// Null when WAYLAND_LIBINPUT is unset or not "1".
+fn buildInputBackend(start: *Startup, seat: *wayland.seat.Seat) !?*wayland.backend.Backend {
+    const value = start.env.get("WAYLAND_LIBINPUT") orelse return null;
+    if (!std.mem.eql(u8, value, "1")) {
+        log.warn("WAYLAND_LIBINPUT '{s}' ignored (expected \"1\")", start.io, start.log_cfg, "server", .{value});
+        return null;
+    }
+    return try libinput_mod.LibinputBackend.create(
+        start.allocator,
+        start.io,
+        start.log_cfg,
+        seat,
+        "seat0",
+        output_width,
+        output_height,
+    );
+}
+
+/// The renderer WAYLAND_RENDERER selects, with the log line that says so.
+/// An unset variable is the normal default (no warning — the same rule
+/// WAYLAND_BACKEND follows); an unknown value warns and falls back to
+/// the pixman renderer.
+fn selectRendererKind(start: *Startup) RendererKind {
+    const raw = start.env.get("WAYLAND_RENDERER");
+    if (parseRendererEnv(raw)) |kind| {
+        log.info("renderer: {s} (WAYLAND_RENDERER={s})", start.io, start.log_cfg, "server", .{
+            @tagName(kind),
+            raw orelse "(unset)",
+        });
+        return kind;
+    }
+    log.warn("WAYLAND_RENDERER '{s}' unknown; using the pixman renderer", start.io, start.log_cfg, "server", .{raw.?});
+    return .pixman;
+}
+
+/// The ServerState every listener handler and policy function hangs
+/// off: the modules, the render targets and the mutable frame policy.
+fn initServerState(
+    start: *Startup,
+    core: *const CoreModules,
+    seat_mods: *const SeatModules,
+    output: *const OutputModules,
+    framebuffer: *pixman.Framebuffer,
+) !ServerState {
+    return .{
+        .allocator = start.allocator,
+        .io = start.io,
+        .log_cfg = start.log_cfg,
+        .display = core.display,
+        .compositor = core.compositor,
+        .shm_state = core.shm_state,
+        .shell = core.shell,
+        .layer_shell = core.layer_shell,
+        .seat = core.seat,
+        .subcompositor = core.subcompositor,
+        .data_device = core.data_device,
+        .primary_selection = core.primary_selection,
+        .renderer = output.renderer,
+        .pixman_renderer = output.pixman_renderer,
+        .renderer_kind = output.renderer_kind,
+        .xdg_activation = core.xdg_activation,
+        .xdg_decoration = core.xdg_decoration,
+        .fractional_scale = core.fractional_scale,
+        .viewporter = core.viewporter,
+        .pointer_gestures = seat_mods.pointer_gestures,
+        .relative_pointer = seat_mods.relative_pointer,
+        .pointer_constraints = seat_mods.pointer_constraints,
+        .tablet = seat_mods.tablet,
+        .cursor_shape = seat_mods.cursor_shape,
+        .tearing_control = seat_mods.tearing_control,
+        .session_lock = seat_mods.session_lock,
+        .data_control = seat_mods.data_control,
+        .foreign_toplevel = seat_mods.foreign_toplevel,
+        .linux_dmabuf = output.linux_dmabuf,
+        .backend = output.backend,
+        .drm_backend = if (output.is_drm) output.backend else null,
         .framebuffer = framebuffer,
         .camera = default_camera,
-        .camera_env = init.environ_map.get("WAYLAND_CAMERA"),
-        .presentation = presentation,
+        .camera_env = start.env.get("WAYLAND_CAMERA"),
+        .presentation = core.presentation,
         .toplevels = .empty,
         .layer_surfaces = .empty,
         .layer_popups = .empty,
@@ -958,128 +1512,97 @@ pub fn main(init: std.process.Init) !void {
         .lock_surface_gone_listener = wire.Listener(*wayland.session_lock.LockSurface).init(onLockSurfaceGone),
         .cursor_shape_changed_listener = wire.Listener(*wayland.cursor_shape.ShapeChange).init(onCursorShapeChanged),
     };
-    if (backend_is_drm) state.drm_backend = backend;
-    defer state.synth_clicked.deinit(allocator);
-    defer state.toplevels.deinit(allocator);
-    defer state.layer_surfaces.deinit(allocator);
-    defer state.layer_popups.deinit(allocator);
-    // Scene teardown (LIFO): drop the per-surface scene state first, then
-    // the scene output view, then the scene tree itself. The compositor
-    // (deferred earlier in main) destroys its surfaces afterwards; the
-    // listeners were already removed, so no entry is freed twice.
-    defer if (state.scene) |scene| scene.deinit();
-    defer if (state.scene_output) |so| so.destroy();
-    defer cleanupSurfaceEntries(&state);
-    // Destroy the clients FIRST in the teardown (LIFO: registered last,
-    // runs first — before the scene/shm/module deinits below). Their
-    // surface/buffer destroy signals must fire against LIVE modules: the
-    // shm map remove (shm.zig:223), the surface-node registry and the
-    // seat cleanup all touch module state. display.deinit ALSO calls
-    // destroyClients as idempotent safety (no clients left here), which
-    // alone would run AFTER the shm deinit — the shutdown UAF a live
-    // client (e.g. foot at window close) hit.
-    defer display.destroyClients();
+}
 
-    backend.events.new_output.add(&state.new_output_listener);
-    if (input_backend) |ib| {
-        state.input_backend = ib;
+/// Every signal the compositor listens to, in the order the handlers
+/// were registered before: the backend's outputs and input devices, the
+/// shell's new surfaces, the seat's pointer stream (which carries the
+/// camera controls), the focus-driven activation, the decoration and
+/// activation requests, the session lock's four signals, and the
+/// cursor-shape record.
+fn subscribe(state: *ServerState) void {
+    state.backend.events.new_output.add(&state.new_output_listener);
+    if (state.input_backend) |ib| {
         ib.events.new_input.add(&state.new_input_listener);
     }
-    shell.events.new_toplevel.add(&state.new_toplevel_listener);
-    shell.events.new_popup.add(&state.new_popup_listener);
-    layer_shell.events.new_layer_surface.add(&state.new_layer_surface_listener);
+    state.shell.events.new_toplevel.add(&state.new_toplevel_listener);
+    state.shell.events.new_popup.add(&state.new_popup_listener);
+    state.layer_shell.events.new_layer_surface.add(&state.new_layer_surface_listener);
     // L1: layer-popup parenting (get_popup) is observable; no anchoring or
     // placement policy here (out of scope, same as layer-surface layout).
-    layer_shell.events.new_popup.add(&state.new_layer_popup_listener);
-    seat.events.key.add(&state.seat_key_listener);
+    state.layer_shell.events.new_popup.add(&state.new_layer_popup_listener);
+    state.seat.events.key.add(&state.seat_key_listener);
     // M4 Phase B camera controls: wheel zoom + drag pan hook the seat's
     // existing event surface (button, pointer_move, axis). The raylib
     // and libinput backends feed these signals through the seat API
     // (pointerButton/pointerMotion/pointerAxis), so no backend change is
     // needed; headless E2E synthesizes the same calls.
-    seat.events.button.add(&state.seat_button_listener);
-    seat.events.pointer_move.add(&state.seat_pointer_move_listener);
-    seat.events.axis.add(&state.seat_axis_listener);
+    state.seat.events.button.add(&state.seat_button_listener);
+    state.seat.events.pointer_move.add(&state.seat_pointer_move_listener);
+    state.seat.events.axis.add(&state.seat_axis_listener);
     // wl_toplevel.activated is compositor-authored state driven by the
     // seat's keyboard focus (P1-9), so a click — not only an
     // xdg_activation request — updates the active titlebar.
-    seat.events.keyboard_focus.add(&state.seat_focus_listener);
+    state.seat.events.keyboard_focus.add(&state.seat_focus_listener);
     // xdg_activation_v1: activation requests with known tokens (focus
     // policy is out of scope — the handler logs and accepts) and the
     // token-creation hook (XA-1; the compositor can observe allowlists /
     // telemetry).
-    xdg_activation.events.request_activate.add(&state.request_activate_listener);
-    xdg_activation.events.new_token.add(&state.new_activation_token_listener);
+    state.xdg_activation.events.request_activate.add(&state.request_activate_listener);
+    state.xdg_activation.events.new_token.add(&state.new_activation_token_listener);
     // zxdg_decoration_manager_v1: mode requests; the handler replies with
     // the effective mode via sendConfigure. New decorations announce the
     // compositor's initial mode the same way, so a client that never sends
     // set_mode still draws the policy chrome (L2).
-    xdg_decoration.events.request_mode.add(&state.request_mode_listener);
-    xdg_decoration.events.new_toplevel_decoration.add(&state.new_decoration_listener);
+    state.xdg_decoration.events.request_mode.add(&state.request_mode_listener);
+    state.xdg_decoration.events.new_toplevel_decoration.add(&state.new_decoration_listener);
     // The compositor hit-tests over the scene graph: surfaces map to
     // scene nodes through the surface entries.
-    seat.setPick(pickSurface, &state);
+    state.seat.setPick(pickSurface, state);
     // Click-to-focus gates, in the order they are consulted: the session
     // lock first (while locked only a lock surface of the lock client may
     // take focus), then L-D7's layer policy — a layer surface with
     // keyboard_interactivity=none must never get focus, and the
     // move-based routing in applyLayerKeyboardFocus enforces the same
     // for hover.
-    seat.setKeyboardFocusGate(keyboardFocusAllowed, &state);
+    state.seat.setKeyboardFocusGate(keyboardFocusAllowed, state);
     // ext_session_lock_manager_v1: the four signals main owns. `locked`
     // runs inside the lock surface's commit dispatch, so the grabs are
     // ended and the focus forced onto a lock surface BEFORE any frame can
     // be composited (shell/session_lock.zig wiring item 1).
-    session_lock.events.locked.add(&state.session_locked_listener);
-    session_lock.events.unlocked.add(&state.session_unlocked_listener);
-    session_lock.events.new_lock_surface.add(&state.new_lock_surface_listener);
-    session_lock.events.lock_surface_gone.add(&state.lock_surface_gone_listener);
-    // Unlink before the module deinits run: their teardown emits
-    // lock_surface_gone, and these handlers dereference `state`, whose
-    // own teardown defers were registered later and have already run.
-    defer unlinkSessionLockListeners(&state);
+    state.session_lock.?.events.locked.add(&state.session_locked_listener);
+    state.session_lock.?.events.unlocked.add(&state.session_unlocked_listener);
+    state.session_lock.?.events.new_lock_surface.add(&state.new_lock_surface_listener);
+    state.session_lock.?.events.lock_surface_gone.add(&state.lock_surface_gone_listener);
     // wp_cursor_shape_manager_v1: an accepted set_shape is recorded by the
     // module; this compositor paints one cursor image for every shape, so
     // the handler only says so.
-    cursor_shape.events.shape_changed.add(&state.cursor_shape_changed_listener);
+    state.cursor_shape.?.events.shape_changed.add(&state.cursor_shape_changed_listener);
+}
 
-    // zwlr_screencopy_v1: captures the compositor framebuffer (shm only).
-    // The copy is deferred to the next output commit; requestFrame wakes
-    // the renderer so a pending copy gets its commit.
-    state.screencopy = try wayland.screencopy.Screencopy.init(
-        allocator,
-        io,
-        &log_cfg,
-        display,
-        shm_state,
-        getFramebuffer,
-        &state,
-        outputFromResource,
-        &state,
-        requestFrame,
-        &state,
-    );
-    defer if (state.screencopy) |sc| sc.deinit();
-
-    if (init.environ_map.get("WAYLAND_RUN_FRAMES")) |frames| {
+/// The startup knobs read once and written straight into the
+/// ServerState: the frame budget, the synthesized input, the perf trace,
+/// and the raylib window's input source.
+fn applyEnvironment(start: *Startup, state: *ServerState, output: *const OutputModules) !void {
+    if (start.env.get("WAYLAND_RUN_FRAMES")) |frames| {
         state.run_frames = std.fmt.parseInt(u32, frames, 10) catch |err| blk: {
             log.warn(
                 "WAYLAND_RUN_FRAMES '{s}' not parseable ({s}); running until watchdog",
-                io,
-                &log_cfg,
+                start.io,
+                start.log_cfg,
                 "server",
                 .{ frames, @errorName(err) },
             );
             break :blk 0;
         };
         if (state.run_frames > 0) {
-            log.info("WAYLAND_RUN_FRAMES: stopping after {d} frames", io, &log_cfg, "server", .{state.run_frames});
+            log.info("WAYLAND_RUN_FRAMES: stopping after {d} frames", start.io, start.log_cfg, "server", .{state.run_frames});
         }
     }
-    if (init.environ_map.get("WAYLAND_SYNTH_INPUT")) |v| {
+    if (start.env.get("WAYLAND_SYNTH_INPUT")) |v| {
         if (std.mem.eql(u8, v, "1")) state.synth_input = true;
     }
-    if (init.environ_map.get("WAYLAND_PERF")) |v| {
+    if (start.env.get("WAYLAND_PERF")) |v| {
         if (std.mem.eql(u8, v, "1")) state.perf = true;
     }
 
@@ -1087,19 +1610,36 @@ pub fn main(init: std.process.Init) !void {
     // state every commit and feeds the seat through raylib_input.poll.
     // Only when the raylib backend actually owns the backend object (the
     // headless fallback has no input source).
-    if (backend_is_raylib and build_options.enable_raylib) {
-        const input = try raylib_input_mod.create(allocator, state.seat);
+    if (output.is_raylib and build_options.enable_raylib) {
+        const input = try raylib_input_mod.create(start.allocator, state.seat);
         state.raylib_input = input;
         raylib_mod.RaylibBackend.setInputHook(state.backend, raylib_input_mod.poll, input);
-        log.info("raylib input source attached", io, &log_cfg, "server", .{});
+        log.info("raylib input source attached", start.io, start.log_cfg, "server", .{});
     }
+}
 
-    // --- zio event loop ---------------------------------------------------
-    // SAFETY: initialized by loop.init() immediately below, before any use.
-    var loop: zio.ev.Loop = undefined;
-    try loop.init(.{});
-    defer loop.deinit();
-    state.loop = &loop;
+/// Register the loop's timers. The Timer/PipePoll values live in
+/// `timers` (main's scope) because the ServerState keeps pointers to
+/// them; these functions only write them and add them. The fd pollers are
+/// armed separately, AFTER backend.start(), exactly as before.
+fn armEventLoop(
+    start: *Startup,
+    state: *ServerState,
+    output: *const OutputModules,
+    timers: *LoopTimers,
+) void {
+    const loop = state.loop.?;
+    timers.* = .{
+        .watchdog = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(watchdog_timeout_ms) }),
+        .ping = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(xdg_ping_interval_ms) }),
+        .repeat = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(600) }),
+        .raylib_poll = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(16) }),
+        .display_poll = zio.ev.PipePoll.init(state.display.loopFd(), .read),
+        // SAFETY: the two optional pollers are written by the branches
+        // below and read only under the same condition.
+        .input_poll = undefined,
+        .drm_poll = undefined,
+    };
 
     // Watchdog: registered BEFORE backend.start() so the first DRM frame's
     // re-arm (renderFrame) targets a timer already in the loop — a frame
@@ -1107,96 +1647,113 @@ pub fn main(init: std.process.Init) !void {
     // un-added timer would be a no-op. It fires only when nothing re-arms
     // it for the full window; a wedged loop stops with an error instead
     // of hanging tests.
-    var watchdog = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(watchdog_timeout_ms) });
-    watchdog.c.userdata = &state;
-    watchdog.c.callback = onWatchdog;
-    state.watchdog = &watchdog;
+    timers.watchdog.c.userdata = state;
+    timers.watchdog.c.callback = onWatchdog;
+    state.watchdog = &timers.watchdog;
     // The idle-frame skip means a healthy server renders nothing between
     // changes, so the watchdog (re-armed only per render) would stop an
     // idle interactive demo after the window. WAYLAND_WATCHDOG_DISABLE
     // opts out (set by the interactive VM demo; the E2E keeps it).
-    const watchdog_disabled = init.environ_map.get("WAYLAND_WATCHDOG_DISABLE") != null;
+    const watchdog_disabled = start.env.get("WAYLAND_WATCHDOG_DISABLE") != null;
     state.watchdog_enabled = !watchdog_disabled;
-    if (!watchdog_disabled) loop.add(&watchdog.c);
+    if (!watchdog_disabled) loop.add(&timers.watchdog.c);
 
     // xdg_wm_base ping policy (F3): a repeating timer re-arms itself in
     // onPingTick; each tick pings every live client and declares clients
     // unresponsive (error 6) when the previous ping went unanswered.
-    var ping_timer = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(xdg_ping_interval_ms) });
-    ping_timer.c.userdata = &state;
-    ping_timer.c.callback = onPingTick;
-    state.ping_timer = &ping_timer;
-    loop.add(&ping_timer.c);
+    timers.ping.c.userdata = state;
+    timers.ping.c.callback = onPingTick;
+    state.ping_timer = &timers.ping;
+    loop.add(&timers.ping.c);
 
     // Server-side key repeat (seat key_repeat_delay/rate): one-shot
     // timer; the initial add arms a harmless no-op tick (nothing repeats),
     // onSeatKey re-arms it on a key press and disarms on release.
-    var repeat_timer = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(600) });
-    repeat_timer.c.userdata = &state;
-    repeat_timer.c.callback = onRepeatTick;
-    state.repeat_timer = &repeat_timer;
-    loop.add(&repeat_timer.c);
+    timers.repeat.c.userdata = state;
+    timers.repeat.c.callback = onRepeatTick;
+    state.repeat_timer = &timers.repeat;
+    loop.add(&timers.repeat.c);
 
     // raylib window input: poll + feed the seat from the loop at ~60 Hz.
     // The commit must NOT poll (mid-render feeding lands after the frame's
     // flush + the in_render guard suppresses the follow-up frame, leaving
     // the events queued forever). The timer requests a render when the
     // poll fed something, so events flush on the next pointerFrame().
-    if (backend_is_raylib and build_options.enable_raylib) {
-        var raylib_poll_timer = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(16) });
-        raylib_poll_timer.c.userdata = &state;
-        raylib_poll_timer.c.callback = onRaylibPollTick;
-        state.raylib_poll_timer = &raylib_poll_timer;
-        loop.add(&raylib_poll_timer.c);
+    if (output.is_raylib and build_options.enable_raylib) {
+        timers.raylib_poll.c.userdata = state;
+        timers.raylib_poll.c.callback = onRaylibPollTick;
+        state.raylib_poll_timer = &timers.raylib_poll;
+        loop.add(&timers.raylib_poll.c);
     }
+}
 
-    try backend.start(); // fires new_output; the headless timer paces frames
-    if (input_backend) |ib| try ib.start();
+/// Register the fd pollers: the display (client requests + wire timers),
+/// the libinput device fd and the DRM card fd. Called after the backends
+/// start, so the first frame a backend fires already has its poller.
+fn armBackendPollers(
+    state: *ServerState,
+    output: *const OutputModules,
+    input_backend: ?*wayland.backend.Backend,
+    timers: *LoopTimers,
+) void {
+    const loop = state.loop.?;
 
     // Watch the display fd: readable when a client sent requests or a wire
     // timer (headless frame pacing) is due. Rearm keeps the registration.
-    var display_poll = zio.ev.PipePoll.init(display.loopFd(), .read);
-    display_poll.c.userdata = &state;
-    display_poll.c.callback = onDisplayReady;
-    display_poll.c.flags.rearm = true;
-    loop.add(&display_poll.c);
+    timers.display_poll.c.userdata = state;
+    timers.display_poll.c.callback = onDisplayReady;
+    timers.display_poll.c.flags.rearm = true;
+    loop.add(&timers.display_poll.c);
 
     // libinput: watch the udev/evdev fd; dispatch drains events into the seat.
     if (input_backend) |ib| {
         const input_fd = libinput_mod.LibinputBackend.fromBackend(ib).pollFd();
-        var input_poll = zio.ev.PipePoll.init(input_fd, .read);
-        input_poll.c.userdata = &state;
-        input_poll.c.callback = onInputReady;
-        input_poll.c.flags.rearm = true;
-        loop.add(&input_poll.c);
+        timers.input_poll = zio.ev.PipePoll.init(input_fd, .read);
+        timers.input_poll.c.userdata = state;
+        timers.input_poll.c.callback = onInputReady;
+        timers.input_poll.c.flags.rearm = true;
+        loop.add(&timers.input_poll.c);
     }
     // DRM: watch the card fd for page-flip events (the frame pacing).
-    if (backend_is_drm) {
-        const drm_fd = drm_mod.pollFd(drm_mod.DrmBackend.fromBackend(backend));
+    if (output.is_drm) {
+        const drm_fd = drm_mod.pollFd(drm_mod.DrmBackend.fromBackend(output.backend));
         state.drm_poll_fd = drm_fd;
-        var drm_poll = zio.ev.PipePoll.init(drm_fd, .read);
-        drm_poll.c.userdata = &state;
-        drm_poll.c.callback = onDrmReady;
-        drm_poll.c.flags.rearm = true;
-        loop.add(&drm_poll.c);
+        timers.drm_poll = zio.ev.PipePoll.init(drm_fd, .read);
+        timers.drm_poll.c.userdata = state;
+        timers.drm_poll.c.callback = onDrmReady;
+        timers.drm_poll.c.flags.rearm = true;
+        loop.add(&timers.drm_poll.c);
     }
+}
 
-    log.info("entering event loop (display fd {d})", io, &log_cfg, "server", .{display.loopFd()});
+/// Poll until the loop stops (the watchdog, WAYLAND_RUN_FRAMES, a poll
+/// error or a client shutdown), then drop the loop pointer the state
+/// hands to the watchdog re-arm.
+fn runEventLoop(state: *ServerState) void {
+    log.info("entering event loop (display fd {d})", state.io, state.log_cfg, "server", .{state.display.loopFd()});
+    const loop = state.loop.?;
     while (!loop.stopped()) {
         loop.poll(.max) catch |err| {
-            log.err("loop poll error: {s}", io, &log_cfg, "server", .{@errorName(err)});
+            log.err("loop poll error: {s}", state.io, state.log_cfg, "server", .{@errorName(err)});
             break;
         };
     }
-    log.info("event loop exited: frames={d} watchdog_fired={}", io, &log_cfg, "server", .{
+    log.info("event loop exited: frames={d} watchdog_fired={}", state.io, state.log_cfg, "server", .{
         state.frames_rendered,
         state.watchdog_fired,
     });
     state.loop = null;
-    // The ServerState owns the render framebuffer (onNewOutput may have
-    // replaced the original via resize); free the CURRENT one here — the
-    // backend must already be torn down so nothing references it. The base
-    // (canvas-without-cursor) too.
+}
+
+/// The render targets the ServerState owns, freed here after the event
+/// loop: the GLES2 target first (its GL objects need the renderer's
+/// context, still current — the renderer itself is destroyed later, by
+/// OutputModules.deinit), then the CPU base (the canvas without the
+/// cursor) and the display framebuffer the backends scanned out. The
+/// backend is already torn down, so nothing references them.
+fn freeRenderTargets(state: *ServerState) void {
+    if (state.gles2_target) |t| t.destroy();
+    state.gles2_target = null;
     if (state.base_framebuffer) |base| base.deinit();
     state.base_framebuffer = null;
     state.framebuffer.deinit();
@@ -1236,6 +1793,11 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
         // size on the next composite; a stale-sized base would copy wrong.
         if (self.base_framebuffer) |base| base.deinit();
         self.base_framebuffer = null;
+        // The GLES2 canvas target follows the framebuffer: its FBO's
+        // color texture was allocated at the old size and every pass
+        // renders at the target's own size (u_viewport is the target's).
+        if (self.gles2_target) |t| t.destroy();
+        self.gles2_target = null;
         log.info("framebuffer resized to {d}x{d}", self.io, self.log_cfg, "server", .{
             out.mode.width, out.mode.height,
         });
@@ -1300,7 +1862,11 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
         scene,
         self.compositor,
         self.seat,
-        self.renderer,
+        // The pixman renderer, never `self.renderer`: Cursor.draw takes
+        // a *pixman.Framebuffer and its textures are imported through
+        // PixmanRenderer.importMemory (cursor.zig:260, :337), so under
+        // WAYLAND_RENDERER=gles2 the two are different objects.
+        self.pixman_renderer,
     ) catch |err| {
         log.err("cursor init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
@@ -2112,6 +2678,37 @@ fn requestRender(self: *ServerState) void {
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// What the render phases share, captured once per frame by beginFrame:
+/// the session-lock decision (read ONCE, the privilege boundary), the
+/// cursor footprints (captured BEFORE the cursor nodes move) and the
+/// scene output this frame composites into.
+const FrameInput = struct {
+    lock: LockedFrame,
+    cursor_fp: wayland.cursor.Cursor.Footprints,
+    scene_output: *wayland.scene.SceneOutput,
+};
+
+/// The five marks one frame takes, in the order the phases take them.
+/// finishFrame logs them as perf_frame_fmt's spans (microseconds).
+const FramePerf = struct {
+    /// Frame start, after the idle skip.
+    t0: u64,
+    /// After the scene sync (subsurfaces, popups, drag icon).
+    sync: u64,
+    /// After the cursor update.
+    cursor: u64,
+    /// After the composite, before the present.
+    render: u64,
+    /// After the output commit.
+    present: u64,
+};
+
+/// One frame, in five phases: gather what the frame needs (beginFrame),
+/// accumulate its damage, composite the canvas, commit it to the output,
+/// then finish (frame callbacks, presentation, bookkeeping). The order
+/// and every short-circuit in between are the frame's contract: a locked
+/// session must be the FIRST thing a composited frame sees, and a failed
+/// commit must skip every finishing step so the next flip re-renders.
 fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     const zone = tracy.Zone.begin(.{ .src = @src() });
     defer zone.end();
@@ -2132,7 +2729,27 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     if (!self.repaint_pending) {
         return;
     }
-    const perf_t0 = perfNs(self);
+    var perf: FramePerf = .{ .t0 = perfNs(self), .sync = 0, .cursor = 0, .render = 0, .present = 0 };
+
+    const input = beginFrame(self, out, &perf) orelse return;
+    accumulateFrameDamage(self, out, input);
+    compositeFrame(self, input);
+    // A failed commit skips the whole finishing phase: no frame callback,
+    // no presentation, no watchdog re-arm — the repaint flag stays set
+    // so the flip event re-renders the same frame.
+    if (!presentFrame(self, out, input, &perf)) return;
+    finishFrame(self, out, &perf);
+}
+
+/// Phase 1: the frame's inputs. Reads the session-lock latch ONCE (see
+/// the ext_session_lock_manager_v1 wiring item 1 in the body), syncs the
+/// scene, moves the cursor and captures its footprints. Null when there
+/// is no scene output to render into.
+fn beginFrame(
+    self: *ServerState,
+    out: *wayland.output.Output,
+    perf: *FramePerf,
+) ?FrameInput {
     // ext_session_lock_manager_v1, wiring item 1: the latch is read HERE,
     // once per frame, and every composite decision below uses this value.
     // Nothing caches "was I unlocked" across a dispatch, so the first
@@ -2141,7 +2758,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // locked frame.
     const lock = lockedFrameFor(self, out);
 
-    const perf_t_sync = perfNs(self);
+    perf.sync = perfNs(self);
     // Subsurfaces: position child nodes over their mapped parent.
     syncSubsurfaceNodes(self);
     // F12: popups position over their parent at the geometry offset and
@@ -2154,7 +2771,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
 
     const so = self.scene_output orelse {
         log.err("render: no scene output", self.io, self.log_cfg, "server", .{});
-        return;
+        return null;
     };
 
     // M3 cursor: follow the seat pointer, show the client cursor surface
@@ -2162,8 +2779,14 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // footprints BEFORE moving the nodes: a partial upload must repaint
     // both the old and the new position.
     const cursor_fp = self.cursor.?.update();
-    const perf_t_cursor = perfNs(self);
+    perf.cursor = perfNs(self);
+    return .{ .lock = lock, .cursor_fp = cursor_fp, .scene_output = so };
+}
 
+/// Phase 2: this frame's damage ring — the region the raylib backend
+/// uploads and the commit reports.
+fn accumulateFrameDamage(self: *ServerState, out: *wayland.output.Output, input: FrameInput) void {
+    const so = input.scene_output;
     // Damage accumulation: this frame's surface damage translated into
     // output coordinates, plus the cursor's old+new footprints. The ring
     // is the upload region for the raylib backend; the pixman repaint
@@ -2191,15 +2814,21 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // consumed below for frame callbacks + presentation feedback.
     wayland.surface_node.collectPresented(self.scene.?);
     wayland.surface_node.addSurfaceDamage(self.scene.?, so, out_rect);
-    if (!std.meta.eql(cursor_fp.old[0], cursor_fp.new[0]) or !std.meta.eql(cursor_fp.old[1], cursor_fp.new[1])) {
-        for (cursor_fp.old) |r| if (r) |rr| so.addDamage(rr);
-        for (cursor_fp.new) |r| if (r) |rr| so.addDamage(rr);
+    if (!std.meta.eql(input.cursor_fp.old[0], input.cursor_fp.new[0]) or
+        !std.meta.eql(input.cursor_fp.old[1], input.cursor_fp.new[1]))
+    {
+        for (input.cursor_fp.old) |r| if (r) |rr| so.addDamage(rr);
+        for (input.cursor_fp.new) |r| if (r) |rr| so.addDamage(rr);
     }
+}
 
-    // Composite the canvas into the framebuffer, then present it. M4:
-    // the canvas pass (background fill + camera-transformed surface
-    // textures + screen-space cursor) replaces the scene-output render;
-    // the damage-ring accounting below is unchanged.
+/// Phase 3: put this frame's canvas on screen — a full composite, or one
+/// of the two cheap paths the frame policy allows. M4: the canvas pass
+/// (background fill + camera-transformed surface textures +
+/// screen-space cursor) replaces the scene-output render; the
+/// damage-ring accounting is unchanged.
+fn compositeFrame(self: *ServerState, input: FrameInput) void {
+    const lock = input.lock;
     if (lock.locked) {
         // A locked session never reuses the previous canvas: the two
         // shortcuts below (hover cursor restore, present-unchanged) would
@@ -2208,7 +2837,9 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         self.cursor_repaint = false;
         self.frame_kick = false;
         compositeCanvas(self, lock);
-    } else if (self.cursor_repaint) {
+        return;
+    }
+    if (self.cursor_repaint) {
         // Hover cursor move: the canvas is static, so restore the old
         // cursor region from the persisted base + redraw the cursor at the
         // new pointer — no full-canvas recomposite (the ~450ms bilinear).
@@ -2221,31 +2852,44 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
             // so the visible cursor is the buf node, not the rect node).
             // Restoring only the rect node left the old client cursor in
             // place, smearing a trail behind the moving pointer.
-            for (cursor_fp.old) |r| {
+            for (input.cursor_fp.old) |r| {
                 if (r) |rr| copyRegion(base, self.framebuffer, rr);
             }
         }
         if (!lock.cursor_hidden) self.cursor.?.draw(self.framebuffer);
-    } else if (self.frame_kick) {
+        return;
+    }
+    if (self.frame_kick) {
         // A client is ready for the next frame (pending wl_callback) but
         // the canvas is unchanged. Present the current framebuffer so the
         // callback fires and the client can render + commit its pending
         // update — no recomposite.
         self.frame_kick = false;
-    } else {
-        compositeCanvas(self, lock);
+        return;
     }
+    compositeCanvas(self, lock);
+}
 
+/// Phase 4: hand the framebuffer to the output. The output damage is the
+/// ring's rects for this frame — the raylib backend uploads only that
+/// region. An empty ring (nothing changed, or whole damage) falls back to
+/// a whole-output damage. False when the commit failed; the repaint flag
+/// stays set so the flip event re-renders.
+fn presentFrame(
+    self: *ServerState,
+    out: *wayland.output.Output,
+    input: FrameInput,
+    perf: *FramePerf,
+) bool {
     // wp_tearing_control_manager_v1: the present path consults the
     // committed hint of every surface it is about to scan out, per frame.
     _ = consultTearingHints(self, out);
-    _ = so.damage_ring.rotate();
-    const perf_t_render = perfNs(self);
+    _ = input.scene_output.damage_ring.rotate();
+    // The render span ends here — after the tearing consult and the ring
+    // rotation, which is where the perf trace has always taken it — and
+    // before the commit, so the present span covers the commit alone.
+    perf.render = perfNs(self);
 
-    // Present: hand the framebuffer to the output. The output damage is
-    // the ring's rects for this frame — the raylib backend uploads only
-    // that region. An empty ring (nothing changed, or whole damage) falls
-    // back to a whole-output damage.
     var state = wayland.output.Output.State.init(self.allocator);
     defer state.deinit();
     state.committed = wayland.output.Output.State.committed_enabled |
@@ -2254,7 +2898,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     state.enabled = true;
     state.mode = .{ .width = out.mode.width, .height = out.mode.height, .refresh_msec = out.mode.refresh_msec };
     state.buffer = @ptrCast(self.framebuffer);
-    const damage_rects = so.takeDamage();
+    const damage_rects = input.scene_output.takeDamage();
     if (damage_rects.len == 0) {
         state.damage.addWhole();
     } else {
@@ -2270,10 +2914,16 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         // flip is in flight); the DRM logs real failures itself. The
         // repaint flag stays set so the flip event re-renders it.
         log.debug("output commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
+        return false;
     };
-    const perf_t_present = perfNs(self);
+    perf.present = perfNs(self);
+    return true;
+}
 
+/// Phase 5: what a committed frame owes its clients — the frame
+/// callbacks, the presentation feedback, the counters and the loop
+/// bookkeeping that follows a successful present.
+fn finishFrame(self: *ServerState, out: *wayland.output.Output, perf: *FramePerf) void {
     // Frame callbacks: the surfaces presented this frame get
     // wl_callback.done at present time (wlroots wlr_surface_send_frame_done,
     // wlr_compositor.c:1131-1139). The time is the monotonic clock in ms
@@ -2285,11 +2935,11 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     if (self.perf) {
         log.info(perf_frame_fmt, self.io, self.log_cfg, "perf", .{
             self.frames_rendered,
-            (perf_t_sync - perf_t0) / 1000,
-            (perf_t_cursor - perf_t_sync) / 1000,
-            (perf_t_render - perf_t_cursor) / 1000,
-            (perf_t_present - perf_t_render) / 1000,
-            (perf_t_present - perf_t0) / 1000,
+            (perf.sync - perf.t0) / 1000,
+            (perf.cursor - perf.sync) / 1000,
+            (perf.render - perf.cursor) / 1000,
+            (perf.present - perf.render) / 1000,
+            (perf.present - perf.t0) / 1000,
         });
     }
 
@@ -2360,7 +3010,7 @@ const PresentTearing = struct {
 /// The present path's wp_tearing_control_v1 gate: read every surface's
 /// committed hint once per frame, for exactly the surfaces this frame is
 /// about to scan out (`scene.presented`, rebuilt by collectPresented
-/// earlier in renderFrame).
+/// earlier in accumulateFrameDamage).
 ///
 /// The OUTPUT GATE is the honest part. `.async` is a permission from the
 /// client (tearing-control-v1.xml:95-100), and wlroots only takes the
@@ -2438,7 +3088,8 @@ const LockedFrame = struct {
     cursor_hidden: bool = false,
 };
 
-/// The locked frame for `out`, read at the start of renderFrame. The
+/// The locked frame for `out`, read once per frame at the top of
+/// beginFrame. The
 /// `locked` signal is emitted inside the lock surface's commit dispatch
 /// (shell/session_lock.zig), so this read happens after the latch was
 /// written and the frame it decides IS the first locked frame — no
@@ -2470,7 +3121,7 @@ fn lockedFrameFor(self: *ServerState, out: *wayland.output.Output) LockedFrame {
 /// Composite the full canvas (background + camera-transformed surfaces +
 /// screen-space cursor) into the display framebuffer. The background +
 /// surfaces (the "base") are rendered into the persisted base_framebuffer
-/// first and copied out, so renderFrame's cursor_repaint path can restore
+/// first and copied out, so compositeFrame's cursor_repaint path can restore
 /// a cursor region from the base without recompositing the whole canvas
 /// (the ~450ms full-canvas bilinear in the VM).
 fn compositeCanvas(self: *ServerState, lock: LockedFrame) void {
@@ -2494,6 +3145,17 @@ fn compositeCanvas(self: *ServerState, lock: LockedFrame) void {
 /// content, the drag icon and the cursor are never drawn, which is the
 /// render half of the privilege boundary (ext_session_lock_v1:74-91).
 fn compositeBase(self: *ServerState, lock: LockedFrame) void {
+    if (self.base_framebuffer == null) return;
+    switch (self.renderer_kind) {
+        .pixman => compositeBasePixman(self, lock),
+        .gles2 => compositeBaseGles2(self, lock),
+    }
+}
+
+/// The CPU canvas pass: fill the base framebuffer and rasterize the
+/// surfaces through the camera into it, byte for byte the output this
+/// server has always presented (WAYLAND_RENDERER unset or "pixman").
+fn compositeBasePixman(self: *ServerState, lock: LockedFrame) void {
     const base = self.base_framebuffer orelse return;
     // 1. Fill. Premultiplied ARGB8888, memory bytes B,G,R,A; the scene's
     //    background rect drew the same color via addRect
@@ -2502,14 +3164,7 @@ fn compositeBase(self: *ServerState, lock: LockedFrame) void {
     //    lock color INSTEAD, before anything is drawn: an output with no
     //    (or a too small) lock surface must never show what was there
     //    before.
-    const fill = if (lock.locked) lock_blank_color else background_color;
-    const bg: [4]u8 = .{
-        @intFromFloat(@round(fill[2] * 255.0)),
-        @intFromFloat(@round(fill[1] * 255.0)),
-        @intFromFloat(@round(fill[0] * 255.0)),
-        @intFromFloat(@round(fill[3] * 255.0)),
-    };
-    base.fill(bg);
+    base.fill(premultipliedFill(lock));
     // A blank output draws NOTHING: the solid color stays (outputIsBlank
     // said the lock surface is missing, unmapped or smaller than the
     // output, and composited lock content must never be stretched to
@@ -2525,6 +3180,122 @@ fn compositeBase(self: *ServerState, lock: LockedFrame) void {
     //    identical).
     var items: std.ArrayList(CanvasItem) = .empty;
     defer items.deinit(self.allocator);
+    collectCanvasItems(self, lock, .sampled, &items);
+    wayland.canvas.render(self.allocator, base, &self.camera, items.items, if (self.gestures.fast_render) 3 else 1);
+}
+
+/// The GLES2 canvas pass (WAYLAND_RENDERER=gles2): the same canvas —
+/// the same fill color, the same item list, the same camera — drawn by
+/// the GPU renderer, with the camera UPLOADED as the renderer's one
+/// scene -> target affine. The frame this produces is what the backends
+/// scan out; nothing here falls back to pixman.
+fn compositeBaseGles2(self: *ServerState, lock: LockedFrame) void {
+    const base = self.base_framebuffer orelse return;
+    const target = ensureGles2Target(self) orelse return;
+    // THE CAMERA IS THE UNIFORM: the shader maps every dst rect through
+    // u_transform (gles2.zig "# Transform"), so the world-space dst rects
+    // below land exactly where Camera.worldToScreen puts them — the M4
+    // camera reaches the GPU instead of being applied per CPU pixel.
+    gles2.Gles2Renderer.setTransform(self.renderer, cameraAffine(self.camera));
+    const pass = self.renderer.beginPass(target) orelse return;
+
+    // 1. Fill, in WORLD coordinates: the rect is scene space and the
+    //    scene space is the world, because the camera is the uniform.
+    //    Straight-alpha RGBA, the same colour the CPU path premultiplies
+    //    into its fill bytes (wlr_render_color,
+    //    include/wlr/render/pass.h:135-137). At a = 1 the two agree to
+    //    within one unit per channel: the shader declares `precision
+    //    mediump float` and converts the result to unorm8 at that
+    //    precision, so a channel whose exact value sits on a .5 boundary
+    //    (0.1 * 255 = 25.5) can land one lower than the CPU path's
+    //    round-half-away-from-zero. The tests pin both sides.
+    const fill: [4]f32 = if (lock.locked) lock_blank_color else background_color;
+    pass.addRect(worldRectForOutput(self.camera), fill);
+
+    // A blank output draws NOTHING: the solid color stays (outputIsBlank
+    // said the lock surface is missing, unmapped or smaller than the
+    // output, and composited lock content must never be stretched to
+    // cover the gap).
+    if (!lock.blank) {
+        var items: std.ArrayList(CanvasItem) = .empty;
+        defer items.deinit(self.allocator);
+        collectCanvasItems(self, lock, .identity_only, &items);
+        // `gestures.fast_render` has no counterpart here and is
+        // deliberately not consulted: it asks the CPU rasterizer for a
+        // strided, blocky composite during a camera drag
+        // (compositeBasePixman's `quality` argument), while the GLES2
+        // sampler is already bilinear and costs no more per pixel — the
+        // knob exists to make a SOFTWARE rasterizer affordable, and
+        // honouring it here would only degrade the GPU path.
+        for (items.items) |item| {
+            pass.addTexture(
+                item.texture,
+                // The whole texture: `.identity_only` already dropped
+                // every surface whose buffer transform is not the
+                // identity, so sampling the full texture into the world
+                // rect IS that surface's 1:1 blit.
+                null,
+                .{
+                    .x = @floatCast(item.world_x),
+                    .y = @floatCast(item.world_y),
+                    .width = @floatCast(item.world_w),
+                    .height = @floatCast(item.world_h),
+                },
+                item.opacity,
+            );
+        }
+    }
+    pass.submit();
+
+    // 3. Scanout read-back. Every backend in this server scans out CPU
+    //    bytes — they cast the committed buffer to a *pixman.Framebuffer
+    //    (backend/raylib.zig:283, backend/wayland.zig:376,
+    //    backend/drm.zig) and headless ignores it — so the frame the
+    //    compositor presents is this read-back, not the FBO. It is the
+    //    same renderer -> CPU move wlroots' screencopy makes with
+    //    wlr_texture_read_back (render/texture.c:1177), and the byte
+    //    order is the CPU renderer's own (Gles2Target.readPixels).
+    const pixels = target.readPixels(self.allocator) catch |err| {
+        log.err("gles2 read-back failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    defer self.allocator.free(pixels);
+    if (pixels.len != base.data.len) {
+        log.err("gles2 read-back is {d} bytes, the base framebuffer {d}", self.io, self.log_cfg, "server", .{
+            pixels.len, base.data.len,
+        });
+        return;
+    }
+    @memcpy(base.data, pixels);
+}
+
+/// Which wl_output_transforms the canvas pass can express.
+const SurfaceTransformPolicy = enum {
+    /// pixman: the CPU rasterizer samples each item through its
+    /// transform (canvas.zig's surfaceToTexture), so all nine are drawn.
+    sampled,
+    /// GLES2: one pass uploads ONE scene -> target affine — the camera
+    /// — and a pass's quads take their source from a crop rect, which
+    /// cannot express a rotated or mirrored buffer. The 90/180/270 and
+    /// flipped transforms are therefore dropped with a warning instead of
+    /// drawn wrongly; the identity transform (what every client has
+    /// unless it calls wl_surface.set_buffer_transform) is a plain 1:1
+    /// quad.
+    identity_only,
+};
+
+/// The frames' canvas items, in array order (canvas.render composites in
+/// that order, so the last item draws on top): every mapped surface
+/// except the four the compositor refuses to draw as content — the
+/// client's cursor surface, the drag icon, a disabled (minimized) node
+/// and, while the session is locked, everything that is not a lock
+/// surface.
+fn collectCanvasItems(
+    self: *ServerState,
+    lock: LockedFrame,
+    policy: SurfaceTransformPolicy,
+    items: *std.ArrayList(CanvasItem),
+) void {
     // The cursor's WlSurface is drawn ONLY as the cursor (Cursor.draw),
     // never as a normal surface — matching wlroots (the cursor is a
     // separate plane, never a scene node) and niri (the cursor surface is
@@ -2558,6 +3329,16 @@ fn compositeBase(self: *ServerState, lock: LockedFrame) void {
         if (!node.enabled) continue;
         const bn = node.kind.buffer;
         const texture = bn.texture orelse continue;
+        if (policy == .identity_only and sn.*.surface.current.transform != .normal) {
+            log.warn(
+                "gles2: surface skipped, wl_output_transform={s} has no counterpart in the GLES2 canvas pass",
+                self.io,
+                self.log_cfg,
+                "server",
+                .{@tagName(sn.*.surface.current.transform)},
+            );
+            continue;
+        }
         const rect = node.absolutePosition();
         items.append(self.allocator, .{
             .texture = texture,
@@ -2571,7 +3352,37 @@ fn compositeBase(self: *ServerState, lock: LockedFrame) void {
             log.warn("canvas item append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         };
     }
-    wayland.canvas.render(self.allocator, base, &self.camera, items.items, if (self.gestures.fast_render) 3 else 1);
+}
+
+/// This frame's fill color as premultiplied ARGB8888 memory bytes
+/// (B,G,R,A): the opaque lock color while the session is locked, the
+/// background otherwise.
+fn premultipliedFill(lock: LockedFrame) [4]u8 {
+    const fill = if (lock.locked) lock_blank_color else background_color;
+    return .{
+        @intFromFloat(@round(fill[2] * 255.0)),
+        @intFromFloat(@round(fill[1] * 255.0)),
+        @intFromFloat(@round(fill[0] * 255.0)),
+        @intFromFloat(@round(fill[3] * 255.0)),
+    };
+}
+
+/// The GLES2 canvas target, created on first use at the display
+/// framebuffer's size and re-created if that size changes (onNewOutput
+/// drops it on a mode change). Null when the target cannot be created;
+/// the frame then keeps the previous canvas instead of clearing it.
+fn ensureGles2Target(self: *ServerState) ?*gles2.Gles2Target {
+    if (self.gles2_target) |t| {
+        if (t.width == self.framebuffer.width and t.height == self.framebuffer.height) return t;
+        t.destroy();
+        self.gles2_target = null;
+    }
+    const t = gles2.Gles2Target.create(self.allocator, self.framebuffer.width, self.framebuffer.height) catch |err| {
+        log.err("gles2 target create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return null;
+    };
+    self.gles2_target = t;
+    return t;
 }
 
 /// Create the base framebuffer (matching the display framebuffer's size)
@@ -2696,13 +3507,25 @@ fn surfaceNodeUpdate(
     _ = s;
     const pixels = surfacePixels(self, buf) orelse return false;
     const byte_len = @as(usize, @intCast(pixels.stride)) * @as(usize, @intCast(buf.height));
-    return wayland.pixman.PixmanRenderer.updateMemory(
-        texture,
-        buf.width,
-        buf.height,
-        pixels.stride,
-        pixels.ptr[0..byte_len],
-    );
+    // The same contract on both renderers — overwrite in place when the
+    // geometry matches, false when the texture must be re-imported — so
+    // the hot path has no per-renderer special case above it.
+    return switch (self.renderer_kind) {
+        .pixman => pixman.PixmanRenderer.updateMemory(
+            texture,
+            buf.width,
+            buf.height,
+            pixels.stride,
+            pixels.ptr[0..byte_len],
+        ),
+        .gles2 => gles2.Gles2Renderer.updateMemory(
+            texture,
+            buf.width,
+            buf.height,
+            pixels.stride,
+            pixels.ptr[0..byte_len],
+        ),
+    };
 }
 
 /// Compositor policy before the node syncs from a commit: subsurface
@@ -2774,13 +3597,27 @@ fn surfacePixels(_: *ServerState, buf: *wayland.buffers.Buffer) ?SurfacePixels {
 fn importSurfacePixels(self: *ServerState, buf: *wayland.buffers.Buffer, pixels: SurfacePixels) ?*Texture {
     const t0 = perfNs(self);
     const byte_len = @as(usize, @intCast(pixels.stride)) * @as(usize, @intCast(buf.height));
-    const tex = pixman.PixmanRenderer.importMemory(
-        self.renderer,
-        buf.width,
-        buf.height,
-        pixels.stride,
-        pixels.ptr[0..byte_len],
-    ) catch |err| {
+    // Both renderers take the same arguments and return the same
+    // `*Texture`: the CPU one copies into pixman memory, the GLES2 one
+    // uploads into a GL texture (gles2.zig's "# Wiring contract"), and
+    // the rest of the compositor never has to know which it got.
+    const imported = switch (self.renderer_kind) {
+        .pixman => pixman.PixmanRenderer.importMemory(
+            self.renderer,
+            buf.width,
+            buf.height,
+            pixels.stride,
+            pixels.ptr[0..byte_len],
+        ),
+        .gles2 => gles2.Gles2Renderer.importMemory(
+            self.renderer,
+            buf.width,
+            buf.height,
+            pixels.stride,
+            pixels.ptr[0..byte_len],
+        ),
+    };
+    const tex = imported catch |err| {
         log.err("texture import failed: {s} ({d}x{d} stride={d})", self.io, self.log_cfg, "server", .{
             @errorName(err), buf.width, buf.height, pixels.stride,
         });
@@ -3931,6 +4768,10 @@ const PolicyServer = struct {
     xdg_output: ?*wayland.xdg_output.XdgOutput = null,
     screencopy: ?*wayland.screencopy.Screencopy = null,
     renderer: ?*wayland.renderer.Renderer = null,
+    /// The pixman renderer the ServerState hands the cursor (see
+    /// ServerState.pixman_renderer); identical to `renderer` unless
+    /// the harness was built with the GLES2 one.
+    pixman_renderer: ?*wayland.renderer.Renderer = null,
     presentation: ?*wayland.presentation.Presentation = null,
     backend: ?*wayland.backend.Backend = null,
     output: ?*wayland.output.Output = null,
@@ -3976,7 +4817,17 @@ const PolicyServer = struct {
         return .{ .surface = s, .sx = x, .sy = y };
     }
 
+    /// The default harness: pixman, the configuration every policy test
+    /// has always run under.
     fn init(allocator: std.mem.Allocator) !*PolicyServer {
+        return initWithRenderer(allocator, .pixman);
+    }
+
+    /// The harness with the renderer main() would pick for
+    /// WAYLAND_RENDERER=<kind>. Everything else — the registry, the
+    /// modules, the scene, the client — is identical, so a test that
+    /// switches kind compares like with like.
+    fn initWithRenderer(allocator: std.mem.Allocator, kind: RendererKind) !*PolicyServer {
         const ts = try allocator.create(PolicyServer);
         errdefer allocator.destroy(ts);
         ts.* = .{
@@ -4118,8 +4969,20 @@ const PolicyServer = struct {
         // zxdg_output_manager_v1: advertised by main() too.
         ts.xdg_output = try wayland.xdg_output.XdgOutput.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
         errdefer if (ts.xdg_output) |xo| xo.deinit();
-        ts.renderer = try pixman.PixmanRenderer.create(allocator, &ts.io, &ts.log_cfg);
-        errdefer if (ts.renderer) |r| r.destroy();
+        // The renderer the state composites with, exactly as main()
+        // selects it (WAYLAND_RENDERER): a test that pins the GLES2
+        // path builds the harness with `initWithRenderer(., .gles2)`
+        // and every surface texture is imported through that renderer
+        // from then on.
+        ts.pixman_renderer = try pixman.PixmanRenderer.create(allocator, &ts.io, &ts.log_cfg);
+        errdefer if (ts.pixman_renderer) |r| r.destroy();
+        ts.renderer = switch (kind) {
+            .pixman => ts.pixman_renderer.?,
+            .gles2 => try gles2.Gles2Renderer.create(allocator, &ts.io, &ts.log_cfg),
+        };
+        errdefer if (ts.renderer != ts.pixman_renderer) {
+            ts.renderer.?.destroy();
+        };
         ts.presentation = try wayland.presentation.Presentation.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
         errdefer if (ts.presentation) |p| p.deinit();
         ts.backend = try wayland.backend.Backend.init(allocator, &ts.io, &ts.log_cfg, &test_backend_impl, &ts.dummy);
@@ -4182,6 +5045,8 @@ const PolicyServer = struct {
             .foreign_toplevel = ts.foreign_toplevel.?,
             .linux_dmabuf = ts.linux_dmabuf.?,
             .renderer = ts.renderer.?,
+            .pixman_renderer = ts.pixman_renderer.?,
+            .renderer_kind = kind,
             .backend = ts.backend.?,
             .camera = default_camera,
             .camera_env = null,
@@ -4331,6 +5196,10 @@ const PolicyServer = struct {
             // composites has one); ServerState.deinit frees it in main(),
             // so the harness has to as well.
             if (state.base_framebuffer) |base| base.deinit();
+            // The GLES2 canvas target (a .gles2 harness only), freed
+            // before the renderer below, whose EGL context its GL
+            // objects belong to.
+            if (state.gles2_target) |t| t.destroy();
             ts.allocator.destroy(state);
         }
         if (ts.scene) |sc| sc.deinit();
@@ -4339,7 +5208,13 @@ const PolicyServer = struct {
         if (ts.output) |o| o.destroy();
         if (ts.backend) |b| b.destroy();
         if (ts.presentation) |p| p.deinit();
-        if (ts.renderer) |r| r.destroy();
+        // The selected renderer first when it is the GLES2 one, then
+        // the pixman renderer (the same object in the default
+        // configuration, so it must not be freed twice).
+        if (ts.renderer != ts.pixman_renderer) {
+            if (ts.renderer) |r| r.destroy();
+        }
+        if (ts.pixman_renderer) |r| r.destroy();
         // The new modules, in reverse dependency order: cursor_shape dies
         // before the tablet registry it resolves serials from, data_control
         // before the selection managers it mirrors, foreign_toplevel before
@@ -4383,10 +5258,15 @@ const PolicyServer = struct {
     }
 
     /// Client flush -> server dispatch -> server flush -> client dispatch.
+    ///
+    /// The first three steps are the shared roundtrip
+    /// (wayland.utils.test_pump): this harness emits nothing between the
+    /// dispatch and the flush, so the combined helper is exactly the
+    /// sequence. The client-side dispatch afterwards is this harness's
+    /// own — a test's assertions live there, so the helper's split pair
+    /// (dispatchOnce + flushServers) would only move code around.
     fn pump(ts: *PolicyServer) !void {
-        if (ts.c_display.?.flush() != .SUCCESS) return error.ClientFlushFailed;
-        try ts.display.?.getServer().getEventLoop().dispatch(0);
-        ts.display.?.flushClients();
+        try test_pump.roundtrip(ts.c_display.?, ts.display.?, 0);
         var fds = [_]std.posix.pollfd{.{
             .fd = ts.c_display.?.getFd(),
             .events = std.posix.POLL.IN,
@@ -5547,4 +6427,216 @@ test "with the resolver cleared a dmabuf buffer is no longer attached (F56)" {
     try testing.expect(std.mem.indexOfScalar(*Surface, ts.compositor.?.surfaces.items, s) == null);
     // Client side: the protocol error took the connection down.
     try testing.expect(!ts.toClient());
+}
+
+// ---------------------------------------------------------------------------
+// Renderer selection (WAYLAND_RENDERER)
+// ---------------------------------------------------------------------------
+//
+// The tests below pin three things: the selection rule itself, the
+// default's bytes (the CPU canvas pass must keep compositing what it
+// always has), and the GLES2 path — that it composites the same canvas
+// through renderer/gles2.zig and that the camera really reaches the
+// shader as its one scene -> target affine.
+
+/// EGL/GLES2 is single-threaded per process: the display's current
+/// context is process-global, and `zig test` runs test bodies on a
+/// thread pool, so two renderers created at once fight over it (the
+/// same hazard renderer/gles2.zig locks its own tests against). One
+/// lock for every GL-touching body in this file.
+var gles2_server_test_lock: std.atomic.Value(bool) = .init(false);
+
+fn lockGles2ServerTest() void {
+    while (gles2_server_test_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        std.Thread.yield() catch continue;
+    }
+}
+
+fn unlockGles2ServerTest() void {
+    gles2_server_test_lock.store(false, .release);
+}
+
+/// The premultiplied ARGB8888 memory bytes of the background fill
+/// (0.1, 0.1, 0.12, 1.0) as the CPU canvas pass produces them:
+/// B = round(0.12 * 255) = 31, G = R = round(0.1 * 255) = 26.
+const background_bytes: [4]u8 = .{ 0x1F, 0x1A, 0x1A, 0xFF };
+/// The test client's opaque gray surface (filledMemfd, value 0x40).
+const surface_bytes: [4]u8 = .{ 0x40, 0x40, 0x40, 0xFF };
+
+/// The background fill as the GLES2 pass produces it: the SAME colour,
+/// but its float -> unorm8 conversion runs at the shader's `mediump`
+/// precision (GLES2 gles2.zig's fragment shader, "precision mediump
+/// float"), where 0.1 is 0.09997… and lands on 25 instead of the exact
+/// 25.5 the CPU path rounds away from zero to 26. One unit, and only on
+/// a channel whose exact value sits on a .5 boundary — so the GLES2
+/// assertions check the fill within one unit per channel rather than
+/// pinning a driver's rounding choice. The alpha is opaque on both.
+fn expectFillPixel(got: [4]u8) !void {
+    for (background_bytes, got) |want, actual| {
+        const diff = if (want > actual) want - actual else actual - want;
+        try testing.expect(diff <= 1);
+    }
+}
+
+test "WAYLAND_RENDERER selects the renderer; an unknown value is rejected, not guessed" {
+    // Unset is the default: the CPU renderer, every byte of what this
+    // server has always presented.
+    try testing.expectEqual(RendererKind.pixman, parseRendererEnv(null).?);
+    try testing.expectEqual(RendererKind.pixman, parseRendererEnv("pixman").?);
+    try testing.expectEqual(RendererKind.gles2, parseRendererEnv("gles2").?);
+    // Unknown values return null so the caller WARNS and falls back,
+    // instead of silently rendering with something nobody asked for.
+    // Matching is exact — case included: a typo must not reach EGL.
+    try testing.expectEqual(@as(?RendererKind, null), parseRendererEnv("vulkan"));
+    try testing.expectEqual(@as(?RendererKind, null), parseRendererEnv(""));
+    try testing.expectEqual(@as(?RendererKind, null), parseRendererEnv("GLES2"));
+    try testing.expectEqual(@as(?RendererKind, null), parseRendererEnv(" pixman"));
+}
+
+test "the camera's world->screen map is the matrix the GLES2 shader uploads" {
+    // One case per factor the camera composes: the server default (a
+    // pure shift), a pan, a zoom, a rotation, and a rotated zoom.
+    const cases = [_]Camera{
+        default_camera,
+        .{ .center_x = -100, .center_y = 300, .zoom = 1, .rotation = 0, .screen_w = 800, .screen_h = 600 },
+        .{ .center_x = 12.5, .center_y = -7.25, .zoom = 2.5, .rotation = 0, .screen_w = 800, .screen_h = 600 },
+        .{ .center_x = 0, .center_y = 0, .zoom = 1, .rotation = 1.0471975511965976, .screen_w = 640, .screen_h = 480 },
+        .{ .center_x = 30, .center_y = -30, .zoom = 1.75, .rotation = -0.4, .screen_w = 1024, .screen_h = 768 },
+    };
+    const probes = [_][2]f64{
+        .{ 0, 0 },
+        .{ 123.5, -456.25 },
+        .{ -1000, 900 },
+        .{ 63.75, 63.75 },
+    };
+    for (cases) |cam| {
+        const a = cameraAffine(cam);
+        for (probes) |p| {
+            const want = cam.worldToScreen(p[0], p[1]);
+            // Affine.m is COLUMN-major (gles2.zig:188), which is the
+            // whole point of the test: the wrong order here is a
+            // transpose that still "works" and silently inverts every
+            // rotation.
+            const x: f32 = @floatCast(p[0]);
+            const y: f32 = @floatCast(p[1]);
+            const got_x = a.m[0] * x + a.m[3] * y + a.m[6];
+            const got_y = a.m[1] * x + a.m[4] * y + a.m[7];
+            try testing.expectApproxEqAbs(want.x, @as(f64, got_x), 0.05);
+            try testing.expectApproxEqAbs(want.y, @as(f64, got_y), 0.05);
+        }
+    }
+}
+
+test "the GLES2 background rect is the world rect the camera maps onto the whole output" {
+    // The server default's visible world rect IS the output.
+    try testing.expectEqual(
+        geom.Rect{ .x = 0, .y = 0, .width = output_width, .height = output_height },
+        worldRectForOutput(default_camera),
+    );
+    // A zoomed-out, rotated camera has no integral visible rect, so the
+    // fill rounds OUT. Rounding in would leave a bare corner; the forward
+    // image of a superset is still a superset, which is what makes the
+    // round-out safe. Every screen corner must land inside it.
+    const cam: Camera = .{
+        .center_x = 5,
+        .center_y = -3,
+        .zoom = 0.5,
+        .rotation = 0.3,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    const rect = worldRectForOutput(cam);
+    for ([_][2]i32{ .{ 0, 0 }, .{ 800, 0 }, .{ 0, 600 }, .{ 800, 600 } }) |corner| {
+        const w = cam.screenToWorld(@floatFromInt(corner[0]), @floatFromInt(corner[1]));
+        try testing.expect(w.x >= @as(f64, @floatFromInt(rect.x)));
+        try testing.expect(w.y >= @as(f64, @floatFromInt(rect.y)));
+        try testing.expect(w.x <= @as(f64, @floatFromInt(rect.x + rect.width)));
+        try testing.expect(w.y <= @as(f64, @floatFromInt(rect.y + rect.height)));
+    }
+}
+
+test "WAYLAND_RENDERER=pixman composites the canvas byte for byte as before" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const state = ts.state.?;
+    // The default: one renderer, and it is the CPU one.
+    try testing.expectEqual(RendererKind.pixman, state.renderer_kind);
+    try testing.expect(state.renderer == state.pixman_renderer);
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    ensureBaseFramebuffer(state);
+    compositeBase(state, .{});
+
+    // The 64x64 opaque gray toplevel at the canvas origin, and the
+    // background fill everywhere else. These are the exact bytes the
+    // server has produced for this canvas since the canvas pass landed;
+    // a refactor that changed the fill math, the item order or the
+    // sampling would move one of them.
+    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 10, 10));
+    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 63, 63));
+    try testing.expectEqual(background_bytes, framebufferPixel(state.base_framebuffer.?, 64, 64));
+    try testing.expectEqual(background_bytes, framebufferPixel(state.base_framebuffer.?, 700, 500));
+}
+
+test "WAYLAND_RENDERER=gles2 composites the same canvas through the GLES2 renderer" {
+    lockGles2ServerTest();
+    defer unlockGles2ServerTest();
+
+    const ts = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
+    defer ts.deinit();
+    const state = ts.state.?;
+    // The selected renderer is the GLES2 one; the cursor's pixman twin is
+    // a second, independent object (the cursor's draw path is pixman's).
+    try testing.expectEqual(RendererKind.gles2, state.renderer_kind);
+    try testing.expect(state.renderer != state.pixman_renderer);
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    ensureBaseFramebuffer(state);
+    compositeBase(state, .{});
+
+    // The GLES2 pass really composited: it filled the background and
+    // stamped the surface's GL texture through the camera. The surface
+    // pixels are the CPU pass's bytes exactly — an opaque texture over
+    // the fill — and the fill is the same colour within the shader's
+    // mediump rounding (expectFillPixel).
+    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 10, 10));
+    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 63, 63));
+    try expectFillPixel(framebufferPixel(state.base_framebuffer.?, 64, 64));
+    try expectFillPixel(framebufferPixel(state.base_framebuffer.?, 700, 500));
+}
+
+test "the GLES2 canvas pass draws through the camera uniform" {
+    lockGles2ServerTest();
+    defer unlockGles2ServerTest();
+
+    const ts = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
+    defer ts.deinit();
+    const state = ts.state.?;
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    ensureBaseFramebuffer(state);
+
+    // A zoom-2 camera centred on the world origin: the 64x64 toplevel at
+    // world (0,0) belongs on output [400, 528) x [300, 428), exactly what
+    // Camera.worldToScreen says for its corners. Without the affine the
+    // surface would sit 1:1 at the origin; with a transposed or
+    // mis-ordered one the probes below would land outside the image.
+    state.camera = .{
+        .center_x = 0,
+        .center_y = 0,
+        .zoom = 2,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    compositeBase(state, .{});
+
+    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 400, 300));
+    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 527, 427));
+    // One output pixel outside the mapped quad, still inside the fill:
+    // background, on both sides of the image.
+    try expectFillPixel(framebufferPixel(state.base_framebuffer.?, 399, 299));
+    try expectFillPixel(framebufferPixel(state.base_framebuffer.?, 528, 428));
 }

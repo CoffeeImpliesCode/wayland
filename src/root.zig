@@ -19,6 +19,7 @@ const geom_mod = @import("utils/geom.zig");
 const damage_mod = @import("utils/damage.zig");
 const log_mod = @import("utils/log.zig");
 const matrix_mod = @import("utils/matrix.zig");
+const test_pump_mod = @import("utils/test_pump.zig");
 const display_mod = @import("core/display.zig");
 
 pub const utils = struct {
@@ -26,6 +27,11 @@ pub const utils = struct {
     pub const damage = damage_mod;
     pub const log = log_mod;
     pub const matrix = matrix_mod;
+    /// Test-only: the one definition of a test-server roundtrip. It lives
+    /// here because the server module's path root is `src/server/`, so
+    /// `src/server/*` cannot import `src/utils/*` directly and reaches this
+    /// through the `wayland` module like every other library file.
+    pub const test_pump = test_pump_mod;
 };
 
 pub const core = struct {
@@ -162,6 +168,7 @@ comptime {
     _ = utils.damage;
     _ = utils.log;
     _ = utils.matrix;
+    _ = utils.test_pump;
     _ = core;
     _ = buffers;
     _ = shm;

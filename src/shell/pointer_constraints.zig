@@ -75,6 +75,7 @@
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
+const test_pump = @import("../utils/test_pump.zig");
 const geom = @import("../utils/geom.zig");
 const wire = @import("../core/wire.zig");
 const protocol = @import("protocol");
@@ -1028,15 +1029,14 @@ const TestServer = struct {
         allocator.destroy(ts);
     }
 
-    /// Client flush -> server dispatch -> seat batch close -> server flush
-    /// -> client dispatch.
+    /// `test_pump.dispatchOnce` (client flush -> server dispatch), then the
+    /// seat batch close, then the server flush — so the wl_pointer.frame the
+    /// close queues still reaches the client in this roundtrip, as it did
+    /// before the shared helper existed. Then a client dispatch.
     fn pump(ts: *TestServer) !void {
-        if (ts.a.c_display) |d| {
-            if (d.flush() != .SUCCESS) return error.ClientFlushFailed;
-        }
-        try ts.display.?.getServer().getEventLoop().dispatch(0);
+        try test_pump.dispatchOnce(ts.a.c_display, ts.display.?, 0);
         if (ts.seat) |s| s.pointerFrame();
-        ts.display.?.flushClients();
+        test_pump.flushServers(ts.display.?);
         if (ts.a.c_display) |d| {
             var fds = [_]posix.pollfd{.{ .fd = d.getFd(), .events = posix.POLL.IN, .revents = 0 }};
             if (try posix.poll(&fds, 0) > 0) {

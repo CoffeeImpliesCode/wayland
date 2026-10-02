@@ -61,6 +61,7 @@
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
+const test_pump = @import("../utils/test_pump.zig");
 const wire = @import("../core/wire.zig");
 const protocol = @import("protocol");
 const server = protocol.server;
@@ -524,17 +525,23 @@ const TestServer = struct {
         allocator.destroy(ts);
     }
 
-    /// Client flush -> server dispatch -> seat batch close -> server flush
-    /// -> client dispatch, for every connected peer.
+    /// Per-peer client flush, then `test_pump.dispatchOnce` / `flushServers`
+    /// around the seat's batch close, then the per-peer client dispatch —
+    /// the roundtrip order this harness had before the shared helper existed.
     fn pump(ts: *TestServer) !void {
         for ([_]*Peer{ &ts.a, &ts.b }) |p| {
             if (p.c_display) |d| {
                 if (d.flush() != .SUCCESS) return error.ClientFlushFailed;
             }
         }
-        try ts.display.?.getServer().getEventLoop().dispatch(0);
+        // The server dispatches, then the seat closes its per-batch
+        // wl_pointer.frame, and only THEN do the server's replies go out —
+        // the order this harness had before the shared helper existed, so
+        // the frame event still reaches the client in the same roundtrip.
+        // `null`: both peers flushed their own request above.
+        try test_pump.dispatchOnce(null, ts.display.?, 0);
         if (ts.seat) |s| s.pointerFrame();
-        ts.display.?.flushClients();
+        test_pump.flushServers(ts.display.?);
         for ([_]*Peer{ &ts.a, &ts.b }) |p| {
             const d = p.c_display orelse continue;
             var fds = [_]posix.pollfd{.{ .fd = d.getFd(), .events = posix.POLL.IN, .revents = 0 }};

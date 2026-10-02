@@ -171,6 +171,7 @@
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
+const test_pump = @import("../utils/test_pump.zig");
 const wire = @import("../core/wire.zig");
 const protocol = @import("protocol");
 const server = protocol.server;
@@ -1256,12 +1257,11 @@ const TestServer = struct {
         ts.c_outputs = .{ null, null };
     }
 
-    /// Client flush -> server event loop dispatch -> server flush ->
-    /// client dispatch. Drives one roundtrip without blocking.
+    /// The shared `test_pump.roundtrip` (client flush -> server dispatch ->
+    /// server flush) plus a client dispatch, which runs only when the server
+    /// actually wrote to the socket. Never blocks.
     fn pump(ts: *TestServer) !void {
-        if (ts.c_display.?.flush() != .SUCCESS) return error.ClientFlushFailed;
-        try ts.display.?.getServer().getEventLoop().dispatch(0);
-        ts.display.?.flushClients();
+        try test_pump.roundtrip(ts.c_display.?, ts.display.?, 0);
         var fds = [_]posix.pollfd{
             .{ .fd = ts.c_display.?.getFd(), .events = posix.POLL.IN, .revents = 0 },
         };
