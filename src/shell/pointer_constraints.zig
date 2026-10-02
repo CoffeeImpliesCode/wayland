@@ -137,13 +137,6 @@ pub const Constraint = struct {
     confined_res: ?*server.zwp.ConfinedPointerV1 = null,
     /// Whether `locked` / `confined` has been sent and not yet revoked.
     active: bool = false,
-    /// The serial minted at the last activation. The XML declares no serial
-    /// ARGUMENT on locked/confined/unlocked/unconfined, so this is the
-    /// seat's serial for the activation boundary — minted through
-    /// Seat.serialFor, which records it in the client's serial ring exactly
-    /// like wlroots' wlr_seat_client_next_serial (wlr_pointer_gestures_v1.c
-    /// style; wlr_seat_client_next_serial, wlr_seat.c:473-497).
-    serial: u32 = 0,
     /// The surface-local point an active lock pins the cursor at.
     lock_x: i32 = 0,
     lock_y: i32 = 0,
@@ -179,11 +172,6 @@ pub const Constraint = struct {
 
     pub fn isActive(self: *const Constraint) bool {
         return self.active;
-    }
-
-    /// The serial minted at the last activation.
-    pub fn activationSerial(self: *const Constraint) u32 {
-        return self.serial;
     }
 
     /// The effective constraint region, in surface-local coordinates. Empty
@@ -439,9 +427,10 @@ pub const PointerConstraints = struct {
 
     fn activate(self: *PointerConstraints, c: *Constraint, seat: *seat_mod.Seat) void {
         c.active = true;
-        // The XML carries no serial argument, but the transition is a seat
-        // event: mint a serial so it lands in the client's serial ring.
-        c.serial = seat.serialFor(c.client);
+        // No serial is minted: locked/confined/unlocked/unconfined carry none in
+        // the XML, so there is no argument to validate one against. Burning a
+        // number in the client's serial ring for an event that names none only
+        // moves the ring out of step with the wire.
         c.lock_x = seat.focus_x;
         c.lock_y = seat.focus_y;
         c.sendLocked(true);
@@ -1140,10 +1129,8 @@ test "lock lifecycle: locked, cursor pinned, unlocked when focus is lost" {
     try std.testing.expectEqual(@as(usize, 1), ev.locked);
     try std.testing.expectEqual(@as(usize, 1), ts.pc.?.activeCount());
 
-    // The activation minted a seat serial, so it lands in the client's
-    // serial ring exactly like wlroots' wlr_seat_client_next_serial.
     const c = ts.pc.?.constraints.items[0];
-    try std.testing.expect(ts.seat.?.validateEventSerial(ts.a.client.?, c.activationSerial()));
+    try std.testing.expect(c.active);
 
     // The cursor is pinned where the lock activated, even though the live
     // pointer keeps moving.

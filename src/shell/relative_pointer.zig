@@ -598,11 +598,87 @@ test "relative pointer init and teardown with no seat and no client" {
     const relative = try RelativePointer.init(allocator, io, &log_cfg, display, null);
     try std.testing.expectEqual(@as(usize, 0), relative.managers.items.len);
     try std.testing.expectEqual(@as(usize, 0), relative.pointers.items.len);
-    // The compositor-side entry point is inert without a seat.
+    // No seat: the compositor-side entry point is inert. It delivers to
+    // no object and — the part that was silently unasserted — it must
+    // NOT fabricate a delta baseline. have_last is what the derived
+    // path keys off, and only syncPointerPosition (the backend's own
+    // statement of where the pointer is) may set it; a call that
+    // quietly recorded one would make the first motion after a later
+    // attach report a jump out of (0, 0).
     relative.sendRelativeMotion(5, -3, 5, -3);
+    try std.testing.expect(relative.seat == null);
+    try std.testing.expectEqual(@as(usize, 0), relative.pointers.items.len);
+    try std.testing.expect(!relative.have_last);
+    try std.testing.expectEqual(@as(i32, 0), relative.last_x);
+    try std.testing.expectEqual(@as(i32, 0), relative.last_y);
+
+    // syncPointerPosition is NOT gated on a seat: recording the position
+    // the pointer is at needs no focus target, and the recorded baseline
+    // is what the next derived delta is measured from.
     relative.syncPointerPosition(10, 20);
+    try std.testing.expect(relative.have_last);
+    try std.testing.expectEqual(@as(i32, 10), relative.last_x);
+    try std.testing.expectEqual(@as(i32, 20), relative.last_y);
+
+    // Detaching an already detached module is a no-op (setSeat :178), so
+    // the recorded baseline survives it and deinit must cope with it.
     relative.setSeat(null);
+    try std.testing.expect(relative.have_last);
+    try std.testing.expectEqual(@as(i32, 10), relative.last_x);
+    try std.testing.expectEqual(@as(i32, 20), relative.last_y);
     relative.deinit();
+}
+
+test "both entry points are inert with no seat and deliver once attached" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    const surface = try ts.createSurface(&ts.a);
+    const rel = try ts.a.wl_manager.?.getRelativePointer(ts.a.wl_pointer.?);
+    var ev: RelativeEvents = .{};
+    rel.setListener(*RelativeEvents, RelativeEvents.listener, &ev);
+    try ts.pump();
+    try ts.focus(surface);
+
+    // Detach, so the module holds no seat at all — the same state init
+    // leaves it in with a null seat.
+    ts.relative.?.setSeat(null);
+    try ts.pump();
+    try std.testing.expect(ts.relative.?.seat == null);
+    try std.testing.expect(!ts.relative.?.have_last);
+
+    // Inert: nothing reaches the client and no baseline appears.
+    ts.relative.?.sendRelativeMotion(5, -3, 5, -3);
+    try std.testing.expectEqual(@as(usize, 0), ev.count);
+    try std.testing.expect(!ts.relative.?.have_last);
+
+    // The position sync still records its baseline.
+    ts.relative.?.syncPointerPosition(10, 20);
+    try std.testing.expect(ts.relative.?.have_last);
+    try std.testing.expectEqual(@as(i32, 10), ts.relative.?.last_x);
+    try std.testing.expectEqual(@as(i32, 20), ts.relative.?.last_y);
+
+    // Re-attaching clears the baseline, so the first motion only
+    // re-establishes it and the next one reports the exact delta.
+    ts.relative.?.setSeat(ts.seat);
+    ts.seat.?.pointerMotion(100, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ev.count);
+    ts.seat.?.pointerMotion(105, 97);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.count);
+    try std.testing.expectEqual(@as(i32, 5), ev.dx.toInt());
+    try std.testing.expectEqual(@as(i32, -3), ev.dy.toInt());
+
+    // And the backend entry point delivers verbatim again.
+    ts.relative.?.sendRelativeMotion(7, -11, 9, -13);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), ev.count);
+    try std.testing.expectEqual(@as(i32, 7), ev.dx.toInt());
+    try std.testing.expectEqual(@as(i32, -11), ev.dy.toInt());
+    try std.testing.expectEqual(@as(i32, 9), ev.dx_unaccel.toInt());
+    try std.testing.expectEqual(@as(i32, -13), ev.dy_unaccel.toInt());
 }
 
 test "a client binds and releases the manager with no seat behind it" {

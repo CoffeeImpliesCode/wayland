@@ -436,17 +436,33 @@ fn paramsAdd(
 }
 
 fn paramsSetSamplingDevice(params: *Params, device: *server.wl.Array) void {
-    // The payload is a wire array; copy the dev_t out before returning,
-    // the message buffer does not outlive this call.
-    const raw = device.slice(u64)[0..];
-    if (raw.len != 1) {
+    // The size must be judged before anything else touches the payload.
+    // `common.Array.slice` ends in
+    // `ptr[0..@divExact(array.size, @sizeOf(T))]`
+    // (zig-wayland common_core.zig:208-213), and `array.size` is a raw
+    // uint32 taken verbatim off the wire: libwayland's
+    // `wl_connection_demarshal` reads `length = *p++` and stores it in
+    // `array_extra->size` after checking only that the message is long
+    // enough (wayland/src/connection.c:1034-1053). Nothing divides it
+    // by the element type first, so a 1-7 byte array from any client
+    // that bound the global at v6 would trap in `@divExact` and abort
+    // the whole compositor. The XML names this exact failure:
+    // "If the array is too small to contain a dev_t or larger than
+    // required, the invalid_dev_t_size error will be emitted."
+    // (linux-dmabuf-v1.xml:413-415).
+    if (device.size != @sizeOf(u64)) {
         params.res.postError(
             .invalid_dev_t_size,
             "set_sampling_device carries exactly one dev_t",
         );
         return;
     }
-    params.sampling_device = raw[0];
+    // The slice is total now: the size is exactly one u64, so the
+    // `@divExact` inside it has remainder zero, and libwayland points
+    // `data` at the message buffer (connection.c:1050), never null. The
+    // payload still has to be copied out - the message buffer does not
+    // outlive this call.
+    params.sampling_device = device.slice(u64)[0];
 }
 
 /// `buffer_id` is 0 for the asynchronous `create` (the XML carries the
@@ -1430,6 +1446,71 @@ test "a set_sampling_device array of the wrong size is invalid_dev_t_size" {
     params.setSamplingDevice(&devs_arr);
     try testing.expectError(error.ClientDispatchFailed, ts.pump());
     try testing.expectEqual(ParamsErrorCode.invalid_dev_t_size, protocolError(ts).code);
+}
+
+test "a set_sampling_device array that is not a whole number of dev_t is invalid_dev_t_size" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const params = try ts.wl_dmabuf.?.createParams();
+    // Seven bytes. libwayland copies the wl_array length out of the
+    // message verbatim and never checks it against the element type
+    // (wl_closure_recv in wayland-util.c assigns `arg->a.size = d[0]`),
+    // so this is exactly what a hostile client can put on the wire.
+    // `common.Array.slice` then evaluates
+    // `@divExact(array.size, @sizeOf(u64))` (common_core.zig:208-213),
+    // which traps on any non-multiple of 8 and takes the whole
+    // compositor with it. The size must be judged before the slice
+    // exists.
+    const short = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
+    var short_arr = arrayOf(u8, short[0..]);
+    params.setSamplingDevice(&short_arr);
+    try testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try testing.expectEqual(ParamsErrorCode.invalid_dev_t_size, protocolError(ts).code);
+}
+
+test "an empty set_sampling_device array is invalid_dev_t_size" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const params = try ts.wl_dmabuf.?.createParams();
+    // XML :413-414: "If the array is too small to contain a dev_t or
+    // larger than required" - zero bytes is the first half of that
+    // sentence and must be rejected, not divided into zero elements.
+    const none = [_]u8{};
+    var empty_arr = arrayOf(u8, none[0..]);
+    params.setSamplingDevice(&empty_arr);
+    try testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try testing.expectEqual(ParamsErrorCode.invalid_dev_t_size, protocolError(ts).code);
+}
+
+test "a one dev_t set_sampling_device array is accepted and leaves the params usable" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const params = try ts.wl_dmabuf.?.createParams();
+    var cap: ParamsCapture = .{};
+    params.setListener(*ParamsCapture, ParamsCapture.listener, &cap);
+    const devs = [_]u64{0x1234_5678};
+    var devs_arr = arrayOf(u64, devs[0..]);
+    params.setSamplingDevice(&devs_arr);
+    try ts.pump();
+
+    // Exactly one dev_t is the only size the XML allows (:413-416), so
+    // the request must not raise anything. A params object that survived
+    // it is still usable, which is what proves the handler returned
+    // instead of erroring: the import that follows still produces a
+    // wl_buffer.
+    try testing.expectEqual(@as(c_int, 0), protocolError(ts).code);
+    const fd = try planeObject(256 * 64);
+    params.add(fd, 0, 0, 256, 0, 0);
+    params.create(64, 64, dmabuf.drm_format_xrgb8888, .{});
+    try ts.pump();
+    try testing.expect(cap.created != null);
+    try testing.expectEqual(@as(u32, 1), ts.fake.?.imports);
 }
 
 test "create_immed on an import the device refuses is invalid_wl_buffer" {

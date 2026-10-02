@@ -13,6 +13,11 @@
 //! `notifyOutputLeave`, `notifyParent` — and each names the xdg signal
 //! (or the absence of one) that motivates it.
 //!
+//! Focus. `activate` moves keyboard focus, which is a privilege, not a
+//! request the module may grant: the session lock lives in the server
+//! (main.zig's keyboardFocusAllowed), so the module consults it through
+//! `setFocusGate` and never decides on its own.
+//!
 //! Identity. zwlr_foreign_toplevel_handle_v1 has no get_id, so the
 //! server-side object IS the identity: `Binding.handles` holds exactly
 //! one Handle per (binding, xdg toplevel) pair for the whole toplevel
@@ -62,6 +67,13 @@ pub const ForeignToplevelManager = struct {
     /// activate is then ignored — the XML declares no error for it, so it
     /// is never a protocol error.
     seat: ?*seat_mod.Seat,
+    /// The compositor's keyboard-focus gate, consulted by `activate`
+    /// BEFORE it moves focus. Null means "no gate": every surface may
+    /// take focus, which is what this module did before the gate
+    /// existed — and is why the server must install one.
+    focus_gate: ?*const fn (ctx: *anyopaque, surface: *surface_mod.Surface) bool = null,
+    /// The module the focus gate belongs to, handed back on every call.
+    focus_gate_ctx: ?*anyopaque = null,
     /// The manager global, for teardown.
     global: ?*wire.Global = null,
     /// One entry per bound zwlr_foreign_toplevel_manager_v1, in bind
@@ -116,6 +128,42 @@ pub const ForeignToplevelManager = struct {
         }
         self.bindings.deinit(allocator);
         allocator.destroy(self);
+    }
+
+    /// Set the compositor's keyboard-focus gate: may this surface take
+    /// keyboard focus right now? `ctx` is opaque and handed back on
+    /// every call. Installed at init by the server; null means "no
+    /// gate", which must behave exactly as it does today. Mirrors the
+    /// DmabufResolver seam in src/compositor/compositor.zig.
+    ///
+    /// WHY the module cannot decide this itself: the session lock is
+    /// server state this module never sees, and ext-session-lock-v1.xml
+    /// ("locked" event) requires that "the compositor must stop
+    /// rendering and providing input to normal clients". A client that
+    /// binds this global can `activate` a handle to its OWN toplevel
+    /// (every toplevel is announced to every binding, announce), so an
+    /// ungated activate steals the keyboard mid-session and reads every
+    /// keystroke. The XML lets us refuse — activate's own description
+    /// says "There is no guarantee the toplevel will be actually
+    /// activated" (wlr-foreign-toplevel-management-unstable-v1.xml:142)
+    /// — and that is the whole privilege boundary.
+    ///
+    /// The server MUST clear it during teardown: call this again with
+    /// `gate = null` (the ctx is then unused) before the state the ctx
+    /// points at goes away, or a late `activate` dispatch reaches a
+    /// freed module.
+    pub fn setFocusGate(mgr: *ForeignToplevelManager, ctx: *anyopaque, gate: ?*const fn (ctx: *anyopaque, surface: *surface_mod.Surface) bool) void {
+        mgr.focus_gate = gate;
+        mgr.focus_gate_ctx = if (gate == null) null else ctx;
+    }
+
+    /// Whether `surface` may take keyboard focus right now. No gate
+    /// installed: allowed — the seam is opt-in so the module keeps
+    /// working standalone, and the server is the one that knows about
+    /// the session lock.
+    fn focusAllowed(mgr: *ForeignToplevelManager, surface: *surface_mod.Surface) bool {
+        const gate = mgr.focus_gate orelse return true;
+        return gate(mgr.focus_gate_ctx.?, surface);
     }
 
     /// The toplevel's state changed: re-send `state` to every binding's
@@ -652,13 +700,25 @@ fn applyFullscreen(h: *Handle, want: bool) void {
 /// seat argument would be worse than doing nothing. The activated state
 /// itself arrives with the ordinary focus configure, so no state event is
 /// sent here.
+///
+/// The compositor's focus gate is consulted LAST and decides: every
+/// route to the keyboard passes one (seat.zig setKeyboardFocusGate for
+/// click-to-focus, main.zig layerKeyboardFocusAllowed for a layer
+/// activation request), and activate was the one route that passed
+/// none. A client that binds this global is announced its OWN toplevel
+/// (Binding.announce), so an ungated activate handed any client the
+/// keyboard for the length of a locked session. Refusing is legal —
+/// "There is no guarantee the toplevel will be actually activated"
+/// (wlr-foreign-toplevel-management-unstable-v1.xml:142).
 fn activate(h: *Handle, seat_res: *server.wl.Seat) void {
     const mgr = h.binding.manager;
     const seat = mgr.seat orelse return;
     const ud = seat_res.getUserData() orelse return;
     const arg: *seat_mod.Seat = @ptrCast(@alignCast(ud));
     if (arg != seat) return;
-    seat.setKeyboardFocus(h.toplevel.xdg_surface.surface);
+    const surface = h.toplevel.xdg_surface.surface;
+    if (!mgr.focusAllowed(surface)) return;
+    seat.setKeyboardFocus(surface);
 }
 
 fn handleDestroy(res: *server.zwlr.ForeignToplevelHandleV1, h: *Handle) void {
@@ -849,6 +909,30 @@ const ClientToplevelEvents = struct {
     }
 };
 
+/// A stand-in for the server's focus gate. main.zig's
+/// keyboardFocusAllowed answers the session lock first and only then the
+/// layer policy, so this answers in the same order: `locked` refuses,
+/// otherwise `allow` (the layer policy) decides. It counts its calls
+/// and remembers the surface it was asked about, which is what proves
+/// the module consulted it and asked about the right surface.
+const FocusGate = struct {
+    locked: bool = false,
+    allow: bool = true,
+    calls: usize = 0,
+    last: ?*surface_mod.Surface = null,
+
+    fn gate(ctx: *anyopaque, surface: *surface_mod.Surface) bool {
+        const self: *FocusGate = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.last = surface;
+        // ext-session-lock-v1.xml, "locked": "the compositor must stop
+        // rendering and providing input to normal clients". A locked
+        // session answers false whatever the layer policy says.
+        if (self.locked) return false;
+        return self.allow;
+    }
+};
+
 /// One surface-destroy listener slot. main.zig's ToplevelListeners is the
 /// same shape (a back pointer plus the listeners): @fieldParentPtr walks
 /// up from the listener FIELD to its owner, and an array field has no way
@@ -889,6 +973,19 @@ const TestServer = struct {
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, compositor, shell and manager all store it).
     fn init(allocator: std.mem.Allocator) !*TestServer {
+        return initSeatWired(allocator, true);
+    }
+
+    /// A TestServer whose MANAGER has no seat, while the compositor
+    /// still has one: the wl_seat global stays bindable, so a test can
+    /// hand `activate` a real seat and watch the module ignore it. That
+    /// is the production case — a compositor with no seat must not be
+    /// the only thing the no-seat path is ever exercised on.
+    fn initNoSeat(allocator: std.mem.Allocator) !*TestServer {
+        return initSeatWired(allocator, false);
+    }
+
+    fn initSeatWired(allocator: std.mem.Allocator, manager_has_seat: bool) !*TestServer {
         const ts = try allocator.create(TestServer);
         errdefer allocator.destroy(ts);
         ts.* = .{
@@ -904,7 +1001,14 @@ const TestServer = struct {
         errdefer if (ts.shell) |s| s.deinit();
         ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, .{});
         errdefer if (ts.seat) |s| s.deinit();
-        ts.ft = try ForeignToplevelManager.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, ts.shell.?, ts.seat.?);
+        ts.ft = try ForeignToplevelManager.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.shell.?,
+            if (manager_has_seat) ts.seat.? else null,
+        );
         errdefer if (ts.ft) |f| f.deinit();
 
         // In-memory client connection: one socketpair end for the server,
@@ -1377,9 +1481,126 @@ test "activate focuses the toplevel on the compositor's seat" {
     const surface = serverSurface(ts);
     try testing.expect(ts.seat.?.keyboard_focus == null);
 
+    // No gate installed: this module holds no session-lock state of its
+    // own, so an ungated compositor sees exactly the behaviour it always
+    // saw. That is the documented contract of setFocusGate, and the
+    // reason the SERVER has to install one — the module cannot notice a
+    // lock that happened without it.
+    try testing.expect(ts.ft.?.focus_gate == null);
     events.last.?.activate(ts.wl_seat.?);
     try ts.pump();
     try testing.expect(ts.seat.?.keyboard_focus == surface);
+}
+
+test "activate consults the compositor's focus gate and obeys a refusal" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var events: ManagerEvents = .{};
+    const panel = try ts.bindPanel();
+    panel.setListener(*ManagerEvents, ManagerEvents.listener, &events);
+    try ts.pump();
+
+    const wl_surface = try ts.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+    const target = serverSurface(ts);
+
+    // Focus some OTHER surface first, so "focus did not move" is a real
+    // postcondition and not merely "focus was still empty".
+    _ = try ts.createSurface();
+    try ts.pump();
+    const other = serverSurface(ts);
+    try testing.expect(other != target);
+    ts.seat.?.setKeyboardFocus(other);
+    try testing.expect(ts.seat.?.keyboard_focus == other);
+
+    // The session is locked, so the gate refuses every surface. The
+    // client can still reach this handle: it was announced its own
+    // toplevel (Binding.announce), which is what makes this a
+    // privilege boundary and not a policy nicety.
+    var gate: FocusGate = .{ .locked = true };
+    ts.ft.?.setFocusGate(&gate, FocusGate.gate);
+
+    events.last.?.activate(ts.wl_seat.?);
+    try ts.pump();
+
+    // The gate was asked about THIS toplevel's surface, once, and said
+    // no — so the keyboard stayed exactly where it was. Without the
+    // gate, activate moves focus unconditionally, which is the whole
+    // of the session-lock leak: every keystroke would go to the client.
+    try testing.expectEqual(@as(usize, 1), gate.calls);
+    try testing.expect(gate.last.? == target);
+    try testing.expect(ts.seat.?.keyboard_focus == other);
+    // Refusing is not a protocol error, so the client is still here.
+    try testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+}
+
+test "a focus gate that permits still lets activate focus the toplevel" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var events: ManagerEvents = .{};
+    const panel = try ts.bindPanel();
+    panel.setListener(*ManagerEvents, ManagerEvents.listener, &events);
+    try ts.pump();
+
+    const wl_surface = try ts.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+    const surface = serverSurface(ts);
+    try testing.expect(ts.seat.?.keyboard_focus == null);
+
+    // An unlocked session: the gate permits, and the request does what
+    // it always did. The gate is a boundary, not a mute.
+    var gate: FocusGate = .{};
+    ts.ft.?.setFocusGate(&gate, FocusGate.gate);
+    events.last.?.activate(ts.wl_seat.?);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), gate.calls);
+    try testing.expect(gate.last.? == surface);
+    try testing.expect(ts.seat.?.keyboard_focus == surface);
+}
+
+test "the focus gate is re-read per request, so an unlock opens the next activate" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    var events: ManagerEvents = .{};
+    const panel = try ts.bindPanel();
+    panel.setListener(*ManagerEvents, ManagerEvents.listener, &events);
+    try ts.pump();
+
+    const wl_surface = try ts.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+    const surface = serverSurface(ts);
+
+    var gate: FocusGate = .{ .locked = true };
+    ts.ft.?.setFocusGate(&gate, FocusGate.gate);
+    events.last.?.activate(ts.wl_seat.?);
+    try ts.pump();
+    try testing.expect(ts.seat.?.keyboard_focus == null);
+
+    // The lock is gone and NOTHING is re-installed: the gate is asked
+    // again per request, so it answers for the state as it is now.
+    gate.locked = false;
+    events.last.?.activate(ts.wl_seat.?);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 2), gate.calls);
+    try testing.expect(ts.seat.?.keyboard_focus == surface);
+
+    // Clearing the gate restores the ungated behaviour, which is what
+    // the server's teardown does before its state goes away.
+    ts.ft.?.setFocusGate(&gate, null);
+    try testing.expect(ts.ft.?.focus_gate == null);
+    try testing.expect(ts.ft.?.focus_gate_ctx == null);
 }
 
 test "stop silences new toplevels but keeps the handles" {
@@ -1451,21 +1672,40 @@ test "finished tears the binding down and makes its handles inert" {
     try ts.pump();
 }
 
-test "a manager with no seat and no client still comes up and tears down" {
+test "a manager with no seat ignores activate instead of killing the client" {
     const allocator = testing.allocator;
-    var io = std.Io.Threaded.global_single_threaded.io();
-    var log_cfg: log.Config = .{ .min_level = .err };
+    // The COMPOSITOR has a seat, so wl_seat is bindable and the client
+    // hands `activate` a real argument; the MANAGER has none, which is
+    // the case under test.
+    var ts = try TestServer.initNoSeat(allocator);
+    defer ts.deinit();
+    try testing.expect(ts.ft.?.seat == null);
 
-    const display = try display_mod.CompositorDisplay.init(allocator, &io, &log_cfg);
-    defer display.deinit();
-    const compositor = try compositor_mod.Compositor.init(allocator, &io, &log_cfg, display);
-    defer compositor.deinit();
-    const shell = try xdg_mod.XdgShell.init(allocator, &io, &log_cfg, display, compositor);
-    defer shell.deinit();
-    // No seat: activate is a no-op (it is never a protocol error) and no
-    // client ever binds, so the module has no handle to close.
-    const mgr = try ForeignToplevelManager.init(allocator, &io, &log_cfg, display, shell, null);
-    try testing.expect(mgr.seat == null);
-    try testing.expectEqual(@as(usize, 0), mgr.bindings.items.len);
-    mgr.deinit();
+    var events: ManagerEvents = .{};
+    const panel = try ts.bindPanel();
+    panel.setListener(*ManagerEvents, ManagerEvents.listener, &events);
+    try ts.pump();
+
+    const wl_surface = try ts.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    _ = try xdg_surface.getToplevel();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.toplevel_count);
+    const surface = serverSurface(ts);
+
+    // The request really is dispatched, and really is ignored: it did
+    // not reach the seat's focus, and activate is never a protocol
+    // error, so the client survives having sent it.
+    events.last.?.activate(ts.wl_seat.?);
+    try ts.pump();
+    try testing.expect(ts.seat.?.keyboard_focus != surface);
+    try testing.expectEqual(@as(c_int, 0), wl_display_get_protocol_error(ts.c_display.?, null, null));
+
+    // The handle is still live: a later request on it still travels, so
+    // activate neither killed the resource nor the binding. Teardown then
+    // closes the announced handle with its toplevel and no listener
+    // outlives the module.
+    events.last.?.setMaximized();
+    try ts.pump();
+    try testing.expect(ts.lastToplevel().scheduled.maximized);
 }

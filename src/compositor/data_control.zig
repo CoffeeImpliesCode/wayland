@@ -1318,6 +1318,87 @@ const TestServer = struct {
     }
 };
 
+/// A display, a wl_seat, one client, and a data-control manager built
+/// WITHOUT that seat and without the mirrored managers. TestServer
+/// cannot express this: its manager is wired to its seat, and the null
+/// seat is the shape that owns the F-SEL-5 dead device and the
+/// teardown of a focus listener that was never attached.
+const SeatlessServer = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_cfg: log.Config,
+    display: ?*display_mod.CompositorDisplay = null,
+    seat: ?*seat_mod.Seat = null,
+    ctrl: ?*DataControlManager = null,
+    client: ?*wire.Client = null,
+    c_display: ?*client.wl.Display = null,
+    wl_seat: ?*client.wl.Seat = null,
+    wl_control_manager: ?*client.zwlr.DataControlManagerV1 = null,
+
+    /// Heap-allocated: the display and every manager store `&self.io`,
+    /// which has to outlive this call.
+    fn init(allocator: std.mem.Allocator) !*SeatlessServer {
+        const ts = try allocator.create(SeatlessServer);
+        errdefer allocator.destroy(ts);
+        ts.* = .{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .log_cfg = .{ .min_level = .err },
+        };
+        ts.display = try display_mod.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
+        errdefer if (ts.display) |d| d.deinit();
+        // The compositor HAS a seat; the module below is the one built
+        // without it, which is the state get_data_device must survive.
+        ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, .{});
+        errdefer if (ts.seat) |s| s.deinit();
+        ts.ctrl = try DataControlManager.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, null, null, null);
+        errdefer if (ts.ctrl) |c| c.deinit();
+
+        var fds: [2]posix.socket_t = undefined;
+        const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+        if (posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+        ts.client = wire.Client.create(ts.display.?.getServer(), fds[0]) orelse return error.ClientCreateFailed;
+        ts.c_display = client.wl.Display.connectToFd(fds[1]) catch return error.ClientConnectFailed;
+
+        const registry = try ts.c_display.?.getRegistry();
+        var globals: RegistryCapture = .{};
+        registry.setListener(*RegistryCapture, RegistryCapture.listener, &globals);
+        try ts.pump();
+        if (globals.seat_name == null or globals.data_control_name == null) return error.GlobalMissing;
+        ts.wl_seat = try registry.bind(globals.seat_name.?, client.wl.Seat, 7);
+        ts.wl_control_manager = try registry.bind(globals.data_control_name.?, client.zwlr.DataControlManagerV1, 2);
+        try ts.pump();
+        return ts;
+    }
+
+    fn deinit(ts: *SeatlessServer) void {
+        // Client first: its destroy handlers must run while the module
+        // lives.
+        if (ts.c_display) |d| d.disconnect();
+        if (ts.client) |c| c.destroy();
+        if (ts.ctrl) |c| c.deinit();
+        if (ts.seat) |s| s.deinit();
+        if (ts.display) |d| d.deinit();
+        const allocator = ts.allocator;
+        allocator.destroy(ts);
+    }
+
+    /// One shared roundtrip plus this client's dispatch, the same
+    /// sequence TestServer.pump drives.
+    fn pump(ts: *SeatlessServer) !void {
+        try test_pump.roundtrip(ts.c_display.?, ts.display.?, 0);
+        var fds = [_]posix.pollfd{
+            .{ .fd = ts.c_display.?.getFd(), .events = posix.POLL.IN, .revents = 0 },
+        };
+        if (try posix.poll(&fds, 0) > 0) {
+            if (ts.c_display.?.dispatch() != .SUCCESS) {
+                ts.client = null;
+                return error.ClientDispatchFailed;
+            }
+        }
+    }
+};
+
 fn surfaceForClient(ts: *TestServer, client_wire: *wire.Client) *surface_mod.Surface {
     for (ts.compositor.?.surfaces.items) |s| {
         if (s.resource.getClient() == client_wire) return s;
@@ -1845,26 +1926,66 @@ test "re-using a consumed source raises used_source" {
     try testing.expectEqual(@as(c_int, 1), wl_display_get_protocol_error(ts.c_display.?, null, null));
 }
 
-test "a module with no seat serves devices with no selection" {
+test "a bound device is told the selection and primary selection are empty" {
     const allocator = testing.allocator;
-    // The init family stores io as a *std.Io (log.zig's io-generic
-    // contract), so the local must be mutable for &io to be one.
-    var io = std.Io.Threaded.global_single_threaded.io();
-    var log_cfg: log.Config = .{ .min_level = .err };
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
 
-    const display = try display_mod.CompositorDisplay.init(allocator, &io, &log_cfg);
-    defer display.deinit();
-    const compositor = try compositor_mod.Compositor.init(allocator, &io, &log_cfg, display);
-    defer compositor.deinit();
-    // No seat, no wl_data_device_manager, no primary selection: the
-    // mirrored read side is empty and the global still comes up.
-    const mgr = try DataControlManager.init(allocator, &io, &log_cfg, display, null, null, null);
-    defer mgr.deinit();
-    try testing.expect(mgr.seat == null);
-    try testing.expectEqual(@as(usize, 0), mgr.devices.items.len);
-    try testing.expectEqual(@as(usize, 0), mgr.offers.items.len);
-    // Both delivery paths are safe with nothing to mirror.
-    deliverSelection(mgr);
-    deliverPrimary(mgr);
-    try testing.expectEqual(@as(usize, 0), mgr.offers.items.len);
+    // Neither the clipboard nor the primary selection holds anything:
+    // the XML still mandates "The first selection event is sent upon
+    // binding the wlr_data_control_device object", so the device must
+    // be told the selection is EMPTY rather than left waiting for an
+    // event that never comes. Both delivery paths are load-bearing
+    // here — an empty one would leave the client with a device it has
+    // heard nothing on.
+    const device = try ts.wl_control_manager.?.getDataDevice(ts.wl_seat.?);
+    var events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &events);
+    try ts.pump();
+
+    try testing.expectEqual(@as(usize, 1), ts.ctrl.?.devices.items.len);
+    try testing.expectEqual(@as(usize, 1), events.selection_count);
+    try testing.expect(events.last_selection_null);
+    try testing.expectEqual(@as(usize, 1), events.primary_count);
+    try testing.expect(events.last_primary_null);
+    // An empty selection mints no offer on either channel.
+    try testing.expectEqual(@as(usize, 0), ts.ctrl.?.offers.items.len);
+}
+
+test "a manager with no seat hands out a dead device and leaks nothing" {
+    const allocator = testing.allocator;
+    var ts = try SeatlessServer.init(allocator);
+    defer ts.deinit();
+
+    // F-SEL-5: the client's object id must stay valid whatever the seat
+    // argument, or its next request would kill the client. The device
+    // carries no state, so the module announces nothing on it.
+    const device = try ts.wl_control_manager.?.getDataDevice(ts.wl_seat.?);
+    var events: DeviceEvents = .{};
+    device.setListener(*DeviceEvents, DeviceEvents.listener, &events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), ts.ctrl.?.devices.items.len);
+    try testing.expectEqual(@as(usize, 0), ts.ctrl.?.offers.items.len);
+    try testing.expectEqual(@as(usize, 0), events.selection_count);
+    try testing.expectEqual(@as(usize, 0), events.primary_count);
+
+    // Its requests are no-ops (deadDeviceHandler): a module that ran
+    // them as if the device were live would take this client down. The
+    // source below is a real one, so a device that DID install it
+    // would leave selection_source set — the assertions distinguish
+    // "swallowed" from "handled as live".
+    const src = try ts.wl_control_manager.?.createDataSource();
+    src.offer("text/plain");
+    device.setSelection(src);
+    device.setPrimarySelection(src);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ts.ctrl.?.sources.items.len);
+    try testing.expect(ts.ctrl.?.selection_source == null);
+    try testing.expect(ts.ctrl.?.primary_source == null);
+    try testing.expectEqual(@as(usize, 0), ts.ctrl.?.offers.items.len);
+
+    // deinit tears down a module that never had a seat behind it: the
+    // global, the manager and the never-attached focus listener link
+    // all have to go, and the testing allocator fails this test if any
+    // of them is left behind.
 }

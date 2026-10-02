@@ -526,11 +526,26 @@ pub const Tablet = struct {
         return self.display.nextSerial();
     }
 
+    /// Tell the seat's client the compositor ran out of memory.
+    ///
+    /// `getClient().postNoMemory()` is `wl_client_post_no_memory`, which
+    /// only WRITES the no_memory error: in libwayland 1.26 it is a tail
+    /// call into `wl_resource_post_error` on the client's dummy
+    /// resource, and `wl_resource_post_no_memory` is the same tail call.
+    /// Neither destroys the client. The display's event loop does, on
+    /// its next dispatch, once it sees the flagged client
+    /// (wl_display_run's `if (client->error) wl_client_destroy`).
+    ///
+    /// Two consequences the announce paths rely on: a seat stays in
+    /// `self.seats` for the rest of the current loop (so walking the
+    /// live `items` slice cannot be invalidated from here), and a
+    /// half-announced object keeps its state until the client's destroy
+    /// handlers run — which is why the announce path never unwinds it.
+    ///
+    /// Do NOT substitute `resource.postNoMemory()` or a
+    /// `wl_resource_destroy`: in this libwayland neither kills the
+    /// client either, and only the destroy path frees the structs.
     fn postOutOfMemory(_: *Tablet, seat: *SeatClient) void {
-        // wl_resource_post_no_memory destroys the client, so any partially
-        // announced object disappears with it and every destroy handler
-        // still runs. That is why the announce path never unwinds its own
-        // half-built state.
         seat.res.getClient().postNoMemory();
     }
 
@@ -577,6 +592,9 @@ pub const Tablet = struct {
         }
         hw.paths = paths;
         try self.tablets.append(allocator, hw);
+        // The seat list cannot change under this loop: postOutOfMemory
+        // only posts the error (see above), and nothing here dispatches
+        // the client that would run seatClientDestroy.
         for (self.seats.items) |seat| hw.announceTo(seat) catch {
             self.postOutOfMemory(seat);
         };
@@ -1534,6 +1552,8 @@ const TestServer = struct {
     tablet_manager: ?*client.zwp.TabletManagerV2 = null,
     event_log: EventLog = .{},
     capture: Capture = .{ .log = undefined },
+    /// Extra clients added by addPeer, torn down with this server.
+    peers: std.ArrayList(*Peer) = .empty,
 
     /// Heap-allocated: the `io` pointer must outlive the stack frame, and
     /// `capture` holds a pointer into this struct, so it must be stable
@@ -1580,10 +1600,50 @@ const TestServer = struct {
         return ts;
     }
 
+    /// A second, third, ... connection with its own zwp_tablet_seat_v2
+    /// and its own event log. See Peer for why the out-of-memory
+    /// announce test needs one seat per client.
+    fn addPeer(ts: *TestServer, manager_version: u32) !*Peer {
+        const peer = try ts.allocator.create(Peer);
+        errdefer ts.allocator.destroy(peer);
+        // SAFETY: every field below is written before the peer is read;
+        // only `ts` has to be right for the error paths, and they only
+        // free the struct.
+        peer.* = .{
+            .ts = ts,
+            .client = undefined,
+            .c_display = undefined,
+            .tablet_manager = undefined,
+            .seat = undefined,
+        };
+        peer.capture = .{ .log = &peer.log };
+        var fds: [2]posix.socket_t = undefined;
+        const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+        if (posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+        peer.client = wire.Client.create(ts.display.?.getServer(), fds[0]) orelse return error.ClientCreateFailed;
+        peer.c_display = client.wl.Display.connectToFd(fds[1]) catch return error.ClientConnectFailed;
+
+        const registry = try peer.c_display.getRegistry();
+        var globals: RegistryCapture = .{};
+        registry.setListener(*RegistryCapture, RegistryCapture.listener, &globals);
+        try peer.pump();
+        if (globals.seat_name == null or globals.tablet_name == null) return error.GlobalMissing;
+        const wl_seat = try registry.bind(globals.seat_name.?, client.wl.Seat, 7);
+        peer.tablet_manager = try registry.bind(globals.tablet_name.?, client.zwp.TabletManagerV2, manager_version);
+        try peer.pump();
+        peer.seat = try peer.tablet_manager.getTabletSeat(wl_seat);
+        peer.seat.setListener(*Capture, Capture.seat, &peer.capture);
+        try peer.pump();
+        try ts.peers.append(ts.allocator, peer);
+        return peer;
+    }
+
     fn deinit(ts: *TestServer) void {
         // Tear the client down first: its resource destroy handlers must
         // run while the tablet module lives.
         if (ts.c_display) |d| d.disconnect();
+        for (ts.peers.items) |peer| peer.deinit();
+        ts.peers.deinit(ts.allocator);
         if (ts.client) |c| c.destroy();
         if (ts.tablet) |t| t.deinit();
         if (ts.seat) |s| s.deinit();
@@ -1634,6 +1694,50 @@ const TestServer = struct {
             if (s.resource.getId() == proxy.getId()) return s;
         }
         unreachable;
+    }
+};
+
+/// A second, third, ... test client: its own socketpair, its own
+/// zwp_tablet_seat_v2 and its own event log, so a test can tell whose
+/// announcements reached whom.
+///
+/// The out-of-memory announce path needs one seat per CLIENT. The failure
+/// handler posts wl_resource_post_no_memory, which destroys the whole
+/// connection — three seats on one client would all die with the first
+/// failure, and the test could no longer tell whether the announce loop
+/// went on to the seats behind the dead one.
+const Peer = struct {
+    ts: *TestServer,
+    client: *wire.Client,
+    c_display: *client.wl.Display,
+    tablet_manager: *client.zwp.TabletManagerV2,
+    seat: *client.zwp.TabletSeatV2,
+    log: EventLog = .{},
+    capture: Capture = .{ .log = undefined },
+    /// False once the server destroyed this connection (a no_memory
+    /// post, or a protocol error): deinit must not destroy the wire
+    /// client again, the same rule TestServer.deinit follows through its
+    /// nullable `client`.
+    alive: bool = true,
+
+    fn pump(self: *Peer) !void {
+        try test_pump.roundtrip(self.c_display, self.ts.display.?, 0);
+        var fds = [_]posix.pollfd{
+            .{ .fd = self.c_display.getFd(), .events = posix.POLL.IN, .revents = 0 },
+        };
+        if (try posix.poll(&fds, 0) > 0) {
+            if (self.c_display.dispatch() != .SUCCESS) {
+                self.alive = false;
+                return error.ClientDispatchFailed;
+            }
+        }
+    }
+
+    fn deinit(self: *Peer) void {
+        self.c_display.disconnect();
+        if (self.alive) self.client.destroy();
+        const allocator = self.ts.allocator;
+        allocator.destroy(self);
     }
 };
 
@@ -2011,6 +2115,14 @@ test "a surface already another tool's cursor raises zwp_tablet_tool_v2.role" {
 const LiveBytes = struct {
     inner: std.mem.Allocator,
     live: usize = 0,
+    /// Refuse the allocation with this index, ONCE. The counting above
+    /// is what makes that possible: std.testing's FailingAllocator
+    /// leaves `alloc_index` where it was when it refuses, so EVERY
+    /// later allocation fails as well — one refused announce would then
+    /// take down all the seats behind it, and the test could no longer
+    /// tell which of them the module actually failed.
+    fail_index: usize = std.math.maxInt(usize),
+    allocs: usize = 0,
 
     fn allocator(self: *LiveBytes) std.mem.Allocator {
         return .{
@@ -2021,6 +2133,9 @@ const LiveBytes = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *LiveBytes = @ptrCast(@alignCast(ctx));
+        const index = self.allocs;
+        self.allocs += 1;
+        if (index == self.fail_index) return null;
         const ptr = self.inner.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.live += len;
         return ptr;
@@ -2100,4 +2215,107 @@ test "addTablet keeps a path-less descriptor on the comptime empty slice" {
         tablet.deinit();
     }
     try std.testing.expectEqual(baseline, live.live);
+}
+
+test "an OOM tablet announce fails one client and still serves every other seat once" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator, tablet_v2_version);
+    defer ts.deinit();
+
+    // Three seats on three CONNECTIONS, in bind order: the FIRST seat's
+    // announce runs out of memory, which is the only way one announce
+    // failure could disturb the ones behind it.
+    const a = try ts.addPeer(tablet_v2_version);
+    const b = try ts.addPeer(tablet_v2_version);
+    const c = try ts.addPeer(tablet_v2_version);
+    try std.testing.expectEqual(@as(usize, 3), ts.tablet.?.seats.items.len);
+
+    // Every allocation addTablet makes through the module allocator, in
+    // order: 0 the TabletHw, 1 the name copy, 2 the registry slot,
+    // 3 the TabletClient for the FIRST seat. Only that one is refused,
+    // so the two announces behind it still have memory: an earlier
+    // failure aborts addTablet and announces to nobody, which is what
+    // keeps this index honest.
+    var live = LiveBytes{ .inner = allocator, .fail_index = 3 };
+    ts.tablet.?.allocator = live.allocator();
+    _ = try ts.tablet.?.addTablet(.{ .name = "intuos" });
+    ts.tablet.?.allocator = allocator;
+
+    // The failure really was a's announce: it got no zwp_tablet_v2, so
+    // the module holds a client object for the two survivors only.
+    try std.testing.expectEqual(@as(usize, 2), ts.tablet.?.tablets.items[0].clients.items.len);
+    // postOutOfMemory only POSTS the error, so the seat is still listed
+    // when addTablet returns — the announce loop walked a list that
+    // could not move under it.
+    try std.testing.expectEqual(@as(usize, 3), ts.tablet.?.seats.items.len);
+
+    // The error reaches a's connection. Its seat leaves the registry
+    // only when the compositor's run loop sweeps an errored client
+    // (wl_display_run's `if (client->error) wl_client_destroy`), which
+    // the harness's wl_event_loop_dispatch never does — and which, in
+    // production, still never runs inside an announce loop.
+    try std.testing.expectError(error.ClientDispatchFailed, a.pump());
+    try std.testing.expectEqual(@as(usize, 3), ts.tablet.?.seats.items.len);
+
+    // Both survivors were announced exactly once each. A loop that lost
+    // its place here — skipping the seat behind the dead one and giving
+    // the last one a second burst — would fail on these two strings.
+    try b.pump();
+    try c.pump();
+    try std.testing.expectEqualStrings("tablet_added name done ", b.log.text());
+    try std.testing.expectEqualStrings("tablet_added name done ", c.log.text());
+}
+
+test "an OOM tool announce fails one client and still serves every other seat once" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator, tablet_v2_version);
+    defer ts.deinit();
+
+    const a = try ts.addPeer(tablet_v2_version);
+    const b = try ts.addPeer(tablet_v2_version);
+    const c = try ts.addPeer(tablet_v2_version);
+
+    // Same order as addTablet without the name copy: 0 the ToolHw,
+    // 1 the registry slot, 2 the ToolClient for the FIRST seat.
+    var live = LiveBytes{ .inner = allocator, .fail_index = 2 };
+    ts.tablet.?.allocator = live.allocator();
+    _ = try ts.tablet.?.addTool(.{ .tool_type = .pen });
+    ts.tablet.?.allocator = allocator;
+
+    try std.testing.expectEqual(@as(usize, 2), ts.tablet.?.tools.items[0].clients.items.len);
+    // postOutOfMemory only posts, so a's seat is still listed here.
+    try std.testing.expectEqual(@as(usize, 3), ts.tablet.?.seats.items.len);
+    try std.testing.expectError(error.ClientDispatchFailed, a.pump());
+    try std.testing.expectEqual(@as(usize, 3), ts.tablet.?.seats.items.len);
+    try b.pump();
+    try c.pump();
+    try std.testing.expectEqualStrings("tool_added type done ", b.log.text());
+    try std.testing.expectEqualStrings("tool_added type done ", c.log.text());
+}
+
+test "an OOM pad announce fails one client and still serves every other seat once" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator, tablet_v2_version);
+    defer ts.deinit();
+
+    const a = try ts.addPeer(tablet_v2_version);
+    const b = try ts.addPeer(tablet_v2_version);
+    const c = try ts.addPeer(tablet_v2_version);
+
+    // No path, so the descriptor copy is skipped: 0 the PadHw, 1 the
+    // registry slot, 2 the PadClient for the FIRST seat.
+    var live = LiveBytes{ .inner = allocator, .fail_index = 2 };
+    ts.tablet.?.allocator = live.allocator();
+    _ = try ts.tablet.?.addPad(.{ .buttons = 1 });
+    ts.tablet.?.allocator = allocator;
+
+    try std.testing.expectEqual(@as(usize, 2), ts.tablet.?.pads.items[0].clients.items.len);
+    // postOutOfMemory only posts, so a's seat is still listed here.
+    try std.testing.expectEqual(@as(usize, 3), ts.tablet.?.seats.items.len);
+    try std.testing.expectError(error.ClientDispatchFailed, a.pump());
+    try std.testing.expectEqual(@as(usize, 3), ts.tablet.?.seats.items.len);
+    try b.pump();
+    try c.pump();
+    try std.testing.expectEqualStrings("pad_added pad_buttons pad_done ", b.log.text());
+    try std.testing.expectEqualStrings("pad_added pad_buttons pad_done ", c.log.text());
 }

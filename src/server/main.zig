@@ -889,6 +889,11 @@ pub fn main(init: std.process.Init) !void {
     defer freeStateResources(&state);
     state.input_backend = input_backend;
     subscribe(&state);
+    // The foreign-toplevel focus gate names `state` as its context, and
+    // the defer below tears down the fields that context reads before the
+    // module holding it dies — so the gate comes off first, exactly as
+    // subscribe installs it.
+    defer if (state.foreign_toplevel) |ft| ft.setFocusGate(&state, null);
     // Unlink before the module deinits run: their teardown emits
     // lock_surface_gone, and these handlers dereference `state`, whose
     // own teardown defer was registered earlier and has already run.
@@ -1566,6 +1571,16 @@ fn subscribe(state: *ServerState) void {
     // move-based routing in applyLayerKeyboardFocus enforces the same
     // for hover.
     state.seat.setKeyboardFocusGate(keyboardFocusAllowed, state);
+    // zwlr_foreign_toplevel_manager_v1's `activate` is the THIRD route a
+    // client has to keyboard focus (a click, xdg_activation, this one), so
+    // it goes through the SAME composite gate with the SAME context: the
+    // session-lock boundary must not have a hole on the side.
+    state.foreign_toplevel.?.setFocusGate(state, keyboardFocusAllowed);
+    // The popup grab hit-tests a pointer event (SCREEN pixels) against the
+    // popup's WORLD rect, so the shell needs the same camera inversion
+    // pickSurface does. Uninstalled it assumes the identity map, which is
+    // only true until the first zoom or pan.
+    state.shell.setScreenToWorld(screenToWorld, state);
     // ext_session_lock_manager_v1: the four signals main owns. `locked`
     // runs inside the lock surface's commit dispatch, so the grabs are
     // ended and the focus forced onto a lock surface BEFORE any frame can
@@ -1914,10 +1929,29 @@ fn onToplevelTitle(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *way
 /// X08: the client performed the initial commit; the compositor replies
 /// with the configure (the module never self-configures). 0,0 = "client
 /// decides" (wlroots tinywl does the same on the initial commit).
+///
+/// The activation state is seeded here, not only in the seat's focus
+/// signal. A role object may be a RE-CREATION on a wl_surface that still
+/// holds the keyboard: a client may destroy xdg_toplevel and call
+/// get_toplevel again on the same xdg_surface (xdg-shell.xml:637-641),
+/// Seat.setKeyboardFocus early-returns on an unchanged focus
+/// (seat.zig:1238), and the role destroy unmaps without touching the seat
+/// (xdg.zig:1328-1329). Nothing moves, so the keyboard_focus signal never
+/// fires and the only publisher of wl_toplevel.activated never runs for
+/// the new role: it would configure activated=false forever and its CSD
+/// would paint an inactive titlebar on the window that has the keyboard.
+///
+/// Seeding BEFORE the pass below means the pass sees this toplevel's
+/// scheduled state already correct, skips it, and reconfigures only the
+/// OTHER windows whose activation really flipped — so the activation
+/// lands in the single configure the initial commit is entitled to.
 fn onToplevelInitialCommit(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
     const tl: *ToplevelListeners = @fieldParentPtr("initial_commit", listener);
+    const self = tl.state;
+    t.scheduled.activated = toplevelIsActivated(self, self.seat, t.xdg_surface.surface);
+    syncToplevelActivation(self, self.seat);
     t.scheduleConfigure() catch {
-        log.warn("initial toplevel configure failed", tl.state.io, tl.state.log_cfg, "server", .{});
+        log.warn("initial toplevel configure failed", self.io, self.log_cfg, "server", .{});
     };
 }
 
@@ -2024,9 +2058,19 @@ fn onToplevelMaximize(
     // this handler writes.
     const maximize = t.pending.maximized;
     if (maximize) {
-        const area = usableArea(self);
-        t.scheduled.width = area.width;
-        t.scheduled.height = area.height;
+        // A fullscreen surface covers the FULL output box whatever the
+        // maximize request says: xdg-shell.xml:1049-1051 — set_maximized
+        // "has no direct effect" while the surface is fullscreen — and
+        // xdg-shell.xml:850-854 requires a fullscreened surface to be
+        // able to cover the fullscreened area. So the STATE is recorded
+        // (a later un-fullscreen needs it) and the GEOMETRY is left as
+        // the fullscreen handler wrote it: the usable area would pull the
+        // window out from under the panel a fullscreen window covers.
+        if (!t.scheduled.fullscreen) {
+            const area = usableArea(self);
+            t.scheduled.width = area.width;
+            t.scheduled.height = area.height;
+        }
     } else {
         t.scheduled.width = 0;
         t.scheduled.height = 0;
@@ -2056,7 +2100,12 @@ fn onToplevelFullscreen(
     const t = req.toplevel;
     t.scheduled.fullscreen = req.fullscreen;
     // Leaving fullscreen hands the size back to the client (same reason
-    // as unmaximize: no stored pre-fullscreen geometry to restore).
+    // as unmaximize: no stored pre-fullscreen geometry to restore) —
+    // unless the window is STILL maximized, in which case the box that
+    // maximizes means is the answer, exactly as onToplevelMaximize wrote
+    // it. 0x0 would tell the client to pick its own size for a state it
+    // was just told it has, and discard a geometry the two handlers
+    // otherwise disagree about.
     t.scheduled.width = 0;
     t.scheduled.height = 0;
     if (req.fullscreen) {
@@ -2064,6 +2113,10 @@ fn onToplevelFullscreen(
             t.scheduled.width = box.width;
             t.scheduled.height = box.height;
         }
+    } else if (t.scheduled.maximized) {
+        const area = usableArea(self);
+        t.scheduled.width = area.width;
+        t.scheduled.height = area.height;
     }
     log.info("toplevel fullscreen -> {s} ({d}x{d})", self.io, self.log_cfg, "server", .{
         if (req.fullscreen) "on" else "off",
@@ -2322,10 +2375,15 @@ fn onRequestActivate(
     log.info("xdg_activation: request_activate surface={*} token={s}", self.io, self.log_cfg, "server", .{
         req.surface, req.token,
     });
-    // The focus gate is the compositor's policy for what may hold
-    // keyboard focus (a keyboard_interactivity=none layer surface may
-    // not, L-D7), so activation goes through it too.
-    if (layerKeyboardFocusAllowed(self, req.surface)) {
+    // The COMPOSITE gate, the same one a click goes through
+    // (setKeyboardFocusGate in subscribe): the session lock first — while
+    // locked only a lock surface of the lock client may hold the keyboard
+    // — then L-D7's layer policy. Activation is SELF-SERVICE (a token
+    // with no serial validates trivially, xdg_activation.zig:545-558), so
+    // a client that consults only the layer half walks straight through
+    // the privilege boundary and reads every keystroke typed at the lock
+    // screen.
+    if (keyboardFocusAllowed(self, req.surface)) {
         self.seat.setKeyboardFocus(req.surface);
     }
 }
@@ -2333,9 +2391,25 @@ fn onRequestActivate(
 /// The seat's keyboard focus changed (it fires after the leave/enter/
 /// modifiers wire events, seat.zig:1270): republish wl_toplevel.
 /// activated for every toplevel whose activated state flipped.
+///
+/// It is a pure observer: calling setKeyboardFocus from here re-enters the
+/// signal being emitted, and wire.Signal.emitInner walks a list whose
+/// sentinel is an uninitialized cursor node — the nested emit notifies it
+/// as if it were a listener and calls through a garbage function pointer.
+/// The session-lock focus re-assertion that belongs on a focus change
+/// therefore lives in onSeatButton, on a signal of its own.
 fn onSeatKeyboardFocus(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_focus_listener", listener);
     syncToplevelActivation(self, seat);
+}
+
+/// The COMPOSITE focus gate decides what `activated` means: a surface
+/// that cannot take keyboard focus must never be reported activated,
+/// whoever routed the focus at it (the session lock first, then L-D7).
+/// Split out of syncToplevelActivation so the initial-commit path asks
+/// exactly the same question instead of restating it.
+fn toplevelIsActivated(self: *ServerState, seat: *wayland.seat.Seat, surface: *Surface) bool {
+    return surface == seat.keyboard_focus and keyboardFocusAllowed(self, surface);
 }
 
 /// wl_toplevel.activated follows the seat's KEYBOARD FOCUS (P1-9). The
@@ -2344,20 +2418,22 @@ fn onSeatKeyboardFocus(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayl
 /// CSD toolkit renders its active titlebar from it, so a server that
 /// never sends it never shows an active titlebar.
 ///
-/// Driven from seat.events.keyboard_focus, so a CLICK updates it, not
-/// only an xdg_activation request. Both ends of the change are
-/// reconfigured in the same pass: an unfocused window must report
-/// activated=false, or the client keeps drawing it active forever.
+/// Driven from seat.events.keyboard_focus AND from the initial commit, so
+/// a CLICK updates it, not only an xdg_activation request, and a role
+/// re-created on a still-focused surface is not left unactivated. Both
+/// ends of the change are reconfigured in the same pass: an unfocused
+/// window must report activated=false, or the client keeps drawing it
+/// active forever.
 ///
-/// The focus gate is re-checked here (layerKeyboardFocusAllowed): a
-/// surface that cannot take keyboard focus must never be reported
-/// activated, whoever routed the focus at it.
+/// The focus gate is re-checked here (toplevelIsActivated): a surface
+/// that cannot take keyboard focus must never be reported activated,
+/// whoever routed the focus at it.
 fn syncToplevelActivation(self: *ServerState, seat: *wayland.seat.Seat) void {
     // shell.toplevels is pruned when a role object is destroyed
     // (xdg.zig:1317-1318), so every entry here is live.
     for (self.shell.toplevels.items) |t| {
         const surface = t.xdg_surface.surface;
-        const activated = surface == seat.keyboard_focus and layerKeyboardFocusAllowed(self, surface);
+        const activated = toplevelIsActivated(self, seat, surface);
         // The module never self-configures: the server writes `scheduled`
         // and schedules the configure, the same contract as the initial
         // commit. Only a CHANGE schedules — the seat emits this signal
@@ -3684,6 +3760,19 @@ fn wantNestedBackend(environ_map: *std.process.Environ.Map) bool {
 // M3: seat hit-test, screencopy sources, input bindings
 // ---------------------------------------------------------------------------
 
+/// Seat input is in SCREEN pixels; scene nodes — and every popup origin
+/// published by syncPopupNodes — are in WORLD pixels. This inverts the
+/// camera exactly as the seat's hit test does, and is installed into the
+/// shell through setScreenToWorld so an xdg_popup grab hit-tests its
+/// inside/outside decision in the same space the popup was placed in
+/// (xdg.zig popupGrabMotion / popupGrabButton). Without it the shell
+/// assumes the identity map, which is right only until the first zoom or
+/// pan (the camera is live: WAYLAND_CAMERA zoom is clamped to 0.1..16.0).
+fn screenToWorld(ctx: *anyopaque, sx: i32, sy: i32) geom.FPoint {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    return self.camera.screenToWorld(@floatFromInt(sx), @floatFromInt(sy));
+}
+
 /// Seat hit test: the topmost surface scene node under (x, y), mapped
 /// back to its surface with surface-local coordinates.
 fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
@@ -3691,18 +3780,12 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     const scene = self.scene orelse return null;
     // M4: the pointer arrives in SCREEN coords, but the scene nodes live
     // in world space — invert the camera first, then pick in world coords
-    // (surface-local coords are world coords too). With the default
-    // camera worldToScreen is the identity mapping, so this is a no-op.
-    const world = self.camera.screenToWorld(@floatFromInt(x), @floatFromInt(y));
-    const pick_x: i32 = @intFromFloat(@min(
-        @max(world.x, @as(f64, std.math.minInt(i32))),
-        @as(f64, std.math.maxInt(i32)),
-    ));
-    const pick_y: i32 = @intFromFloat(@min(
-        @max(world.y, @as(f64, std.math.minInt(i32))),
-        @as(f64, std.math.maxInt(i32)),
-    ));
-    const node = scene.pick(pick_x, pick_y) orelse return null;
+    // (surface-local coords are world coords too). The conversion is the
+    // ONE the shell was handed (setScreenToWorld in subscribe), so the
+    // seat's hit test and the popup grab's can never drift apart; with
+    // the default camera it is the identity mapping, so a no-op.
+    const pick = self.shell.worldFromScreen(x, y);
+    const node = scene.pick(pick.x, pick.y) orelse return null;
     // Back-map the picked node to its surface through the library's
     // surface→scene table.
     const surface = wayland.surface_node.surfaceForNode(scene, node) orelse return null;
@@ -3720,8 +3803,8 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     const rect = node.absolutePosition();
     return .{
         .surface = surface,
-        .sx = pick_x - rect.x,
-        .sy = pick_y - rect.y,
+        .sx = pick.x - rect.x,
+        .sy = pick.y - rect.y,
     };
 }
 
@@ -3861,6 +3944,21 @@ fn onSessionLocked(
     // The layer keyboard grab is ours: release it without restoring its
     // previous surface, which would put focus back on user content.
     self.layer_kbd_grab = null;
+    // The POINTER must leave user content too. pointer_focus is refreshed
+    // by exactly one thing — Seat.pointerMotion (seat.zig:884-891) — and
+    // that returns early under a pointer grab, so the cache still named
+    // whatever the user had hovered when the latch fired. Both
+    // pointerButton (seat.zig:1015) and pointerAxisDir (seat.zig:1125)
+    // route by that cache, so the next click delivered its press AND its
+    // release to a client the lock is supposed to be deaf to. The grab
+    // ended on the line above, so re-running the seat's own refresh at the
+    // pointer's CURRENT position is the state transition, not a guard:
+    // pickSurface drops everything that is not a lock surface while the
+    // session is locked, so the seat either sends wl_pointer.leave to the
+    // user client and clears the focus, or enters the lock surface the
+    // pointer really is over (session_lock.zig:99-103 — a null pick makes
+    // the pointer leave and no client see motion or buttons).
+    self.seat.pointerMotion(self.seat.pointer_x, self.seat.pointer_y);
     // Force keyboard focus onto a lock surface. The seat delivers keys
     // only to the focused surface's client (seat.zig:1339-1346), so this
     // is what actually suppresses typing to every other client. The XML
@@ -4114,7 +4212,29 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
     // arm (and must not install the pointer grab that swallows input) on
     // a press that belongs to the lock client.
     if (self.session_lock) |sl| {
-        if (sl.isLocked()) return;
+        if (sl.isLocked()) {
+            // The keyboard belongs to the lock client, and the module's
+            // contract re-asserts the lock focus on every focus change
+            // (session_lock.zig:104-108). The one-shot assignment in
+            // onSessionLocked is not an invariant: a press that hits
+            // nothing clears the focus (seat.zig:995, this server's
+            // null-pick policy) and deafens the lock screen until
+            // something focuses it again — and with the lock surface
+            // covering less than the output, "a click on empty canvas" is
+            // a click the user makes on purpose. Re-asserted HERE, on the
+            // button signal the seat emits after its own focus work, and
+            // not in onSeatKeyboardFocus: setKeyboardFocus from inside a
+            // keyboard_focus handler re-enters that signal's safe
+            // iteration, whose uninitialized cursor node would then be
+            // notified as if it were a listener (wire.Signal.emitInner).
+            const focus = seat.keyboard_focus;
+            if (focus == null or !sl.isLockSurface(focus.?)) {
+                if (sl.lockSurfaces().len > 0) {
+                    seat.setKeyboardFocus(sl.lockSurfaces()[0].surface);
+                }
+            }
+            return;
+        }
     }
     if (seat.last_button != wayland.seat.btn_left) return;
     if (seat.last_button_pressed) {
@@ -4588,16 +4708,39 @@ const state_maximized: u32 = 1;
 const state_fullscreen: u32 = 2;
 const state_activated: u32 = 4;
 
+/// The client's xdg_surface events, and the harness's ONLY ack_configure
+/// driver. The compositor's half of the double buffer (`current`) moves
+/// exactly once per ack (xdg.zig:415-434: `applyAckedConfigure` is called
+/// from the ack request alone), so a harness that records the serial and
+/// never acks can only assert on `scheduled` — the state the server wrote
+/// microseconds earlier, right by construction — and never on the half a
+/// client actually lives in. Acking here closes that gap: every configure
+/// a test provokes completes the full request -> configure -> ack ->
+/// current cycle.
+///
+/// `auto_ack = false` is the deferred mode (createToplevelDeferredAck):
+/// the test observes the PRE-ack state and calls ackToplevelConfigure
+/// itself, which is the only way to see that `current` is still unmoved.
 const ClientXdgSurfaceEvents = struct {
     configures: usize = 0,
     serial: u32 = 0,
+    acks: usize = 0,
+    auto_ack: bool = true,
 
     fn listener(xdg_surface: *client.xdg.Surface, event: client.xdg.Surface.Event, data: *ClientXdgSurfaceEvents) void {
-        _ = xdg_surface;
         switch (event) {
             .configure => |c| {
                 data.configures += 1;
                 data.serial = c.serial;
+                // Requests from an event handler are ordinary libwayland
+                // traffic: the proxy marshals into the same outgoing
+                // buffer and the ack leaves with the next flush
+                // (PolicyServer.pump: flush -> server dispatch -> flush ->
+                // client dispatch, so the ack needs ONE more pump).
+                if (data.auto_ack) {
+                    xdg_surface.ackConfigure(c.serial);
+                    data.acks += 1;
+                }
             },
         }
     }
@@ -4690,28 +4833,44 @@ const PolicyRegistryCapture = struct {
 /// still exist.
 const PolicyGlobalCapture = struct {
     const max_globals = 64;
+    /// The interface string is COPIED, not pointed at: libwayland hands
+    /// `wl_registry.global` its interface as a `[*:0]const u8` INTO the
+    /// connection's read buffer (the generated event carries the raw
+    /// pointer), and the next read on that connection overwrites the
+    /// buffer. A stored pointer therefore compares against whatever the
+    /// buffer holds later — which is how a capture could report a global
+    /// as missing that the server had just advertised.
+    const max_interface_len = 64;
     const Entry = struct {
-        interface: [*:0]const u8,
-        name: u32,
-        version: u32,
+        interface: [max_interface_len]u8 = [_]u8{0} ** max_interface_len,
+        interface_len: usize = 0,
+        name: u32 = 0,
+        version: u32 = 0,
     };
-    entries: [max_globals]Entry = undefined,
+    entries: [max_globals]Entry = [_]Entry{.{}} ** max_globals,
     len: usize = 0,
 
     fn listener(_: *client.wl.Registry, event: client.wl.Registry.Event, self: *PolicyGlobalCapture) void {
         switch (event) {
             .global => |g| {
                 if (self.len >= self.entries.len) return;
-                self.entries[self.len] = .{ .interface = g.interface, .name = g.name, .version = g.version };
+                const entry = &self.entries[self.len];
+                const s = std.mem.span(g.interface);
+                const n = @min(s.len, entry.interface.len - 1);
+                @memcpy(entry.interface[0..n], s[0..n]);
+                entry.interface[n] = 0;
+                entry.interface_len = n;
+                entry.name = g.name;
+                entry.version = g.version;
                 self.len += 1;
             },
             .global_remove => {},
         }
     }
 
-    fn find(self: *const PolicyGlobalCapture, interface: []const u8) ?Entry {
-        for (self.entries[0..self.len]) |e| {
-            if (std.mem.eql(u8, std.mem.span(e.interface), interface)) return e;
+    fn find(self: *const PolicyGlobalCapture, interface: []const u8) ?*const Entry {
+        for (self.entries[0..self.len]) |*e| {
+            if (std.mem.eql(u8, e.interface[0..e.interface_len], interface)) return e;
         }
         return null;
     }
@@ -4810,10 +4969,17 @@ const PolicyServer = struct {
 
     /// The compositor hit test for the tests: always the one surface the
     /// test armed it with (a drag's origin check needs the pointer to be
-    /// over the origin surface).
+    /// over the origin surface), behind the SAME lock filter the real hit
+    /// test applies (pickSurface:3717-3719). Without that half the harness
+    /// would keep handing the seat a user surface while the session is
+    /// locked — the one thing the compositor must never do — and no input
+    /// policy would be observable.
     fn pick(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
         const ts: *PolicyServer = @ptrCast(@alignCast(ctx));
         const s = ts.pick_surface orelse return null;
+        if (ts.session_lock) |sl| {
+            if (sl.isLocked() and !sl.isLockSurface(s)) return null;
+        }
         return .{ .surface = s, .sx = x, .sy = y };
     }
 
@@ -5098,9 +5264,18 @@ const PolicyServer = struct {
         ts.seat.?.events.keyboard_focus.add(&state.seat_focus_listener);
         ts.seat.?.events.button.add(&state.seat_button_listener);
         ts.seat.?.events.pointer_move.add(&state.seat_pointer_move_listener);
+        // xdg_activation_v1: main() subscribes this in subscribe(), and it
+        // is the route a client uses to ASK for keyboard focus, so a
+        // test of the focus policy has to reach it the same way.
+        ts.xdg_activation.?.events.request_activate.add(&state.request_activate_listener);
         ts.seat.?.setPick(PolicyServer.pick, ts);
         // main()'s gate: the session lock first, then L-D7's layer policy.
         ts.seat.?.setKeyboardFocusGate(keyboardFocusAllowed, state);
+        // main()'s other two policy seams: the foreign-toplevel activate
+        // gate (the third route to keyboard focus) and the popup grab's
+        // screen->world conversion.
+        ts.foreign_toplevel.?.setFocusGate(state, keyboardFocusAllowed);
+        ts.shell.?.setScreenToWorld(screenToWorld, state);
         // The production subscriptions main() makes for the new modules.
         ts.session_lock.?.events.locked.add(&state.session_locked_listener);
         ts.session_lock.?.events.unlocked.add(&state.session_unlocked_listener);
@@ -5188,6 +5363,10 @@ const PolicyServer = struct {
             unlinkOne(*wayland.seat.Seat, &state.seat_focus_listener);
             unlinkOne(*wayland.seat.Seat, &state.seat_button_listener);
             unlinkOne(*wayland.seat.Seat, &state.seat_pointer_move_listener);
+            unlinkOne(*wayland.xdg_activation.ActivateRequest, &state.request_activate_listener);
+            // The focus gate names `state`, which is freed a few lines
+            // below — same reason main() clears it before freeStateResources.
+            if (ts.foreign_toplevel) |ft| ft.setFocusGate(state, null);
             state.toplevels.deinit(ts.allocator);
             state.layer_surfaces.deinit(ts.allocator);
             state.layer_popups.deinit(ts.allocator);
@@ -5388,8 +5567,23 @@ const PolicyServer = struct {
 
     /// A mapped toplevel: xdg_surface + xdg_toplevel, the initial commit
     /// the compositor answers with a configure, then a buffer so the
-    /// surface has a scene node.
+    /// surface has a scene node. The listener acks every configure
+    /// (ClientXdgSurfaceEvents), so the returned toplevel has a `current`
+    /// that matches the last configure it saw.
     fn createToplevel(ts: *PolicyServer) !*Toplevel {
+        return ts.createToplevelWithAck(true);
+    }
+
+    /// The same, with the harness's auto-ack switched OFF: configures are
+    /// recorded but not acked, so a test can observe the PRE-ack state and
+    /// drive the ack itself (ackToplevelConfigure). Only the initial
+    /// configure is acked here — attaching a buffer before any ack is
+    /// `unconfigured_buffer` (xdg-shell.xml:1063-1065).
+    fn createToplevelDeferredAck(ts: *PolicyServer) !*Toplevel {
+        return ts.createToplevelWithAck(false);
+    }
+
+    fn createToplevelWithAck(ts: *PolicyServer, auto_ack: bool) !*Toplevel {
         // Heap-allocated: the client listeners take the address of the
         // event state, so it must outlive this call (a returned-by-value
         // copy would leave them pointing at the dead local).
@@ -5403,7 +5597,7 @@ const PolicyServer = struct {
             .xdg_surface = undefined,
             .toplevel = undefined,
             .tl_events = .{},
-            .xs_events = .{},
+            .xs_events = .{ .auto_ack = auto_ack },
         };
         out.wl_surface = try ts.wl_compositor.?.createSurface();
         out.xdg_surface = try ts.wm_base.?.getXdgSurface(out.wl_surface);
@@ -5415,13 +5609,110 @@ const PolicyServer = struct {
         // with the configure the client acks.
         out.wl_surface.commit();
         try ts.pump();
+        if (!auto_ack) ts.ackToplevelConfigure(out);
         // Attach a buffer + ack: the surface maps and gets a scene node.
         out.wl_surface.attach(try ts.createBuffer(), 0, 0);
-        out.xdg_surface.ackConfigure(out.xs_events.serial);
         out.wl_surface.commit();
         try ts.pump();
         syncSurfaces(ts.state.?);
         return out;
+    }
+
+    /// Ack the configure `t` last received — the deferred-ack path (the
+    /// auto-ack listener would have sent this already).
+    fn ackToplevelConfigure(_: *PolicyServer, t: *Toplevel) void {
+        t.xdg_surface.ackConfigure(t.xs_events.serial);
+        t.xs_events.acks += 1;
+    }
+
+    /// Destroy the role object and create a fresh one on the SAME
+    /// xdg_surface / wl_surface, exactly as a client may
+    /// (xdg-shell.xml:637-641: destroying the role leaves the xdg_surface
+    /// usable for a new role). The wl_surface keeps its buffer, so the
+    /// re-created role only needs its initial commit to reach the first
+    /// configure.
+    fn recreateRole(ts: *PolicyServer, t: *Toplevel) !void {
+        t.toplevel.destroy();
+        try ts.pump();
+        t.toplevel = try t.xdg_surface.getToplevel();
+        // The old proxy died with the role; its listener registration with
+        // it. A fresh state object (in place, so the listener's data
+        // pointer stays valid) records only what the NEW role is told.
+        t.tl_events = .{};
+        t.toplevel.setListener(*ClientToplevelEvents, ClientToplevelEvents.listener, &t.tl_events);
+        try ts.pump();
+        // The initial commit of the new role: the compositor answers with
+        // the first configure, which the auto-ack listener acks.
+        t.wl_surface.commit();
+        try ts.pump();
+        t.wl_surface.attach(try ts.createBuffer(), 0, 0);
+        t.wl_surface.commit();
+        try ts.pump();
+        syncSurfaces(ts.state.?);
+    }
+
+    /// Two roundtrips. The harness acks from the configure listener, and
+    /// the ack itself only leaves the client on the NEXT flush (pump's
+    /// order: client flush -> server dispatch -> server flush -> client
+    /// dispatch). Anything asserting on the compositor's `current` needs
+    /// both halves.
+    fn pumpAcked(ts: *PolicyServer) !void {
+        try ts.pump();
+        try ts.pump();
+    }
+
+    /// A committed top panel with an exclusive zone: the output's usable
+    /// area shrinks by it, so a maximized box and the fullscreen box are
+    /// two DIFFERENT sizes. Without it every maximized/fullscreen geometry
+    /// assertion passes no matter which one the policy wrote.
+    fn addExclusiveTopPanel(ts: *PolicyServer, zone: i32) !void {
+        const wl_surface = try ts.wl_compositor.?.createSurface();
+        const layer_surface = try ts.layer_shell_client.?.getLayerSurface(wl_surface, null, .top, "panel");
+        layer_surface.setListener(*u8, ignoreLayerEvents, &ts.layer_listener_data);
+        layer_surface.setSize(800, @intCast(zone));
+        // zwlr_layer_surface_v1.anchor is a bitmask and the scanner binds
+        // it as the raw u32; bit 0 is `top` (layer-shell.xml anchors).
+        layer_surface.setAnchor(@bitCast(@as(u32, 1)));
+        layer_surface.setExclusiveZone(zone);
+        try ts.pump();
+        // The layer module applies pending at commit.
+        wl_surface.commit();
+        try ts.pump();
+    }
+
+    /// Lock the session from this harness's own connection — the steps a
+    /// lock client performs, up to and including the latch the `locked`
+    /// signal fires on — and return the server-side lock surface. The
+    /// event state is the CALLER's on purpose: a client listener keeps
+    /// the address it was given, and the lock object outlives this call
+    /// (its `unlocked` event arrives long after). The caller must keep
+    /// `pick_surface` armed the way it wants the hit test to see it: a
+    /// locked pick drops everything that is not a lock surface
+    /// (pickSurface, ext_session_lock_manager_v1 wiring item 2).
+    fn lockSession(
+        ts: *PolicyServer,
+        lock_events: *LockClientEvents,
+        surface_events: *LockSurfaceClientEvents,
+    ) !*Surface {
+        var capture: PolicyGlobalCapture = .{};
+        const registry = try ts.readGlobals(&capture);
+        const entry = capture.find("ext_session_lock_manager_v1") orelse return error.GlobalMissing;
+        const manager = try registry.bind(entry.name, client.ext.SessionLockManagerV1, entry.version);
+        try ts.pump();
+        const lock = try manager.lock();
+        lock.setListener(*LockClientEvents, LockClientEvents.listener, lock_events);
+        const wl_surface = try ts.wl_compositor.?.createSurface();
+        const lock_surface = try lock.getLockSurface(wl_surface, ts.wl_output_client.?);
+        lock_surface.setListener(*LockSurfaceClientEvents, LockSurfaceClientEvents.listener, surface_events);
+        try ts.pump();
+        // get_lock_surface configures immediately, sized to the output.
+        lock_surface.ackConfigure(surface_events.serial);
+        // The acked, correctly sized first buffer IS the locked frame.
+        wl_surface.attach(try ts.createFilledBuffer(800, 600, 0x80), 0, 0);
+        wl_surface.commit();
+        try ts.pump();
+        if (lock_events.locked != 1) return error.SessionNotLocked;
+        return ts.serverSurface(wl_surface);
     }
 
     /// The server-side XdgToplevel created by `t`.
@@ -5711,6 +6002,345 @@ test "a surface the focus gate refuses never reports activated (P1-9)" {
     try testing.expect(!t.tl_events.carries(state_activated));
 }
 
+/// The client's wl_pointer events. A pointer resource exists only where a
+/// test creates one: the seat delivers to the client that OWNS the focused
+/// surface's wl_pointer list, so without one a leaked button is invisible.
+const ClientPointerEvents = struct {
+    entered: bool = false,
+    enter_surface_id: u32 = 0,
+    left: usize = 0,
+    motion: usize = 0,
+    button: usize = 0,
+
+    fn listener(_: *client.wl.Pointer, event: client.wl.Pointer.Event, data: *ClientPointerEvents) void {
+        switch (event) {
+            .enter => |e| {
+                data.entered = true;
+                if (e.surface) |s| data.enter_surface_id = s.getId();
+            },
+            .leave => data.left += 1,
+            .motion => data.motion += 1,
+            .button => data.button += 1,
+            else => {},
+        }
+    }
+};
+
+/// The client's xdg_activation_v1 token: the done() event carries the
+/// opaque token string activate() must echo back.
+const ClientActivationTokenEvents = struct {
+    done_count: usize = 0,
+    /// The last done() token, NUL-terminated.
+    token: [33]u8 = undefined,
+
+    fn listener(_: *client.xdg.ActivationTokenV1, event: client.xdg.ActivationTokenV1.Event, data: *ClientActivationTokenEvents) void {
+        switch (event) {
+            .done => |d| {
+                data.done_count += 1;
+                const s = std.mem.span(d.token);
+                const n = @min(s.len, data.token.len - 1);
+                @memcpy(data.token[0..n], s[0..n]);
+                data.token[n] = 0;
+            },
+        }
+    }
+};
+
+test "a locked session refuses an xdg_activation that names a user surface" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const st = ts.serverToplevel(t.toplevel);
+    const user_surface = ts.serverSurface(t.wl_surface);
+
+    // Lock from THIS connection, so the request below comes from the very
+    // client that owns the lock: what is refused is the SURFACE, not who
+    // asked. The lock surface covers the output, so it is what the pointer
+    // is over from here on.
+    var lock_events: LockClientEvents = .{};
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    const lock_surface = try ts.lockSession(&lock_events, &lock_surface_events);
+    try testing.expect(ts.seat.?.keyboard_focus == lock_surface);
+
+    // Activation is SELF-SERVICE: a token that never got a serial
+    // validates trivially (xdg_activation.zig:545-558), so no input event
+    // and no launcher stand between this request and every keystroke the
+    // user types into their password field.
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const entry = capture.find("xdg_activation_v1") orelse return error.GlobalMissing;
+    const activation = try registry.bind(entry.name, client.xdg.ActivationV1, entry.version);
+    try ts.pump();
+    const token = try activation.getActivationToken();
+    var token_events: ClientActivationTokenEvents = .{};
+    token.setListener(*ClientActivationTokenEvents, ClientActivationTokenEvents.listener, &token_events);
+    token.commit();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), token_events.done_count);
+
+    activation.activate(@ptrCast(&token_events.token), t.wl_surface);
+    try ts.pumpAcked();
+    // The lock surface still holds the keyboard, and the user window is
+    // not reported activated: the request went through the SAME composite
+    // gate a click does, not the layer-only half of it.
+    try testing.expect(ts.seat.?.keyboard_focus == lock_surface);
+    try testing.expect(ts.seat.?.keyboard_focus != user_surface);
+    try testing.expect(!st.current.activated);
+    try testing.expect(!t.tl_events.carries(state_activated));
+}
+
+/// The client's zwlr_foreign_toplevel_manager_v1: the handles it is
+/// announced, plus a listener for every event of every handle
+/// (libwayland aborts on an event with no listener).
+const ClientForeignToplevelEvents = struct {
+    handles: usize = 0,
+    last: ?*client.zwlr.ForeignToplevelHandleV1 = null,
+
+    fn managerListener(
+        _: *client.zwlr.ForeignToplevelManagerV1,
+        event: client.zwlr.ForeignToplevelManagerV1.Event,
+        self: *ClientForeignToplevelEvents,
+    ) void {
+        switch (event) {
+            .toplevel => |e| {
+                e.toplevel.setListener(*ClientForeignToplevelEvents, handleListener, self);
+                self.handles += 1;
+                self.last = e.toplevel;
+            },
+            .finished => {},
+        }
+    }
+
+    fn handleListener(_: *client.zwlr.ForeignToplevelHandleV1, _: client.zwlr.ForeignToplevelHandleV1.Event, _: *ClientForeignToplevelEvents) void {}
+};
+
+test "a locked session refuses a foreign-toplevel activate for a user surface" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const st = ts.serverToplevel(t.toplevel);
+
+    var lock_events: LockClientEvents = .{};
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    const lock_surface = try ts.lockSession(&lock_events, &lock_surface_events);
+    try testing.expect(ts.seat.?.keyboard_focus == lock_surface);
+
+    // The THIRD route to the keyboard, and the one the module had no way
+    // to gate by itself: every binding is announced every toplevel
+    // (wlr-foreign-toplevel-management-unstable-v1.xml), so this client
+    // holds a handle to the user window and can ask for its focus.
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const entry = capture.find("zwlr_foreign_toplevel_manager_v1") orelse return error.GlobalMissing;
+    const panel = try registry.bind(entry.name, client.zwlr.ForeignToplevelManagerV1, entry.version);
+    var panel_events: ClientForeignToplevelEvents = .{};
+    panel.setListener(*ClientForeignToplevelEvents, ClientForeignToplevelEvents.managerListener, &panel_events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), panel_events.handles);
+
+    panel_events.last.?.activate(ts.wl_seat.?);
+    try ts.pumpAcked();
+    // The lock surface still holds the keyboard: the module consults the
+    // gate main() installed, and that gate is the SAME composite one the
+    // click path and the xdg_activation path consult, so the session-lock
+    // boundary has no hole on this side.
+    try testing.expect(ts.seat.?.keyboard_focus == lock_surface);
+    try testing.expect(ts.seat.?.keyboard_focus != ts.serverSurface(t.wl_surface));
+    try testing.expect(!st.current.activated);
+}
+
+test "the session-lock latch clears the pointer focus and keeps the keyboard on the lock" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const user_surface = ts.serverSurface(t.wl_surface);
+
+    // A live wl_pointer on this connection, or a leaked button would be
+    // invisible: the seat delivers to the focused CLIENT's pointers.
+    const pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: ClientPointerEvents = .{};
+    pointer.setListener(*ClientPointerEvents, ClientPointerEvents.listener, &ptr_events);
+    try ts.pump();
+
+    // Hover the user toplevel: enter, and the seat's cached pointer focus.
+    ts.pick_surface = user_surface;
+    ts.seat.?.pointerMotion(10, 10);
+    try ts.pump();
+    try testing.expect(ptr_events.entered);
+    try testing.expectEqual(t.wl_surface.getId(), ptr_events.enter_surface_id);
+    try testing.expect(ts.seat.?.pointer_focus == user_surface);
+
+    // Lock. The grabs end and the keyboard focus moves to the lock
+    // surface, and the POINTER must leave the user client too:
+    // pointer_focus is refreshed only by Seat.pointerMotion, which returns
+    // early under a grab, so the cache still named the user surface and
+    // pointerButton (seat.zig:1015) routed the next click there — a press
+    // AND a release delivered to a client that must not see input at all.
+    var lock_events: LockClientEvents = .{};
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    const lock_surface = try ts.lockSession(&lock_events, &lock_surface_events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ptr_events.left);
+    try testing.expect(ts.seat.?.pointer_focus == null);
+    try testing.expect(ts.seat.?.keyboard_focus == lock_surface);
+
+    // A click over the (now invisible) user window while locked: the
+    // lock-aware pick drops the surface, so there is no focus to route the
+    // button by and nothing is delivered.
+    ts.seat.?.pointerButton(wayland.seat.btn_left, true);
+    ts.seat.?.pointerButton(wayland.seat.btn_left, false);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), ptr_events.button);
+    try testing.expect(ts.seat.?.pointer_focus == null);
+    // And the keyboard never left the lock surface: a null pick on the
+    // click-to-focus path must not deafen the lock screen
+    // (session_lock.zig:104-108 re-asserts the lock focus on every focus
+    // change).
+    try testing.expect(ts.seat.?.keyboard_focus == lock_surface);
+}
+
+test "set_maximized does not resize a fullscreen toplevel (P1-8)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    // A top panel with an exclusive zone, so the usable area (800x576) and
+    // the fullscreen box (800x600) are different sizes: without it the
+    // geometry assertion below cannot tell which one the policy wrote.
+    try ts.addExclusiveTopPanel(24);
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const st = ts.serverToplevel(t.toplevel);
+
+    t.toplevel.setFullscreen(ts.wl_output_client.?);
+    try ts.pumpAcked();
+    try testing.expect(st.current.fullscreen);
+    try testing.expectEqual(@as(i32, 800), st.current.width);
+    try testing.expectEqual(@as(i32, 600), st.current.height);
+
+    // xdg-shell.xml:1049-1051: set_maximized "has no direct effect" on a
+    // fullscreen surface; xdg-shell.xml:850-854 requires a fullscreened
+    // surface to be able to cover the fullscreened area. The STATE is
+    // remembered (so a later un-fullscreen knows), the GEOMETRY is left
+    // alone: a 800x576 box would pull the window out from under the panel
+    // a fullscreen window is supposed to cover.
+    t.toplevel.setMaximized();
+    try ts.pumpAcked();
+    try testing.expect(t.tl_events.carries(state_maximized));
+    try testing.expect(t.tl_events.carries(state_fullscreen));
+    try testing.expectEqual(@as(i32, 800), t.tl_events.width);
+    try testing.expectEqual(@as(i32, 600), t.tl_events.height);
+    try testing.expect(st.scheduled.maximized and st.scheduled.fullscreen);
+    try testing.expect(st.current.maximized and st.current.fullscreen);
+    try testing.expectEqual(@as(i32, 600), st.current.height);
+}
+
+test "leaving fullscreen re-applies the maximized area (P1-8)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    try ts.addExclusiveTopPanel(24);
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const st = ts.serverToplevel(t.toplevel);
+
+    t.toplevel.setMaximized();
+    try ts.pumpAcked();
+    try testing.expect(st.current.maximized);
+    try testing.expectEqual(@as(i32, 576), st.current.height);
+
+    t.toplevel.setFullscreen(ts.wl_output_client.?);
+    try ts.pumpAcked();
+    try testing.expect(st.current.maximized and st.current.fullscreen);
+    try testing.expectEqual(@as(i32, 600), st.current.height);
+
+    // Leaving fullscreen: the window is STILL maximized, so the box that
+    // maximizes means comes back. Handing the client 0x0 instead tells it
+    // to pick its own size for a state it was just told it has, and
+    // discards the box onToplevelMaximize agreed to.
+    t.toplevel.unsetFullscreen();
+    try ts.pumpAcked();
+    try testing.expect(!t.tl_events.carries(state_fullscreen));
+    try testing.expect(t.tl_events.carries(state_maximized));
+    try testing.expectEqual(@as(i32, 800), t.tl_events.width);
+    try testing.expectEqual(@as(i32, 576), t.tl_events.height);
+    try testing.expect(st.current.maximized);
+    try testing.expectEqual(@as(i32, 576), st.current.height);
+}
+
+test "a re-created role on a focused surface is activated in its first configure (P1-9)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    ts.seat.?.setKeyboardFocus(ts.serverSurface(t.wl_surface));
+    try ts.pumpAcked();
+    try testing.expect(t.tl_events.carries(state_activated));
+    try testing.expect(ts.serverToplevel(t.toplevel).current.activated);
+
+    // The client throws the role away and asks for a new one on the SAME
+    // wl_surface (xdg-shell.xml:637-641). The seat's focus never MOVES —
+    // it is the same surface — so the keyboard_focus signal never fires
+    // and the only publisher of wl_toplevel.activated never runs. The
+    // fresh role therefore configured activated=false forever, and its
+    // client-side decoration painted an inactive titlebar on the one
+    // window that had the keyboard.
+    const xs_before = t.xs_events.configures;
+    try ts.recreateRole(t);
+    try ts.pumpAcked();
+    try testing.expect(t.tl_events.carries(state_activated));
+    try testing.expect(ts.serverToplevel(t.toplevel).current.activated);
+    // ONE configure, not two: the activation state is seeded into the
+    // initial configure rather than published as a separate one. The
+    // xdg_surface listener is not reset (the xdg_surface is the same
+    // object), so its count is compared against the baseline.
+    try testing.expectEqual(@as(usize, 1), t.tl_events.configures);
+    try testing.expectEqual(xs_before + 1, t.xs_events.configures);
+}
+
+test "the toplevel's current state moves only on ack_configure (P1-8)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    // The deferred-ack harness: this test is about the state the client has
+    // NOT committed to yet.
+    const t = try ts.createToplevelDeferredAck();
+    defer ts.allocator.destroy(t);
+    const st = ts.serverToplevel(t.toplevel);
+    try ts.pumpAcked();
+    try testing.expect(!st.current.maximized);
+
+    const before = t.tl_events.configures;
+    t.toplevel.setMaximized();
+    try ts.pump();
+    // The wire says yes...
+    try testing.expectEqual(before + 1, t.tl_events.configures);
+    try testing.expect(t.tl_events.carries(state_maximized));
+    try testing.expectEqual(@as(i32, 800), t.tl_events.width);
+    // ...and the compositor's own current state still says no: it is the
+    // state the client COMMITTED against, and only ack_configure moves it
+    // (xdg.zig:415-434).
+    try testing.expect(!st.current.maximized);
+    try ts.pump();
+    try testing.expect(!st.current.maximized);
+
+    ts.ackToplevelConfigure(t);
+    try ts.pump();
+    try testing.expect(st.current.maximized);
+    try testing.expectEqual(@as(i32, 800), st.current.width);
+    try testing.expectEqual(@as(i32, 600), st.current.height);
+    // The auto-ack listener sent NONE of them: the deferred mode really
+    // was in force, so the only acks are the initial one the harness had
+    // to send (a buffer may not be attached before an ack,
+    // xdg-shell.xml:1063-1065) and the one this test just made.
+    try testing.expectEqual(@as(usize, 2), t.xs_events.acks);
+}
+
 test "syncPopupNodes publishes the popup's absolute scene origin (P1-5b)" {
     const ts = try PolicyServer.init(testing.allocator);
     defer ts.deinit();
@@ -5736,7 +6366,6 @@ test "syncPopupNodes publishes the popup's absolute scene origin (P1-5b)" {
     try ts.pump();
     try testing.expectEqual(@as(usize, 1), popup_xs.configures);
     popup_wl_surface.attach(try ts.createBuffer(), 0, 0);
-    popup_xdg_surface.ackConfigure(popup_xs.serial);
     popup_wl_surface.commit();
     try ts.pump();
     syncSurfaces(ts.state.?);

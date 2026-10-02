@@ -9,6 +9,16 @@
 //! popup stacking/hit-testing (F12); reactive popup reconfigure (X05:
 //! compositor-initiated re-place for set_reactive v3+ popups).
 //!
+//! Server wiring the popup grab needs (main.zig owns both ends):
+//! - `setPopupOrigin` every frame from the scene sync, with the popup
+//!   node's ABSOLUTE WORLD position (syncPopupNodes).
+//! - `XdgShell.setScreenToWorld` once at startup, because the seat
+//!   reports pointer input in SCREEN pixels while that origin is a
+//!   WORLD coordinate: the two spaces differ by the camera, and camera
+//!   zoom/pan are live gestures. Uninstalled means the identity
+//!   mapping, which is correct only for an unzoomed, untranslated
+//!   view.
+//!
 //! Mapping semantics: an xdg surface maps when the client commits a buffer
 //! after acking a configure. The compositor's commit pipeline performs the
 //! map/unmap transition (`mapped = current.buffer != null` plus role map/unmap
@@ -53,8 +63,29 @@ const surface_mod = @import("../compositor/surface.zig");
 const compositor_mod = @import("../compositor/compositor.zig");
 const seat_mod = @import("../compositor/seat.zig");
 const display_mod = @import("../core/display.zig");
+/// The compositor's view transform. Production code never touches it:
+/// the popup grab reaches the camera through the screen→world seam the
+/// server installs (XdgShell.setScreenToWorld). The tests back that
+/// seam with the real Camera so they exercise the shipped transform.
+const camera_mod = @import("../scene/camera.zig");
 
 const log_tag = "xdg";
+
+/// Screen → world conversion for the coordinates the seat hands popup
+/// grabs, installed by the compositor (see `XdgShell.setScreenToWorld`).
+/// `sx, sy` are the seat's screen (output-local) pixels; the return
+/// value is the same point in world pixels.
+pub const ScreenToWorldFn = *const fn (ctx: *anyopaque, sx: i32, sy: i32) geom.FPoint;
+
+/// f64 → i32 with saturation: a camera zoomed far out maps a screen
+/// point far outside the i32 range and @intFromFloat traps on that in
+/// ReleaseSafe. Same guard the server's pick applies (main.zig:3697-3704).
+fn clampToI32(v: f64) i32 {
+    return @intFromFloat(@min(
+        @max(v, @as(f64, std.math.minInt(i32))),
+        @as(f64, std.math.maxInt(i32)),
+    ));
+}
 
 // ---------------------------------------------------------------------------
 // XdgShell: the xdg_wm_base global.
@@ -72,6 +103,15 @@ pub const XdgShell = struct {
     toplevels: std.ArrayList(*XdgToplevel),
     /// All live popups (role objects), in creation order.
     popups: std.ArrayList(*XdgPopup),
+    /// Screen → world input conversion, installed by the compositor.
+    /// Null = the identity mapping, which is what an unzoomed,
+    /// untranslated camera does (the server default) — but only that:
+    /// camera zoom and pan are live gestures, so a server that never
+    /// installs this mis-hit-tests every popup grab as soon as the view
+    /// moves. See setScreenToWorld.
+    screen_to_world: ?ScreenToWorldFn = null,
+    screen_to_world_ctx: ?*anyopaque = null,
+
     events: struct {
         /// A new xdg_toplevel role object was created.
         new_toplevel: wire.Signal(*XdgToplevel),
@@ -120,6 +160,41 @@ pub const XdgShell = struct {
             shell,
         );
         return shell;
+    }
+
+    /// Install the seat's SCREEN → WORLD input conversion, which the
+    /// compositor owns (its camera, not this module). Popup grabs
+    /// receive pointer input in screen pixels but popup origins are
+    /// published in world pixels, so every popup hit-test and every
+    /// surface-local coordinate goes through this first.
+    ///
+    /// Wiring (src/server/main.zig, next to `state.seat.setPick`):
+    ///
+    ///     state.shell.setScreenToWorld(screenToWorld, state);
+    ///
+    ///     /// Seat input is in SCREEN coords; scene nodes (and every
+    ///     /// popup origin) are in WORLD coords — invert the camera
+    ///     /// exactly as pickSurface does, main.zig:3692-3695.
+    ///     fn screenToWorld(ctx: *anyopaque, sx: i32, sy: i32) geom.FPoint {
+    ///         const self: *ServerState = @ptrCast(@alignCast(ctx));
+    ///         return self.camera.screenToWorld(
+    ///             @floatFromInt(sx),
+    ///             @floatFromInt(sy),
+    ///         );
+    ///     }
+    pub fn setScreenToWorld(self: *XdgShell, to_world: ScreenToWorldFn, ctx: *anyopaque) void {
+        self.screen_to_world = to_world;
+        self.screen_to_world_ctx = ctx;
+    }
+
+    /// The seat's screen coordinates (x, y) in world pixels. Without an
+    /// installed conversion this is the identity — see the field doc.
+    pub fn worldFromScreen(self: *const XdgShell, x: i32, y: i32) geom.Point {
+        const world = if (self.screen_to_world) |f|
+            f(self.screen_to_world_ctx.?, x, y)
+        else
+            geom.FPoint{ .x = @floatFromInt(x), .y = @floatFromInt(y) };
+        return .{ .x = clampToI32(world.x), .y = clampToI32(world.y) };
     }
 
     pub fn deinit(self: *XdgShell) void {
@@ -1421,18 +1496,21 @@ pub const XdgPopup = struct {
         p.constraint_box = box;
     }
 
-    /// Record where the popup surface sits in the scene. The SERVER's
-    /// scene sync calls this every frame, after resolving the popup's
-    /// absolute position (call site: `syncPopupNodes` in
-    /// src/server/main.zig, which owns the layout this module cannot
-    /// see). The popup grab needs it because the seat hands input
-    /// events in scene coordinates while wl_pointer.enter/motion carry
-    /// surface-local ones (wayland.xml:2224-2232).
+    /// Record where the popup surface sits in the scene, in WORLD
+    /// pixels. The SERVER's scene sync calls this every frame, after
+    /// resolving the popup's absolute position (call site:
+    /// `syncPopupNodes` in src/server/main.zig, which owns the layout
+    /// this module cannot see). The popup grab needs it because the
+    /// seat hands input events in SCREEN coordinates while
+    /// wl_pointer.enter/motion carry surface-local ones
+    /// (wayland.xml:2224-2232) — the two spaces differ by the camera,
+    /// which the popup grab converts through before subtracting
+    /// (see localPointFromScreen).
     pub fn setPopupOrigin(popup: *XdgPopup, x: i32, y: i32) void {
         popup.origin = .{ .x = x, .y = y };
     }
 
-    /// The popup's absolute rectangle in scene coordinates: the synced
+    /// The popup's absolute rectangle in WORLD coordinates: the synced
     /// origin plus the configured size. `geometry.x/y` are parent-
     /// relative and are NOT added here — the origin already absorbs
     /// the parent's own scene position.
@@ -1445,13 +1523,24 @@ pub const XdgPopup = struct {
         };
     }
 
-    /// The seat coordinates `x, y` expressed in this popup's
-    /// surface-local space. Negative results are normal: a pointer left
-    /// of or above the popup still has a well-defined surface-local
-    /// position, and the protocol carries it as such (wayland.xml:
-    /// 2206-2209, the enter event's "surface-local x coordinate").
-    fn localPoint(popup: *const XdgPopup, x: i32, y: i32) geom.Point {
-        return .{ .x = x - popup.origin.x, .y = y - popup.origin.y };
+    /// The seat's SCREEN coordinates `x, y` expressed in this popup's
+    /// surface-local space. The seat reports pointer input in output
+    /// pixels while `origin` is a WORLD coordinate (SceneNode.
+    /// absolutePosition), so the point is converted screen → world
+    /// first — the same order `pickSurface` uses (main.zig:3692-3695).
+    /// Subtracting the two spaces directly is invisible under the
+    /// default identity camera and wrong under any zoom or pan: the
+    /// hit-test would then judge a different rectangle than the one the
+    /// user sees, and a click visibly inside the popup would dismiss
+    /// it.
+    ///
+    /// Negative results are normal: a pointer left of or above the
+    /// popup still has a well-defined surface-local position, and the
+    /// protocol carries it as such (wayland.xml:2206-2209, the enter
+    /// event's "surface-local x coordinate").
+    fn localPointFromScreen(popup: *const XdgPopup, x: i32, y: i32) geom.Point {
+        const world = popup.xdg_surface.shell.worldFromScreen(x, y);
+        return .{ .x = world.x - popup.origin.x, .y = world.y - popup.origin.y };
     }
 
     /// Send the initial/popup configure: xdg_popup.configure with the
@@ -1567,7 +1656,10 @@ const PopupGrab = struct {
     active: bool = true,
     /// The popup's client received a pointer enter for the popup surface
     /// (the seat never hit-tests while a grab is installed, so the grab
-    /// delivers the enter itself on the first motion).
+    /// delivers the enter itself on the first motion). Cleared when
+    /// popupGrabEnd sends the leave that balances it — an enter with no
+    /// leave leaves the client holding the popup surface as its pointer
+    /// focus forever (wayland.xml:2212-2218).
     pointer_entered: bool = false,
     /// The seat's grab slots this state owns. No defaults: the install
     /// literal in popupRequest writes both, and a default would be dead
@@ -1575,8 +1667,8 @@ const PopupGrab = struct {
     /// pointer to it.
     pointer_grab: seat_mod.PointerGrab,
     keyboard_grab: seat_mod.KeyboardGrab,
-    /// The last seat (scene) coordinates this grab's motion handler
-    /// saw. The seat's own pointer_x/pointer_y are module-private, and
+    /// The last SCREEN coordinates this grab's motion handler saw. The
+    /// seat's own pointer_x/pointer_y are module-private, and
     /// every motion routes through popupGrabMotion while the grab is
     /// installed, so this is the position a button event belongs to.
     /// has_position stays false until the first motion: a button that
@@ -1638,8 +1730,61 @@ fn popupGrabEnd(g: *PopupGrab, dismiss: bool) void {
     g.active = false;
     if (dismiss) g.popup.sendPopupDone();
     const seat = g.seat orelse return;
+    // The owed pointer events go out BEFORE the grabs end: once the
+    // seat's default path is back it delivers the release of a still
+    // held button to whatever `pointer_focus` happens to hold — a value
+    // this grab never re-picked, because the seat does not hit-test
+    // under a grab (seat.zig:877-883). That release would reach a client
+    // that never saw the press, or nobody at all when the focus is null
+    // (the seat delivers to the focus only, seat.zig:1015), stranding
+    // the button down on the popup client.
+    popupGrabFlushPointer(g);
     if (seat.pointer_grab == &g.pointer_grab) seat.endPointerGrab();
     if (seat.keyboard_grab == &g.keyboard_grab) seat.endKeyboardGrab();
+}
+
+/// Close out the grab's pointer stream: `button(released)` for every
+/// press this grab delivered whose physical release never arrived, then
+/// the `wl_pointer.leave` that balances the enter this grab sent.
+///
+/// Both are owed to the popup's CLIENT, and both are per the protocol
+/// non-optional once the matching enter/press went out:
+///  - `wl_pointer.button` carries no surface, so its position and its
+///    pairing are read off "the last motion, warp or enter event"
+///    (wayland.xml:2244-2252) — a release delivered after the leave
+///    that ended that enter belongs to no surface the client holds.
+///  - `wl_pointer.leave` "is sent before the enter notification for
+///    the new focus" (wayland.xml:2212-2218), so the popup's enter
+///    must be closed by one; a client left with a dangling enter keeps
+///    the popup surface as its pointer focus forever. wlroots sends
+///    this leave when the popup grab ends (wlr_xdg_popup.c
+///    xdg_pointer_grab_end).
+///
+/// Only what this grab actually delivered is sent: the press must have
+/// reached the client and the enter must have been sent — a grab that
+/// never entered owes no leave, and a press the client never saw owes
+/// no release.
+fn popupGrabFlushPointer(g: *PopupGrab) void {
+    const seat = g.seat orelse return;
+    const popup = g.popup;
+    const wl_client = popup.resource.getClient();
+    const held = g.held_button_count;
+    g.held_button_count = 0;
+    var i: usize = 0;
+    while (i < held) : (i += 1) {
+        const serial = seat.serialFor(wl_client);
+        sendPopupGrabButton(seat, wl_client, serial, g.held_buttons[i], .released);
+    }
+    if (!g.pointer_entered) return;
+    g.pointer_entered = false;
+    const serial = seat.serialFor(wl_client);
+    var delivered = false;
+    for (seat.pointers.items) |ptr| {
+        if (ptr.getClient() != wl_client) continue;
+        ptr.sendLeave(serial, popup.xdg_surface.surface.resource);
+        delivered = true;
+    }
+    if (delivered) seat.markFramePending(wl_client);
 }
 
 /// The pointer grab was cancelled (replaced by another grab or ended):
@@ -1667,11 +1812,11 @@ fn popupGrabKeyboardCancel(seat: *seat_mod.Seat, grab: *const seat_mod.KeyboardG
 ///
 /// Coordinates go out SURFACE-LOCAL, as the protocol requires
 /// (wayland.xml:2224-2232, "the location relative to the focused
-/// surface"), so the seat's scene coordinates are converted through
-/// the popup's synced origin (setPopupOrigin) before the 24.8
-/// fixed-point encoding. The conversion is unclamped: a pointer left of
-/// or above the popup has a negative surface-local coordinate, which is
-/// what the wire carries.
+/// surface"), so the seat's SCREEN coordinates are converted to world
+/// space and then through the popup's synced origin (setPopupOrigin)
+/// before the 24.8 fixed-point encoding. The conversion is unclamped:
+/// a pointer left of or above the popup has a negative surface-local
+/// coordinate, which is what the wire carries.
 fn popupGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i32, y: i32) void {
     const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
     if (!g.active) return;
@@ -1683,7 +1828,7 @@ fn popupGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i
     g.has_position = true;
     const popup = g.popup;
     const wl_client = popup.resource.getClient();
-    const local = popup.localPoint(x, y);
+    const local = popup.localPointFromScreen(x, y);
     const fx = wire.wl.Fixed.fromInt(@intCast(local.x));
     const fy = wire.wl.Fixed.fromInt(@intCast(local.y));
     if (!g.pointer_entered) {
@@ -1763,8 +1908,12 @@ fn popupGrabButton(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, butt
         sendPopupGrabButton(seat, wl_client, serial, button, .released);
         return;
     }
+    // Inside is judged in the popup's own WORLD rect (absoluteRect) with
+    // the pointer converted into that space first: mixing the seat's
+    // screen pixels with a world origin would test a rectangle the user
+    // never sees.
     const rect = popup.absoluteRect();
-    const local = popup.localPoint(g.last_x, g.last_y);
+    const local = popup.localPointFromScreen(g.last_x, g.last_y);
     const inside = g.has_position and
         local.x >= 0 and local.x < rect.width and
         local.y >= 0 and local.y < rect.height;
@@ -4908,6 +5057,9 @@ const PopupGrabPointerEvents = struct {
     motion_y: i24 = 0,
     presses: usize = 0,
     releases: usize = 0,
+    /// Leaves the client received. Every enter the grab sends must be
+    /// balanced by exactly one of these when the grab ends.
+    leaves: usize = 0,
     frame: usize = 0,
 
     fn listener(pointer: *client.wl.Pointer, event: client.wl.Pointer.Event, data: *PopupGrabPointerEvents) void {
@@ -4929,7 +5081,8 @@ const PopupGrabPointerEvents = struct {
                 else => {},
             },
             .frame => data.frame += 1,
-            .leave, .axis, .axis_stop, .axis_discrete, .axis_source, .axis_value120, .axis_relative_direction => {
+            .leave => data.leaves += 1,
+            .axis, .axis_stop, .axis_discrete, .axis_source, .axis_value120, .axis_relative_direction => {
                 // Not routed by the popup grab (wlroots xdg_popup scope).
             },
             .warp => {},
@@ -5209,6 +5362,220 @@ test "popup grab converts seat coordinates to surface-local ones (X04b)" {
     try ts.pump();
     try std.testing.expectEqual(@as(i24, 10), ptr_events.motion_x);
     try std.testing.expectEqual(@as(i24, 10), ptr_events.motion_y);
+}
+
+/// The compositor's screen → world conversion, in the shape
+/// `XdgShell.setScreenToWorld` takes: the seat's output pixels in, the
+/// same point in world pixels out. Backed by the real Camera, so the
+/// test exercises the same transform main.zig installs.
+fn testCameraScreenToWorld(ctx: *anyopaque, sx: i32, sy: i32) geom.FPoint {
+    const cam: *const camera_mod.Camera = @ptrCast(@alignCast(ctx));
+    return cam.screenToWorld(@floatFromInt(sx), @floatFromInt(sy));
+}
+
+/// The output pixel at which `cam` renders the world point (wx, wy) —
+/// the seat coordinate a user clicking that point produces.
+fn screenPointOf(cam: camera_mod.Camera, wx: f64, wy: f64) geom.Point {
+    const s = cam.worldToScreen(wx, wy);
+    return .{ .x = @intFromFloat(s.x), .y = @intFromFloat(s.y) };
+}
+
+test "popup grab hit-tests in world coordinates under a zoomed camera (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    try ts.pump();
+    var popup_events: PopupEvents = .{};
+
+    // The view is zoomed 2x on an 800x600 viewport. Camera zoom and pan
+    // are live gestures, so the seat's coordinates and the popup's
+    // world origin live in different spaces from here on.
+    var cam: camera_mod.Camera = .{
+        .center_x = 0,
+        .center_y = 0,
+        .zoom = 2,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    ts.shell.?.setScreenToWorld(testCameraScreenToWorld, &cam);
+    const p = try installTestPopupGrab(ts, &popup_events);
+
+    // The scene sync publishes the popup's ABSOLUTE WORLD position
+    // (syncPopupNodes reads SceneNode.absolutePosition): world rect
+    // (100,200)-(200,250).
+    p.setPopupOrigin(100, 200);
+
+    // A click that visibly lands in the middle of the popup. Under the
+    // identity camera this would be the seat point (150,220); the zoom
+    // moves it, and the grab has to follow.
+    const click = screenPointOf(cam, 150, 220);
+    try std.testing.expect(click.x != 150 or click.y != 220);
+    ts.seat.?.pointerMotion(click.x, click.y);
+    ts.seat.?.pointerFrame();
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+
+    // Surface-local, not screen: (150,220) - (100,200) = (50,20).
+    try std.testing.expectEqual(@as(i24, 50), ptr_events.enter_x);
+    try std.testing.expectEqual(@as(i24, 20), ptr_events.enter_y);
+    // The click is inside the popup: it reaches the client and the grab
+    // stays. Reading the seat's raw pixels against the world origin
+    // would call this point far outside and dismiss the menu under the
+    // user's finger.
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.presses);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+    try std.testing.expect(p.grab_state.?.active);
+
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.releases);
+
+    // The same click with the view turned a quarter turn. The surface
+    // axes no longer line up with the screen ones, so only a real
+    // camera inverse can find the popup; the exact local coordinate is
+    // not asserted because the world→screen→world round trip through
+    // integer output pixels can differ by one.
+    cam.rotation = std.math.pi / 2.0;
+    const rotated = screenPointOf(cam, 140, 225);
+    ts.seat.?.pointerMotion(rotated.x, rotated.y);
+    ts.seat.?.pointerFrame();
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), ptr_events.motion);
+    try std.testing.expect(ptr_events.motion_x >= 0 and ptr_events.motion_x < 100);
+    try std.testing.expect(ptr_events.motion_y >= 0 and ptr_events.motion_y < 50);
+    try std.testing.expectEqual(@as(usize, 2), ptr_events.presses);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+    try std.testing.expect(p.grab_state.?.active);
+}
+
+test "popup grab leaves the popup surface when a dismissal ends it (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    try ts.pump();
+    var popup_events: PopupEvents = .{};
+    const p = try installTestPopupGrab(ts, &popup_events);
+    p.setPopupOrigin(100, 200);
+
+    // The grab's own enter for the popup surface: the seat never
+    // hit-tests under a grab, so the grab sends it itself.
+    ts.seat.?.pointerMotion(150, 220);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expect(ptr_events.entered);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.leaves);
+
+    // Moving off the popup does not leave it: the grab keeps routing
+    // motion, and that enter is still open.
+    ts.seat.?.pointerMotion(400, 400);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.leaves);
+
+    // A press outside dismisses. The enter the grab sent must be
+    // balanced by a leave in the same batch, or the client keeps the
+    // popup surface as its pointer focus forever (wayland.xml:
+    // 2212-2218). Nothing is owed for the outside press itself: it was
+    // never delivered, so no release may be invented for it.
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.presses);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.leaves);
+    try std.testing.expect(ts.seat.?.pointer_grab == null);
+
+    // Idempotent: the cancel path that runs inside endPointerGrab
+    // calls back into popupGrabEnd, and no second leave is sent.
+    popupGrabEnd(p.grab_state.?, false);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.leaves);
+}
+
+test "popup grab releases a held button to its client when the popup is destroyed (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    try ts.pump();
+    var popup_events: PopupEvents = .{};
+
+    // The fixture is inlined rather than installTestPopupGrab because
+    // this test needs the client-side proxy to destroy the popup.
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    positioner.destroy();
+    try ts.pump();
+    const p = ts.shell.?.popups.items[0];
+    ts.seat.?.setKeyboardFocus(p.xdg_surface.surface);
+    popup.grab(ts.wl_seat.?, ts.seat.?.last_serial);
+    try ts.pump();
+    p.setPopupOrigin(100, 200);
+
+    // The menu-item flow: a press inside the popup reaches the client
+    // and the grab stays so the click can complete.
+    ts.seat.?.pointerMotion(150, 220);
+    ts.seat.?.pointerFrame();
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.presses);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 1), p.grab_state.?.held_button_count);
+
+    // The client destroys the popup while the button is still down. The
+    // release belongs to the client that got the press; the seat's
+    // default path is not an alternative, because it delivers to a
+    // pointer focus this grab never re-picked (seat.zig:877-883) — and
+    // with no pick installed that focus is null, so the release would
+    // reach nobody and the client would be left with a button stuck
+    // down for the rest of the session.
+    popup.destroy();
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.leaves);
+    try std.testing.expect(ts.seat.?.pointer_grab == null);
+    try std.testing.expect(ts.seat.?.keyboard_grab == null);
+    // Teardown never dismisses (popup_done is not sent here).
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+
+    // The physical release that follows finds an empty set: no second
+    // release is invented for a button that is already up.
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
 }
 
 test "popupGrabEnd leaves a keyboard grab it does not own installed (X04b)" {

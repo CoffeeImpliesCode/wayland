@@ -39,11 +39,16 @@
 //!   when the timer fires, the hold begins. Motion past hold_slop_px
 //!   cancels the hold instead — the XML's own words: the hold ends
 //!   "if the fingers move past an implementation-defined threshold"
-//!   (pointer-gestures-unstable-v1.xml:259-261).
+//!   (pointer-gestures-unstable-v1.xml:262-265).
 //! - SWIPE: travel past swipe_threshold_px promotes the candidate to a
 //!   swipe, but only with at least min_swipe_fingers fingers (held
 //!   buttons). A swipe is a MULTI-finger gesture (XML:88-92), so one held
 //!   button is either a hold or a plain drag, never a swipe.
+//!   Promoting a LIVE hold closes it first, with hold.end and
+//!   cancelled = 1: the XML names that exact case, "the hold gesture
+//!   changes into a different type of gesture" (XML:262-265), and the
+//!   XML forbids two gestures on one pointer at once (XML:96-100), so
+//!   swipe.begin may not go out while a hold.begin is still open.
 //! - SLOP BOUND: one motion step larger than max_step_px while the
 //!   candidate has not begun kills it outright. A jump that big is a
 //!   cursor warp (layout change, unlocking constraint, compositor-driven
@@ -52,6 +57,19 @@
 //!   with cancelled = 0; cancel() ends it with cancelled = 1. Either way
 //!   the state returns to idle and the end event carries a fresh
 //!   focus-client serial.
+//! - GRAB: a compositor pointer grab owns the WHOLE gesture. The grab
+//!   gates client delivery (seat.zig:872-882, :1013-1023) while the
+//!   seat's own pointer_move / button signals keep firing for
+//!   compositor listeners, and a grab never clears pointer_focus — so
+//!   without a guard a hold.begin could reach a client that received
+//!   neither the press nor any of the travel, breaking the promise the
+//!   grab makes (seat.zig:205-213, main.zig:322-325). Under a grab the
+//!   module reports nothing: no candidate arms, no gesture begins, no
+//!   update is sent. A gesture already live when the grab takes over is
+//!   closed once with cancelled = 1 — the grab synthesized a release
+//!   for every button the client held (seat.zig:800-823) and leaving a
+//!   begin without its end is the same violation this module refuses
+//!   everywhere else.
 //! - PINCH: the seat carries no pinch source (no scale, no rotation — it
 //!   reports absolute positions and button codes only), so pinch is driven
 //!   by the backend through pinchBegin/pinchUpdate/pinchEnd, the
@@ -330,9 +348,12 @@ pub const PointerGestures = struct {
     /// (wlr_pointer_gestures_v1.c:160-185). Cancels an active swipe or
     /// hold first — the XML forbids two simultaneous gestures on one
     /// pointer/seat. With no pointer focus nothing is sent and no pinch
-    /// becomes active (wlroots :165-170).
+    /// becomes active (wlroots :165-170). Under a compositor pointer
+    /// grab the whole call is dropped: the grab owns the pointer, so a
+    /// pinch would reach a client that received no motion at all.
     pub fn pinchBegin(self: *PointerGestures, time_ms: u32, fingers: u32) void {
         const seat = self.seat orelse return;
+        if (self.grabOwned(seat)) return;
         self.cancelHoldTimer();
         if (self.phase == .swipe or self.phase == .hold) self.cancel(true);
         const focus = focusTarget(seat) orelse {
@@ -354,6 +375,9 @@ pub const PointerGestures = struct {
     /// (wlr_pointer_gestures_v1.c:187-216): `scale` is ABSOLUTE against
     /// begin and `rotation` is the RELATIVE clockwise angle in degrees
     /// against the previous begin/update (XML:185-206).
+    /// Dropped under a compositor pointer grab for the same reason
+    /// pinchBegin is: the client under the pointer sees no motion, so a
+    /// pinch update would describe travel it never witnessed.
     pub fn pinchUpdate(
         self: *PointerGestures,
         time_ms: u32,
@@ -363,6 +387,7 @@ pub const PointerGestures = struct {
         rotation: f64,
     ) void {
         const seat = self.seat orelse return;
+        if (self.grabOwned(seat)) return;
         if (self.phase != .pinch) return;
         const focus = focusTarget(seat) orelse return;
         const fdx = fixedFromDouble(dx);
@@ -391,9 +416,30 @@ pub const PointerGestures = struct {
         return self.phase != .idle;
     }
 
+    /// A compositor pointer grab owns the whole gesture, so the caller
+    /// must report nothing. `Seat.pointerMotion` returns right after the
+    /// grab handler and still emits pointer_move (seat.zig:878-881),
+    /// `pressed_count` is bumped before the grab branch
+    /// (seat.zig:967-970) and `events.button` fires unconditionally
+    /// (seat.zig:1066) — while `Seat.pointerButton` sends the client
+    /// nothing at all (seat.zig:1013-1023) and a grab never clears
+    /// pointer_focus, the only thing `focusTarget` requires. So every
+    /// detection entry point gates here, exactly as a pointer
+    /// constraint refuses to activate under one (pointer_constraints.zig:432).
+    fn grabOwned(self: *PointerGestures, seat: *seat_mod.Seat) bool {
+        if (seat.pointer_grab == null) return false;
+        // A gesture live when the grab took over is closed once, here:
+        // startPointerGrab synthesized a release for every button the
+        // client held (seat.zig:800-823), so the client's gesture is
+        // over and an open begin would never be answered.
+        self.cancel(true);
+        return true;
+    }
+
     // --- detection -----------------------------------------------------
 
     fn handleButton(self: *PointerGestures, seat: *seat_mod.Seat) void {
+        if (self.grabOwned(seat)) return;
         if (seat.pressed_count == 0) {
             // The release that drains the last held button ends the
             // gesture normally (cancelled = 0): "one or more fingers are
@@ -408,6 +454,7 @@ pub const PointerGestures = struct {
     }
 
     fn handleMotion(self: *PointerGestures, seat: *seat_mod.Seat) void {
+        if (self.grabOwned(seat)) return;
         const x = seat.pointer_x;
         const y = seat.pointer_y;
         switch (self.phase) {
@@ -415,9 +462,14 @@ pub const PointerGestures = struct {
             .hold => {
                 if (atLeast(x, y, self.origin_x, self.origin_y, swipe_threshold_px)) {
                     // "the hold gesture changes into a different type of
-                    // gesture" (XML:259-261): hand over to the swipe.
-                    self.prev_x = x;
-                    self.prev_y = y;
+                    // gesture" (XML:262-265): the hold is OVER, so close
+                    // it before the swipe opens. cancel(true) is the same
+                    // handover pinchBegin uses (:358) — it sends
+                    // hold.end with cancelled = 1 and leaves the phase
+                    // idle, which is the state promoteToSwipe expects,
+                    // so NEITHER of its exits (too few fingers, no focus)
+                    // can reach a client that still holds an open hold.
+                    self.cancel(true);
                     self.promoteToSwipe(seat);
                     return;
                 }
@@ -564,12 +616,16 @@ pub const PointerGestures = struct {
 
 /// The hold delay elapsed. libwayland 1.24 disarms a timer before
 /// dispatching it, so the source is removed here (xdg_activation.zig:558-571).
+/// A grab installed between the press and this callback owns the pointer
+/// by then, so the candidate is dropped instead of becoming a hold
+/// (grabOwned, :429).
 fn holdTimeout(self: *PointerGestures) c_int {
     self.cancelHoldTimer();
     const seat = self.seat orelse {
         self.phase = .idle;
         return 1;
     };
+    if (self.grabOwned(seat)) return 1;
     if (self.phase != .pending) return 1;
     if (atLeast(self.prev_x, self.prev_y, self.origin_x, self.origin_y, hold_slop_px)) return 1;
     const focus = focusTarget(seat) orelse {
@@ -1264,7 +1320,7 @@ test "motion past the hold slop cancels the pending hold" {
     try std.testing.expectEqual(@as(usize, 0), ev.begins);
 }
 
-test "a hold that moves too far is cancelled with cancelled = 1" {
+test "a live hold past the slop but short of the swipe threshold is cancelled" {
     const allocator = std.testing.allocator;
     var ts = testServer(allocator) catch return;
     defer ts.deinit();
@@ -1280,11 +1336,209 @@ test "a hold that moves too far is cancelled with cancelled = 1" {
     try ts.pumpWith(2 * @as(c_int, @intCast(hold_threshold_ms)));
     try std.testing.expectEqual(@as(usize, 1), ev.begins);
 
-    // A live hold that moves past the slop ends as cancelled (XML:259-261).
+    // A live hold that moves past the slop ends as cancelled (XML:262-265).
     seat.pointerMotion(100 + hold_slop_px + 1, 100);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), ev.ends);
     try std.testing.expectEqual(@as(i32, 1), ev.cancelled);
+}
+
+test "a live hold that reaches the swipe threshold ends with hold.end, one finger" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.focusSurface();
+    const hold = try ts.wl_gestures.?.getHoldGesture(ts.wl_pointer.?);
+    const swipe = try ts.wl_gestures.?.getSwipeGesture(ts.wl_pointer.?);
+    var hold_ev: HoldEvents = .{};
+    var swipe_ev: SwipeEvents = .{};
+    hold.setListener(*HoldEvents, HoldEvents.listener, &hold_ev);
+    swipe.setListener(*SwipeEvents, SwipeEvents.listener, &swipe_ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    seat.pointerButton(seat_mod.btn_left, true);
+    try ts.pumpWith(2 * @as(c_int, @intCast(hold_threshold_ms)));
+    try std.testing.expectEqual(@as(usize, 1), hold_ev.begins);
+
+    // Past the swipe threshold, but a swipe needs min_swipe_fingers
+    // fingers (XML:88-92). The hold is still over: it changes into a
+    // different type of gesture, so hold.end MUST go out (XML:262-265)
+    // before the travel is reported as the plain drag it is.
+    seat.pointerMotion(100 + swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), hold_ev.ends);
+    try std.testing.expectEqual(@as(i32, 1), hold_ev.cancelled);
+    try std.testing.expectEqual(@as(usize, 0), swipe_ev.begins);
+    try std.testing.expect(!ts.gestures.?.tracking());
+
+    // The release that follows ends nothing a second time.
+    seat.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), hold_ev.ends);
+    try std.testing.expectEqual(@as(usize, 0), swipe_ev.begins);
+}
+
+test "a live hold promoted to a swipe ends the hold before the swipe begins" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.focusSurface();
+    const hold = try ts.wl_gestures.?.getHoldGesture(ts.wl_pointer.?);
+    const swipe = try ts.wl_gestures.?.getSwipeGesture(ts.wl_pointer.?);
+    var hold_ev: HoldEvents = .{};
+    var swipe_ev: SwipeEvents = .{};
+    hold.setListener(*HoldEvents, HoldEvents.listener, &hold_ev);
+    swipe.setListener(*SwipeEvents, SwipeEvents.listener, &swipe_ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    seat.pointerButton(seat_mod.btn_left, true);
+    seat.pointerButton(seat_mod.btn_right, true);
+    try ts.pumpWith(2 * @as(c_int, @intCast(hold_threshold_ms)));
+    try std.testing.expectEqual(@as(usize, 1), hold_ev.begins);
+    try std.testing.expectEqual(min_swipe_fingers, @as(u32, hold_ev.fingers));
+
+    // Two fingers plus a full threshold is a promotion. The hold closes
+    // FIRST and with cancelled = 1 — swipe.begin while hold.begin is
+    // still open is exactly the two-gestures-at-once the XML forbids
+    // (XML:96-100, :262-265).
+    seat.pointerMotion(100 + swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), hold_ev.ends);
+    try std.testing.expectEqual(@as(i32, 1), hold_ev.cancelled);
+    try std.testing.expectEqual(@as(usize, 1), swipe_ev.begins);
+    try std.testing.expectEqual(min_swipe_fingers, swipe_ev.begin_fingers);
+    try std.testing.expect(ts.gestures.?.tracking());
+
+    // The swipe owns the gesture from here; the hold is not ended again.
+    seat.pointerButton(seat_mod.btn_left, false);
+    seat.pointerButton(seat_mod.btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), hold_ev.ends);
+    try std.testing.expectEqual(@as(usize, 1), swipe_ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), swipe_ev.cancelled);
+    try std.testing.expect(!ts.gestures.?.tracking());
+}
+
+test "a compositor pointer grab reaches no client as a gesture" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.focusSurface();
+    const hold = try ts.wl_gestures.?.getHoldGesture(ts.wl_pointer.?);
+    const swipe = try ts.wl_gestures.?.getSwipeGesture(ts.wl_pointer.?);
+    const pinch = try ts.wl_gestures.?.getPinchGesture(ts.wl_pointer.?);
+    var hold_ev: HoldEvents = .{};
+    var swipe_ev: SwipeEvents = .{};
+    var pinch_ev: PinchEvents = .{};
+    hold.setListener(*HoldEvents, HoldEvents.listener, &hold_ev);
+    swipe.setListener(*SwipeEvents, SwipeEvents.listener, &swipe_ev);
+    pinch.setListener(*PinchEvents, PinchEvents.listener, &pinch_ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    // The interactive move / camera pan takes the pointer
+    // (main.zig:659-662, :2114). The seat keeps emitting pointer_move
+    // and button for compositor listeners and keeps pointer_focus, so
+    // nothing but the module's own gate stops detection here.
+    seat.startPointerGrab(&seat_mod.swallow_pointer_grab);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus != null);
+    try std.testing.expect(!ts.gestures.?.tracking());
+
+    // A two-finger press and a full-threshold drag under the grab: the
+    // client saw neither the press nor the travel, so no candidate may
+    // arm and no swipe may open.
+    seat.pointerButton(seat_mod.btn_left, true);
+    seat.pointerButton(seat_mod.btn_right, true);
+    seat.pointerMotion(100 + swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expect(!ts.gestures.?.tracking());
+    try std.testing.expectEqual(@as(usize, 0), swipe_ev.begins);
+
+    // The hold timer would fire hold_threshold_ms after the press: the
+    // candidate is gone, so nothing is sent.
+    try ts.pumpWith(2 * @as(c_int, @intCast(hold_threshold_ms)));
+    try std.testing.expectEqual(@as(usize, 0), hold_ev.begins);
+
+    // The backend pinch API is gated the same way.
+    ts.gestures.?.pinchBegin(2000, 2);
+    ts.gestures.?.pinchUpdate(2010, 1, 1, 1, 0);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), pinch_ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), pinch_ev.updates);
+    try std.testing.expect(!ts.gestures.?.tracking());
+
+    // More travel and the releases change nothing.
+    seat.pointerMotion(400, 100);
+    seat.pointerButton(seat_mod.btn_right, false);
+    seat.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), hold_ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), hold_ev.ends);
+    try std.testing.expectEqual(@as(usize, 0), swipe_ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), swipe_ev.updates);
+    try std.testing.expectEqual(@as(usize, 0), pinch_ev.begins);
+    try std.testing.expect(!ts.gestures.?.tracking());
+
+    // With the grab released the very same input is detected again: the
+    // gate is the grab, not a detector that stopped working.
+    seat.endPointerGrab();
+    seat.pointerMotion(100, 100);
+    try ts.pump();
+    seat.pointerButton(seat_mod.btn_left, true);
+    seat.pointerButton(seat_mod.btn_right, true);
+    seat.pointerMotion(100 + swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), swipe_ev.begins);
+    try std.testing.expect(ts.gestures.?.tracking());
+    seat.pointerButton(seat_mod.btn_left, false);
+    seat.pointerButton(seat_mod.btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), swipe_ev.ends);
+}
+
+test "a grab installed mid-hold closes the open hold exactly once" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.focusSurface();
+    const hold = try ts.wl_gestures.?.getHoldGesture(ts.wl_pointer.?);
+    var ev: HoldEvents = .{};
+    hold.setListener(*HoldEvents, HoldEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    seat.pointerButton(seat_mod.btn_left, true);
+    try ts.pumpWith(2 * @as(c_int, @intCast(hold_threshold_ms)));
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+
+    // The compositor takes the pointer mid-hold. startPointerGrab
+    // synthesized a release for the button the client held
+    // (seat.zig:800-823), so the gesture is over for the client: it is
+    // closed here, never abandoned with its begin unanswered. The nudge
+    // below stays UNDER hold_slop_px on purpose, so the hold's own
+    // slop branch cannot produce that end by accident — only the grab
+    // takeover can.
+    seat.startPointerGrab(&seat_mod.swallow_pointer_grab);
+    seat.pointerMotion(100 + hold_slop_px - 1, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 1), ev.cancelled);
+    try std.testing.expect(!ts.gestures.?.tracking());
+
+    // Nothing further is reported for the rest of the grab.
+    seat.pointerMotion(300, 100);
+    seat.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    // The hold began once and is not begun again for the rest of the grab.
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
 }
 
 test "pinch runs on the compositor API with exact 24.8 encoding" {
