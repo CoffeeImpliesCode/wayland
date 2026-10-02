@@ -14,7 +14,7 @@ Zig `0.16.0` (`0.0.0` package): a reusable compositor library and prototype serv
 
 ## Commands (repository root)
 
-- `devenv shell -c "zig build"` builds with native dependencies; `zig build` generates bindings and installs artifacts.
+- `devenv shell -- zig build` builds with native dependencies; `zig build` generates bindings and installs artifacts. Use `devenv shell -- <cmd>`, never `devenv shell -c "<cmd>"` — the `-c` form drops into an interactive prompt and silently runs nothing.
 - `zig build run` shows the binding summary. `zig build run-server -- <args>` starts the compositor.
 - `zig build run-client -- <args>` and `zig build run-rtprobe -- <args>` run against a live server.
 - `zig build test` runs library and server tests; `zig build check` compiles the main executable and both test artifacts. In devenv, `gate` runs configured checks.

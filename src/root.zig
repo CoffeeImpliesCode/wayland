@@ -48,6 +48,10 @@ pub const data_device = @import("compositor/data_device.zig");
 /// zwp_primary_selection_device_manager_v1 (compositor/primary_selection.zig):
 /// the X11 PRIMARY analogue, keyboard-focus-owned.
 pub const primary_selection = @import("compositor/primary_selection.zig");
+/// zwlr_data_control_manager_v1 (compositor/data_control.zig): the
+/// compositor as the data SOURCE — a client reads the selection out
+/// without ever providing a wl_data_source.
+pub const data_control = @import("compositor/data_control.zig");
 pub const backend = @import("backend/backend.zig");
 /// libinput input backend (backend/libinput.zig): evdev devices via
 /// libinput (udev context). Exported for the test server.
@@ -93,6 +97,32 @@ pub const fractional_scale = @import("shell/fractional_scale.zig");
 pub const xdg_output = @import("shell/xdg_output.zig");
 /// wp_viewporter (stable/viewporter): crop/scale surface content.
 pub const viewporter = @import("shell/viewporter.zig");
+/// zwp_pointer_gestures_v1 (shell/pointer_gestures.zig): swipe, pinch
+/// and hold recognition from the seat's pointer stream.
+pub const pointer_gestures = @import("shell/pointer_gestures.zig");
+/// zwp_relative_pointer_manager_v1 (shell/relative_pointer.zig):
+/// unclaccelerated relative motion (24.8 deltas + a 64-bit utime).
+pub const relative_pointer = @import("shell/relative_pointer.zig");
+/// zwp_pointer_constraints_v1 (shell/pointer_constraints.zig): locked
+/// and confined pointers.
+pub const pointer_constraints = @import("shell/pointer_constraints.zig");
+/// zwp_tablet_manager_v2 (shell/tablet.zig): the tablet/tool/pad
+/// hardware registry and the full v2 announcement tree.
+pub const tablet = @import("shell/tablet.zig");
+/// wp_cursor_shape_manager_v1 (shell/cursor_shape.zig): per-pointer and
+/// per-tablet-tool cursor shapes, gated on the device enter serial.
+pub const cursor_shape = @import("shell/cursor_shape.zig");
+/// wp_tearing_control_manager_v1 (shell/tearing_control.zig): the
+/// per-surface async-presentation hint. Recording only — whether an
+/// output actually tears is the present path's gate.
+pub const tearing_control = @import("shell/tearing_control.zig");
+/// ext_session_lock_manager_v1 (shell/session_lock.zig): the session
+/// lock privilege boundary — input suppression and lock-surface
+/// rendering while locked.
+pub const session_lock = @import("shell/session_lock.zig");
+/// zwlr_foreign_toplevel_manager_v1 (shell/foreign_toplevel.zig): the
+/// compositor's own toplevels as client-visible handles.
+pub const foreign_toplevel = @import("shell/foreign_toplevel.zig");
 pub const scene = @import("scene/scene.zig");
 /// Surface→scene binding (scene/surface_node.zig): the library's
 /// wl_surface→scene-node table. Tracks a surface through its
@@ -136,6 +166,7 @@ comptime {
     _ = primary_selection;
     _ = backend;
     _ = libinput;
+    _ = data_control;
     _ = drm;
     // raylib/raylib_input import "raylib_c", which build.zig only wires
     // with -Denable_raylib; force their analysis only when it exists.
@@ -153,6 +184,14 @@ comptime {
     _ = fractional_scale;
     _ = xdg_output;
     _ = viewporter;
+    _ = pointer_gestures;
+    _ = relative_pointer;
+    _ = pointer_constraints;
+    _ = tablet;
+    _ = cursor_shape;
+    _ = tearing_control;
+    _ = session_lock;
+    _ = foreign_toplevel;
     _ = scene;
     _ = surface_node;
     _ = camera;

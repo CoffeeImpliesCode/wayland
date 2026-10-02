@@ -51,13 +51,33 @@ pub fn build(b: *Build) void {
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-output/xdg-output-unstable-v1.xml");
+    scanner.addSystemProtocol("stable/tablet/tablet-v2.xml");
+    scanner.addSystemProtocol("stable/linux-dmabuf/linux-dmabuf-v1.xml");
+    scanner.addSystemProtocol("staging/tearing-control/tearing-control-v1.xml");
+    scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
+    scanner.addSystemProtocol("staging/ext-session-lock/ext-session-lock-v1.xml");
+    scanner.addSystemProtocol("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/relative-pointer/relative-pointer-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-screencopy-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-data-control-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocols/wlroots/wlr-foreign-toplevel-management-unstable-v1.xml"));
 
     // Maximum versions implemented by this server. Interfaces reachable
     // from these globals (wl_surface, wl_region, xdg_surface, xdg_toplevel,
     // wl_keyboard, wl_pointer, wl_touch, wl_callback, ...) are generated as
     // well; wl_display/wl_registry/wl_buffer always are.
+    //
+    // Only the top-level global is named per protocol: zig-wayland's
+    // Protocol.emit emits a target's global together with global.children,
+    // i.e. every interface constructed by one of its requests or events.
+    // Naming a child here instead would never match a global and the scanner
+    // would abort with "requested global interface '<name>' not found".
+    //
+    // Each version is the maximum the vendored XML declares. Requesting more
+    // aborts the build (Protocol.emit compares target.version against
+    // global.interface.version).
     scanner.generate("wl_compositor", 7);
     scanner.generate("wl_shm", 3);
     scanner.generate("wl_seat", 11);
@@ -74,6 +94,16 @@ pub fn build(b: *Build) void {
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_presentation", 2);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
+    scanner.generate("zwp_tablet_manager_v2", 2);
+    scanner.generate("zwp_linux_dmabuf_v1", 6);
+    scanner.generate("wp_tearing_control_manager_v1", 1);
+    scanner.generate("wp_cursor_shape_manager_v1", 2);
+    scanner.generate("ext_session_lock_manager_v1", 1);
+    scanner.generate("zwp_pointer_gestures_v1", 3);
+    scanner.generate("zwp_relative_pointer_manager_v1", 1);
+    scanner.generate("zwp_pointer_constraints_v1", 1);
+    scanner.generate("zwlr_data_control_manager_v1", 2);
+    scanner.generate("zwlr_foreign_toplevel_manager_v1", 3);
 
     const protocol = b.createModule(.{
         .root_source_file = scanner.result,

@@ -11,10 +11,16 @@
 //!   - data_offer.receive(mime, fd) relays the fd to the owning client's
 //!     data_source.send(mime, fd) — the source writes the payload, the
 //!     target reads it (memfd relay).
-//!   - Offer lifetime mirrors wlroots: an offer is destroyed (its wire
-//!     resource left inert) whenever the selection is re-delivered or its
-//!     source dies, so an offer never outlives the source it references
-//!     and receive() can never read freed source memory.
+//!   - Offer lifetime mirrors wlroots. A SELECTION offer is destroyed
+//!     (its wire resource left inert) whenever the selection is
+//!     re-delivered or its source dies. A DRAG offer belongs to the
+//!     in-flight drag instead and deliberately survives an accepted drop
+//!     for the data transfer, so it — and only it — can outlive its
+//!     source: sourceDestroy then nulls offer.source (wlroots
+//!     data_offer_handle_source_destroy, wlr_data_offer.c:230-237,
+//!     :273-274) and every request on such a DEAD offer raises
+//!     wl_data_offer.error.invalid_offer instead of reading freed
+//!     source memory.
 //!   - set_selection/start_drag validate the serial against the seat's
 //!     per-client serial ring (Seat.validateEventSerial, the wlroots
 //!     model — a serial handed to ANY other client is invalid) plus a
@@ -46,6 +52,17 @@
 //!   - get_data_device with an inert or foreign seat argument yields a
 //!     dead device (F-SEL-5): the object id stays valid, every request
 //!     is a no-op (wlroots wlr_data_device.c:238-244).
+//!   - One data device per client: a second get_data_device from the same
+//!     client binds its new object to the device that client already has
+//!     (DataDevice.objects holds the bound wire objects oldest-first;
+//!     events go out on the first one, and when that object dies the next
+//!     takes over). wlroots gives every call its own resource
+//!     (wlr_data_device.c:226-252), keeps them all linked on
+//!     seat_client->data_devices and sends every event on every one that
+//!     is still there (seat_client_send_selection :138-141, drag_set_focus
+//!     wlr_drag.c:88-109), so its drag creates one offer per object; this
+//!     drag tracks a single Drag.offer, so a second device would orphan
+//!     the first offer in manager.offers and double every drag event.
 //!   - set_selection with a source that advertised DnD actions raises
 //!     wl_data_source.error.invalid_source (KWin datadevice.cpp:91-101
 //!     hardening; wlroots has no such check).
@@ -55,10 +72,10 @@
 //!     mask/preferred action, the compositor-forced action and the
 //!     current negotiated action. offer.set_actions stores and re-runs
 //!     the negotiation, and the negotiated wl_data_offer.action /
-//!     wl_data_source.action events go out with v3 guards. No drag offer
-//!     exists while start_drag is a stub (DnD deferred), so the events
-//!     wait for the DnD state machine; the offer action STATE and
-//!     negotiation are live.
+//!     wl_data_source.action events go out with v3 guards. Only a DRAG
+//!     offer negotiates — a selection offer raises
+//!     wl_data_offer.error.invalid_offer — and drag offers are created
+//!     by dragSetFocus with offer_type = .drag.
 //!   - offer.set_actions on a clipboard (non-drag) offer raises
 //!     wl_data_offer.error.invalid_offer (wayland.xml: "This request can
 //!     only be made on drag-and-drop offers, a protocol error will be
@@ -70,10 +87,21 @@
 //!   - data_source teardown (destroy/cancel) clears the stored selection
 //!     and destroys the offers that referenced it.
 //!
-//! Drag-and-drop (start_drag) is not implemented in M3: the request is
-//! accepted, the source is cancelled, no drag icon is shown. The
-//! action-negotiation machinery above is wired for the future drag
-//! state machine (drag offers would be created with offer_type = .drag).
+//! Drag-and-drop (start_drag) runs as a real drag (wlroots wlr_drag,
+//! wlr_drag.c:22-256): a serial that validates against the seat's
+//! pointer grab installs a drag pointer grab (the source is finalized
+//! but NOT cancelled), the icon surface takes the wl_data_device-icon
+//! role (wlr_data_device.c:65-72, wlr_drag.c:411-415) and is reachable
+//! through DataDeviceManager.currentDragIcon, and motion over a surface
+//! delivers enter/motion/leave plus a drag offer to that client's data
+//! device. Releasing the origin button over an accepted target with a
+//! negotiated action drops; anything else finishes the drag cancelled
+//! (wlr_drag.c:113-125). Drag offers and selection offers share the
+//! manager's offer list but are superseded by different rules: a
+//! selection re-delivery destroys only the SELECTION offers, a drag
+//! focus change or Drag.end only the DRAG offer (wlroots keeps
+//! seat->selection_offers and seat->drag_offers in two lists,
+//! wlr_data_offer.c:264-271).
 //!
 //! Imports: utils/*, core/wire.zig, core/display.zig, compositor/seat.zig.
 
@@ -84,6 +112,7 @@ const display_mod = @import("../core/display.zig");
 const seat_mod = @import("seat.zig");
 const compositor_mod = @import("compositor.zig");
 const surface_mod = @import("surface.zig");
+const role_mod = @import("role.zig");
 
 const server = @import("protocol").server;
 const client = @import("protocol").client;
@@ -118,13 +147,15 @@ pub const DataDeviceManager = struct {
     /// its struct, and the later client teardown cannot call into the
     /// freed manager.
     sources: std.ArrayList(*DataSource) = .empty,
-    /// Live selection offers, one per data device of the focused client.
-    /// An offer is destroyed (struct freed, wire resource inerted)
-    /// whenever the selection is re-delivered, the focus moves, or its
-    /// source dies — an offer never outlives the source it references
-    /// (wlroots: seat->selection_offers, destroyed by
-    /// seat_client_send_selection, wlr_data_device.c; an offer dies with
-    /// its source, wlr_data_offer.c data_offer_handle_source_destroy).
+    /// Every live offer, selection and drag alike (wlroots keeps
+    /// seat->selection_offers and seat->drag_offers in two separate
+    /// lists, wlr_data_offer.c:264-271; both kinds share one struct
+    /// here). The kinds have DIFFERENT supersession rules, so every
+    /// sweep over this list filters on offer_type: a selection
+    /// re-delivery or a keyboard focus change destroys only the
+    /// SELECTION offers (wlroots seat_client_send_selection,
+    /// wlr_data_device.c:125-142), a drag focus change or Drag.end
+    /// only the DRAG offer (wlroots drag_set_focus, wlr_drag.c:36-58).
     offers: std.ArrayList(*DataOffer) = .empty,
     /// The in-flight drag, or null. One drag at a time per seat
     /// (wlroots seat->drag, wlr_drag.c:145).
@@ -185,20 +216,60 @@ pub const DataDeviceManager = struct {
             self.sources.items[0].resource.destroy();
         }
         while (self.offers.items.len > 0) destroyOffer(self, self.offers.items[0]);
+        // Every wire object of every device, not just the one the events
+        // go out on: the LAST object's destroy handler is what unlinks the
+        // device and frees its struct, so a duplicate left behind here
+        // would outlive the manager it links out of.
         while (self.devices.items.len > 0) {
-            self.devices.items[0].resource.destroy();
+            self.devices.items[0].objects.items[0].destroy();
         }
         self.sources.deinit(allocator);
         self.offers.deinit(allocator);
         self.devices.deinit(allocator);
         allocator.destroy(self);
     }
+
+    /// The icon surface of the in-flight drag, or null when no drag is
+    /// running. wl_data_device.start_drag's icon is a wl_surface the
+    /// source client keeps alive for the drag (wlroots
+    /// wlr_drag_create -> drag_icon_create, wlr_drag.c:424-441); the
+    /// server's scene sync reads it here to draw the icon at the
+    /// pointer.
+    pub fn currentDragIcon(mgr: *DataDeviceManager) ?*surface_mod.Surface {
+        const drag = mgr.drag orelse return null;
+        return drag.icon;
+    }
 };
 
-/// A client's data device (one per client per seat).
+/// A client's data device: one per client per seat.
 const DataDevice = struct {
     manager: *DataDeviceManager,
-    resource: *server.wl.DataDevice,
+    /// Stored next to `manager` so the wire-object teardown path
+    /// (deviceDestroy) can unlink the device and free the struct through
+    /// its own fields.
+    allocator: std.mem.Allocator,
+    /// Every wl_data_device object bound to this device, oldest first: the
+    /// object the first get_data_device created, then one entry per
+    /// duplicate. The struct lives exactly as long as this list and is in
+    /// manager.devices exactly while it is non-empty; its FIRST entry is
+    /// the resource every event goes out on (eventResource).
+    objects: std.ArrayListUnmanaged(*server.wl.DataDevice) = .empty,
+
+    /// The resource every event goes out on: the oldest wl_data_device
+    /// object this client still holds. A dying object is only dropped
+    /// from the list, so the next one takes over and a client that still
+    /// has an object keeps receiving events — wlroots likewise links
+    /// every get_data_device call into seat_client->data_devices, its
+    /// resource destroy handler only unlinks the dead object and frees
+    /// nothing (data_device_handle_resource_destroy, wlr_data_device.c:
+    /// 100-103), and the events then go out on the objects that are left
+    /// (seat_client_send_selection :138-141, drag_set_focus wlr_drag.c:
+    /// 88-109). Null once the LAST object is gone, and a device with no
+    /// object is out of manager.devices, so no send site can reach a
+    /// destroyed resource.
+    fn eventResource(dev: *const DataDevice) ?*server.wl.DataDevice {
+        return if (dev.objects.items.len == 0) null else dev.objects.items[0];
+    }
 };
 
 /// A data source (the client offering clipboard content).
@@ -213,8 +284,7 @@ const DataSource = struct {
     /// treats such a source as copy-only (wlr_data_offer.c:32-37).
     /// Clipboard selection never uses actions, but the mask is validated
     /// and stored so wl_data_offer.set_actions can run its
-    /// invalid_action check against it and the future drag negotiation
-    /// can read it.
+    /// invalid_action check against it and the drag negotiation reads it.
     actions: ?u32 = null,
     /// The source was handed to wl_data_device.set_selection or
     /// start_drag: it is used once (wlroots finalizes it,
@@ -228,21 +298,23 @@ const DataSource = struct {
     /// Set by the compositor before the drag starts.
     compositor_action: u32 = 0,
     /// The currently negotiated action for the in-flight drag (wlroots:
-    /// wlr_data_source.current_dnd_action). 0 = none. Read back by the
-    /// drop/finish paths of the future DnD state machine.
+    /// wlr_data_source.current_dnd_action). 0 = none. Read back by
+    /// Drag.end's drop validation.
     current_dnd_action: u32 = 0,
     /// The destination accepted a mime via wl_data_offer.accept: true
     /// for a non-NULL mime, false on NULL/leave (wlroots:
-    /// wlr_data_source.accepted). Drives the finish validation in the
-    /// future DnD state machine.
+    /// wlr_data_source.accepted). Drives Drag.end's drop validation.
     accepted: bool = false,
 };
 
 /// The kind of offer (wlroots enum wlr_data_offer_type): a selection
-/// (clipboard) offer or a drag-and-drop offer. set_actions and accept
-/// only apply to drag offers; with DnD deferred, every offer created
-/// today is a selection offer and the future drag state machine creates
-/// drag offers.
+/// (clipboard) offer created by deliverSelectionToFocus, or a
+/// drag-and-drop offer created by dragSetFocus. set_actions, accept and
+/// finish only apply to drag offers. The two kinds share one list
+/// (DataDeviceManager.offers) but are superseded by different rules, so
+/// every sweep over that list filters on offer_type — wlroots keeps
+/// selection_offers and drag_offers in two lists for the same reason
+/// (wlr_data_offer.c:264-271).
 const OfferType = enum { selection, drag };
 
 /// A drag-and-drop operation (wlroots wlr_drag, wlr_drag.c). Lives on
@@ -257,26 +329,35 @@ const Drag = struct {
     /// the drag lives (a denied serial keeps it finalized-but-alive,
     /// wlr_data_device.c:82-85).
     source: *DataSource,
-    /// The surface the drag started on (validates via
-    /// validatePointerGrabSerial against the seat's grab_serial).
-    origin: *surface_mod.Surface,
     /// The drag icon surface (wl_data_device.start_drag icon arg), or
-    /// null. Positioned by the compositor's scene path; the drag tracks
-    /// it for the role name only.
+    /// null. It carries the wl_data_device-icon role for the drag's
+    /// lifetime; the scene sync reads it through
+    /// DataDeviceManager.currentDragIcon to draw it at the pointer.
     icon: ?*surface_mod.Surface = null,
     /// The surface currently under the pointer (drag target).
     focus: ?*surface_mod.Surface = null,
-    /// The drag offer delivered to the focus client (one offer; the
-    /// drag targets one client at a time).
+    /// The drag offer delivered to the focus client, or null. ONE slot:
+    /// a client has at most one data device (managerRequest), so one
+    /// drag delivers exactly one offer. Every path that destroys the
+    /// offer clears the slot through the manager's tracked drag
+    /// (destroyOffer for the compositor's own teardown, offerDestroy for
+    /// the client's wl_data_offer.destroy) — a stale pointer here makes
+    /// Drag.end destroy freed memory.
     offer: ?*DataOffer = null,
     /// True once the drop ran: the offer outlives the drag for the data
-    /// transfer (wlroots keeps drag offers after drop,
-    /// drag_set_focus wlr_drag.c:47-61).
+    /// transfer (wlroots keeps drag offers after drop, drag_set_focus
+    /// wlr_drag.c:47-61). It is then the ONLY reason an offer can
+    /// outlive its source, which sourceDestroy's sweep covers.
     dropped: bool = false,
     /// True once dragEnd ran: guards the endPointerGrab→cancel→dragEnd
     /// recursion and the destroy-during-cancel ordering.
     ended: bool = false,
-    /// The installed pointer grab.
+    /// The installed pointer grab. SAFETY: `undefined` is read only
+    /// after deviceRequest assigns the whole struct right after the Drag
+    /// is built, and the seat's pointer_grab points at THIS field for
+    /// exactly as long as the drag lives. Drag.end ends the grab (seat.
+    /// endPointerGrab) before the Drag is freed, so no path reads it
+    /// while undefined.
     grab: seat_mod.PointerGrab = undefined,
 
     /// End the drag (wlroots drag_destroy, wlr_drag.c:115-145): send
@@ -302,8 +383,9 @@ const Drag = struct {
                 drag.dropped = true;
                 const target_client = drag.targetClient().?;
                 for (mgr.devices.items) |dev| {
-                    if (dev.resource.getClient() != target_client) continue;
-                    dev.resource.sendDrop();
+                    const res = dev.eventResource() orelse continue;
+                    if (res.getClient() != target_client) continue;
+                    res.sendDrop();
                 }
                 if (drag.source.resource.getVersion() >= 3) {
                     drag.source.resource.sendDndDropPerformed();
@@ -321,8 +403,9 @@ const Drag = struct {
         if (drag.focus) |focus| {
             const target = focus.resource.getClient();
             for (mgr.devices.items) |dev| {
-                if (dev.resource.getClient() != target) continue;
-                dev.resource.sendLeave();
+                const res = dev.eventResource() orelse continue;
+                if (res.getClient() != target) continue;
+                res.sendLeave();
             }
             if (!drag.dropped) {
                 if (drag.offer) |offer| destroyOffer(mgr, offer);
@@ -365,8 +448,9 @@ fn dragGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i3
             const target = drag.targetClient() orelse return;
             const time = seat.nowMs();
             for (drag.manager.devices.items) |dev| {
-                if (dev.resource.getClient() != target) continue;
-                dev.resource.sendMotion(@intCast(time), Fixed.fromInt(@intCast(p.sx)), Fixed.fromInt(@intCast(p.sy)));
+                const res = dev.eventResource() orelse continue;
+                if (res.getClient() != target) continue;
+                res.sendMotion(@intCast(time), Fixed.fromInt(@intCast(p.sx)), Fixed.fromInt(@intCast(p.sy)));
             }
         }
     } else {
@@ -387,52 +471,37 @@ fn dragSetFocus(drag: *Drag, surface: ?*surface_mod.Surface, sx: i32, sy: i32) v
     if (drag.focus) |old| {
         const old_client = old.resource.getClient();
         for (mgr.devices.items) |dev| {
-            if (dev.resource.getClient() != old_client) continue;
-            dev.resource.sendLeave();
+            const res = dev.eventResource() orelse continue;
+            if (res.getClient() != old_client) continue;
+            res.sendLeave();
         }
         if (!drag.dropped) {
+            // destroyOffer clears drag.offer through the manager's
+            // tracked drag, so the slot never names a freed struct.
             if (drag.offer) |offer| destroyOffer(mgr, offer);
-            drag.offer = null;
         }
     }
     drag.focus = null;
 
     const s = surface orelse return;
-    // A drag source only targets its own client's surfaces? No — the
-    // drag can move to any client; only the source client is special
-    // (it cannot receive its own drag? wlroots allows it). Deliver to
-    // the surface's client.
+    // The drag may target any client's surface (wlroots allows it); only
+    // the source client is special. Deliver to the surface's client,
+    // which has at most one data device, so exactly one offer is
+    // created and exactly one offer slot is filled.
     const target_client = s.resource.getClient();
-    // Create the drag offer for the target's device (wlroots
-    // drag_set_focus wlr_drag.c:78-101): the offer is introduced per
-    // device, mimes + source_actions + enter in order.
     for (mgr.devices.items) |dev| {
-        if (dev.resource.getClient() != target_client) continue;
-        const offer_res = server.wl.DataOffer.create(target_client, dev.resource.getVersion(), 0) catch return;
-        const offer = mgr.allocator.create(DataOffer) catch {
-            offer_res.destroy();
-            return;
-        };
-        offer.* = .{
-            .manager = mgr,
-            .resource = offer_res,
-            .source = drag.source,
-            .offer_type = .drag,
-        };
-        offer_res.setHandler(*DataOffer, offerRequest, offerDestroy, offer);
-        mgr.offers.append(mgr.allocator, offer) catch {
-            offer_res.destroy();
-            return;
-        };
+        const res = dev.eventResource() orelse continue;
+        if (res.getClient() != target_client) continue;
+        const offer = createOffer(mgr, mgr.allocator, res, drag.source, .drag) orelse return;
         // Order: data_offer, per-mime offer, source_actions (v3+),
         // then enter (wlroots wlr_drag.c:93-101).
-        dev.resource.sendDataOffer(offer_res);
-        for (drag.source.mime_types.items) |m| offer_res.sendOffer(m.ptr);
-        if (offer_res.getVersion() >= 3) {
-            offer_res.sendSourceActions(@bitCast(drag.source.actions orelse 0));
+        res.sendDataOffer(offer.resource);
+        for (drag.source.mime_types.items) |m| offer.resource.sendOffer(m.ptr);
+        if (offer.resource.getVersion() >= 3) {
+            offer.resource.sendSourceActions(@bitCast(drag.source.actions orelse 0));
         }
         const serial = seat.serialFor(target_client);
-        dev.resource.sendEnter(serial, s.resource, Fixed.fromInt(@intCast(sx)), Fixed.fromInt(@intCast(sy)), offer_res);
+        res.sendEnter(serial, s.resource, Fixed.fromInt(@intCast(sx)), Fixed.fromInt(@intCast(sy)), offer.resource);
         drag.offer = offer;
         log.debug("drag entered surface@{d}", mgr.io, mgr.log_cfg, "data_device", .{s.resource.getId()});
     }
@@ -483,10 +552,12 @@ fn dragGrabCancel(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab) void 
 const DataOffer = struct {
     manager: *DataDeviceManager,
     resource: *server.wl.DataOffer,
-    /// The offering client's source. Nulled when the offer is destroyed
-    /// (the source may already be freed), so a dead offer never reads
-    /// freed source memory (wlroots nulls offer->source in
-    /// data_offer_handle_source_destroy, wlr_data_offer.c).
+    /// The offering client's source, or null once the offer is DEAD.
+    /// Nulled when the offer is destroyed (the source may already be
+    /// freed) and when the source itself dies under a dropped drag offer
+    /// (sourceDestroy's sweep), so a dead offer never reads freed source
+    /// memory (wlroots nulls offer->source in
+    /// data_offer_handle_source_destroy, wlr_data_offer.c:230-237).
     source: ?*DataSource,
     offer_type: OfferType = .selection,
     /// The destination's supported action mask
@@ -504,11 +575,69 @@ const DataOffer = struct {
     in_ask: bool = false,
 };
 
+/// Create the wl_data_offer resource and its DataOffer struct for one
+/// delivery to `dev_res` — the device object the events go out on — and
+/// link the struct into mgr.offers. Returns null when either allocation
+/// fails, with NOTHING left behind: the resource is destroyed and the
+/// struct freed on both paths (wlroots data_offer_create, wlr_data_offer.c:
+/// 239-284, frees its calloc before returning NULL for the same reason,
+/// and likewise takes the DEVICE resource, so the offer inherits that
+/// object's client and version). `allocator` is a parameter so a test can
+/// drive the out-of-memory paths with a FailingAllocator; production
+/// always passes mgr.allocator.
+fn createOffer(
+    mgr: *DataDeviceManager,
+    allocator: std.mem.Allocator,
+    dev_res: *server.wl.DataDevice,
+    src: *DataSource,
+    offer_type: OfferType,
+) ?*DataOffer {
+    const offer_res = server.wl.DataOffer.create(dev_res.getClient(), dev_res.getVersion(), 0) catch return null;
+    const offer = allocator.create(DataOffer) catch {
+        // No handler is installed yet: destroying the resource cannot
+        // reach the struct, so free it here or it leaks.
+        offer_res.destroy();
+        return null;
+    };
+    offer.* = .{
+        .manager = mgr,
+        .resource = offer_res,
+        .source = src,
+        .offer_type = offer_type,
+    };
+    offer_res.setHandler(*DataOffer, offerRequest, offerDestroy, offer);
+    mgr.offers.append(allocator, offer) catch {
+        // offerDestroy unlinks (it is not in the list) and frees the
+        // struct; destroying the resource runs it.
+        offer_res.destroy();
+        return null;
+    };
+    return offer;
+}
+
 /// wl_data_device_manager.dnd_action bits (wayland.xml).
 const dnd_action_none: u32 = 0;
 const dnd_action_copy: u32 = 1;
 const dnd_action_move: u32 = 2;
 const dnd_action_ask: u32 = 4;
+
+/// The role a drag icon surface carries for the drag's lifetime (wlroots
+/// drag_icon_surface_role, wlr_drag.c:411-415, assigned by
+/// data_device_start_drag, wlr_data_device.c:65-72). Only the name is
+/// protocol-visible; the commit hook is empty because the icon is mapped
+/// by the client's own commit and drawn by the scene sync.
+const drag_icon_role: role_mod.SurfaceRole = .{ .name = "wl_data_device-icon" };
+
+/// The live data device of `client_wire`, or null. There is at most one
+/// per client: a duplicate get_data_device binds its wire object to the
+/// existing device (managerRequest).
+fn deviceForClient(mgr: *DataDeviceManager, client_wire: *wire.Client) ?*DataDevice {
+    for (mgr.devices.items) |dev| {
+        const res = dev.eventResource() orelse continue;
+        if (res.getClient() == client_wire) return dev;
+    }
+    return null;
+}
 
 fn bindManager(client_wire: *wire.Client, mgr: *DataDeviceManager, version: u32, id: u32) void {
     const resource = server.wl.DataDeviceManager.create(client_wire, version, id) catch {
@@ -582,6 +711,31 @@ fn managerRequest(
                 dev_res.setHandler(?*DataDevice, deadDeviceHandler, null, null);
                 return;
             }
+            // One device per client. wlroots keys the device off
+            // seat_client but still hands EVERY get_data_device call its
+            // own wire resource (wlr_data_device.c:226-252); its drag
+            // then creates one offer per object (wlr_drag.c:88-109).
+            // Ours tracks a single Drag.offer, so a second device would
+            // orphan the first offer in mgr.offers — a live wl_data_offer
+            // resource holding a live source long after the drag ended —
+            // and deliver two data_offer/enter/drop sequences for one
+            // drag. Bind the duplicate object to the existing device
+            // instead: deviceRequest keeps no state in its own resource
+            // (it reads the client and runs the same request logic), so
+            // the requests work, only the device's oldest live object
+            // ever receives events — and when that object dies the
+            // duplicate takes over (deviceDestroy).
+            if (deviceForClient(mgr, resource.getClient())) |dev| {
+                dev.objects.append(dev.allocator, dev_res) catch {
+                    // No handler is installed yet, so destroying the
+                    // resource cannot reach the device.
+                    dev_res.destroy();
+                    resource.getClient().postNoMemory();
+                    return;
+                };
+                dev_res.setHandler(*DataDevice, deviceRequest, deviceDestroy, dev);
+                return;
+            }
             const dev = mgr.allocator.create(DataDevice) catch {
                 dev_res.destroy();
                 resource.getClient().postNoMemory();
@@ -589,7 +743,13 @@ fn managerRequest(
             };
             dev.* = .{
                 .manager = mgr,
-                .resource = dev_res,
+                .allocator = mgr.allocator,
+            };
+            dev.objects.append(dev.allocator, dev_res) catch {
+                dev_res.destroy();
+                mgr.allocator.destroy(dev);
+                resource.getClient().postNoMemory();
+                return;
             };
             dev_res.setHandler(*DataDevice, deviceRequest, deviceDestroy, dev);
             mgr.devices.append(mgr.allocator, dev) catch {
@@ -692,6 +852,19 @@ fn freeSource(mgr: *DataDeviceManager, src: *DataSource) void {
     if (std.mem.findScalar(*DataSource, mgr.sources.items, src)) |idx| {
         _ = mgr.sources.orderedRemove(idx);
     }
+    // No offer may outlive the source it points at. freeSource is the
+    // single choke point for source death (cancelSource and
+    // sourceDestroy both funnel here), so the sweep belongs here: every
+    // offer that referenced this source becomes DEAD (source = null)
+    // before the struct goes. wlroots reaches the same state from the
+    // offer side — every offer registers
+    // data_offer_handle_source_destroy, which nulls offer->source
+    // (wlr_data_offer.c:230-237, :273-274). A live drag's offer is
+    // destroyed before this runs (sourceDestroy ends the drag); only a
+    // dropped drag offer survives to be swept here.
+    for (mgr.offers.items) |offer| {
+        if (offer.source == src) offer.source = null;
+    }
     for (src.mime_types.items) |m| mgr.allocator.free(m);
     src.mime_types.deinit(mgr.allocator);
     const allocator = mgr.allocator;
@@ -738,16 +911,18 @@ fn sourceDestroy(src_res: *server.wl.DataSource, src: *DataSource) void {
     if (mgr.selection_source == src) {
         // The selected source died: clear the seat-wide selection and
         // cancel the (already dying) source. The re-delivery below
-        // destroys every offer that referenced it, so no offer can read
-        // the freed source (wlroots: seat_handle_selection_source_destroy
-        // clears the selection and re-sends selection to the focused
-        // client, which first destroys all selection offers,
-        // wlr_data_device.c; an offer dies with its source,
-        // wlr_data_offer.c data_offer_handle_source_destroy).
+        // destroys every SELECTION offer that referenced it (wlroots:
+        // seat_handle_selection_source_destroy clears the selection and
+        // re-sends selection to the focused client, which first destroys
+        // all selection offers, wlr_data_device.c:167-178, :125-142).
         mgr.selection_source = null;
         src.resource.sendCancelled();
         deliverSelectionToFocus(mgr);
     }
+    // A surviving DRAG offer (the dropped one Drag.end keeps for the
+    // transfer) is made DEAD by freeSource's sweep below: a live drag
+    // was ended above, and that offer is the only thing that can outlive
+    // its source.
     freeSource(mgr, src);
 }
 
@@ -875,6 +1050,30 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
             const origin_ud = r.origin.getUserData() orelse return;
             const origin: *surface_mod.Surface = @ptrCast(@alignCast(origin_ud));
 
+            // The icon surface takes the drag-icon role (wlroots
+            // data_device_start_drag assigns it before it builds the
+            // drag, wlr_data_device.c:65-72; the role is
+            // drag_icon_surface_role, wlr_drag.c:411-415). A role
+            // conflict drops the request outright, exactly like
+            // wlroots' WL_DATA_DEVICE_ERROR_ROLE path: assignRole has
+            // already posted the error to the offending surface.
+            var icon: ?*surface_mod.Surface = null;
+            if (r.icon) |icon_res| {
+                if (icon_res.getUserData()) |ud| {
+                    const icon_surface: *surface_mod.Surface = @ptrCast(@alignCast(ud));
+                    role_mod.assignRole(icon_surface, &drag_icon_role, null) catch {
+                        log.debug(
+                            "start_drag: icon surface@{d} already has a role: no drag icon",
+                            mgr.io,
+                            mgr.log_cfg,
+                            "data_device",
+                            .{icon_surface.resource.getId()},
+                        );
+                        return;
+                    };
+                    icon = icon_surface;
+                }
+            }
             // F-SEL-1: validate via the seat's grab serial (S-F5): the
             // client must be holding exactly one button, the serial must
             // be the one minted for that press, and the pointer must
@@ -898,13 +1097,7 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
             drag.* = .{
                 .manager = mgr,
                 .source = src.?,
-                .origin = origin,
-                .icon = if (r.icon) |icon_res| blk: {
-                    if (icon_res.getUserData()) |ud| {
-                        break :blk @as(*surface_mod.Surface, @ptrCast(@alignCast(ud)));
-                    }
-                    break :blk null;
-                } else null,
+                .icon = icon,
             };
             drag.grab = .{
                 .data = drag,
@@ -921,15 +1114,6 @@ fn deviceRequest(dev_res: *server.wl.DataDevice, request: server.wl.DataDevice.R
             mgr.drag = drag;
             mgr.seat.startPointerGrab(&drag.grab);
 
-            // A drag icon surface has the drag-icon role name (wlroots
-            // wlr_drag.c:402-442); role enforcement is surface.zig's
-            // validatePending — assign nothing here, the role name is
-            // cosmetic until a scene policy claims it.
-            if (drag.icon) |icon| {
-                log.debug("drag icon surface@{d}", mgr.io, mgr.log_cfg, "data_device", .{
-                    icon.resource.getId(),
-                });
-            }
             log.info("start_drag: grab installed (origin surface@{d})", mgr.io, mgr.log_cfg, "data_device", .{
                 origin.resource.getId(),
             });
@@ -952,18 +1136,42 @@ fn deadDeviceHandler(resource: *server.wl.DataDevice, request: server.wl.DataDev
     }
 }
 
+/// Teardown of ANY bound wl_data_device object — the one the first
+/// get_data_device created or a duplicate. The object leaves the device's
+/// list and the next one takes over as the event resource, so no event is
+/// ever sent on a destroyed resource and a client that still holds an
+/// object keeps receiving them (wlroots drops the dead object's link and
+/// nothing else, data_device_handle_resource_destroy, wlr_data_device.c:
+/// 100-103). The seat-wide selection is owned by the manager, not the
+/// device: it survives the device (wlr_seat keeps the selection when the
+/// device dies; the source stays valid for the focused client). The LAST
+/// object takes the device out of manager.devices and frees the struct.
+///
+/// Every bound object carries this handler, so the one that empties the
+/// list always runs while the manager is alive: DataDeviceManager.deinit
+/// destroys every object of every device before it frees itself.
 fn deviceDestroy(dev_res: *server.wl.DataDevice, dev: *DataDevice) void {
-    _ = dev_res;
-    const mgr = dev.manager;
-    // The seat-wide selection is owned by the manager, not the device: it
-    // survives the device (wlr_seat keeps the selection when the device
-    // dies; the source stays valid for the focused client).
-    const idx = std.mem.findScalar(*DataDevice, mgr.devices.items, dev) orelse 0;
-    if (idx < mgr.devices.items.len and mgr.devices.items[idx] == dev) {
+    // Bound by construction: the handler is installed together with the
+    // entry, so the dying resource is always in the list.
+    const idx = std.mem.indexOfScalar(
+        *server.wl.DataDevice,
+        dev.objects.items,
+        dev_res,
+    ) orelse unreachable;
+    _ = dev.objects.orderedRemove(idx);
+    if (dev.objects.items.len > 0) return;
+    unlinkDevice(dev.manager, dev);
+    dev.objects.deinit(dev.allocator);
+    dev.allocator.destroy(dev);
+}
+
+/// Drop the device from the manager's device list. No-op when it is
+/// already out (the append-failure path in managerRequest frees a
+/// device that never got linked).
+fn unlinkDevice(mgr: *DataDeviceManager, dev: *DataDevice) void {
+    if (std.mem.findScalar(*DataDevice, mgr.devices.items, dev)) |idx| {
         _ = mgr.devices.orderedRemove(idx);
     }
-    const allocator = mgr.allocator;
-    allocator.destroy(dev);
 }
 
 /// Keyboard focus moved: deliver the stored selection to the focused
@@ -974,16 +1182,20 @@ fn onKeyboardFocus(listener: *wire.Listener(*seat_mod.Seat), seat: *seat_mod.Sea
     deliverSelectionToFocus(mgr);
 }
 
-/// For the focused client's data devices: destroy the previous offers and
-/// deliver the stored selection — a fresh offer per device when a
+/// For the focused client's data device: destroy the previous selection
+/// offers and deliver the stored selection — a fresh offer when a
 /// selection exists, selection(NULL) when it was cleared (wlroots:
 /// seat_client_send_selection / device_resource_send_selection,
-/// wlr_data_device.c).
+/// wlr_data_device.c:105-142).
 fn deliverSelectionToFocus(mgr: *DataDeviceManager) void {
     // A re-delivery (new/cleared selection, focus change, source death)
-    // supersedes every previous offer: destroy them all first, so no
-    // stale offer outlives the selection it advertises (wlroots destroys
-    // all seat selection offers before re-sending, wlr_data_device.c).
+    // supersedes every previous SELECTION offer: destroy them all first,
+    // so no stale offer outlives the selection it advertises (wlroots
+    // destroys all seat selection offers before re-sending,
+    // wlr_data_device.c:131-136). Drag offers are NOT selection offers
+    // and are left alone — a keyboard focus change happens mid-drag all
+    // the time (Seat.pointerButton moves focus before it dispatches the
+    // grab, seat.zig:974-992).
     destroyAllOffers(mgr);
     // The seat never holds a dangling focus: Seat.surfaceDestroyed clears
     // keyboard_focus when the surface dies (wired by main.zig's
@@ -997,35 +1209,22 @@ fn deliverSelectionToFocus(mgr: *DataDeviceManager) void {
     // from the manager, not from the focused client's own device.
     const src = mgr.selection_source;
     for (mgr.devices.items) |dev| {
-        if (dev.resource.getClient() != focus_client) continue;
+        const res = dev.eventResource() orelse continue;
+        if (res.getClient() != focus_client) continue;
         if (src) |s| {
             // The offer is introduced in a data_device event, so its
             // version follows the device's (wlroots: data_offer_create,
             // wl_resource_get_version(device_resource),
             // wlr_data_offer.c:249-251) — never the module maximum.
-            const offer_res = server.wl.DataOffer.create(focus_client, dev.resource.getVersion(), 0) catch return;
-            const offer = mgr.allocator.create(DataOffer) catch {
-                offer_res.destroy();
-                return;
-            };
-            offer.* = .{
-                .manager = mgr,
-                .resource = offer_res,
-                .source = s,
-            };
-            offer_res.setHandler(*DataOffer, offerRequest, offerDestroy, offer);
-            mgr.offers.append(mgr.allocator, offer) catch {
-                // offerDestroy frees the offer (it is not in the list).
-                offer_res.destroy();
-                return;
-            };
+            const offer = createOffer(mgr, mgr.allocator, res, s, .selection) orelse return;
+            const offer_res = offer.resource;
             // Order matters (wlroots device_resource_send_selection,
             // wlr_data_device.c): introduce the offer via data_offer
             // FIRST, then the per-mime offer events, then selection.
             // libwayland-client discards events for object ids it does
             // not know yet (queue_event, wayland-client.c), so sending
             // the mimes before data_offer would silently drop them.
-            dev.resource.sendDataOffer(offer_res);
+            res.sendDataOffer(offer_res);
             for (s.mime_types.items) |m| offer_res.sendOffer(m.ptr);
             // F-SEL-2: wl_data_offer.source_actions is mandated
             // "immediately after creating the wl_data_offer object"
@@ -1033,11 +1232,11 @@ fn deliverSelectionToFocus(mgr: *DataDeviceManager) void {
             // per-mime offer events and the selection event, v3+ only.
             // The payload is the source's action mask: 0 for a clipboard
             // source (the KWin invalid_source gate rejects
-            // action-advertising sources at set_selection); the future
-            // drag offer creation (F-SEL-1) sends the real mask through
-            // this same line (wlroots wlr_drag.c:99-101).
+            // action-advertising sources at set_selection); dragSetFocus
+            // sends the real mask through this same line for a drag
+            // offer (wlroots wlr_drag.c:98-101).
             if (offer_res.getVersion() >= 3) offer_res.sendSourceActions(@bitCast(s.actions orelse 0));
-            dev.resource.sendSelection(offer_res);
+            res.sendSelection(offer_res);
             log.debug("selection delivered to focused client ({d} mimes)", mgr.io, mgr.log_cfg, "data_device", .{
                 s.mime_types.items.len,
             });
@@ -1045,7 +1244,7 @@ fn deliverSelectionToFocus(mgr: *DataDeviceManager) void {
             // No selection: the focused client's offer is void
             // (wlroots: wl_data_device_send_selection(device, NULL),
             // device_resource_send_selection).
-            dev.resource.sendSelection(null);
+            res.sendSelection(null);
         }
     }
 }
@@ -1086,14 +1285,14 @@ fn chooseAction(offer: *DataOffer) u32 {
 
 /// Recompute the negotiated action for a drag offer and emit it to both
 /// sides when it changed (wlroots data_offer_update_action,
-/// wlr_data_offer.c:57-76). The source's current action is stored so the
-/// drop/finish paths of the future DnD state machine can read it back.
-/// Emission only happens for drag offers; with DnD deferred (DD-1) no
-/// drag offer exists yet, so the wl_data_offer.action /
-/// wl_data_source.action events wait for the drag state machine. wlroots
-/// also suppresses the events during "ask" negotiation (offer->in_ask,
-/// declared in wlr_data_device.h:43 but never set in 0.20.2); not
-/// modeled here.
+/// wlr_data_offer.c:57-76). The source's current action is stored so
+/// Drag.end's drop validation can read it back. Only a live drag offer
+/// gets here — a selection offer is refused with invalid_offer before
+/// this runs — and `source` is null only once the source died, in which
+/// case there is nobody left to negotiate with. wlroots also suppresses
+/// the events during "ask" negotiation (offer->in_ask, declared in
+/// wlr_data_device.h:43 but never set in 0.20.2); this models that
+/// suppression from the negotiated action itself.
 fn updateAction(offer: *DataOffer) void {
     const src = offer.source orelse return;
     const action = chooseAction(offer);
@@ -1132,11 +1331,18 @@ fn offerRequest(offer_res: *server.wl.DataOffer, request: server.wl.DataOffer.Re
         },
         .receive => |r| {
             // Relay the fd to the owning client: the source writes the
-            // payload into it, the target reads it. A live offer always
-            // has a live source (the source is nulled only when the
-            // offer is destroyed, which also removes it from the
-            // manager's list); the guard is defensive.
+            // payload into it, the target reads it. A DEAD offer — one
+            // whose source died under it, which only a dropped drag
+            // offer can be, sourceDestroy's sweep nulls it — has nobody
+            // to relay to: raise invalid_offer, "offer doesn't accept
+            // this request" (wayland.xml:588-589), the same refusal
+            // set_actions makes below. wlroots instead inerts the whole
+            // offer (data_offer_destroy, wlr_data_offer.c:211-214) so
+            // receive() silently closes the fd and the target blocks
+            // forever on a pipe nobody will write. The fd arrived with
+            // the request either way, so both paths close it.
             const src = offer.source orelse {
+                offer_res.postError(.invalid_offer, "wl_data_offer.receive: offer has no source");
                 _ = std.os.linux.close(r.fd);
                 return;
             };
@@ -1260,31 +1466,53 @@ fn deadOfferHandler(resource: *server.wl.DataOffer, request: server.wl.DataOffer
     }
 }
 
-/// Destroy a selection offer the compositor owns (the selection was
-/// re-delivered, the focus moved, or the source died): unlink and free
-/// the offer, and leave its wire resource inert with a no-op handler.
-/// Inerting — not destroying — matters: the object id stays valid, so a
-/// well-behaved client that destroys its offer after selection(NULL)
-/// neither errors nor is killed, and a NULL-implementation resource would
-/// make libwayland abort the compositor on the next request (wlroots
-/// inerts: data_offer_destroy, wlr_data_offer.c; wayland-server.c
+/// Destroy an offer the compositor owns: unlink and free it, and leave
+/// its wire resource inert with a no-op handler. Inerting — not
+/// destroying — matters: the object id stays valid, so a well-behaved
+/// client that destroys its offer after selection(NULL) neither errors
+/// nor is killed, and a NULL-implementation resource would make
+/// libwayland abort the compositor on the next request (wlroots inerts:
+/// data_offer_destroy, wlr_data_offer.c:191-215; wayland-server.c
 /// wl_closure_invoke aborts on NULL implementation).
 fn destroyOffer(mgr: *DataDeviceManager, offer: *DataOffer) void {
     if (std.mem.findScalar(*DataOffer, mgr.offers.items, offer)) |idx| {
         _ = mgr.offers.orderedRemove(idx);
     }
-    // Drop the source reference before freeing: the source may already be
-    // gone (sourceDestroy clears the selection before the offers). The
-    // dead offer must never read it (wlroots nulls offer->source in
-    // data_offer_handle_source_destroy).
+    // The live drag tracks the offer it delivered to its focus client so
+    // it can destroy that offer on a focus change or at drag end. Clear
+    // the slot HERE, not only in offerDestroy: this path frees the offer
+    // from under the drag, and a stale Drag.offer makes Drag.end (or the
+    // next dragSetFocus) destroy freed memory.
+    if (mgr.drag) |drag| {
+        if (drag.offer == offer) drag.offer = null;
+    }
+    // Drop the source reference before freeing: the source may already
+    // be gone (sourceDestroy clears the selection before the offers).
+    // The dead offer must never read it (wlroots nulls offer->source in
+    // data_offer_handle_source_destroy, wlr_data_offer.c:230-237).
     offer.source = null;
     offer.resource.setHandler(?*DataOffer, deadOfferHandler, null, null);
     mgr.allocator.destroy(offer);
 }
 
-/// Destroy every live selection offer.
+/// Destroy every live SELECTION offer. Drag offers are NOT touched: they
+/// belong to the in-flight drag, not to the selection, and a selection
+/// re-delivery must not tear a live drag's offer down — wlroots keeps
+/// seat->selection_offers and seat->drag_offers in two lists for exactly
+/// this reason (wlr_data_offer.c:264-271) and only walks the selection
+/// one in seat_client_send_selection (wlr_data_device.c:131-136).
 fn destroyAllOffers(mgr: *DataDeviceManager) void {
-    while (mgr.offers.items.len > 0) destroyOffer(mgr, mgr.offers.items[0]);
+    var i: usize = 0;
+    while (i < mgr.offers.items.len) {
+        const offer = mgr.offers.items[i];
+        if (offer.offer_type != .selection) {
+            i += 1;
+            continue;
+        }
+        // destroyOffer removes the entry with orderedRemove, which
+        // shifts the tail left, so this index now holds the next offer.
+        destroyOffer(mgr, offer);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,8 +1588,7 @@ const SourceEvents = struct {
                 data.last_target = if (e.mime_type) |m| std.mem.span(m) else "";
             },
             // DnD lifecycle events: the test client never drags; the
-            // arms exist for the exhaustive switch over the wire enum
-            // (the future DnD state machine would emit them).
+            // arms exist for the exhaustive switch over the wire enum.
             .dnd_drop_performed => {},
             .dnd_finished => {},
         }
@@ -1944,39 +2171,43 @@ test "re-delivering the selection supersedes the previous offer" {
     try testing.expectEqual(@as(usize, 0), events_b.cancelled_count);
 }
 
-test "new data device binding receives the current selection at bind time" {
+test "a data device bound by the focused client receives the current selection at bind time" {
+    // wlroots sends the current selection at bind time when the binding
+    // client is the focused one (data_device_manager_get_data_device ->
+    // device_resource_send_selection, wlr_data_device.c:247-251; KWin
+    // seat.cpp:159-177).
     const allocator = testing.allocator;
     var ts = try TestServer.init(allocator);
     defer ts.deinit();
 
-    const device1 = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const device_a = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
     const src = try ts.wl_data_device_manager.?.createDataSource();
     src.offer("text/plain");
-    var dev1_events: DeviceEvents = .{};
-    device1.setListener(*DeviceEvents, DeviceEvents.listener, &dev1_events);
     try ts.pump();
 
-    // Focus the client so the selection can be set and delivered.
+    // Focus A and give the seat a live selection.
     ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client.?));
     try ts.pump();
-    const serial = ts.seat.?.last_serial;
-
-    device1.setSelection(src, serial);
+    device_a.setSelection(src, ts.seat.?.last_serial);
     try ts.pump();
-    try testing.expectEqual(@as(usize, 2), dev1_events.selection_count); // focus NULL + the selection
-    try testing.expect(!dev1_events.last_selection_null);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
 
-    // A second device bound while the client is focused immediately
-    // receives the current selection (wlroots seat_client_send_selection
-    // on bind, wlr_seat.c; KWin seat.cpp:159-177).
-    const device2 = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
-    var dev2_events: DeviceEvents = .{};
-    device2.setListener(*DeviceEvents, DeviceEvents.listener, &dev2_events);
+    // B takes the focus: A's offer is superseded with the focus and B
+    // has no data device yet, so nothing is delivered.
+    ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client_b.?));
     try ts.pump();
-    try testing.expectEqual(@as(usize, 1), dev2_events.selection_count);
-    try testing.expect(!dev2_events.last_selection_null);
-    // One live offer per device of the focused client.
-    try testing.expectEqual(@as(usize, 2), ts.mgr.?.offers.items.len);
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.offers.items.len);
+
+    // B binds its device while focused: the current selection arrives
+    // with no focus change after it.
+    const device_b = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    var dev_b_events: DeviceEvents = .{};
+    device_b.setListener(*DeviceEvents, DeviceEvents.listener, &dev_b_events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), dev_b_events.selection_count);
+    try testing.expect(!dev_b_events.last_selection_null);
+    // One live offer per focused client.
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
 }
 
 /// Device events for the focus-move test: counts selections and captures
@@ -1994,6 +2225,7 @@ const FocusEvents = struct {
     mime_count: usize = 0,
     has_text_plain: bool = false,
     /// DnD routing counters (F-SEL-1 drag over a target surface).
+    data_offer_count: usize = 0,
     enter_count: usize = 0,
     motion_count: usize = 0,
     leave_count: usize = 0,
@@ -2013,6 +2245,7 @@ const FocusEvents = struct {
                 data.last_selection_null = e.id == null;
             },
             .data_offer => |e| {
+                data.data_offer_count += 1;
                 // The server inerts (frees the id of) the old drag offer
                 // on leave; libwayland reuses freed ids, so a later drag
                 // offer can arrive on a proxy that already has a
@@ -2529,13 +2762,12 @@ test "action negotiation matrix matches wlroots data_offer_choose_action" {
 }
 
 test "drag offer action negotiation stores state and emits action to both sides" {
-    // DD-2: white-box drag simulation — with DnD deferred (DD-1) no
-    // drag offer can be created through the protocol; the test flips
-    // the delivered selection offer to a drag offer (as the future drag
-    // state machine would create it) and drives the negotiation over
-    // the wire. The negotiated action goes to both the destination
-    // (wl_data_offer.action) and the source (wl_data_source.action),
-    // version-guarded (v3 offers here).
+    // DD-2: white-box negotiation over a drag offer. The protocol path
+    // creates drag offers too (dragSetFocus); this test uses the shorter
+    // selection-offer route and flips its type so the negotiation can be
+    // driven without a second client. The negotiated action goes to both
+    // the destination (wl_data_offer.action) and the source
+    // (wl_data_source.action), version-guarded (v3 offers here).
     const allocator = testing.allocator;
     var ts = try TestServer.init(allocator);
     defer ts.deinit();
@@ -2656,7 +2888,7 @@ test "v1 manager creates v1 children" {
     try testing.expectEqual(@as(usize, 1), ts.mgr.?.sources.items.len);
     try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
     try testing.expectEqual(@as(u32, 1), ts.mgr.?.sources.items[0].resource.getVersion());
-    try testing.expectEqual(@as(u32, 1), ts.mgr.?.devices.items[0].resource.getVersion());
+    try testing.expectEqual(@as(u32, 1), ts.mgr.?.devices.items[0].eventResource().?.getVersion());
 }
 
 test "v3 manager creates v3 children" {
@@ -2672,7 +2904,7 @@ test "v3 manager creates v3 children" {
     try testing.expectEqual(@as(usize, 1), ts.mgr.?.sources.items.len);
     try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
     try testing.expectEqual(@as(u32, 3), ts.mgr.?.sources.items[0].resource.getVersion());
-    try testing.expectEqual(@as(u32, 3), ts.mgr.?.devices.items[0].resource.getVersion());
+    try testing.expectEqual(@as(u32, 3), ts.mgr.?.devices.items[0].eventResource().?.getVersion());
 }
 
 test "selection offer carries source_actions after the mime events, before selection" {
@@ -2900,4 +3132,400 @@ test "get_data_device with an inert seat yields a dead device" {
     device.release();
     try ts.pump();
     try testing.expectEqual(@as(usize, 0), ts.mgr.?.devices.items.len);
+}
+
+test "a keyboard focus change during a drag keeps the drag offer alive" {
+    // P0-1: Seat.pointerButton moves keyboard focus BEFORE it hands the
+    // button to the pointer grab (seat.zig:974-992 then :1014-1016), so a
+    // second button press mid-drag emits keyboard_focus and re-delivers
+    // the selection. Only SELECTION offers may be superseded by that: a
+    // drag offer belongs to the in-flight drag (wlroots keeps
+    // seat->selection_offers and seat->drag_offers apart,
+    // wlr_data_offer.c:264-271). Before the fix the sweep freed the live
+    // drag offer and the next Drag.end destroyed it a second time.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device_a = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const device_b = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var events_b: FocusEvents = .{};
+    device_b.setListener(*FocusEvents, FocusEvents.listener, &events_b);
+    try ts.pump();
+
+    // Press over A's surface (origin): mints grab_serial.
+    const origin = surfaceForClient(ts, ts.client.?);
+    const target = surfaceForClient(ts, ts.client_b.?);
+    ts.pick_state.surface = origin;
+    ts.seat.?.setPick(ts.pick_fn, &ts.pick_state);
+    ts.seat.?.pointerMotion(10, 10);
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    try ts.pump();
+    device_a.startDrag(src, ts.surface.?, null, ts.seat.?.last_serial);
+    try ts.pump();
+    try testing.expect(ts.mgr.?.drag != null);
+
+    // Move over B: the drag offer is delivered and tracked.
+    ts.pick_state.surface = target;
+    ts.seat.?.pointerMotion(50, 60);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_b.enter_count);
+    const drag_offer = ts.mgr.?.drag.?.offer.?;
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+
+    // Press a second button over the target: click-to-focus moves the
+    // keyboard focus, the focus listener re-delivers the (empty)
+    // selection, and the drag offer must come out the other side alive.
+    ts.seat.?.pointerButton(seat_mod.btn_right, true);
+    try ts.pump();
+    try testing.expectEqual(surfaceForClient(ts, ts.client_b.?), ts.seat.?.keyboard_focus.?);
+    try testing.expect(ts.mgr.?.drag != null);
+    try testing.expectEqual(drag_offer, ts.mgr.?.drag.?.offer.?);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+    try testing.expect(drag_offer.source != null);
+
+    // The drag ends afterwards: the offer is destroyed exactly once (the
+    // test allocator reports a double free).
+    ts.seat.?.pointerButton(seat_mod.btn_right, false);
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try testing.expectEqual(@as(?*Drag, null), ts.mgr.?.drag);
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.offers.items.len);
+}
+
+test "a dropped drag offer whose source client exits refuses receive" {
+    // P0-2: Drag.end keeps the dropped offer for the transfer and clears
+    // mgr.drag, so when the source client's wl_data_source dies there is
+    // no drag left to destroy that offer — sourceDestroy's sweep is the
+    // only thing that keeps the target from reading freed source memory
+    // (wlroots data_offer_handle_source_destroy, wlr_data_offer.c:230-237,
+    // :273-274). Before the fix the surviving offer dangled.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device_a = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const device_b = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var src_events: SourceEvents = .{};
+    src.setListener(*SourceEvents, SourceEvents.listener, &src_events);
+    var events_b: FocusEvents = .{};
+    device_b.setListener(*FocusEvents, FocusEvents.listener, &events_b);
+    try ts.pump();
+
+    const origin = surfaceForClient(ts, ts.client.?);
+    const target = surfaceForClient(ts, ts.client_b.?);
+    ts.pick_state.surface = origin;
+    ts.seat.?.setPick(ts.pick_fn, &ts.pick_state);
+    ts.seat.?.pointerMotion(10, 10);
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    try ts.pump();
+    const serial = ts.seat.?.last_serial;
+    src.setActions(@bitCast(@as(u32, 1)));
+    device_a.startDrag(src, ts.surface.?, null, serial);
+    try ts.pump();
+
+    ts.pick_state.surface = target;
+    ts.seat.?.pointerMotion(50, 60);
+    try ts.pump();
+    const offer = events_b.last_offer_id.?;
+    offer.setActions(@bitCast(@as(u32, 1)), @bitCast(@as(u32, 1)));
+    offer.accept(0, "text/plain");
+    try ts.pump();
+
+    // Release over the accepted target: the drop runs, and the offer is
+    // KEPT for the transfer while the drag itself is gone.
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_b.drop_count);
+    try testing.expectEqual(@as(?*Drag, null), ts.mgr.?.drag);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+    const srv_offer = ts.mgr.?.offers.items[0];
+    try testing.expectEqual(OfferType.drag, srv_offer.offer_type);
+    try testing.expect(srv_offer.source != null);
+
+    // The source client exits: its wl_data_source dies with it.
+    ts.c_display.?.disconnect();
+    ts.client.?.destroy();
+    ts.client = null;
+    ts.c_display = null;
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.sources.items.len);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+    try testing.expectEqual(@as(?*DataSource, null), srv_offer.source);
+
+    // The dead offer refuses the transfer rather than reading freed
+    // source memory: wl_data_offer.error.invalid_offer ("offer doesn't
+    // accept this request", wayland.xml:588-589) kills the target, and
+    // nothing was relayed to the source.
+    var fds: [2]posix.socket_t = undefined;
+    const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+    offer.receive("text/plain", fds[0]);
+    try testing.expectError(error.ClientDispatchFailed, ts.pump());
+    _ = std.os.linux.close(fds[0]);
+    _ = std.os.linux.close(fds[1]);
+    try testing.expectEqual(@as(usize, 0), src_events.send_count);
+}
+
+test "a second get_data_device binds to the client's existing device" {
+    // P2-10: one device per client. The protocol has no object aliasing,
+    // so the duplicate object id exists, but it is the SAME device: one
+    // manager entry, events on the first object, and both objects running
+    // the same request logic (managerRequest, DataDevice.objects).
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device_b1 = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    const device_b2 = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    var dev1_events: DeviceEvents = .{};
+    device_b1.setListener(*DeviceEvents, DeviceEvents.listener, &dev1_events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
+    try testing.expectEqual(device_b1.getId(), ts.mgr.?.devices.items[0].eventResource().?.getId());
+    try testing.expectEqual(@as(usize, 2), ts.mgr.?.devices.items[0].objects.items.len);
+
+    // The duplicate object is the same device: a set_selection through it
+    // is the seat's selection, delivered ONCE, on the first object. The
+    // source has to be B's own — a Wayland object id names an object on
+    // the connection that created it, so libwayland refuses to marshal
+    // another client's object into this request.
+    const src = try ts.wl_data_device_manager_b.?.createDataSource();
+    src.offer("text/plain");
+    try ts.pump();
+    ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client_b.?));
+    try ts.pump();
+    device_b2.setSelection(src, ts.seat.?.last_serial);
+    try ts.pump();
+    try testing.expectEqual(src.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    try testing.expectEqual(@as(usize, 2), dev1_events.selection_count); // focus NULL + the selection
+
+    // Releasing the duplicate takes down one wire object only: the device,
+    // its event resource and the stored selection all survive.
+    device_b2.release();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items[0].objects.items.len);
+    try testing.expectEqual(device_b1.getId(), ts.mgr.?.devices.items[0].eventResource().?.getId());
+    try testing.expectEqual(src.getId(), ts.mgr.?.selection_source.?.resource.getId());
+
+    // The remaining object still drives the seat: a new selection goes
+    // out on it, on the same device the released duplicate belonged to.
+    const src2 = try ts.wl_data_device_manager_b.?.createDataSource();
+    src2.offer("text/plain");
+    try ts.pump();
+    device_b1.setSelection(src2, ts.seat.?.last_serial);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 3), dev1_events.selection_count);
+    try testing.expectEqual(src2.getId(), ts.mgr.?.selection_source.?.resource.getId());
+
+    // Releasing the last object takes the device out and frees it.
+    device_b1.release();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.devices.items.len);
+}
+
+test "a released first device object hands the device to its duplicate" {
+    // wl_data_device has no destroy request: an object dies when the
+    // client releases it (wlroots data_device_release ->
+    // wl_resource_destroy, wlr_data_device.c:89-92), on a protocol error,
+    // or with the client. When the object the events go out on dies first
+    // the duplicate takes over, exactly as wlroots only unlinks the dead
+    // object's link and leaves the rest of seat_client->data_devices
+    // live (data_device_handle_resource_destroy, wlr_data_device.c:
+    // 100-103) — a client that still holds an object must keep receiving
+    // the selection rather than lose it to a freed resource.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device_b1 = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    const device_b2 = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    var dev1_events: DeviceEvents = .{};
+    var dev2_events: DeviceEvents = .{};
+    device_b1.setListener(*DeviceEvents, DeviceEvents.listener, &dev1_events);
+    device_b2.setListener(*DeviceEvents, DeviceEvents.listener, &dev2_events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
+
+    // Focus lands on B while the first object is still the event object.
+    ts.seat.?.setKeyboardFocus(surfaceForClient(ts, ts.client_b.?));
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), dev1_events.selection_count);
+    try testing.expectEqual(@as(usize, 0), dev2_events.selection_count);
+
+    // The first object goes away with the duplicate still bound: the
+    // device lives on and now speaks through the duplicate.
+    device_b1.release();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items[0].objects.items.len);
+    try testing.expectEqual(device_b2.getId(), ts.mgr.?.devices.items[0].eventResource().?.getId());
+
+    // A selection set through the promoted object is delivered on it.
+    const src = try ts.wl_data_device_manager_b.?.createDataSource();
+    src.offer("text/plain");
+    try ts.pump();
+    device_b2.setSelection(src, ts.seat.?.last_serial);
+    try ts.pump();
+    try testing.expectEqual(src.getId(), ts.mgr.?.selection_source.?.resource.getId());
+    try testing.expectEqual(@as(usize, 1), dev2_events.selection_count);
+    try testing.expect(!dev2_events.last_selection_null);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+    // The dead object never receives anything again.
+    try testing.expectEqual(@as(usize, 1), dev1_events.selection_count);
+
+    // The last object goes: the device is unlinked and freed.
+    device_b2.release();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.devices.items.len);
+}
+
+test "a client with two data devices receives one offer for one drag" {
+    // P2-10: with a single tracked Drag.offer, a second device used to
+    // orphan the first offer in mgr.offers and double every drag event.
+    // One device per client makes the delivery exactly-once.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device_a = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const device_b1 = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    const device_b2 = try ts.wl_data_device_manager_b.?.getDataDevice(ts.wl_seat_b.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    var events_b: FocusEvents = .{};
+    device_b1.setListener(*FocusEvents, FocusEvents.listener, &events_b);
+    try ts.pump();
+    // A's device plus B's one device.
+    try testing.expectEqual(@as(usize, 2), ts.mgr.?.devices.items.len);
+
+    const origin = surfaceForClient(ts, ts.client.?);
+    const target = surfaceForClient(ts, ts.client_b.?);
+    ts.pick_state.surface = origin;
+    ts.seat.?.setPick(ts.pick_fn, &ts.pick_state);
+    ts.seat.?.pointerMotion(10, 10);
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    try ts.pump();
+    const serial = ts.seat.?.last_serial;
+    src.setActions(@bitCast(@as(u32, 1)));
+    device_a.startDrag(src, ts.surface.?, null, serial);
+    try ts.pump();
+
+    // One drag, one target: exactly one data_offer + enter, even though
+    // the target bound two device objects.
+    ts.pick_state.surface = target;
+    ts.seat.?.pointerMotion(50, 60);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_b.data_offer_count);
+    try testing.expectEqual(@as(usize, 1), events_b.enter_count);
+    try testing.expectEqual(@as(usize, 1), events_b.mime_count);
+
+    // ... and exactly one drop, with one offer left for the transfer.
+    const offer = events_b.last_offer_id.?;
+    offer.setActions(@bitCast(@as(u32, 1)), @bitCast(@as(u32, 1)));
+    offer.accept(0, "text/plain");
+    try ts.pump();
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events_b.drop_count);
+    try testing.expectEqual(@as(usize, 1), events_b.leave_count);
+    try testing.expectEqual(@as(?*Drag, null), ts.mgr.?.drag);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+
+    // The duplicate object really was a second get_data_device call on
+    // B's manager: releasing it takes down that wire object only, the
+    // device and the transferred offer stay.
+    device_b2.release();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 2), ts.mgr.?.devices.items.len);
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+}
+
+test "a failed offer allocation leaks neither the wl_data_offer nor its struct" {
+    // P2-11: both out-of-memory paths in createOffer must tear down what
+    // they already built. The test allocator turns a leak into a failure
+    // at TestServer.deinit.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    _ = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    _ = try ts.wl_data_device_manager.?.createDataSource();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.devices.items.len);
+    const srv_device = ts.mgr.?.devices.items[0];
+    const srv_source = ts.mgr.?.sources.items[0];
+    const srv_resource = srv_device.eventResource().?;
+
+    // The DataOffer allocation fails: the wl_data_offer resource dies and
+    // nothing is linked.
+    var fail_create: std.testing.FailingAllocator = .init(allocator, .{ .fail_index = 0 });
+    try testing.expect(
+        createOffer(ts.mgr.?, fail_create.allocator(), srv_resource, srv_source, .drag) == null,
+    );
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.offers.items.len);
+
+    // The mgr.offers append fails: offerDestroy frees the struct through
+    // the resource it is installed on.
+    var fail_append: std.testing.FailingAllocator = .init(allocator, .{ .fail_index = 1 });
+    try testing.expect(
+        createOffer(ts.mgr.?, fail_append.allocator(), srv_resource, srv_source, .drag) == null,
+    );
+    try testing.expectEqual(@as(usize, 0), ts.mgr.?.offers.items.len);
+
+    // The manager's own allocator still produces a working offer, and the
+    // test allocator reports nothing leaked at deinit.
+    const offer = createOffer(ts.mgr.?, ts.mgr.?.allocator, srv_resource, srv_source, .selection).?;
+    try testing.expectEqual(@as(usize, 1), ts.mgr.?.offers.items.len);
+    try testing.expectEqual(srv_resource.getClient(), offer.resource.getClient());
+}
+
+test "the drag icon surface takes the drag-icon role and is readable while the drag lives" {
+    // The icon is not decoration: wlroots claims it with
+    // drag_icon_surface_role (wlr_data_device.c:65-72, wlr_drag.c:411-415)
+    // and the scene sync draws it, so currentDragIcon must hand out the
+    // live surface for exactly the drag's lifetime.
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const device = try ts.wl_data_device_manager.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.wl_data_device_manager.?.createDataSource();
+    src.offer("text/plain");
+    const icon = try ts.wl_compositor.?.createSurface();
+    try ts.pump();
+
+    // No drag yet: no icon.
+    try testing.expectEqual(@as(?*surface_mod.Surface, null), ts.mgr.?.currentDragIcon());
+
+    const origin = surfaceForClient(ts, ts.client.?);
+    ts.pick_state.surface = origin;
+    ts.seat.?.setPick(ts.pick_fn, &ts.pick_state);
+    ts.seat.?.pointerMotion(10, 10);
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    try ts.pump();
+    device.startDrag(src, ts.surface.?, icon, ts.seat.?.last_serial);
+    try ts.pump();
+    try testing.expect(ts.mgr.?.drag != null);
+
+    // The icon surface is A's second surface (surfaceForClient returns
+    // the first) and it carries the drag-icon role.
+    var icon_surface: ?*surface_mod.Surface = null;
+    for (ts.compositor.?.surfaces.items) |s| {
+        if (s == origin) continue;
+        icon_surface = s;
+    }
+    try testing.expectEqual(icon_surface, ts.mgr.?.currentDragIcon());
+    try testing.expect(ts.mgr.?.currentDragIcon().?.role.? == &drag_icon_role);
+
+    // The drag ends: the icon goes with it.
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try testing.expectEqual(@as(?*Drag, null), ts.mgr.?.drag);
+    try testing.expectEqual(@as(?*surface_mod.Surface, null), ts.mgr.?.currentDragIcon());
 }

@@ -21,8 +21,12 @@
 //! through the same API.
 //!
 //! Click-to-focus: a pointer button press moves keyboard focus to the
-//! pointer focus surface. The seat also emits `key` signals so the
-//! compositor can bind keys (the server quits on Mod4+Escape).
+//! pointer focus surface — unless a grab suppresses click-to-focus
+//! (PointerGrab.suppress_click_focus: the interactive move and the
+//! camera pan own the gesture, and the client under the pointer sees
+//! neither the press nor the focus change). The seat also emits `key`
+//! signals so the compositor can bind keys (the server quits on
+//! Mod4+Escape).
 //!
 //! Event delivery follows wlroots: keyboard and pointer events (enter,
 //! leave, key, modifiers, motion, button, axis) reach only the focused
@@ -200,8 +204,13 @@ fn swallowGrabCancel(seat: *Seat, grab: *const PointerGrab) void {
     _ = grab;
 }
 /// Shared swallow grab (see handlers above). Installed by main.zig for
-/// the camera drag and the interactive move; reused by seat tests.
+/// the camera drag and the interactive move; reused by seat tests. The
+/// gesture owns the pointer: the client sees no pointer events AND no
+/// focus change (suppress_click_focus), because the synthetic releases
+/// startPointerGrab sends belong to the client that held the button
+/// when the grab was installed.
 pub const swallow_pointer_grab: PointerGrab = .{
+    .suppress_click_focus = true,
     .motion = swallowGrabMotion,
     .button = swallowGrabButton,
     .axis = swallowGrabAxis,
@@ -217,6 +226,16 @@ pub const swallow_pointer_grab: PointerGrab = .{
 /// (pointer_move, button, axis) still fire, so compositor listeners
 /// (main.zig's camera pan) keep working during the grab.
 pub const PointerGrab = struct {
+    /// The grab owns the whole gesture: the client under the pointer
+    /// sees nothing (main.zig:322-325 — "the client sees no pointer
+    /// events during the move"), so a press during the grab must not
+    /// move keyboard focus either. Set only by swallow_pointer_grab. A
+    /// grab that leaves it false keeps the compositor's click-to-focus
+    /// policy — drag-and-drop (wlroots wlr_drag_handle_pointer_button,
+    /// wlr_drag.c:113-125 routes the buttons to the source client and
+    /// never touches focus) and xdg popup grabs both keep the focus
+    /// policy of the compositor that installed them.
+    suppress_click_focus: bool = false,
     /// Grab-specific state (owned by the installer; freed in cancel).
     data: ?*anyopaque = null,
     /// Route a pointer motion (output coords). The default forwards to
@@ -331,12 +350,27 @@ pub const Seat = struct {
     /// the notification, these fields carry the payload).
     last_button: u32 = 0,
     last_button_pressed: bool = false,
-    /// Pointer buttons the focused client believes are held (delivered
-    /// pressed without a delivered release). setPointerGrab(true)
+    /// Pointer buttons the focused client believes is held (delivered
+    /// pressed without a delivered release). startPointerGrab
     /// synthesizes releases for these (wlroots reset_buttons on grab
     /// focus change, wlr_seat_pointer.c:435-437) so a client gesture
     /// cannot extend into the compositor's grab (S2).
+    // SAFETY: only held_buttons[0..held_button_count] is read; the count
+    // gates every access and startPointerGrab zeroes it.
     held_buttons: [16]u32 = undefined,
+    /// The client each held_buttons entry was delivered to, index
+    /// parallel to held_buttons. startPointerGrab releases to THESE
+    /// clients, not to whoever holds pointer focus when the grab is
+    /// installed: the pointer can cross onto another surface while a
+    /// button is down (main.zig arms the camera pan from a MOTION
+    /// handler, main.zig:2419-2436), and releasing to the new focus
+    /// client would strand the press on the first client and invent a
+    /// release on the second.
+    // SAFETY: only held_clients[0..held_button_count] is read; the entry
+    // at an index is written together with the held_buttons entry there.
+    // The pointer is compared, never dereferenced, so a client that dies
+    // while its button is held cannot turn into a use-after-free.
+    held_clients: [16]*wire.Client = undefined,
     held_button_count: usize = 0,
     /// Physical pointer buttons currently held down: incremented on
     /// every press, decremented on every release (never below 0).
@@ -764,23 +798,28 @@ pub const Seat = struct {
         if (self.pointer_grab) |old| old.cancel(self, old);
         self.pointer_grab = grab;
         if (self.held_button_count == 0) return;
-        if (self.pointer_focus) |focus| {
-            const focus_client = focus.resource.getClient();
-            const time = nowMs(self);
+        // The synthetic release goes to the client that RECEIVED the
+        // press (held_clients), not to whoever holds pointer focus
+        // now: those are two different clients whenever the pointer
+        // crossed onto another surface while the button was down, and a
+        // release sent to the wrong client both strands the press on the
+        // first one and invents a release on the second.
+        const time = nowMs(self);
+        const held = self.held_buttons[0..self.held_button_count];
+        const held_clients = self.held_clients[0..self.held_button_count];
+        for (held, held_clients) |button, held_client| {
+            const serial = serialFor(self, held_client);
             var delivered = false;
-            for (self.held_buttons[0..self.held_button_count]) |button| {
-                const serial = serialFor(self, focus_client);
-                for (self.pointers.items) |ptr| {
-                    if (ptr.getClient() != focus_client) continue;
-                    ptr.sendButton(serial, time, button, .released);
-                    delivered = true;
-                }
+            for (self.pointers.items) |ptr| {
+                if (ptr.getClient() != held_client) continue;
+                ptr.sendButton(serial, time, button, .released);
+                delivered = true;
             }
-            if (delivered) self.markFramePending(focus_client);
+            if (delivered) self.markFramePending(held_client);
         }
-        // The buttons are logically released whether or not a focus
-        // client got the release; a later physical release is then a
-        // no-op for the set (the pointerButton gate swallows it anyway).
+        // The buttons are logically released whether or not a client
+        // got the release; a later physical release is then a no-op for
+        // the set (the pointerButton gate swallows it anyway).
         self.held_button_count = 0;
     }
 
@@ -908,7 +947,10 @@ pub const Seat = struct {
     }
 
     /// Pointer button press/release (linux input button code). A press
-    /// moves keyboard focus to the surface under the pointer.
+    /// moves keyboard focus to the surface under the pointer, unless
+    /// the installed grab suppresses click-to-focus (the swallow grab:
+    /// the compositor's own gesture, during which the client under the
+    /// pointer sees nothing at all).
     pub fn pointerButton(self: *Seat, button: u32, pressed: bool) void {
         // Record the event for compositor listeners (mirrors keyEvent's
         // last_keysym): the camera drag hook reads these from the button
@@ -927,7 +969,16 @@ pub const Seat = struct {
         } else if (self.pressed_count > 0) {
             self.pressed_count -= 1;
         }
-        if (pressed) {
+        // Click-to-focus is the compositor's policy, but a gesture grab
+        // owns the press: the compositor promised the client it sees no
+        // pointer events at all (main.zig:322-325), so the press must
+        // not move the focus either — and the synthetic releases
+        // startPointerGrab sends belong to the client that held focus
+        // when the grab was installed. Only a grab that suppresses
+        // click-to-focus turns this off (swallow_pointer_grab);
+        // drag-and-drop and xdg popup grabs keep the policy.
+        const suppress_focus = if (self.pointer_grab) |g| g.suppress_click_focus else false;
+        if (pressed and !suppress_focus) {
             // Keyboard focus follows the click. Hit-test the pointer
             // position fresh: the cached pointer focus may be stale at
             // the pointer's initial position (no motion yet), and a
@@ -982,6 +1033,7 @@ pub const Seat = struct {
                     std.mem.indexOfScalar(u32, self.held_buttons[0..self.held_button_count], button) == null)
                 {
                     self.held_buttons[self.held_button_count] = button;
+                    self.held_clients[self.held_button_count] = focus_client;
                     self.held_button_count += 1;
                 }
             } else {
@@ -993,6 +1045,7 @@ pub const Seat = struct {
                     ) orelse 0;
                     if (idx < self.held_button_count and self.held_buttons[idx] == button) {
                         self.held_buttons[idx] = self.held_buttons[self.held_button_count - 1];
+                        self.held_clients[idx] = self.held_clients[self.held_button_count - 1];
                         self.held_button_count -= 1;
                     }
                 }
@@ -1874,6 +1927,8 @@ const KeyboardEvents = struct {
     enter_surface_id: u32 = 0,
     /// The enter event's pressed-keys array (wire format = evdev
     /// scancodes; F1) — first 8 entries.
+    // SAFETY: only enter_keys[0..enter_key_count] is read, and the
+    // listener writes exactly that many entries into it.
     enter_keys: [8]u32 = undefined,
     enter_key_count: usize = 0,
     modifiers: usize = 0,
@@ -1979,6 +2034,8 @@ const SeatEvents = struct {
     capabilities: usize = 0,
     last_capability: server.wl.Seat.Capability = .{},
     names: usize = 0,
+    // SAFETY: only last_name[0..last_name_len] is read, and the listener
+    // copies exactly last_name_len bytes into it first.
     last_name: [64]u8 = undefined,
     last_name_len: usize = 0,
 
@@ -2737,6 +2794,167 @@ test "pointer grab lifecycle: start routes, end cancels and restores delivery (F
     seat.pointerMotion(40, 40);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 2), a.ptr_events.motion);
+}
+
+test "a swallow grab suppresses click-to-focus: the press leaves the focus alone (P1-7)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server);
+    const surface_b = surfaceForClient(ts, b.server);
+
+    // A plain click focuses what is under the pointer.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+
+    // The compositor's gesture takes the pointer (camera pan /
+    // interactive move): the grab start releases the button the client
+    // is holding, then the physical release.
+    seat.startPointerGrab(&swallow_pointer_grab);
+    try ts.pump();
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+
+    // The pointer now travels over B — under a grab the seat does not
+    // hit-test, so the pointer focus stays where it was — and a press
+    // during the gesture must NOT move the keyboard focus: the client
+    // was told it sees no pointer events (main.zig:322-325), and the
+    // synthetic releases belong to the client that held focus when the
+    // grab was installed.
+    ts.pick_state.surface = surface_b;
+    seat.pointerMotion(50, 50);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == surface_a);
+    const b_buttons = b.ptr_events.button;
+    seat.pointerButton(btn_right, true);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+    try std.testing.expectEqual(b_buttons, b.ptr_events.button);
+
+    // Ending the grab restores the policy: the next click focuses B.
+    seat.endPointerGrab();
+    ts.pick_state.surface = surface_b;
+    seat.pointerButton(btn_right, false);
+    seat.pointerMotion(50, 50);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_b);
+}
+
+test "a drag-and-drop grab keeps click-to-focus (P1-7)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, ts.a.server);
+    const surface_b = surfaceForClient(ts, ts.b.server);
+
+    // Focus A, then install a grab shaped like the drag-and-drop grab
+    // data_device.zig installs (its own data plus dragGrab* handlers)
+    // — which, like wlroots' wlr_drag_handle_pointer_button
+    // (wlr_drag.c:113-125), routes the buttons to the SOURCE client and
+    // leaves the focus policy to the shell: a click still focuses.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+
+    var gst: CancelGrabState = .{};
+    const dnd_grab: PointerGrab = .{
+        .data = &gst,
+        .motion = cancelGrabMotion,
+        .button = cancelGrabButton,
+        .axis = cancelGrabAxis,
+        .cancel = cancelGrabCancel,
+        // suppress_click_focus is left at its default false, exactly as
+        // the drag grab in data_device.zig leaves it.
+    };
+    seat.startPointerGrab(&dnd_grab);
+    try ts.pump();
+
+    // The drag carries the pointer over B. The grab routes the buttons
+    // to the source client, but the seat still hit-tests the press, so
+    // the click focuses B.
+    ts.pick_state.surface = surface_b;
+    seat.pointerMotion(50, 50);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_b);
+
+    seat.endPointerGrab();
+}
+
+test "grab start releases the held buttons to the client that got the press (P1-7)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server);
+    const surface_b = surfaceForClient(ts, b.server);
+
+    // A takes the press and believes BTN_LEFT is down.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.button);
+    // A holds the keyboard focus (the click-to-focus) and the button.
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+
+    // The pointer crosses onto B before the compositor installs the
+    // gesture grab: main.zig arms the camera pan from a MOTION handler
+    // (main.zig:2419-2436), and the interactive move is installed from
+    // the client's move request, a roundtrip after the press.
+    ts.pick_state.surface = surface_b;
+    seat.pointerMotion(50, 50);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == surface_b);
+
+    const a_buttons = a.ptr_events.button;
+    const b_buttons = b.ptr_events.button;
+    seat.startPointerGrab(&swallow_pointer_grab);
+    try ts.pump();
+    // A — the client that received the press and holds the focus the
+    // gesture took over — gets the synthetic release; B, which never
+    // saw a press, gets nothing.
+    try std.testing.expectEqual(a_buttons + 1, a.ptr_events.button);
+    try std.testing.expectEqual(b_buttons, b.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 0), seat.held_button_count);
+    // The physical release ends the gesture and reaches neither client.
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(a_buttons + 1, a.ptr_events.button);
+    try std.testing.expectEqual(b_buttons, b.ptr_events.button);
+    try std.testing.expectEqual(@as(u32, 0), seat.pressed_count);
 }
 
 /// Cancel-capturing keyboard grab for the F2 keyboard-grab test.

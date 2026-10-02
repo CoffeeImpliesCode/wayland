@@ -210,31 +210,19 @@ pub const SurfaceNode = struct {
     /// tracking the surface for a future remap. Idempotent.
     pub fn detach(sn: *SurfaceNode) void {
         const scene = sn.scene;
-        // Detach this surface's subsurface trees first: node.destroy
-        // cascades into the whole subtree, which would free the
-        // children's nodes out from under their bindings. Reparent them
-        // to the root, disabled; they re-enter the parent's tree when
-        // the parent maps again. (On append OOM the cascade still frees
-        // them — a catastrophic-memory path.)
-        if (scene.subcompositor) |sub| {
-            for (sub.subsurfaces.items) |ss| {
-                if (ss.parent != sn.surface) continue;
-                const child_sn = scene.surface_nodes.get(ss.surface) orelse continue;
-                const child_tree = child_sn.tree orelse continue;
-                if (child_tree.parent != scene.root) {
-                    scene.root.appendChild(scene.allocator, child_tree) catch |err| {
-                        log.warn(
-                            "subsurface detach failed: {s}",
-                            scene.io,
-                            scene.log_cfg,
-                            "surface_node",
-                            .{@errorName(err)},
-                        );
-                    };
-                    child_tree.enable(false);
-                }
-            }
-        }
+        // Node destruction CASCADES into the whole subtree
+        // (SceneNode.destroy, scene.zig:239-258; wlr_scene_node_destroy,
+        // types/scene/scene.c:829-843). A tree is not private to one
+        // SurfaceNode: the compositor nests other surfaces' trees under
+        // it as scene policy — a subsurface under its parent
+        // (ensureTree), an xdg/layer popup under its parent's tree (the
+        // placement pass). Freeing this tree therefore frees those
+        // surfaces' nodes while their own bindings still hold the raw
+        // pointers, and the next detach on one of them reads freed
+        // memory. So lift the foreign trees out first and free only the
+        // two nodes this binding owns. On OOM the cascade still frees a
+        // tree that could not be lifted — a catastrophic-memory path.
+        sn.liftForeignTrees();
         // The surface left the output(s): drive the surface's leave
         // tracking (setLeft emits events.leave on the change; idempotent
         // when the surface was never entered).
@@ -247,6 +235,39 @@ pub const SurfaceNode = struct {
         if (sn.tree) |tree| {
             tree.destroy(scene.allocator);
             sn.tree = null;
+        }
+    }
+
+    /// Move every tree under `sn.tree` that belongs to ANOTHER surface's
+    /// SurfaceNode binding to the scene root, so freeing `sn.tree` cannot
+    /// free it (see detach). A subsurface tree goes there disabled — its
+    /// parent chain is unmapped, so it must not draw (wayland.xml:3254-
+    /// 3258); the next syncSubsurfaceNodes pass re-parents and enables it.
+    /// The compositor's own placement pass does the same for a popup tree
+    /// it lifts (syncPopupNodes).
+    fn liftForeignTrees(sn: *SurfaceNode) void {
+        const scene = sn.scene;
+        const own_tree = sn.tree orelse return;
+        var i: usize = own_tree.children.items.len;
+        while (i > 0) {
+            i -= 1;
+            const child = own_tree.children.items[i];
+            const child_sn = surfaceNodeOwner(scene, child) orelse continue;
+            if (child_sn == sn) continue; // this binding's own buffer node
+            const was_subsurface = child_sn.subsurfaceParent() != null;
+            scene.root.appendChild(scene.allocator, child) catch |err| {
+                // OOM: the cascade below still frees it — a
+                // catastrophic-memory path, not a recoverable one.
+                log.warn(
+                    "nested surface tree lift failed: {s}",
+                    scene.io,
+                    scene.log_cfg,
+                    "surface_node",
+                    .{@errorName(err)},
+                );
+                continue;
+            };
+            if (was_subsurface) child.enable(false);
         }
     }
 
@@ -454,6 +475,19 @@ pub fn surfaceForNode(scene: *Scene, node: *SceneNode) ?*Surface {
     var it = scene.surface_nodes.valueIterator();
     while (it.next()) |sn| {
         if (sn.*.node == node) return sn.*.surface;
+    }
+    return null;
+}
+
+/// The tracked-surface binding that OWNS `node` — its `node` (the surface's
+/// buffer node) or its `tree` (the surface's container). Lets a tree's
+/// teardown find the nodes nested under it that belong to OTHER surfaces,
+/// so it frees only what it owns; null when the node belongs to no tracked
+/// surface (decoration, or an untracked tree).
+fn surfaceNodeOwner(scene: *Scene, node: *SceneNode) ?*SurfaceNode {
+    var it = scene.surface_nodes.valueIterator();
+    while (it.next()) |sn| {
+        if (sn.*.node == node or sn.*.tree == node) return sn.*;
     }
     return null;
 }

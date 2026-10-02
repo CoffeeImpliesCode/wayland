@@ -150,23 +150,19 @@ pub const State = struct {
     /// transformed and divided by it (wlr_surface_state_has_buffer,
     /// wlr_compositor.h:356).
     scale: i32 = 1,
-    /// Buffer position within the surface (wlroots wlr_surface_state.dx/dy,
-    /// wlr_compositor.h:58): wl_surface.offset (v5) or the pre-v5 attach
-    /// dx/dy (F34). Consumers: XWayland positioning, cursor hotspots,
-    /// popup placement. Cleared by a commit that carried no offset
-    /// (wlroots surface_state_move wlr_compositor.c:340-346).
-    dx: i32 = 0,
-    dy: i32 = 0,
-    /// Which fields the client changed since the last commit (wlroots
-    /// wlr_surface_state.committed, wlr_compositor.h:38). swapState
-    /// applies only the committed fields; uncommitted fields keep their
-    /// current value across commits (F33). The pending state persists, so
-    /// this is observably equivalent to a full copy EXCEPT where wlroots
-    /// explicitly clears on an absent bit: the offset (dx/dy reset to 0,
-    /// F34) and opaque/input regions (which pending does not persist —
-    /// the swap nulls them). Damage transfers unconditionally: pending
-    /// damage is always empty after a transfer, so wlroots' conditional
-    /// clear-and-copy (wlr_compositor.c:374-385) is identical.
+    /// Which request handlers have run since the last commit (wlroots
+    /// wlr_surface_state.committed, wlr_compositor.h:38): swapState applies
+    /// exactly the fields whose bit is set and leaves the rest of the
+    /// committed surface alone (F33). This is PENDING-side bookkeeping — a
+    /// record of the requests the client made, not a description of the
+    /// committed surface — and the swap consumes it, so pending restarts
+    /// with an empty mask (wlroots clears it in surface_state_move,
+    /// wlr_compositor.c:397-399). Pending values otherwise persist across
+    /// commits; the opaque/input regions are the exception (pending does
+    /// not persist them — the swap moves the list out and nulls it).
+    /// Damage transfers unconditionally: pending damage is always empty
+    /// after a transfer, so wlroots' conditional clear-and-copy
+    /// (wlr_compositor.c:374-385) is identical.
     committed: Committed = .{},
     /// wp_viewport crop/scale state (wlroots wlr_surface_state.viewport,
     /// wlr_compositor.h:45-50): written by the viewporter module from
@@ -179,7 +175,8 @@ pub const State = struct {
     /// wlr_surface_send_frame_done); they accumulate here until then.
     frame_callbacks: std.ArrayList(*server.wl.Callback) = .empty,
 
-    /// Committed-field mask (see `committed`).
+    /// Which pending-state fields the client changed since the last commit
+    /// (see `committed`); one bit per request handler that writes state.
     pub const Committed = struct {
         /// A wl_surface.attach arrived (null attach included: the
         /// NULL-buffer unmap commit).
@@ -192,8 +189,6 @@ pub const State = struct {
         transform: bool = false,
         /// A wl_surface.set_buffer_scale arrived.
         scale: bool = false,
-        /// A wl_surface.offset (or pre-v5 attach offset) arrived.
-        offset: bool = false,
         /// A wp_viewport.set_source / set_destination arrived.
         viewport: bool = false,
     };
@@ -793,13 +788,13 @@ pub const Surface = struct {
             s.resource.postError(.invalid_offset, "wl_surface.attach with non-zero offset (use wl_surface.offset)");
             return;
         }
-        // The attach carries the buffer position: at v5+ it is the
-        // (mandatorily zero) offset that resets the pending dx/dy; below
-        // v5 it is the real offset (F34, wlroots surface_handle_attach
-        // wlr_compositor.c:68-83 stores dx/dy at every version).
-        s.pending.dx = x;
-        s.pending.dy = y;
-        s.pending.committed.offset = true;
+        // The attach offset (below v5: the buffer position itself, F34 —
+        // wlroots surface_handle_attach, wlr_compositor.c:68-83) is
+        // validated above and then dropped: no consumer reads it. A
+        // surface's position comes from the compositor's scene tree
+        // (scene/surface_node.zig sets the node position; the surface size
+        // is the buffer size under the committed transform and scale), so
+        // storing dx/dy here would be write-only state.
 
         if (buffer) |wl_buffer| {
             const res: *wire.Resource = @ptrCast(wl_buffer);
@@ -957,16 +952,14 @@ pub const Surface = struct {
         s.pending.committed.scale = true;
     }
 
-    fn handleOffset(s: *Surface, x: i32, y: i32) void {
-        // wl_surface.offset (v5): role-specific location of the pending
-        // buffer (wlroots surface_handle_offset wlr_compositor.c:640-647).
-        // Consumers: XWayland positioning, cursor hotspots, popup
-        // placement. The offset is committed with the state and cleared by
-        // a commit that carries none (see swapState / F34).
-        s.pending.dx = x;
-        s.pending.dy = y;
-        s.pending.committed.offset = true;
-    }
+    /// wl_surface.offset (v5): the role-specific location of the buffer
+    /// (wlroots surface_handle_offset, wlr_compositor.c:640-647). The
+    /// request is consumed and discarded — this compositor places a
+    /// surface from its own scene-tree coordinates, so a stored offset
+    /// would have no reader. The handler stays (instead of dropping the
+    /// dispatch arm) so a client that sends offset — most toolkits do on
+    /// every attach — is answered normally.
+    fn handleOffset(_: *Surface, _: i32, _: i32) void {}
 
     fn fireReleaseCallbacksCurrent(s: *Surface) void {
         for (s.release_callbacks_current.items) |cb| cb.destroySendDone(0);
@@ -1077,10 +1070,10 @@ fn onPendingBufferDestroy(listener: *wire.Listener(*wire.Resource), resource: *w
 /// this cycle (pending.committed, F33) are applied; uncommitted fields
 /// keep their current value across commits. Pending values persist, so
 /// this is observably equivalent to a full copy except where wlroots
-/// explicitly clears on an absent bit: the offset (dx/dy reset, F34) and
-/// opaque/input regions (which pending does not persist — the swap nulls
-/// them). The committed mask is consumed by this swap; pending restarts
-/// empty and accumulates a fresh mask from the next requests (wlroots
+/// explicitly clears on an absent bit: the opaque/input regions (pending
+/// does not persist them — the swap moves the list out and nulls it).
+/// The committed mask is consumed by this swap; pending restarts empty and
+/// accumulates a fresh mask from the next requests (wlroots
 /// clears it in surface_state_move, wlr_compositor.c:397-399).
 /// Scalar state copies; the damage lists transfer so the pending state
 /// restarts empty (the old current damage is stale — M2's damage ring
@@ -1111,15 +1104,6 @@ pub fn swapState(current: *State, allocator: Allocator, pending: *State) void {
     if (pending.committed.transform) current.transform = pending.transform;
     if (pending.committed.scale) current.scale = pending.scale;
     if (pending.committed.viewport) current.viewport = pending.viewport;
-    if (pending.committed.offset) {
-        current.dx = pending.dx;
-        current.dy = pending.dy;
-    } else {
-        // A commit that carried no offset clears it (wlroots
-        // surface_state_move, wlr_compositor.c:340-346).
-        current.dx = 0;
-        current.dy = 0;
-    }
     pending.committed = .{};
     // Frame callbacks are NOT transferred here: they accumulate on
     // current in Surface.commit until the next present (a commit must not
@@ -1435,16 +1419,15 @@ test "state swap transfers committed fields, resets pending" {
     }
     pending.transform = .@"90";
     pending.scale = 2;
-    pending.dx = 3;
-    pending.dy = -4;
+    pending.viewport = .{ .has_dst = true, .dst = .{ .w = 40, .h = 30 } };
     // Only the committed fields transfer (F33); the rest keep their
-    // current value (and the offset clears without the offset bit, F34).
+    // current value.
     pending.committed.buffer = true;
     pending.committed.@"opaque" = true;
     pending.committed.input = true;
     pending.committed.transform = true;
     pending.committed.scale = true;
-    pending.committed.offset = true;
+    pending.committed.viewport = true;
 
     swapState(&current, allocator, &pending);
 
@@ -1457,8 +1440,11 @@ test "state swap transfers committed fields, resets pending" {
     try testing.expect(pending.input == null);
     try testing.expectEqual(geom.Transform.@"90", current.transform);
     try testing.expectEqual(@as(i32, 2), current.scale);
-    try testing.expectEqual(@as(i32, 3), current.dx);
-    try testing.expectEqual(@as(i32, -4), current.dy);
+    // The viewport transfers with its bit (F-AX-11) and PENDING keeps the
+    // value for the next commit.
+    try testing.expect(current.viewport.has_dst);
+    try testing.expectEqual(@as(i32, 40), current.viewport.dst.w);
+    try testing.expectEqual(@as(i32, 30), current.viewport.dst.h);
     try testing.expectEqual(@as(usize, 1), current.surface_damage.rects.items.len);
     try testing.expect(pending.surface_damage.isEmpty());
     try testing.expectEqual(@as(usize, 1), current.buffer_damage.rects.items.len);
@@ -1469,7 +1455,7 @@ test "state swap transfers committed fields, resets pending" {
     try testing.expect(!pending.committed.input);
     try testing.expect(!pending.committed.transform);
     try testing.expect(!pending.committed.scale);
-    try testing.expect(!pending.committed.offset);
+    try testing.expect(!pending.committed.viewport);
     // Frame callbacks are NOT moved by swapState: Surface.commit
     // accumulates them on current across commits until the next present.
     try testing.expectEqual(@as(usize, 0), current.frame_callbacks.items.len);
@@ -1483,27 +1469,30 @@ test "uncommitted fields keep their current value across the swap" {
     var pending = State.init(allocator);
     defer pending.deinit(allocator);
 
-    // First commit sets everything.
+    // First commit sets buffer, scale and transform.
     pending.buffer = @as(?*Buffer, @ptrFromInt(0x200));
     pending.scale = 2;
-    pending.dx = 3;
+    pending.transform = .@"90";
     pending.committed.buffer = true;
     pending.committed.scale = true;
-    pending.committed.offset = true;
+    pending.committed.transform = true;
     swapState(&current, allocator, &pending);
     try testing.expectEqual(@as(i32, 2), current.scale);
-    try testing.expectEqual(@as(i32, 3), current.dx);
+    try testing.expectEqual(geom.Transform.@"90", current.transform);
 
-    // Second commit changes only the buffer: scale keeps its current
-    // value; the absent offset bit clears dx/dy (F34, wlroots
+    // Second commit changes only the buffer: scale and transform keep
+    // their current value because their bits are absent (F33, wlroots
     // surface_state_move wlr_compositor.c:340-346).
     pending.buffer = @as(?*Buffer, @ptrFromInt(0x300));
     pending.committed.buffer = true;
     swapState(&current, allocator, &pending);
     try testing.expectEqual(@as(?*Buffer, @ptrFromInt(0x300)), current.buffer);
     try testing.expectEqual(@as(i32, 2), current.scale);
-    try testing.expectEqual(@as(i32, 0), current.dx);
-    try testing.expectEqual(@as(i32, 0), current.dy);
+    try testing.expectEqual(geom.Transform.@"90", current.transform);
+    // PENDING keeps its request values across commits, so the bits the
+    // client has not re-sent still describe what it asked for (F33).
+    try testing.expectEqual(@as(i32, 2), pending.scale);
+    try testing.expectEqual(geom.Transform.@"90", pending.transform);
 }
 
 test "opaque and input regions persist until replaced by a commit" {
@@ -2279,11 +2268,13 @@ fn destroyTestCompositor(failing: *std.testing.FailingAllocator, comp: *Composit
     testing.allocator.destroy(comp);
 }
 
-test "offset is stored, committed, and cleared by a commit without one" {
-    // F34: wl_surface.offset stores the pending dx/dy (wlroots
-    // surface_handle_offset wlr_compositor.c:640-647); the commit applies
-    // it; a commit that carried no offset clears it (surface_state_move
-    // wlr_compositor.c:340-346).
+test "wl_surface.offset is consumed and changes no committed state (F34)" {
+    // F34: wl_surface.offset is the role-specific location of the buffer
+    // (wlroots surface_handle_offset, wlr_compositor.c:640-647). This
+    // compositor places a surface from its own scene-tree coordinates, so
+    // the request is accepted and discarded — it must leave the committed
+    // buffer, scale and the map state untouched (clients send offset on
+    // most attaches).
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
@@ -2295,30 +2286,30 @@ test "offset is stored, committed, and cleared by a commit without one" {
     defer tw.deinit();
     const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
 
-    s.handleOffset(7, -9);
-    try testing.expectEqual(@as(i32, 7), s.pending.dx);
-    try testing.expectEqual(@as(i32, -9), s.pending.dy);
-    try testing.expect(s.pending.committed.offset);
-
     var buffer: Buffer = undefined;
     testBuffer(allocator, &buffer);
     s.attachBuffer(&buffer);
     s.commit();
-    try testing.expectEqual(@as(i32, 7), s.current.dx);
-    try testing.expectEqual(@as(i32, -9), s.current.dy);
+    try testing.expect(s.mapped);
 
-    // A commit with no offset bit resets the current offset.
-    s.attachBuffer(&buffer);
+    s.handleOffset(7, -9);
     s.commit();
-    try testing.expectEqual(@as(i32, 0), s.current.dx);
-    try testing.expectEqual(@as(i32, 0), s.current.dy);
+
+    // The mirror (the presented-content cache, F32/C-CS-5) still holds the
+    // buffer, the committed scale is untouched and the surface stays
+    // mapped: a discarded offset changes nothing observable.
+    try testing.expect(s.buffer == &buffer);
+    try testing.expectEqual(@as(i32, 1), s.current.scale);
+    try testing.expect(s.mapped);
 }
 
-test "pre-v5 attach stores the offset" {
+test "pre-v5 attach accepts an offset; an unknown buffer type kills the wl_buffer" {
     // F34: below wl_surface v5 the attach dx/dy ARE the buffer position
-    // (wlroots surface_handle_attach wlr_compositor.c:68-83). The offset
-    // is stored even when the buffer wrap fails (the error path leaves
-    // the pending state's offset intact).
+    // (wlroots surface_handle_attach, wlr_compositor.c:68-83), so no
+    // invalid_offset is posted. The offset itself is not stored (no
+    // consumer reads it); what must hold is that the request is processed
+    // at all: the fabricated wl_buffer fails the wrap with InvalidBuffer
+    // and is destroyed, and the surface survives that error untouched.
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
@@ -2333,13 +2324,17 @@ test "pre-v5 attach stores the offset" {
     defer s4.destroy();
 
     // A fabricated wl_buffer (never created by the internal shm pipeline)
-    // fails the wrap with InvalidBuffer; the offset survives the error.
+    // fails the wrap with InvalidBuffer.
     const foreign = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
     const foreign_buf: *server.wl.Buffer = @ptrCast(foreign);
     s4.handleAttach(foreign_buf, 3, 5);
-    try testing.expectEqual(@as(i32, 3), s4.pending.dx);
-    try testing.expectEqual(@as(i32, 5), s4.pending.dy);
-    try testing.expect(s4.pending.committed.offset);
+    try testing.expect(s4.pending.buffer == null);
+    try testing.expect(s4.pending_resource == null);
+
+    // The surface is intact: a commit with nothing attached maps nothing.
+    s4.commit();
+    try testing.expect(s4.current.buffer == null);
+    try testing.expect(!s4.mapped);
 }
 
 test "previous state snapshots the pre-commit geometry" {

@@ -26,6 +26,26 @@
 //! content as top-down premultiplied ARGB8888 bytes (B, G, R, A in
 //! memory) for scanout: the same byte order as PixmanRenderer's
 //! Framebuffer.
+//! # Transform
+//! Every draw passes through one 2D affine uniform, `u_transform` (a
+//! column-major GLSL `mat3`, see Affine). It maps SCENE pixels — the
+//! space the dst rect of add_texture/add_rect is expressed in: y down,
+//! top-left origin, pixels — to TARGET pixels (the Gles2Target
+//! framebuffer). It is the identity by default, so a caller that never
+//! calls Gles2Renderer.setTransform gets the pre-transform pixels
+//! byte for byte.
+//!
+//! The shader applies it in this order: the dst rect (u_offset plus the
+//! unit quad scaled by u_scale) in scene space, then u_transform, then
+//! the u_viewport NDC step. Output rotation needs no separate path — the
+//! same matrix expresses 90/180/270 — but the target must then be the
+//! ROTATED size (geom.Transform.transformedSize, wlroots
+//! wlr_output_transformed_resolution types/output/output.c:456),
+//! because u_viewport is the target's own size and the NDC step runs
+//! after the transform. Nothing else in this module applies an output
+//! transform: the backends reject committed transform states
+//! (backend/headless.zig:114), so a scene reaches the screen
+//! untransformed until a caller sets this uniform.
 //!
 //! # Wiring contract
 //! The orchestrator wires this module in build.zig like the pixman_c
@@ -39,6 +59,7 @@
 const std = @import("std");
 const geom = @import("../utils/geom.zig");
 const log_mod = @import("../utils/log.zig");
+const matrix = @import("../utils/matrix.zig");
 const renderer_mod = @import("renderer.zig");
 const pass_mod = @import("pass.zig");
 const texture_mod = @import("texture.zig");
@@ -148,6 +169,89 @@ pub const Gles2TextureData = struct {
     allocator: std.mem.Allocator,
 };
 
+/// A 2D affine transform uploaded as the `u_transform` GLSL `mat3`
+/// uniform. `m` is COLUMN-major — the order glUniformMatrix3fv reads
+/// with transpose = GL_FALSE — so a point maps as
+/// p' = (m[0]·x + m[3]·y + m[6], m[1]·x + m[4]·y + m[7]): columns
+/// m[0..3] and m[3..6] are the images of the x and y basis vectors,
+/// m[6..9] the translation. The bottom row is fixed at (0, 0, 1).
+///
+/// Coordinate spaces. FROM: scene pixels — the space the `dst` rect of
+/// add_texture/add_rect is expressed in (y down, top-left origin,
+/// fractional pixels, the same convention as geom.FRect). TO: target
+/// pixels — the Gles2Target framebuffer, which for an output transform
+/// is the ROTATED size (geom.Transform.transformedSize). Composition
+/// order: the shader places the quad in scene space (u_offset plus the
+/// unit quad scaled by u_scale), then applies this matrix, then maps
+/// target pixels to NDC with u_viewport; that order is what keeps a
+/// rotated quad axis-aligned in its own dst rect instead of sheared.
+pub const Affine = struct {
+    m: [9]f32,
+
+    /// The identity: every existing call site keeps today's pixels.
+    pub const identity: Affine = .{ .m = .{ 1, 0, 0, 0, 1, 0, 0, 0, 1 } };
+
+    /// The affine of a wl_output_transform for a `width` x `height`
+    /// scene, i.e. buffer -> surface, exactly wlr_box_transform
+    /// (wlroots util/box.c:105-155, ported verbatim as
+    /// matrix.boxTransform in src/utils/matrix.zig). The matrix is
+    /// derived from that switch instead of restating it, so the two
+    /// cannot drift apart.
+    ///
+    /// The shader works in continuous pixel-origin coordinates (the
+    /// way wlr_fbox and the dst rects do), not pixel indices, so the
+    /// derivation samples a ZERO-EXTENT box: on a degenerate box
+    /// boxTransform returns the continuous point image, while on a 1x1
+    /// box it would return the destination of that pixel's origin
+    /// corner and shift the whole map by one pixel.
+    pub fn fromTransform(t: geom.Transform, width: i32, height: i32) Affine {
+        const o = pointAt(t, 0, 0, width, height);
+        const ex = pointAt(t, 1, 0, width, height);
+        const ey = pointAt(t, 0, 1, width, height);
+        // Linear part: the image of each basis vector, minus the origin.
+        const m00: f32 = @floatFromInt(ex.x - o.x); // d x'/d x
+        const m10: f32 = @floatFromInt(ex.y - o.y); // d y'/d x
+        const m01: f32 = @floatFromInt(ey.x - o.x); // d x'/d y
+        const m11: f32 = @floatFromInt(ey.y - o.y); // d y'/d y
+        return .{ .m = .{ m00, m10, 0, m01, m11, 0, @floatFromInt(o.x), @floatFromInt(o.y), 1 } };
+    }
+
+    /// Composition, `compose(outer, inner)` being the matrix product
+    /// outer·inner: a point goes through `inner` first, then `outer`.
+    /// The camera's world -> screen map (scene/camera.zig:
+    /// T(W/2,H/2)·S(zoom)·R(−rotation)·T(−center)) builds by folding
+    /// left to right, outermost factor last.
+    pub fn compose(outer: Affine, inner: Affine) Affine {
+        // SAFETY: both loops below write every index (col, row) of the
+        // 3x3 before compose returns it.
+        var out: [9]f32 = undefined;
+        for (0..3) |col| {
+            for (0..3) |row| {
+                out[col * 3 + row] = outer.m[row] * inner.m[col * 3] +
+                    outer.m[3 + row] * inner.m[col * 3 + 1] +
+                    outer.m[6 + row] * inner.m[col * 3 + 2];
+            }
+        }
+        return .{ .m = out };
+    }
+
+    /// Pure translation by (dx, dy) scene px.
+    pub fn translate(dx: f32, dy: f32) Affine {
+        return .{ .m = .{ 1, 0, 0, 0, 1, 0, dx, dy, 1 } };
+    }
+
+    /// Pure scale by (sx, sy), scaling about the scene origin.
+    pub fn scale(sx: f32, sy: f32) Affine {
+        return .{ .m = .{ sx, 0, 0, 0, sy, 0, 0, 0, 1 } };
+    }
+
+    /// Continuous point image of a scene point under `t`.
+    fn pointAt(t: geom.Transform, x: i32, y: i32, width: i32, height: i32) geom.Point {
+        const p = matrix.boxTransform(.{ .x = x, .y = y, .width = 0, .height = 0 }, t, width, height);
+        return .{ .x = p.x, .y = p.y };
+    }
+};
+
 /// A deferred draw operation (M2 pass semantics: add_* record, submit
 /// draws).
 const Cmd = union(enum) {
@@ -187,6 +291,7 @@ const Gles2Data = struct {
     loc_pos: c.GLint,
     loc_uv: c.GLint,
     loc_tex: c.GLint,
+    loc_transform: c.GLint,
     loc_offset: c.GLint,
     loc_scale: c.GLint,
     loc_viewport: c.GLint,
@@ -195,6 +300,10 @@ const Gles2Data = struct {
     loc_modulate: c.GLint,
     pass: pass_mod.Pass,
     pass_data: Gles2PassData,
+    /// Scene -> target affine uploaded as u_transform by every
+    /// submitPass. Identity until setTransform changes it (module
+    /// docs: "# Transform").
+    transform: Affine,
 };
 
 /// Hand-written declaration: translate-c renders the
@@ -242,12 +351,14 @@ pub const Gles2Renderer = struct {
             .loc_pos = -1,
             .loc_uv = -1,
             .loc_tex = -1,
+            .loc_transform = -1,
             .loc_offset = -1,
             .loc_scale = -1,
             .loc_viewport = -1,
             .loc_uv_offset = -1,
             .loc_uv_scale = -1,
             .loc_modulate = -1,
+            .transform = .identity,
             // SAFETY: pass.impl/data are filled by begin_pass before use.
             .pass = undefined,
             .pass_data = .{ .owner = data, .allocator = allocator, .io = io, .log_cfg = log_cfg },
@@ -318,6 +429,20 @@ pub const Gles2Renderer = struct {
         defer c.glBindTexture(c.GL_TEXTURE_2D, 0);
         updateTexturePixels(tex_data.tex, w, h, stride, pixels);
         return true;
+    }
+
+    /// Set the scene -> target affine drawn by every later pass, until
+    /// the next call. Identity by default.
+    ///
+    /// `affine` maps FROM scene px — the space the `dst` rect of
+    /// add_texture/add_rect is given in, y down, top-left origin — TO
+    /// target px, the Gles2Target framebuffer. The shader composes it
+    /// as dst rect (in scene space) -> affine -> target-to-NDC
+    /// (u_viewport); see the module's "# Transform" section. Pass
+    /// Affine.identity to undo a set transform.
+    pub fn setTransform(renderer: *renderer_mod.Renderer, affine: Affine) void {
+        const data: *Gles2Data = @ptrCast(@alignCast(renderer.data));
+        data.transform = affine;
     }
 };
 
@@ -400,6 +525,9 @@ fn submitPass(pass: *pass_mod.Pass) void {
     c.glUseProgram(r.program);
     c.glActiveTexture(c.GL_TEXTURE0);
     c.glUniform1i(r.loc_tex, 0);
+    // Pass state, not draw state: every queued op shares the one
+    // scene -> target affine. Uploaded once, before the draws.
+    c.glUniformMatrix3fv(r.loc_transform, 1, c.GL_FALSE, r.transform.m[0..].ptr);
     c.glEnable(c.GL_BLEND);
     c.glBlendFunc(c.GL_ONE, c.GL_ONE_MINUS_SRC_ALPHA); // premultiplied over
     c.glBindBuffer(c.GL_ARRAY_BUFFER, r.vbo);
@@ -450,11 +578,13 @@ fn drawRectQuad(r: *Gles2Data, target: *Gles2Target, rect: geom.Rect, color: [4]
     drawQuad(r, target, r.white_tex, .{ 0, 0 }, .{ 1, 1 }, dst, modulate);
 }
 
-/// Draw one textured quad. `dst` is in target pixels (y down); the
-/// vertex shader maps it to NDC (y flipped) inside the viewport. The
-/// fragment shader samples `uv_offset + v_uv * uv_scale` (crop/scale in
-/// texture space) and swizzles .bgra (uploaded GL_RGBA bytes are BGRA in
-/// memory), then multiplies by the premultiplied u_modulate.
+/// Draw one textured quad. `dst` is in SCENE pixels (y down); the
+/// vertex shader maps it to NDC inside the viewport, applying the
+/// renderer's scene -> target affine (u_transform) between the two.
+/// The fragment shader samples `uv_offset + v_uv * uv_scale`
+/// (crop/scale in texture space) and swizzles .bgra (uploaded GL_RGBA
+/// bytes are BGRA in memory), then multiplies by the premultiplied
+/// u_modulate.
 fn drawQuad(
     r: *Gles2Data,
     target: *Gles2Target,
@@ -593,6 +723,7 @@ fn initGl(r: *Gles2Data) !void {
     r.loc_pos = c.glGetAttribLocation(program, "a_pos");
     r.loc_uv = c.glGetAttribLocation(program, "a_uv");
     r.loc_tex = c.glGetUniformLocation(program, "u_tex");
+    r.loc_transform = c.glGetUniformLocation(program, "u_transform");
     r.loc_offset = c.glGetUniformLocation(program, "u_offset");
     r.loc_scale = c.glGetUniformLocation(program, "u_scale");
     r.loc_viewport = c.glGetUniformLocation(program, "u_viewport");
@@ -600,8 +731,8 @@ fn initGl(r: *Gles2Data) !void {
     r.loc_uv_scale = c.glGetUniformLocation(program, "u_uv_scale");
     r.loc_modulate = c.glGetUniformLocation(program, "u_modulate");
     if (r.loc_pos < 0 or r.loc_uv < 0 or r.loc_tex < 0 or r.loc_offset < 0 or
-        r.loc_scale < 0 or r.loc_viewport < 0 or r.loc_uv_offset < 0 or
-        r.loc_uv_scale < 0 or r.loc_modulate < 0)
+        r.loc_scale < 0 or r.loc_viewport < 0 or r.loc_transform < 0 or
+        r.loc_uv_offset < 0 or r.loc_uv_scale < 0 or r.loc_modulate < 0)
     {
         log_mod.err("shader link: attribute/uniform locations not found", r.io, r.log_cfg, "gles2", .{});
         return error.ShaderLinkFailed;
@@ -697,13 +828,28 @@ fn teardownEgl(r: *Gles2Data) void {
 const vs_src =
     \\attribute vec2 a_pos;
     \\attribute vec2 a_uv;
+    \\uniform mat3 u_transform;
     \\uniform vec2 u_offset;
     \\uniform vec2 u_scale;
     \\uniform vec2 u_viewport;
     \\varying vec2 v_uv;
     \\void main() {
     \\    v_uv = a_uv;
-    \\    vec2 px = u_offset + a_pos * u_scale;
+    \\    // Order, scene px -> target px -> NDC:
+    \\    //   1. the dst rect, in scene px (u_offset + unit quad * u_scale)
+    \\    //   2. u_transform, the scene -> target affine
+    \\    //   3. the viewport step, target px -> NDC (the y flip)
+    \\    // The three are all affine, but they do not commute: u_scale
+    \\    // must land before u_transform or a rotated quad loses its dst
+    \\    // aspect, the viewport step must stay last because it is the
+    \\    // only y-flip, and u_transform must multiply the point from the
+    \\    // LEFT — u_transform is a column-major mat3, so writing
+    \\    // vec3(scene, 1.0) * u_transform would transpose it, turning
+    \\    // every rotation into its inverse and reinterpreting the
+    \\    // translation column as a scale: a silent shear, not a
+    \\    // compile error.
+    \\    vec2 scene = u_offset + a_pos * u_scale;
+    \\    vec2 px = (u_transform * vec3(scene, 1.0)).xy;
     \\    vec2 ndc = vec2(px.x * 2.0 / u_viewport.x - 1.0,
     \\                    1.0 - px.y * 2.0 / u_viewport.y);
     \\    gl_Position = vec4(ndc, 0.0, 1.0);
@@ -734,6 +880,141 @@ fn px(buf: []const u8, w: i32, x: i32, y: i32) [4]u8 {
 fn setPx(buf: []u8, w: i32, x: i32, y: i32, color: [4]u8) void {
     const off = (@as(usize, @intCast(y)) * @as(usize, @intCast(w)) + @as(usize, @intCast(x))) * 4;
     buf[off..][0..4].* = color;
+}
+
+/// Test-only: draw `tex` (whole source) at `dst` into a fresh w x h
+/// target through the renderer's CURRENT scene -> target transform,
+/// then return the read-back buffer; the caller frees it. Runs under
+/// the caller's GL lock.
+fn renderBlit(
+    renderer: *renderer_mod.Renderer,
+    allocator: std.mem.Allocator,
+    w: i32,
+    h: i32,
+    tex: *texture_mod.Texture,
+    dst: geom.FRect,
+) ![]u8 {
+    const target = try Gles2Target.create(allocator, w, h);
+    defer target.destroy();
+    const pass = renderer.beginPass(target).?;
+    pass.addTexture(tex, null, dst, 1.0);
+    pass.submit();
+    return target.readPixels(allocator);
+}
+
+/// CPU reference for a whole-canvas draw of `texel` (tw x th, BGRA
+/// memory bytes) under output transform `t`, a magnification of
+/// `scale` target px per scene px and a final shift of (tx, ty) target
+/// px: the shape of the one mat3 the renderer uploads, i.e.
+/// `Affine.translate(tx, ty) * Affine.scale(scale, scale) *
+/// Affine.fromTransform(t, tw, th)`.
+///
+/// It models the GL pipeline, which is NOT a point-wise map of scene
+/// pixels onto target pixels:
+///
+///   1. The rasteriser fills the TRANSFORMED quad, so one scene pixel
+///      covers a scale x scale block of target pixels and the fragment
+///      centre of target pixel (x, y) is the point (x + 0.5, y + 0.5).
+///   2. That centre maps back to a scene point
+///      `bufferPoint(t, (x + 0.5 - tx) / scale, (y + 0.5 - ty) / scale)`,
+///      which at any scale other than 1 lands BETWEEN texels.
+///   3. GL_LINEAR blends the texels around it, and GL_CLAMP_TO_EDGE
+///      makes an off-texture tap return the edge texel whole instead of
+///      fading out.
+///
+/// Only a magnification of 1 puts every fragment centre on a texel
+/// centre, and only then does the reference degenerate to a plain
+/// point map. At 2x the centres sit a quarter texel off, so the
+/// interior of every block is a 75/25 blend of neighbouring texels and
+/// a reference that reads one texel per scene pixel would disagree
+/// with the GPU on most of the image. All weights here are binary
+/// fractions of whole bytes, so the float arithmetic is exact, and
+/// GL's float -> unorm8 conversion rounds to nearest (GL ES 3.0
+/// §2.1.2, "converted to fixed-point").
+///
+/// The draw is opaque (alpha 1.0) onto the pass's transparent clear,
+/// so submitPass's premultiplied-over blend copies the sample.
+fn expectedMapped(
+    texel: []const u8,
+    tw: i32,
+    th: i32,
+    t: geom.Transform,
+    tx: i32,
+    ty: i32,
+    scale: i32,
+    width: i32,
+    height: i32,
+    out: []u8,
+) void {
+    @memset(out, 0);
+    const s: f64 = @floatFromInt(scale);
+    const w: f64 = @floatFromInt(tw);
+    const h: f64 = @floatFromInt(th);
+    var y: i32 = 0;
+    while (y < height) : (y += 1) {
+        var x: i32 = 0;
+        while (x < width) : (x += 1) {
+            const a = (@as(f64, @floatFromInt(x)) + 0.5 - @as(f64, @floatFromInt(tx))) / s;
+            const b = (@as(f64, @floatFromInt(y)) + 0.5 - @as(f64, @floatFromInt(ty))) / s;
+            const p = bufferPoint(t, a, b, w, h);
+            // Outside the quad the rasteriser produced no fragment; the
+            // pixel keeps the pass's transparent clear.
+            if (p.x < 0 or p.y < 0 or p.x >= w or p.y >= h) continue;
+            setPx(out, width, x, y, sampleBilinear(texel, tw, th, p.x - 0.5, p.y - 0.5));
+        }
+    }
+}
+
+/// Continuous buffer-space image of a surface point (a, b): the
+/// inverse of wlr_box_transform (wlroots util/box.c:105-155) on a
+/// zero-extent box, so it is `matrix.transformPoint` with the
+/// pixel-centre `-1` terms dropped — that function reports the buffer
+/// pixel whose centre sits at the queried surface pixel's centre.
+/// `width`/`height` are the BUFFER size.
+fn bufferPoint(t: geom.Transform, a: f64, b: f64, width: f64, height: f64) geom.FPoint {
+    return switch (t) {
+        .normal => .{ .x = a, .y = b },
+        .@"90" => .{ .x = b, .y = height - a },
+        .@"180" => .{ .x = width - a, .y = height - b },
+        .@"270" => .{ .x = width - b, .y = a },
+        .flipped => .{ .x = width - a, .y = b },
+        .flipped_90 => .{ .x = b, .y = a },
+        .flipped_180 => .{ .x = a, .y = height - b },
+        .flipped_270 => .{ .x = height - b, .y = width - a },
+    };
+}
+
+/// One GL_LINEAR tap: the bilinear blend of the texels around (u, v) in
+/// texel-index space (texel centres sit at half-integers, so u is the
+/// scene coordinate minus 0.5), with GL_CLAMP_TO_EDGE on the
+/// coordinate — clamping the coordinate and clamping the indices are
+/// the same thing for a bilinear filter.
+fn sampleBilinear(texel: []const u8, tw: i32, th: i32, u: f64, v: f64) [4]u8 {
+    const cx = std.math.clamp(u, 0.0, @as(f64, @floatFromInt(tw - 1)));
+    const cy = std.math.clamp(v, 0.0, @as(f64, @floatFromInt(th - 1)));
+    const x0: i32 = @intFromFloat(@floor(cx));
+    const y0: i32 = @intFromFloat(@floor(cy));
+    const x1 = @min(x0 + 1, tw - 1);
+    const y1 = @min(y0 + 1, th - 1);
+    const fx = cx - @as(f64, @floatFromInt(x0));
+    const fy = cy - @as(f64, @floatFromInt(y0));
+    const gx = 1.0 - fx;
+    const gy = 1.0 - fy;
+    const p00 = px(texel, tw, x0, y0);
+    const p10 = px(texel, tw, x1, y0);
+    const p01 = px(texel, tw, x0, y1);
+    const p11 = px(texel, tw, x1, y1);
+    var out: [4]u8 = undefined;
+    for (0..4) |ch| {
+        const blend = gx * gy * @as(f64, @floatFromInt(p00[ch])) +
+            fx * gy * @as(f64, @floatFromInt(p10[ch])) +
+            gx * fy * @as(f64, @floatFromInt(p01[ch])) +
+            fx * fy * @as(f64, @floatFromInt(p11[ch]));
+        // The clamp keeps a one-ulp overshoot above 255 out of
+        // @intFromFloat; the + 0.5 is GL's round-to-nearest.
+        out[ch] = @intFromFloat(@floor(std.math.clamp(blend, 0.0, 255.0) + 0.5));
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -953,4 +1234,166 @@ test "gles2 texture crop" {
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, px(buf, 2, 1, 0));
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, px(buf, 2, 0, 1));
     try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, px(buf, 2, 1, 1));
+}
+
+test "gles2 scene->target transform defaults to identity" {
+    lockGles2Test();
+    defer unlockGles2Test();
+
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+    const renderer = try Gles2Renderer.create(allocator, &io, &log_cfg);
+    defer renderer.destroy();
+
+    // A caller that never sets a transform gets the pre-transform
+    // renderer: the matrix uniform starts at the identity.
+    const data: *Gles2Data = @ptrCast(@alignCast(renderer.data));
+    try std.testing.expectEqual(Affine.identity, data.transform);
+
+    // BGRA bytes: red, green / blue, white (the "1:1 texture blit"
+    // pattern).
+    const pattern = [_]u8{
+        0,   0,   255, 255,
+        0,   255, 0,   255,
+        255, 0,   0,   255,
+        255, 255, 255, 255,
+    };
+    const tex = try Gles2Renderer.importMemory(renderer, 2, 2, 8, &pattern);
+    defer tex.destroy();
+    const dst: geom.FRect = .{ .x = 1, .y = 1, .width = 2, .height = 2 };
+
+    const unset = try renderBlit(renderer, allocator, 4, 4, tex, dst);
+    defer allocator.free(unset);
+
+    // Setting the identity explicitly must be byte-identical to the
+    // unset default: the matrix is live in the shader and it moves
+    // nothing at identity.
+    Gles2Renderer.setTransform(renderer, .identity);
+    const explicit = try renderBlit(renderer, allocator, 4, 4, tex, dst);
+    defer allocator.free(explicit);
+    try std.testing.expectEqualSlices(u8, unset, explicit);
+
+    // ... and those are the pre-change pixels, unchanged. dst
+    // (1,1,2,2) shows the pattern's texels (0,0)..(1,1), i.e. red,
+    // green / blue, white in memory bytes B,G,R,A.
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, px(unset, 4, 0, 0));
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, px(unset, 4, 1, 1)); // red
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, px(unset, 4, 2, 1)); // green
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, px(unset, 4, 1, 2)); // blue
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, px(unset, 4, 2, 2)); // white
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, px(unset, 4, 3, 3));
+}
+
+test "gles2 output transform 90 matches the CPU reference" {
+    lockGles2Test();
+    defer unlockGles2Test();
+
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+    const renderer = try Gles2Renderer.create(allocator, &io, &log_cfg);
+    defer renderer.destroy();
+
+    // 4x2 source, eight distinct opaque colors (memory bytes B,G,R,A):
+    // red, green, blue, white / cyan, magenta, brown, slate.
+    const pattern = [_]u8{
+        0,   0,   255, 255,
+        0,   255, 0,   255,
+        255, 0,   0,   255,
+        255, 255, 255, 255,
+        0,   255, 255, 255,
+        255, 0,   255, 255,
+        128, 64,  32,  255,
+        32,  32,  128, 255,
+    };
+    const tex = try Gles2Renderer.importMemory(renderer, 4, 2, 16, &pattern);
+    defer tex.destroy();
+
+    // Whole scene at dst (0,0,4,2), rotated 90 degrees about the
+    // scene origin and then shifted down one target px. The rotated
+    // target is the ROTATED size, transformedSize(4, 2) = 2x4 (wlroots
+    // wlr_output_transformed_resolution, types/output/output.c:456):
+    // u_viewport is the target's size and runs after the transform.
+    // The extra row makes the shift observable — an image left at the
+    // origin would start at row 0.
+    const whole: geom.FRect = .{ .x = 0, .y = 0, .width = 4, .height = 2 };
+    Gles2Renderer.setTransform(
+        renderer,
+        Affine.compose(Affine.translate(0, 1), Affine.fromTransform(.@"90", 4, 2)),
+    );
+    const gpu = try renderBlit(renderer, allocator, 2, 5, tex, whole);
+    defer allocator.free(gpu);
+
+    const want = try allocator.alloc(u8, 2 * 5 * 4);
+    defer allocator.free(want);
+    expectedMapped(&pattern, 4, 2, .@"90", 0, 1, 1, 2, 5, want);
+    try std.testing.expectEqualSlices(u8, want, gpu);
+
+    // Hand-computed against wlr_box_transform (util/box.c:125-128,
+    // x' = height - y - 1, y' = x) plus the one-pixel shift: scene
+    // (0,0) -> target (1,1), scene (3,1) -> target (0,4).
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, px(gpu, 2, 1, 0));
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, px(gpu, 2, 1, 1)); // red
+    try std.testing.expectEqual([4]u8{ 32, 32, 128, 255 }, px(gpu, 2, 0, 4)); // slate
+}
+
+test "gles2 transform composes rotate, scale and translate" {
+    lockGles2Test();
+    defer unlockGles2Test();
+
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+    const renderer = try Gles2Renderer.create(allocator, &io, &log_cfg);
+    defer renderer.destroy();
+
+    // BGRA bytes: red, green / blue, white.
+    const pattern = [_]u8{
+        0,   0,   255, 255,
+        0,   255, 0,   255,
+        255, 0,   0,   255,
+        255, 255, 255, 255,
+    };
+    const tex = try Gles2Renderer.importMemory(renderer, 2, 2, 8, &pattern);
+    defer tex.destroy();
+
+    // Scene -> target map, in the order the shader applies it: rotate
+    // 90 about the scene origin, magnify 2x, then shift by (1,1) target
+    // px. The quad lands on target x,y in [1, 5); an 8x8 target keeps
+    // that clear of the edges, so a transform that moved or rescaled
+    // wrongly shows up as a shifted or clipped image.
+    const affine = Affine.compose(
+        Affine.translate(1, 1),
+        Affine.compose(Affine.scale(2, 2), Affine.fromTransform(.@"90", 2, 2)),
+    );
+    Gles2Renderer.setTransform(renderer, affine);
+    const whole: geom.FRect = .{ .x = 0, .y = 0, .width = 2, .height = 2 };
+    const gpu = try renderBlit(renderer, allocator, 8, 8, tex, whole);
+    defer allocator.free(gpu);
+
+    const want = try allocator.alloc(u8, 8 * 8 * 4);
+    defer allocator.free(want);
+    expectedMapped(&pattern, 2, 2, .@"90", 1, 1, 2, 8, 8, want);
+    try std.testing.expectEqualSlices(u8, want, gpu);
+
+    // Spot checks, hand-computed from that map (target_x = 5 - 2·scene_y,
+    // target_y = 2·scene_x + 1): the quad covers target [1,5)² and
+    // scene texel (0,0) red owns the 2x2 block x in [3,5), y in [1,3).
+    // At 2x only the four image corners tap a single texel — every
+    // interior fragment centre sits a quarter texel off and GL_LINEAR
+    // blends two of them — so those are the pixels that pin the
+    // placement, plus one blended pixel that pins the magnification.
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, px(gpu, 8, 0, 0));
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, px(gpu, 8, 1, 1)); // blue
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, px(gpu, 8, 4, 1)); // red
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, px(gpu, 8, 1, 4)); // white
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, px(gpu, 8, 4, 4)); // green
+    // 1/4 red over 3/4 blue: 0.25*255 = 63.75 -> 64, 0.75*255 = 191.25
+    // -> 191 (GL rounds float -> unorm8 to nearest).
+    try std.testing.expectEqual([4]u8{ 0xBF, 0, 0x40, 0xFF }, px(gpu, 8, 2, 1));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, px(gpu, 8, 5, 5));
 }

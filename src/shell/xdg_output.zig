@@ -12,14 +12,15 @@
 //! read these to place captures; the re-send keeps them current).
 //!
 //! Cross-module contract: the manager binds per client; get_xdg_output
-//! creates a zxdg_output_v1 for a wl_output resource. One zxdg_output
-//! per (client, wl_output) pair; a second get raises
-//! output_already_exists (wayland.xml). The zxdg_output dies with its
-//! wl_output (the output_destroy listener) and with the client; the
-//! resource destroy frees the state. The wl_output argument must map to
-//! a live WlOutput of this server (the get on a foreign/dead output is
-//! inerted — the resource carries no state, so no events ever arrive
-//! and no request dereferences anything).
+//! creates a zxdg_output_v1 for a wl_output resource. Each get creates a
+//! new zxdg_output — zxdg_output_manager_v1 declares no errors at all
+//! (xdg-output-unstable-v1.xml:57-78), so there is no duplicate-output
+//! error to post. The zxdg_output dies with its wl_output (the
+//! output_destroy listener) and with the client; the resource destroy
+//! frees the state. The wl_output argument must map to a live WlOutput
+//! of this server (the get on a foreign/dead output is inerted — the
+//! resource carries no state, so no events ever arrive and no request
+//! dereferences anything).
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
@@ -120,6 +121,10 @@ fn managerRequest(
             };
             state.* = .{
                 .allocator = xo.allocator,
+                // SAFETY: assigned immediately after `state.* = .{...}`,
+                // before the resource is created and before any listener
+                // can run. The create's catch block destroys state, so no
+                // path reads the field while it is undefined.
                 .resource = undefined,
                 .wl_output = wl_out,
                 .output_destroy_listener = wire.Listener(*output_mod.Output).init(onWlOutputDestroy),

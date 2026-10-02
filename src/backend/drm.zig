@@ -255,10 +255,98 @@ fn start(base: *backend_mod.Backend) error{BackendFailed}!void {
     };
 }
 
+/// Bring the device up. Eleven ordered phases, each a named step that can
+/// fail on its own (the definitions sit below `destroy`):
+///
+///   1. `openDevice`            openat the card node (O_RDWR|O_CLOEXEC).
+///   2. `selectKmsInterface`    DRM_CLIENT_CAP_ATOMIC, or fall back to legacy.
+///   3. `becomeMaster`          DRM_IOCTL_SET_MASTER.
+///   4. `enumerateTarget`       connected connector + preferred mode + CRTC.
+///   5. `resolvePlane`          the CRTC's PRIMARY plane + its property ids.
+///   6. `allocOutput`           the DrmOutput that will own the resources.
+///   7. `scanKmsProps`          connector CRTC_ID, CRTC MODE_ID/ACTIVE ids.
+///   8. `createScanoutBuffers`  the A/B dumb-buffer swapchain.
+///   9. `createModeBlob`        the mode blob MODE_ID points at.
+///  10. `modeset`               bind connector->CRTC->plane->fb.
+///  11. `announceOutput`        publish the output, kick the first frame.
+///
+/// The order is load-bearing at four seams: the ATOMIC client cap must be
+/// requested before any KMS ioctl (wlroots drm.c drm_open issues
+/// drmSetClientCap as part of the open); DRM master must be held before
+/// the modeset commits, because the kernel rejects a non-master client's
+/// mode/plane updates (drm_mode_atomic_ioctl, drm_mode_crtc_set_property);
+/// the primary plane must be resolved before a framebuffer can be
+/// attached to anything, since the atomic commit names the plane object;
+/// and both framebuffers must exist before the modeset points the plane at
+/// one of them. Phases 5, 7 and 9 are atomic-only — the legacy interface
+/// has no planes and no property blobs, so they are skipped there.
+///
+/// One `errdefer drmTeardown` covers every failure: teardown is
+/// null-safe, idempotent and ordered by reverse acquisition, so a phase
+/// that dies half-way leaves the phases before it to be released in the
+/// right order. Success keeps everything; `destroy` tears it down.
 fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!void {
     const self: *DrmBackendData = @ptrCast(@alignCast(base.data));
 
-    // --- open the card node (wlroots drm.c drm_open; O_RDWR|O_CLOEXEC).
+    // --- phases 1-3: the device itself. A failed open publishes no fd, so
+    // teardown only starts mattering once the open succeeded.
+    try openDevice(self);
+    errdefer drmTeardown(self);
+    selectKmsInterface(self);
+    becomeMaster(self);
+
+    // --- phases 4-5: what to drive. `var` (not const): the legacy
+    // drmModeSetCrtc path passes &found.connector_id / &found.mode to C,
+    // which wants mutable [*c] pointers.
+    var found = try enumerateTarget(self);
+    const plane = try resolvePlane(self, found);
+
+    // --- phase 6: the output that owns the device resources from here on.
+    const drm_out = try allocOutput(self, found, plane);
+
+    // --- phases 7-9: the ids, buffers and blob the modeset will commit.
+    try scanKmsProps(self, found, drm_out);
+    try createScanoutBuffers(self, found, drm_out);
+    try createModeBlob(self, found, drm_out);
+
+    // --- phase 10: make it visible.
+    try modeset(self, &found, plane, drm_out);
+
+    // --- phase 11: hand it to the compositor.
+    try announceOutput(base, self, drm_out);
+}
+
+fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
+    const self: *DrmBackendData = @ptrCast(@alignCast(data));
+    // Tear down the output first (emits destroy signals) so no frame
+    // callback can touch the DRM state after the fd closes; then release
+    // the device resources (which live in drm_out) before freeing it.
+    if (self.drm_output) |drm_out| {
+        if (drm_out.out) |out| out.destroy();
+    }
+    drmTeardown(self);
+    if (self.drm_output) |drm_out| allocator.destroy(drm_out);
+    allocator.destroy(self);
+}
+
+// ---------------------------------------------------------------------------
+// Start phases (see startInner for the order and why it is load-bearing)
+// ---------------------------------------------------------------------------
+
+/// The atomic plane driving the scanout: the plane object id plus the
+/// property ids every atomic commit writes through it. The legacy KMS
+/// interface has no planes, so both stay zero there — legacy modeset and
+/// flips target the CRTC directly (wlroots legacy.c), which is why this
+/// struct is zero-valued rather than absent.
+const PlaneSelection = struct {
+    id: u32 = 0,
+    props: PlanePropIds = .{},
+};
+
+/// Phase 1: open the card node (wlroots drm.c drm_open; O_RDWR|O_CLOEXEC).
+/// The fd is published on the backend so every later phase — and
+/// drmTeardown on the failure paths — can reach it.
+fn openDevice(self: *DrmBackendData) error{BackendFailed}!void {
     const fd = std.posix.openat(
         std.posix.AT.FDCWD,
         self.device_path,
@@ -269,17 +357,20 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
         return error.BackendFailed;
     };
     self.fd = fd;
-    errdefer drmTeardown(self);
+}
 
-    // Atomic modesetting must be requested before any KMS ioctl
-    // (wlroots drm.c drm_open: drmSetClientCap(DRM_CLIENT_CAP_ATOMIC, 1)).
-    // When the driver lacks ATOMIC, fall back to the legacy KMS
-    // interface (drmModeSetCrtc modeset + drmModePageFlip flips) instead
-    // of failing — wlroots check_drm_features drm.c:106-110, smithay
-    // LegacyDrmDevice (device/mod.rs:252-256). WLR_DRM_NO_ATOMIC forces
-    // the legacy path (wlroots parity; lets the fallback be exercised on
-    // atomic hardware). The legacy path needs no planes or property
-    // blobs; the connector/mode/CRTC enumeration below is shared.
+/// Phase 2: pick the KMS interface. Atomic modesetting must be requested
+/// before any KMS ioctl (wlroots drm.c drm_open:
+/// drmSetClientCap(DRM_CLIENT_CAP_ATOMIC, 1)). When the driver lacks
+/// ATOMIC, fall back to the legacy KMS interface (drmModeSetCrtc modeset
+/// + drmModePageFlip flips) instead of failing — wlroots
+/// check_drm_features drm.c:106-110, smithay LegacyDrmDevice
+/// (device/mod.rs:252-256). WLR_DRM_NO_ATOMIC forces the legacy path
+/// (wlroots parity; lets the fallback be exercised on atomic hardware).
+/// The legacy path needs no planes or property blobs; the
+/// connector/mode/CRTC enumeration below is shared.
+fn selectKmsInterface(self: *DrmBackendData) void {
+    const fd = self.fd.?;
     const force_legacy = std.c.getenv("WLR_DRM_NO_ATOMIC") != null;
     if (force_legacy) {
         log_mod.info("drm: WLR_DRM_NO_ATOMIC set; using legacy KMS interface", self.io, self.log_cfg, "drm", .{});
@@ -294,21 +385,23 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
         );
         self.atomic = false;
     }
+}
 
-    // Become DRM master (required for modeset). The first opener is
-    // master automatically, so failure is non-fatal here (headless VM).
+/// Phase 3: become DRM master (required for modeset). The first opener is
+/// master automatically, so failure is non-fatal here (headless VM).
+fn becomeMaster(self: *DrmBackendData) void {
+    const fd = self.fd.?;
     if (c.drmIoctl(fd, c.DRM_IOCTL_SET_MASTER, null) == 0) {
         self.is_master = true;
     } else {
         log_mod.warn("drm: DRM_IOCTL_SET_MASTER failed (not master?)", self.io, self.log_cfg, "drm", .{});
     }
+}
 
-    // --- find a connected connector with a mode, its encoder and a CRTC
-    // (wlroots drm.c init_drm_resources + drm_connector_alloc_crtc). `var`
-    // (not const): the legacy drmModeSetCrtc path below passes
-    // &found.connector_id / &found.mode to C, which wants mutable
-    // [*c] pointers.
-    var found = findConnectorMode(self) orelse {
+/// Phase 4: find a connected connector with a mode, its encoder and a
+/// CRTC (wlroots drm.c init_drm_resources + drm_connector_alloc_crtc).
+fn enumerateTarget(self: *DrmBackendData) error{BackendFailed}!FoundConnector {
+    const found = findConnectorMode(self) orelse {
         log_mod.err("drm: no connected connector with a mode on {s}", self.io, self.log_cfg, "drm", .{
             self.device_path,
         });
@@ -321,263 +414,338 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
         "drm",
         .{ basename(self.device_path), found.connector_id, found.mode.hdisplay, found.mode.vdisplay },
     );
+    return found;
+}
 
-    // --- primary plane for the CRTC, with all commit property ids
-    // (wlroots drm.c init_plane: possible_crtcs + type == PRIMARY).
-    // Atomic-only: the legacy interface has no planes — modeset and
-    // flips target the CRTC directly (drmModeSetCrtc/drmModePageFlip).
-    var plane: PlanePropIds = .{};
-    const plane_id: u32 = if (self.atomic) blk: {
-        const id = findPrimaryPlane(self, found.crtc_index, &plane) orelse {
-            log_mod.err("drm: no primary plane for crtc={d}", self.io, self.log_cfg, "drm", .{found.crtc_id});
-            return error.BackendFailed;
-        };
-        break :blk id;
-    } else 0;
+/// Phase 5: the primary plane for the CRTC, with all commit property ids
+/// (wlroots drm.c init_plane: possible_crtcs + type == PRIMARY).
+/// Atomic-only: the legacy interface has no planes — modeset and flips
+/// target the CRTC directly (drmModeSetCrtc/drmModePageFlip), so the
+/// selection stays zeroed.
+fn resolvePlane(self: *DrmBackendData, found: FoundConnector) error{BackendFailed}!PlaneSelection {
+    if (!self.atomic) return .{};
+    var props: PlanePropIds = .{};
+    const id = findPrimaryPlane(self, found.crtc_index, &props) orelse {
+        log_mod.err("drm: no primary plane for crtc={d}", self.io, self.log_cfg, "drm", .{found.crtc_id});
+        return error.BackendFailed;
+    };
+    return .{ .id = id, .props = props };
+}
 
-    const allocator = self.allocator;
-    const drm_out = try allocator.create(DrmOutput);
+/// Phase 6: allocate the DrmOutput that owns every device resource the
+/// later phases create (wlroots attaches the mode, buffers and blobs to
+/// the output it enables). Ownership moves to the backend before
+/// returning, so a failure further down still reaches these through
+/// drmTeardown; the caller's backend.destroy() frees the struct itself.
+fn allocOutput(self: *DrmBackendData, found: FoundConnector, plane: PlaneSelection) error{OutOfMemory}!*DrmOutput {
+    const drm_out = try self.allocator.create(DrmOutput);
     drm_out.* = .{
         .backend = self,
         .crtc_id = found.crtc_id,
-        .plane_id = plane_id,
-        .props = plane,
+        .plane_id = plane.id,
+        .props = plane.props,
         .mode = modeToOutput(found.mode),
         .refresh_ns = modeRefreshNs(found.mode),
     };
-    // Owned by self from here on: a start() failure releases the device
-    // resources via drmTeardown (errdefer below) and the caller's
-    // backend.destroy() frees the struct.
     self.drm_output = drm_out;
+    return drm_out;
+}
 
-    // --- connector + crtc property ids (wlroots properties.c tables).
-    // Atomic-only: the legacy modeset binds the connector to the CRTC
-    // implicitly via drmModeSetCrtc, so no property ids are needed.
-    if (self.atomic) {
-        var conn_props: [1]u32 = undefined;
-        if (!scanPropIds(fd, found.connector_id, c.DRM_MODE_OBJECT_CONNECTOR, &[_][]const u8{"CRTC_ID"}, &conn_props)) {
-            log_mod.err("drm: connector CRTC_ID property missing", self.io, self.log_cfg, "drm", .{});
+/// Phase 7: connector + crtc property ids (wlroots properties.c tables).
+/// Atomic-only: the legacy modeset binds the connector to the CRTC
+/// implicitly via drmModeSetCrtc, so no property ids are needed.
+fn scanKmsProps(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
+    if (!self.atomic) return;
+    const fd = self.fd.?;
+    // SAFETY: scanPropIds @memsets the whole output array to 0 as its
+    // first statement, so every element is initialized before it reads
+    // one — and it returns false without filling in any id.
+    var conn_props: [1]u32 = undefined;
+    if (!scanPropIds(fd, found.connector_id, c.DRM_MODE_OBJECT_CONNECTOR, &[_][]const u8{"CRTC_ID"}, &conn_props)) {
+        log_mod.err("drm: connector CRTC_ID property missing", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
+    }
+    // SAFETY: as conn_props above — scanPropIds zeroes before writing.
+    var crtc_props: [2]u32 = undefined;
+    if (!scanPropIds(
+        fd,
+        found.crtc_id,
+        c.DRM_MODE_OBJECT_CRTC,
+        &[_][]const u8{ "MODE_ID", "ACTIVE" },
+        &crtc_props,
+    )) {
+        log_mod.err("drm: crtc MODE_ID/ACTIVE properties missing", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
+    }
+    drm_out.connector_crtc_id = conn_props[0];
+    drm_out.crtc_mode_id = crtc_props[0];
+    drm_out.crtc_active = crtc_props[1];
+}
+
+/// Phase 8: dumb scanout buffers: create, map, addfb2 — TWO of them, an
+/// A/B swapchain (see the DrmOutput.buffers doc: every flip must change
+/// FB_ID because virtio-gpu's plane update is damage-gated).
+/// (smithay src/backend/drm/dumb.rs framebuffer_from_dumb_buffer:
+/// create dumb -> add_framebuffer; wlroots uses the same ioctls.)
+/// A partial failure is fine: drmTeardown is idempotent and frees
+/// whatever the loop already created.
+fn createScanoutBuffers(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
+    const fd = self.fd.?;
+    const width: u32 = found.mode.hdisplay;
+    const height: u32 = found.mode.vdisplay;
+
+    for (&drm_out.buffers) |*buf| {
+        var create_dumb: c.struct_drm_mode_create_dumb = .{
+            .height = height,
+            .width = width,
+            .bpp = 32,
+            .flags = 0,
+        };
+        if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb) != 0) {
+            log_mod.err("drm: DRM_IOCTL_MODE_CREATE_DUMB failed", self.io, self.log_cfg, "drm", .{});
             return error.BackendFailed;
         }
-        var crtc_props: [2]u32 = undefined;
-        if (!scanPropIds(
+        buf.handle = create_dumb.handle;
+        buf.pitch = create_dumb.pitch;
+        buf.size = @intCast(create_dumb.size);
+
+        var map_dumb: c.struct_drm_mode_map_dumb = .{ .handle = create_dumb.handle };
+        if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0) {
+            log_mod.err("drm: DRM_IOCTL_MODE_MAP_DUMB failed", self.io, self.log_cfg, "drm", .{});
+            return error.BackendFailed;
+        }
+        buf.map = std.posix.mmap(
+            null,
+            buf.size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
             fd,
-            found.crtc_id,
-            c.DRM_MODE_OBJECT_CRTC,
-            &[_][]const u8{ "MODE_ID", "ACTIVE" },
-            &crtc_props,
-        )) {
-            log_mod.err("drm: crtc MODE_ID/ACTIVE properties missing", self.io, self.log_cfg, "drm", .{});
-            return error.BackendFailed;
-        }
-        drm_out.connector_crtc_id = conn_props[0];
-        drm_out.crtc_mode_id = crtc_props[0];
-        drm_out.crtc_active = crtc_props[1];
-    }
-
-    // --- dumb scanout buffers: create, map, addfb2 — TWO of them, an
-    // A/B swapchain (see the DrmOutput.buffers doc: every flip must
-    // change FB_ID because virtio-gpu's plane update is damage-gated).
-    // (smithay src/backend/drm/dumb.rs framebuffer_from_dumb_buffer:
-    // create dumb -> add_framebuffer; wlroots uses the same ioctls.)
-    // A partial failure is fine: drmTeardown is idempotent and frees
-    // whatever the loop already created.
-    {
-        const width: u32 = found.mode.hdisplay;
-        const height: u32 = found.mode.vdisplay;
-
-        for (&drm_out.buffers) |*buf| {
-            var create_dumb: c.struct_drm_mode_create_dumb = .{
-                .height = height,
-                .width = width,
-                .bpp = 32,
-                .flags = 0,
-            };
-            if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb) != 0) {
-                log_mod.err("drm: DRM_IOCTL_MODE_CREATE_DUMB failed", self.io, self.log_cfg, "drm", .{});
-                return error.BackendFailed;
-            }
-            buf.handle = create_dumb.handle;
-            buf.pitch = create_dumb.pitch;
-            buf.size = @intCast(create_dumb.size);
-
-            var map_dumb: c.struct_drm_mode_map_dumb = .{ .handle = create_dumb.handle };
-            if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0) {
-                log_mod.err("drm: DRM_IOCTL_MODE_MAP_DUMB failed", self.io, self.log_cfg, "drm", .{});
-                return error.BackendFailed;
-            }
-            buf.map = std.posix.mmap(
-                null,
-                buf.size,
-                .{ .READ = true, .WRITE = true },
-                .{ .TYPE = .SHARED },
-                fd,
-                map_dumb.offset,
-            ) catch {
-                log_mod.err("drm: mmap dumb buffer failed", self.io, self.log_cfg, "drm", .{});
-                return error.BackendFailed;
-            };
-
-            var fb2: c.struct_drm_mode_fb_cmd2 = .{
-                .width = width,
-                .height = height,
-                .pixel_format = drm_format_xrgb8888,
-                .handles = .{ create_dumb.handle, 0, 0, 0 },
-                .pitches = .{ create_dumb.pitch, 0, 0, 0 },
-                .offsets = .{ 0, 0, 0, 0 },
-            };
-            if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_ADDFB2, &fb2) != 0) {
-                log_mod.err("drm: DRM_IOCTL_MODE_ADDFB2 failed", self.io, self.log_cfg, "drm", .{});
-                return error.BackendFailed;
-            }
-            buf.fb_id = fb2.fb_id;
-        }
-    }
-
-    // --- mode blob (wlroots atomic.c create_mode_blob). Atomic-only:
-    // the legacy modeset passes the drmModeModeInfo directly to
-    // drmModeSetCrtc.
-    if (self.atomic) {
-        var blob_id: u32 = 0;
-        if (c.drmModeCreatePropertyBlob(fd, &found.mode, @sizeOf(c.drmModeModeInfo), &blob_id) != 0) {
-            log_mod.err("drm: drmModeCreatePropertyBlob failed", self.io, self.log_cfg, "drm", .{});
-            return error.BackendFailed;
-        }
-        drm_out.mode_blob = blob_id;
-    }
-
-    // --- modeset. Atomic: connector->crtc binding, crtc active+mode,
-    // plane fb + full source/dest rect + full-fb damage clip, blocking
-    // (no flip event; the first frame's page flip sends the event).
-    // (wlroots atomic.c atomic_connector_add + set_plane_props; smithay
-    // surface/atomic.rs set_connector/set_crtc/set_plane). Legacy: one
-    // drmModeSetCrtc call binds the connector to the CRTC and applies
-    // the mode with buffers[0] as the initial scanout fb (wlroots
-    // legacy.c:121-126).
-    if (self.atomic) {
-        // FB_DAMAGE_CLIPS (full-fb rect) must ride every commit touching
-        // the plane: virtio-gpu's plane update is gated on merged damage
-        // clips — drivers/gpu/drm/virtio/virtgpu_plane.c
-        // virtio_gpu_plane_atomic_update early-returns before the scanout
-        // switch and the dumb upload/flush when
-        // drm_atomic_helper_damage_merged() finds nothing, and our
-        // commits otherwise change only FB_ID (wlroots atomic.c
-        // drm_atomic_connector_prepare -> create_fb_damage_clips_blob,
-        // set_plane_props adds the blob id). Skipped when the driver
-        // lacks the property (fb_damage_clips == 0).
-        var damage_blob: u32 = 0;
-        if (plane.fb_damage_clips != 0) {
-            if (!createDamageBlob(fd, found.mode.hdisplay, found.mode.vdisplay, &damage_blob)) {
-                log_mod.err("drm: create FB_DAMAGE_CLIPS blob failed", self.io, self.log_cfg, "drm", .{});
-                return error.BackendFailed;
-            }
-        }
-        // The kernel copies the clips into the plane state at commit
-        // time; the blob is destroyed right after (wlroots atomic.c
-        // drm_atomic_connector_commit_state: destroy_blob(state->fb_damage_clips)).
-        defer {
-            if (damage_blob != 0) _ = c.drmModeDestroyPropertyBlob(fd, damage_blob);
-        }
-
-        const req = c.drmModeAtomicAlloc() orelse {
-            log_mod.err("drm: drmModeAtomicAlloc failed", self.io, self.log_cfg, "drm", .{});
+            map_dumb.offset,
+        ) catch {
+            log_mod.err("drm: mmap dumb buffer failed", self.io, self.log_cfg, "drm", .{});
             return error.BackendFailed;
         };
-        defer c.drmModeAtomicFree(req);
-        const src_w = fixed16(found.mode.hdisplay);
-        const src_h = fixed16(found.mode.vdisplay);
-        if (c.drmModeAtomicAddProperty(req, found.connector_id, drm_out.connector_crtc_id, found.crtc_id) < 0 or
-            c.drmModeAtomicAddProperty(req, found.crtc_id, drm_out.crtc_mode_id, drm_out.mode_blob) < 0 or
-            c.drmModeAtomicAddProperty(req, found.crtc_id, drm_out.crtc_active, 1) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_id, found.crtc_id) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.fb_id, drm_out.buffers[0].fb_id) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.src_x, 0) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.src_y, 0) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.src_w, src_w) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.src_h, src_h) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_x, 0) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_y, 0) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_w, found.mode.hdisplay) < 0 or
-            c.drmModeAtomicAddProperty(req, plane_id, plane.crtc_h, found.mode.vdisplay) < 0 or
-            (plane.fb_damage_clips != 0 and
-                c.drmModeAtomicAddProperty(req, plane_id, plane.fb_damage_clips, damage_blob) < 0))
-        {
-            log_mod.err("drm: atomic modeset property add failed", self.io, self.log_cfg, "drm", .{});
+
+        var fb2: c.struct_drm_mode_fb_cmd2 = .{
+            .width = width,
+            .height = height,
+            .pixel_format = drm_format_xrgb8888,
+            .handles = .{ create_dumb.handle, 0, 0, 0 },
+            .pitches = .{ create_dumb.pitch, 0, 0, 0 },
+            .offsets = .{ 0, 0, 0, 0 },
+        };
+        if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_ADDFB2, &fb2) != 0) {
+            log_mod.err("drm: DRM_IOCTL_MODE_ADDFB2 failed", self.io, self.log_cfg, "drm", .{});
             return error.BackendFailed;
         }
-        log_mod.debug(
-            "drm: modeset commit plane={d} fbA={d} fbB={d} damage_prop={d} damage_blob={d}",
-            self.io,
-            self.log_cfg,
-            "drm",
-            .{ plane_id, drm_out.buffers[0].fb_id, drm_out.buffers[1].fb_id, plane.fb_damage_clips, damage_blob },
-        );
-        const commit_rc = c.drmModeAtomicCommit(fd, req, c.DRM_MODE_ATOMIC_ALLOW_MODESET, null);
-        if (commit_rc != 0) {
-            log_mod.err(
-                "drm: atomic modeset commit failed (errno {s}); props: " ++
-                    "conn{{id={d},crtc_prop={d},crtc={d}}} " ++
-                    "crtc{{id={d},mode_prop={d},mode={d},active_prop={d}}} " ++
-                    "plane{{id={d},crtc_prop={d},crtc={d},fb_prop={d},fb={d}," ++
-                    "src={d},{d},{d},{d},dst={d},{d},{d},{d},damage_prop={d},damage={d}}}",
-                self.io,
-                self.log_cfg,
-                "drm",
-                .{
-                    @tagName(std.os.linux.errno(@as(usize, @bitCast(@as(isize, @intCast(commit_rc)))))),
-                    found.connector_id,
-                    drm_out.connector_crtc_id,
-                    found.crtc_id,
-                    found.crtc_id,
-                    drm_out.crtc_mode_id,
-                    drm_out.mode_blob,
-                    drm_out.crtc_active,
-                    plane_id,
-                    plane.crtc_id,
-                    found.crtc_id,
-                    plane.fb_id,
-                    drm_out.buffers[0].fb_id,
-                    plane.src_x,
-                    plane.src_y,
-                    plane.src_w,
-                    plane.src_h,
-                    plane.crtc_x,
-                    plane.crtc_y,
-                    plane.crtc_w,
-                    plane.crtc_h,
-                    plane.fb_damage_clips,
-                    damage_blob,
-                },
-            );
-            return error.BackendFailed;
-        }
-    } else {
-        // --- legacy modeset: bind the connector to the CRTC and apply
-        // the mode in one call (wlroots legacy.c:121-126 drmModeSetCrtc
-        // with the connector array + mode). buffers[0] is the A side of
-        // the swapchain; the first commit flips to buffers[1]. The call
-        // is synchronous (no flip event), same as the blocking atomic
-        // modeset above.
-        if (c.drmModeSetCrtc(
-            fd,
-            found.crtc_id,
-            drm_out.buffers[0].fb_id,
-            0,
-            0,
-            &found.connector_id,
-            1,
-            &found.mode,
-        ) != 0) {
-            log_mod.err("drm: drmModeSetCrtc failed", self.io, self.log_cfg, "drm", .{});
+        buf.fb_id = fb2.fb_id;
+    }
+}
+
+/// Phase 9: the mode blob (wlroots atomic.c create_mode_blob). Atomic-only:
+/// the legacy modeset passes the drmModeModeInfo directly to drmModeSetCrtc.
+fn createModeBlob(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
+    if (!self.atomic) return;
+    var blob_id: u32 = 0;
+    if (c.drmModeCreatePropertyBlob(self.fd.?, &found.mode, @sizeOf(c.drmModeModeInfo), &blob_id) != 0) {
+        log_mod.err("drm: drmModeCreatePropertyBlob failed", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
+    }
+    drm_out.mode_blob = blob_id;
+}
+
+/// Phase 10: apply the mode. Atomic commits every binding in one request;
+/// legacy binds connector + CRTC + fb in a single drmModeSetCrtc. Both
+/// paths are synchronous (no flip event) — the first frame's page flip
+/// sends the event.
+fn modeset(
+    self: *DrmBackendData,
+    found: *FoundConnector,
+    plane: PlaneSelection,
+    drm_out: *DrmOutput,
+) error{BackendFailed}!void {
+    if (self.atomic) return atomicModeset(self, found, plane, drm_out);
+    return legacyModeset(self, found, drm_out);
+}
+
+/// Phase 10a: the atomic modeset — connector->crtc binding, crtc
+/// active+mode, plane fb + full source/dest rect + full-fb damage clip
+/// (wlroots atomic.c atomic_connector_add + set_plane_props; smithay
+/// surface/atomic.rs set_connector/set_crtc/set_plane). `found` travels
+/// by pointer because libdrm's legacy twin takes the connector and mode
+/// as non-const C pointers, and both phases share this signature.
+fn atomicModeset(
+    self: *DrmBackendData,
+    found: *FoundConnector,
+    plane: PlaneSelection,
+    drm_out: *DrmOutput,
+) error{BackendFailed}!void {
+    const fd = self.fd.?;
+    // FB_DAMAGE_CLIPS (full-fb rect) must ride every commit touching
+    // the plane: virtio-gpu's plane update is gated on merged damage
+    // clips — drivers/gpu/drm/virtio/virtgpu_plane.c
+    // virtio_gpu_plane_atomic_update early-returns before the scanout
+    // switch and the dumb upload/flush when
+    // drm_atomic_helper_damage_merged() finds nothing, and our commits
+    // otherwise change only FB_ID (wlroots atomic.c
+    // drm_atomic_connector_prepare -> create_fb_damage_clips_blob,
+    // set_plane_props adds the blob id). Skipped when the driver lacks
+    // the property (fb_damage_clips == 0).
+    var damage_blob: u32 = 0;
+    if (plane.props.fb_damage_clips != 0) {
+        if (!createDamageBlob(fd, found.mode.hdisplay, found.mode.vdisplay, &damage_blob)) {
+            log_mod.err("drm: create FB_DAMAGE_CLIPS blob failed", self.io, self.log_cfg, "drm", .{});
             return error.BackendFailed;
         }
     }
+    // The kernel copies the clips into the plane state at commit
+    // time; the blob is destroyed right after (wlroots atomic.c
+    // drm_atomic_connector_commit_state: destroy_blob(state->fb_damage_clips)).
+    defer {
+        if (damage_blob != 0) _ = c.drmModeDestroyPropertyBlob(fd, damage_blob);
+    }
 
-    // --- announce the output, then kick the first frame. The compositor
-    // attaches its frame listener during the emit, so the flip event
-    // chain starts here (wlroots: wlr_output_send_frame after modeset).
+    const req = c.drmModeAtomicAlloc() orelse {
+        log_mod.err("drm: drmModeAtomicAlloc failed", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
+    };
+    defer c.drmModeAtomicFree(req);
+    if (!addModesetProps(req, found, plane, drm_out, damage_blob)) {
+        log_mod.err("drm: atomic modeset property add failed", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
+    }
+    log_mod.debug(
+        "drm: modeset commit plane={d} fbA={d} fbB={d} damage_prop={d} damage_blob={d}",
+        self.io,
+        self.log_cfg,
+        "drm",
+        .{ plane.id, drm_out.buffers[0].fb_id, drm_out.buffers[1].fb_id, plane.props.fb_damage_clips, damage_blob },
+    );
+    const commit_rc = c.drmModeAtomicCommit(fd, req, c.DRM_MODE_ATOMIC_ALLOW_MODESET, null);
+    if (commit_rc != 0) {
+        logAtomicModesetFailure(self, found, plane, drm_out, damage_blob, commit_rc);
+        return error.BackendFailed;
+    }
+}
+
+/// The property set an atomic modeset commits, in the order wlroots adds
+/// them: the connector's CRTC_ID, then the CRTC's MODE_ID and ACTIVE,
+/// then the plane's FB_ID, the full 16.16 source rect, the full
+/// destination rect and — when the driver has the property — the damage
+/// blob (wlroots atomic.c atomic_connector_add adds connector state,
+/// then crtc state, then set_plane_props for the primary plane and its
+/// fb_damage_clips). SRC_* is 16.16 fixed point, the destination rect
+/// plain pixels. False when the driver rejects any add: the request is
+/// then not committed at all rather than committed half-filled.
+fn addModesetProps(
+    req: c.drmModeAtomicReqPtr,
+    found: *FoundConnector,
+    plane: PlaneSelection,
+    drm_out: *DrmOutput,
+    damage_blob: u32,
+) bool {
+    const src_w = fixed16(found.mode.hdisplay);
+    const src_h = fixed16(found.mode.vdisplay);
+    if (c.drmModeAtomicAddProperty(req, found.connector_id, drm_out.connector_crtc_id, found.crtc_id) < 0 or
+        c.drmModeAtomicAddProperty(req, found.crtc_id, drm_out.crtc_mode_id, drm_out.mode_blob) < 0 or
+        c.drmModeAtomicAddProperty(req, found.crtc_id, drm_out.crtc_active, 1) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.crtc_id, found.crtc_id) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.fb_id, drm_out.buffers[0].fb_id) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.src_x, 0) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.src_y, 0) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.src_w, src_w) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.src_h, src_h) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.crtc_x, 0) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.crtc_y, 0) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.crtc_w, found.mode.hdisplay) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.crtc_h, found.mode.vdisplay) < 0 or
+        (plane.props.fb_damage_clips != 0 and
+            c.drmModeAtomicAddProperty(req, plane.id, plane.props.fb_damage_clips, damage_blob) < 0))
+    {
+        return false;
+    }
+    return true;
+}
+
+/// Why the atomic modeset commit was rejected: the errno plus every
+/// property id and value that went into the request. The kernel answers a
+/// bad property set with a bare -EINVAL, so the request has to be
+/// readable from the log alone. Split out of `atomicModeset` to keep the
+/// commit sequence itself legible.
+fn logAtomicModesetFailure(
+    self: *DrmBackendData,
+    found: *FoundConnector,
+    plane: PlaneSelection,
+    drm_out: *DrmOutput,
+    damage_blob: u32,
+    commit_rc: c_int,
+) void {
+    log_mod.err(
+        "drm: atomic modeset commit failed (errno {s}); props: " ++
+            "conn{{id={d},crtc_prop={d},crtc={d}}} " ++
+            "crtc{{id={d},mode_prop={d},mode={d},active_prop={d}}} " ++
+            "plane{{id={d},crtc_prop={d},crtc={d},fb_prop={d},fb={d}," ++
+            "src={d},{d},{d},{d},dst={d},{d},{d},{d},damage_prop={d},damage={d}}}",
+        self.io,
+        self.log_cfg,
+        "drm",
+        .{
+            @tagName(std.os.linux.errno(@as(usize, @bitCast(@as(isize, @intCast(commit_rc)))))),
+            found.connector_id,
+            drm_out.connector_crtc_id,
+            found.crtc_id,
+            found.crtc_id,
+            drm_out.crtc_mode_id,
+            drm_out.mode_blob,
+            drm_out.crtc_active,
+            plane.id,
+            plane.props.crtc_id,
+            found.crtc_id,
+            plane.props.fb_id,
+            drm_out.buffers[0].fb_id,
+            plane.props.src_x,
+            plane.props.src_y,
+            plane.props.src_w,
+            plane.props.src_h,
+            plane.props.crtc_x,
+            plane.props.crtc_y,
+            plane.props.crtc_w,
+            plane.props.crtc_h,
+            plane.props.fb_damage_clips,
+            damage_blob,
+        },
+    );
+}
+
+/// Phase 10b: the legacy modeset — bind the connector to the CRTC and
+/// apply the mode in one call (wlroots legacy.c:121-126 drmModeSetCrtc
+/// with the connector array + mode). buffers[0] is the A side of the
+/// swapchain; the first commit flips to buffers[1].
+fn legacyModeset(self: *DrmBackendData, found: *FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
+    if (c.drmModeSetCrtc(
+        self.fd.?,
+        found.crtc_id,
+        drm_out.buffers[0].fb_id,
+        0,
+        0,
+        &found.connector_id,
+        1,
+        &found.mode,
+    ) != 0) {
+        log_mod.err("drm: drmModeSetCrtc failed", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
+    }
+}
+
+/// Phase 11: announce the output, then kick the first frame. The
+/// compositor attaches its frame listener during the emit, so the flip
+/// event chain starts here (wlroots: wlr_output_send_frame after modeset).
+/// This is the last phase that can fail, and only on allocation — the
+/// device is already live, so the errdefer in startInner tears the whole
+/// output back down.
+fn announceOutput(base: *backend_mod.Backend, self: *DrmBackendData, drm_out: *DrmOutput) error{OutOfMemory}!void {
     const out = try output_mod.Output.create(
-        allocator,
+        self.allocator,
         self.io,
         self.log_cfg,
         base,
@@ -593,19 +761,6 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
     base.emitNewOutput(out);
     out.sendFrame();
     log_mod.info("drm: modeset ok, output live", self.io, self.log_cfg, "drm", .{});
-}
-
-fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
-    const self: *DrmBackendData = @ptrCast(@alignCast(data));
-    // Tear down the output first (emits destroy signals) so no frame
-    // callback can touch the DRM state after the fd closes; then release
-    // the device resources (which live in drm_out) before freeing it.
-    if (self.drm_output) |drm_out| {
-        if (drm_out.out) |out| out.destroy();
-    }
-    drmTeardown(self);
-    if (self.drm_output) |drm_out| allocator.destroy(drm_out);
-    allocator.destroy(self);
 }
 
 // ---------------------------------------------------------------------------

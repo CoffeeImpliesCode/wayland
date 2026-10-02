@@ -1357,6 +1357,15 @@ pub const XdgPopup = struct {
     /// derived from the xdg_positioner at get_popup time and re-derived
     /// on configure/reposition (F1).
     geometry: geom.Rect = geom.Rect.empty(),
+    /// This surface's absolute origin in scene coordinates, kept
+    /// current by the compositor's scene sync through setPopupOrigin.
+    /// The seat reports pointer input in scene coordinates while
+    /// wl_pointer carries surface-local ones (wayland.xml:2224-2232),
+    /// so the popup grab subtracts this origin from every event it
+    /// forwards. (0,0) until the first sync, which leaves the
+    /// conversion a no-op: a popup the scene has not placed yet is
+    /// treated as sitting at the scene's top-left.
+    origin: geom.Point = .{ .x = 0, .y = 0 },
     /// The xdg_surface this popup is attached to (null = layer-shell parent).
     parent: ?*XdgSurface = null,
     /// The layer surface this popup is attached to when the parent is a
@@ -1364,6 +1373,11 @@ pub const XdgPopup = struct {
     layer_parent: ?*surface_mod.Surface = null,
     /// The positioner rules copied at get_popup/reposition time; the
     /// constraint adjustment and reactive re-placement read these (F1).
+    // SAFETY: written before any read — the get_popup construction
+    // (xdgSurfaceGetPopup) copies the validated positioner into this
+    // field before the popup is published to the shell list, and
+    // xdg_popup.reposition copies a fresh PositionerState over it
+    // before recomputeGeometry reads it back.
     positioner_rules: PositionerState = undefined,
     /// The compositor-supplied usable area the popup must stay within
     /// (output or parent-toplevel box, in parent-surface-local coords).
@@ -1404,6 +1418,39 @@ pub const XdgPopup = struct {
     /// within it per the positioner's constraint_adjustment bits.
     pub fn setConstraintBox(p: *XdgPopup, box: geom.Rect) void {
         p.constraint_box = box;
+    }
+
+    /// Record where the popup surface sits in the scene. The SERVER's
+    /// scene sync calls this every frame, after resolving the popup's
+    /// absolute position (call site: `syncPopupNodes` in
+    /// src/server/main.zig, which owns the layout this module cannot
+    /// see). The popup grab needs it because the seat hands input
+    /// events in scene coordinates while wl_pointer.enter/motion carry
+    /// surface-local ones (wayland.xml:2224-2232).
+    pub fn setPopupOrigin(popup: *XdgPopup, x: i32, y: i32) void {
+        popup.origin = .{ .x = x, .y = y };
+    }
+
+    /// The popup's absolute rectangle in scene coordinates: the synced
+    /// origin plus the configured size. `geometry.x/y` are parent-
+    /// relative and are NOT added here — the origin already absorbs
+    /// the parent's own scene position.
+    fn absoluteRect(popup: *const XdgPopup) geom.Rect {
+        return .{
+            .x = popup.origin.x,
+            .y = popup.origin.y,
+            .width = popup.geometry.width,
+            .height = popup.geometry.height,
+        };
+    }
+
+    /// The seat coordinates `x, y` expressed in this popup's
+    /// surface-local space. Negative results are normal: a pointer left
+    /// of or above the popup still has a well-defined surface-local
+    /// position, and the protocol carries it as such (wayland.xml:
+    /// 2206-2209, the enter event's "surface-local x coordinate").
+    fn localPoint(popup: *const XdgPopup, x: i32, y: i32) geom.Point {
+        return .{ .x = x - popup.origin.x, .y = y - popup.origin.y };
     }
 
     /// Send the initial/popup configure: xdg_popup.configure with the
@@ -1521,26 +1568,77 @@ const PopupGrab = struct {
     /// (the seat never hit-tests while a grab is installed, so the grab
     /// delivers the enter itself on the first motion).
     pointer_entered: bool = false,
-    pointer_grab: seat_mod.PointerGrab = undefined,
-    keyboard_grab: seat_mod.KeyboardGrab = undefined,
+    /// The seat's grab slots this state owns. No defaults: the install
+    /// literal in popupRequest writes both, and a default would be dead
+    /// state — nothing reads either slot before the seat is handed a
+    /// pointer to it.
+    pointer_grab: seat_mod.PointerGrab,
+    keyboard_grab: seat_mod.KeyboardGrab,
+    /// The last seat (scene) coordinates this grab's motion handler
+    /// saw. The seat's own pointer_x/pointer_y are module-private, and
+    /// every motion routes through popupGrabMotion while the grab is
+    /// installed, so this is the position a button event belongs to.
+    /// has_position stays false until the first motion: a button that
+    /// arrives before one has no known position, and the grab never
+    /// delivers a press at coordinates it invented.
+    last_x: i32 = 0,
+    last_y: i32 = 0,
+    has_position: bool = false,
+    /// Buttons whose press reached the popup client and whose release
+    /// is still owed to it. A client must never see a release whose
+    /// press it never got, and the seat's own held-button set is only
+    /// maintained on the default delivery path (seat.zig records it
+    /// in pointerButton, never for grab-routed events), so the grab
+    /// keeps its own — same shape as the seat's, seat.zig:339-340.
+    // SAFETY: only the first held_button_count entries are ever read;
+    // both fields start at 0 and every write is guarded by the count.
+    held_buttons: [16]u32 = undefined,
+    held_button_count: usize = 0,
+
     /// Fires when the seat dies first: clears the seat reference so
     /// popupDestroy never touches freed seat memory.
     seat_destroy_listener: wire.Listener(*seat_mod.Seat),
 };
 
+/// Remember that a press for `button` reached the popup client, so its
+/// release is delivered to the same client. The set is small and
+/// duplicate-free: one entry per physical button the client holds.
+fn notePopupGrabPress(g: *PopupGrab, button: u32) void {
+    if (g.held_button_count >= g.held_buttons.len) return;
+    if (std.mem.indexOfScalar(u32, g.held_buttons[0..g.held_button_count], button) != null) return;
+    g.held_buttons[g.held_button_count] = button;
+    g.held_button_count += 1;
+}
+
+/// Drop the press for `button`, reporting whether it had been
+/// delivered. False means this grab never sent the press, so it must
+/// not send the matching release.
+fn takePopupGrabPress(g: *PopupGrab, button: u32) bool {
+    const idx = std.mem.indexOfScalar(u32, g.held_buttons[0..g.held_button_count], button) orelse return false;
+    g.held_buttons[idx] = g.held_buttons[g.held_button_count - 1];
+    g.held_button_count -= 1;
+    return true;
+}
+
 /// End the popup grab (dismiss or teardown). Sends popup_done when
-/// `dismiss` — a grab-owned dismissal (button press, or the grab being
-/// cancelled/replaced); teardown paths have already sent popup_done or
-/// need none. Idempotent: only the first call acts, so the cancel
-/// handlers that run inside end*Grab (which call back into this) cannot
-/// recurse.
+/// `dismiss` — a grab-owned dismissal (a press outside the popup, or
+/// the grab being cancelled/replaced); teardown paths have already
+/// sent popup_done or need none. Idempotent: only the first call acts,
+/// so the cancel handlers that run inside end*Grab (which call back
+/// into this) cannot recurse.
+///
+/// Grabs are ended by OWNERSHIP, not by seat: a grab another
+/// subsystem installed after this one must survive (a keyboard grab
+/// armed while the popup grab was live replaces the seat's keyboard
+/// slot, and ending it here would cancel a grab this popup never
+/// owned — the same check Drag.end makes, data_device.zig:335).
 fn popupGrabEnd(g: *PopupGrab, dismiss: bool) void {
     if (!g.active) return;
     g.active = false;
     if (dismiss) g.popup.sendPopupDone();
     const seat = g.seat orelse return;
-    seat.endPointerGrab();
-    seat.endKeyboardGrab();
+    if (seat.pointer_grab == &g.pointer_grab) seat.endPointerGrab();
+    if (seat.keyboard_grab == &g.keyboard_grab) seat.endKeyboardGrab();
 }
 
 /// The pointer grab was cancelled (replaced by another grab or ended):
@@ -1564,17 +1662,29 @@ fn popupGrabKeyboardCancel(seat: *seat_mod.Seat, grab: *const seat_mod.KeyboardG
 /// Route pointer motion to the popup's client's pointer resources
 /// (wlroots xdg_pointer_grab_motion, wlr_xdg_popup.c:64-66). The seat
 /// never hit-tests under a grab, so the grab delivers the enter for the
-/// popup surface itself on the first motion. Surface-local coordinates
-/// are the raw seat coordinates: converting to popup-local needs the
-/// scene origin, which xdg.zig does not track (follow-up, same as the
-/// parent-motion trigger).
+/// popup surface itself on the first motion.
+///
+/// Coordinates go out SURFACE-LOCAL, as the protocol requires
+/// (wayland.xml:2224-2232, "the location relative to the focused
+/// surface"), so the seat's scene coordinates are converted through
+/// the popup's synced origin (setPopupOrigin) before the 24.8
+/// fixed-point encoding. The conversion is unclamped: a pointer left of
+/// or above the popup has a negative surface-local coordinate, which is
+/// what the wire carries.
 fn popupGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i32, y: i32) void {
     const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
     if (!g.active) return;
+    // The seat's own pointer_x/pointer_y are module-private and every
+    // motion routes here while the grab is installed, so this is where
+    // a later button event's position comes from.
+    g.last_x = x;
+    g.last_y = y;
+    g.has_position = true;
     const popup = g.popup;
     const wl_client = popup.resource.getClient();
-    const fx = wire.wl.Fixed.fromInt(@intCast(x));
-    const fy = wire.wl.Fixed.fromInt(@intCast(y));
+    const local = popup.localPoint(x, y);
+    const fx = wire.wl.Fixed.fromInt(@intCast(local.x));
+    const fy = wire.wl.Fixed.fromInt(@intCast(local.y));
     if (!g.pointer_entered) {
         g.pointer_entered = true;
         const serial = seat.serialFor(wl_client);
@@ -1596,29 +1706,74 @@ fn popupGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i
     if (delivered) seat.markFramePending(wl_client);
 }
 
-/// Any button press while the popup owns the grab dismisses it —
-/// popup_done + grab end (X04b simplification; wlroots dismisses via
-/// xdg_popup_grab_end when the button cannot be delivered to the
-/// client, wlr_xdg_popup.c:72-80). Releases route to the popup's
-/// client.
-fn popupGrabButton(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, button: u32, pressed: bool) void {
-    const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
-    if (!g.active) return;
-    if (pressed) {
-        popupGrabEnd(g, true);
-        return;
-    }
-    const popup = g.popup;
-    const wl_client = popup.resource.getClient();
-    const serial = seat.serialFor(wl_client);
+/// Send a button event to every pointer resource of `wl_client` and
+/// mark the input batch, so the batch closes with the next
+/// wl_pointer.frame (wlroots wlr_seat_pointer.c:394-402). Only the
+/// receiving client's pointers are iterated — the same set the seat's
+/// own default path walks (seat.zig:969-974, mirroring wlroots'
+/// wlr_seat_pointer_send_button).
+fn sendPopupGrabButton(
+    seat: *seat_mod.Seat,
+    wl_client: *wire.Client,
+    serial: u32,
+    button: u32,
+    state: server.wl.Pointer.ButtonState,
+) void {
     const time = seat.nowMs();
     var delivered = false;
     for (seat.pointers.items) |ptr| {
         if (ptr.getClient() != wl_client) continue;
-        ptr.sendButton(serial, time, button, .released);
+        ptr.sendButton(serial, time, button, state);
         delivered = true;
     }
     if (delivered) seat.markFramePending(wl_client);
+}
+
+/// Whether `wl_client` still has a pointer resource able to receive the
+/// event (wlroots sends to focused_client->pointers only, the same set
+/// the seat's default path walks — seat.zig:969-974).
+fn seatHasPointerFor(seat: *seat_mod.Seat, wl_client: *wire.Client) bool {
+    for (seat.pointers.items) |ptr| {
+        if (ptr.getClient() == wl_client) return true;
+    }
+    return false;
+}
+
+/// A press INSIDE the popup reaches the popup's client and the grab
+/// stays (wlroots xdg_pointer_button: the press is delivered when the
+/// pointer is inside the popup's geometry, and the grab ends only when
+/// it is not, wlr_xdg_popup.c:69-80). A press outside the popup — or
+/// one the client cannot receive at all — dismisses with popup_done.
+///
+/// A release is delivered only for a press this grab delivered: a
+/// client must never see a release whose press it never got. The seat
+/// already synthesizes releases for the buttons held when the grab was
+/// installed (seat.zig:766-784), so those presses are accounted for
+/// before the grab takes over.
+fn popupGrabButton(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, button: u32, pressed: bool) void {
+    const g: *PopupGrab = @ptrCast(@alignCast(grab.data.?));
+    if (!g.active) return;
+    const popup = g.popup;
+    const wl_client = popup.resource.getClient();
+    if (!pressed) {
+        // No delivered press, no release.
+        if (!takePopupGrabPress(g, button)) return;
+        const serial = seat.serialFor(wl_client);
+        sendPopupGrabButton(seat, wl_client, serial, button, .released);
+        return;
+    }
+    const rect = popup.absoluteRect();
+    const local = popup.localPoint(g.last_x, g.last_y);
+    const inside = g.has_position and
+        local.x >= 0 and local.x < rect.width and
+        local.y >= 0 and local.y < rect.height;
+    if (!inside or !seatHasPointerFor(seat, wl_client)) {
+        popupGrabEnd(g, true);
+        return;
+    }
+    const serial = seat.serialFor(wl_client);
+    sendPopupGrabButton(seat, wl_client, serial, button, .pressed);
+    notePopupGrabPress(g, button);
 }
 
 /// Axis events are swallowed during the popup grab: the X04b routing
@@ -4742,19 +4897,38 @@ test "popup reposition re-places and acknowledges the token (F1/F7)" {
 
 // --- X04b: popup seat-grab routing -----------------------------------------
 
-/// Event counts for the popup client's wl_pointer during a grab.
+/// Event log for the popup client's wl_pointer during a grab.
 const PopupGrabPointerEvents = struct {
     entered: bool = false,
+    /// The enter's surface-local position as the client decoded it.
+    enter_x: i24 = 0,
+    enter_y: i24 = 0,
     motion: usize = 0,
-    button: usize = 0,
+    /// The last motion's surface-local position as the client decoded it.
+    motion_x: i24 = 0,
+    motion_y: i24 = 0,
+    presses: usize = 0,
+    releases: usize = 0,
     frame: usize = 0,
 
     fn listener(pointer: *client.wl.Pointer, event: client.wl.Pointer.Event, data: *PopupGrabPointerEvents) void {
         _ = pointer;
         switch (event) {
-            .enter => data.entered = true,
-            .motion => data.motion += 1,
-            .button => data.button += 1,
+            .enter => |e| {
+                data.entered = true;
+                data.enter_x = e.surface_x.toInt();
+                data.enter_y = e.surface_y.toInt();
+            },
+            .motion => |m| {
+                data.motion += 1;
+                data.motion_x = m.surface_x.toInt();
+                data.motion_y = m.surface_y.toInt();
+            },
+            .button => |b| switch (b.state) {
+                .pressed => data.presses += 1,
+                .released => data.releases += 1,
+                else => {},
+            },
             .frame => data.frame += 1,
             .leave, .axis, .axis_stop, .axis_discrete, .axis_source, .axis_value120, .axis_relative_direction => {
                 // Not routed by the popup grab (wlroots xdg_popup scope).
@@ -4783,11 +4957,12 @@ const PopupGrabKeyboardEvents = struct {
     }
 };
 
-test "xdg_popup.grab installs pointer + keyboard grabs routing to the popup client (X04b)" {
-    const allocator = std.testing.allocator;
-    var ts = try TestServer.init(allocator);
-    defer ts.deinit();
-
+/// Stand up the fixture the X04b routing tests share: a toplevel
+/// parent, a 100x50 popup on it with `popup_events` attached, and
+/// `xdg_popup.grab` installed over it. The caller's wl_pointer and
+/// wl_keyboard listeners must already be attached — the grab routes to
+/// those resources. Returns the shell-side popup.
+fn installTestPopupGrab(ts: *TestServer, popup_events: *PopupEvents) !*XdgPopup {
     const parent_wl_surface = try ts.wl_compositor.?.createSurface();
     const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
     _ = try parent_xdg_surface.getToplevel();
@@ -4800,11 +4975,43 @@ test "xdg_popup.grab installs pointer + keyboard grabs routing to the popup clie
     positioner.setGravity(.bottom_right);
     const wl_surface = try ts.wl_compositor.?.createSurface();
     const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
-    var popup_events: PopupEvents = .{};
     const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
-    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    popup.setListener(*PopupEvents, PopupEvents.listener, popup_events);
     positioner.destroy();
     try ts.pump();
+
+    // Grab the unmapped, topmost popup with a serial the client was
+    // just handed: the keyboard focus change mints one (xdg_popup.grab
+    // is only valid in response to a user action).
+    const p = ts.shell.?.popups.items[0];
+    ts.seat.?.setKeyboardFocus(p.xdg_surface.surface);
+    popup.grab(ts.wl_seat.?, ts.seat.?.last_serial);
+    try ts.pump();
+    return p;
+}
+
+/// A keyboard grab owned by a different subsystem. Its cancel clears
+/// the seat's slot exactly as the seat's endKeyboardGrab does, so a
+/// popup ending a grab it never installed is directly observable.
+const foreign_keyboard_grab: seat_mod.KeyboardGrab = .{
+    .data = null,
+    .key = foreignGrabKey,
+    .modifiers = foreignGrabModifiers,
+    .cancel = foreignGrabCancel,
+};
+
+fn foreignGrabKey(_: *seat_mod.Seat, _: *const seat_mod.KeyboardGrab, _: u32, _: bool) void {}
+
+fn foreignGrabModifiers(_: *seat_mod.Seat, _: *const seat_mod.KeyboardGrab) void {}
+
+fn foreignGrabCancel(seat: *seat_mod.Seat, grab: *const seat_mod.KeyboardGrab) void {
+    if (seat.keyboard_grab == grab) seat.keyboard_grab = null;
+}
+
+test "xdg_popup.grab installs pointer + keyboard grabs routing to the popup client (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
 
     // The popup client's seat resources: the grab routes to these.
     const wl_pointer = try ts.wl_seat.?.getPointer();
@@ -4815,16 +5022,10 @@ test "xdg_popup.grab installs pointer + keyboard grabs routing to the popup clie
     wl_keyboard.setListener(*PopupGrabKeyboardEvents, PopupGrabKeyboardEvents.listener, &kbd_events);
     try ts.pump();
 
-    // Mint a serial for the client (keyboard enter carries one) and grab
-    // the unmapped, topmost popup with it.
-    const p = ts.shell.?.popups.items[0];
-    ts.seat.?.setKeyboardFocus(p.xdg_surface.surface);
-    const serial = ts.seat.?.last_serial;
-    try std.testing.expect(ts.seat.?.validateEventSerial(ts.client.?, serial));
-
-    popup.grab(ts.wl_seat.?, serial);
-    try ts.pump();
-    // No protocol error; the grabs are installed.
+    var popup_events: PopupEvents = .{};
+    const p = try installTestPopupGrab(ts, &popup_events);
+    // No protocol error; the grabs are installed (a grab echoed with a
+    // serial the client never received is ignored — see the test below).
     try std.testing.expect(p.grab_state != null);
     try std.testing.expect(ts.seat.?.pointer_grab != null);
     try std.testing.expect(ts.seat.?.keyboard_grab != null);
@@ -4851,20 +5052,196 @@ test "xdg_popup.grab installs pointer + keyboard grabs routing to the popup clie
     try std.testing.expectEqual(@as(usize, 2), kbd_events.key);
     try std.testing.expectEqual(@as(usize, 1), kbd_events.modifiers);
 
-    // Any button press dismisses: popup_done, then both grabs end
-    // (X04b simplification).
+    // The pointer is outside the popup: the unsynced origin is (0,0), so
+    // the popup's absolute rect spans x 0..100 and y 0..50, which
+    // (100,120) misses. The press dismisses: popup_done, no button
+    // event, then both grabs end.
     ts.seat.?.pointerButton(seat_mod.btn_left, true);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.presses);
     try std.testing.expect(ts.seat.?.pointer_grab == null);
     try std.testing.expect(ts.seat.?.keyboard_grab == null);
     try std.testing.expect(!p.grab_state.?.active);
+
+    // The grab is gone and the seat has no pointer focus, so the release
+    // reaches nobody: the client never got the press.
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.releases);
 
     // After the grab ends the seat is back to default delivery: another
     // press is not an error and sends no duplicate popup_done.
     ts.seat.?.pointerButton(seat_mod.btn_left, true);
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.presses);
+}
+
+test "popup grab delivers an inside press and its release to the popup client (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    try ts.pump();
+    var popup_events: PopupEvents = .{};
+    const p = try installTestPopupGrab(ts, &popup_events);
+
+    // The scene sync placed the popup's surface origin at (100,200), so
+    // its absolute rect spans x 100..200 and y 200..250. geometry.x/y are
+    // parent-relative and are NOT added on top of that origin.
+    p.setPopupOrigin(100, 200);
+
+    // Inside the popup: the press reaches the client, and the grab stays
+    // so the click can complete (a menu that dismissed on the press
+    // could never activate an item).
+    ts.seat.?.pointerMotion(150, 220);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.presses);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+    try std.testing.expect(p.grab_state.?.active);
+    try std.testing.expect(ts.seat.?.pointer_grab != null);
+
+    // The matching release reaches the same client.
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+    try std.testing.expect(p.grab_state.?.active);
+
+    // A release for a button the grab never pressed is swallowed: a
+    // client must never see a release whose press it never got.
+    ts.seat.?.pointerButton(seat_mod.btn_right, false);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.releases);
+    try std.testing.expect(p.grab_state.?.active);
+}
+
+test "popup grab dismisses on a press outside the popup (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    try ts.pump();
+    var popup_events: PopupEvents = .{};
+    const p = try installTestPopupGrab(ts, &popup_events);
+    p.setPopupOrigin(100, 200);
+
+    // The popup's rect is half-open: (200,225) is its right edge, not
+    // its interior, so the press dismisses rather than reaching the
+    // client.
+    ts.seat.?.pointerMotion(200, 225);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.presses);
+    try std.testing.expect(ts.seat.?.pointer_grab == null);
+    try std.testing.expect(ts.seat.?.keyboard_grab == null);
+    try std.testing.expect(!p.grab_state.?.active);
+
+    // The release of that press never reaches the popup client: the grab
+    // that never sent the press is gone, and the seat's default path has
+    // no pointer focus to fall back on.
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
+}
+
+test "popup grab converts seat coordinates to surface-local ones (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    try ts.pump();
+    var popup_events: PopupEvents = .{};
+    const p = try installTestPopupGrab(ts, &popup_events);
+
+    // The scene has not placed the popup yet: the origin defaults to
+    // (0,0), so seat coordinates pass through unchanged.
+    ts.seat.?.pointerMotion(7, 9);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expect(ptr_events.entered);
+    try std.testing.expectEqual(@as(i24, 7), ptr_events.enter_x);
+    try std.testing.expectEqual(@as(i24, 9), ptr_events.enter_y);
+    try std.testing.expectEqual(@as(i24, 7), ptr_events.motion_x);
+    try std.testing.expectEqual(@as(i24, 9), ptr_events.motion_y);
+
+    // After the scene sync places the popup, motion carries
+    // surface-local coordinates — a pointer left of and above the
+    // popup's top-left corner is negative, not clamped
+    // (wayland.xml:2206-2209, the enter event's "surface-local x
+    // coordinate").
+    p.setPopupOrigin(100, 200);
+    ts.seat.?.pointerMotion(90, 190);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), ptr_events.motion);
+    try std.testing.expectEqual(@as(i24, -10), ptr_events.motion_x);
+    try std.testing.expectEqual(@as(i24, -10), ptr_events.motion_y);
+    // The enter is sent once, so it still carries the unsynced origin.
+    try std.testing.expectEqual(@as(i24, 7), ptr_events.enter_x);
+
+    // The origin is re-synced every frame: the conversion follows it.
+    p.setPopupOrigin(4, 5);
+    ts.seat.?.pointerMotion(14, 15);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(i24, 10), ptr_events.motion_x);
+    try std.testing.expectEqual(@as(i24, 10), ptr_events.motion_y);
+}
+
+test "popupGrabEnd leaves a keyboard grab it does not own installed (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    try ts.pump();
+    var popup_events: PopupEvents = .{};
+    const p = try installTestPopupGrab(ts, &popup_events);
+
+    // Another subsystem owns the seat's keyboard slot while the popup
+    // grab is live.
+    ts.seat.?.keyboard_grab = &foreign_keyboard_grab;
+
+    // The popup's grab ends. It must end the pointer grab it installed
+    // and leave the foreign keyboard grab alone: ending a grab it does
+    // not own cancels someone else's grab, and every key event is lost
+    // until its owner re-arms (the same ownership check Drag.end makes,
+    // data_device.zig:335).
+    popupGrabEnd(p.grab_state.?, false);
+    try std.testing.expect(!p.grab_state.?.active);
+    try std.testing.expect(ts.seat.?.pointer_grab == null);
+    try std.testing.expect(ts.seat.?.keyboard_grab == &foreign_keyboard_grab);
+
+    // A second end is a no-op (the cancel handlers call back into it).
+    popupGrabEnd(p.grab_state.?, false);
+    try std.testing.expect(ts.seat.?.keyboard_grab == &foreign_keyboard_grab);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
 }
 
 test "xdg_popup.grab with a serial the client never received is ignored (X04b)" {

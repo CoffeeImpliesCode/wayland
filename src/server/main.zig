@@ -155,6 +155,20 @@ const background_color = [4]f32{ 0.1, 0.1, 0.12, 1.0 };
 /// panning the camera.
 const drag_threshold_sq: i32 = 16; // 4 px
 
+/// The camera the server starts with: the world origin centered on the
+/// viewport center at zoom 1, no rotation, whose worldToScreen is the
+/// identity mapping. An unset or unparseable WAYLAND_CAMERA falls back to
+/// exactly this (see parseCameraEnv), and `last_camera` starts here too so
+/// the first frame observes no camera change.
+const default_camera: Camera = .{
+    .center_x = @as(f64, @floatFromInt(output_width)) / 2.0,
+    .center_y = @as(f64, @floatFromInt(output_height)) / 2.0,
+    .zoom = 1,
+    .rotation = 0,
+    .screen_w = @floatFromInt(output_width),
+    .screen_h = @floatFromInt(output_height),
+};
+
 const ServerState = struct {
     allocator: std.mem.Allocator,
     io: *std.Io,
@@ -314,42 +328,15 @@ const ServerState = struct {
     /// zoom lands after the phase-1 capture buffer is fully delivered
     /// (ready message flushed) without depending on frame timing.
     synth_scroll_grace: u32 = 0,
-    /// M4 Phase B camera drag: the last pointer position while the left
-    /// button is held (the pan anchor); null when not dragging. A click
-    /// without motion never produces a delta, so the seat's
-    /// click-to-focus is unchanged.
-    camera_drag: ?DragPoint = null,
-    /// Interactive move (xdg_toplevel.move — the client's titlebar drag):
-    /// the toplevel being moved, null when idle. The move owns the
-    /// pointer grab until the button release (the client sees no pointer
-    /// events during the move).
-    moving_toplevel: ?*wayland.shell.XdgToplevel = null,
-    /// The pointer's WORLD position at the last move tick; the node
-    /// moves by the delta between ticks.
-    move_anchor: geom.FPoint = .{ .x = 0, .y = 0 },
+    /// The compositor's own pointer gestures (the interactive move and
+    /// the camera pan). Grouped because they are installed and torn
+    /// down as ONE seat pointer grab and the left-button release ends
+    /// both — see PointerGestures.
+    gestures: PointerGestures = .{},
     /// The camera state at the last render: a change (pan/zoom) forces
     /// whole-output damage so the partial upload never smears the
     /// previous canvas (the drag-streak bug).
-    last_camera: Camera = .{
-        .center_x = @as(f64, @floatFromInt(output_width)) / 2.0,
-        .center_y = @as(f64, @floatFromInt(output_height)) / 2.0,
-        .zoom = 1,
-        .rotation = 0,
-        .screen_w = @floatFromInt(output_width),
-        .screen_h = @floatFromInt(output_height),
-    },
-    /// Whether the drag has crossed the movement threshold (a real pan has
-    /// started). A press alone only arms camera_drag; the pan (and the
-    /// fast-render blockiness) begins once the pointer moves > drag_threshold
-    /// px — so a click with a tiny micro-move doesn't pan the camera or
-    /// steal focus from the terminal (the reported 'click hangs the cursor').
-    drag_active: bool = false,
-    /// Progressive-quality fast render: set while a camera drag/pan is
-    /// active so compositeBase renders the canvas at a reduced stride
-    /// (blocky but ~stride² cheaper per frame — keeps panning responsive
-    /// on a slow CPU). Cleared when the drag ends; the next full-quality
-    /// render replaces the blocky frame.
-    fast_render: bool = false,
+    last_camera: Camera = default_camera,
     /// WAYLAND_PERF=1: log per-frame pipeline timings (import -> render
     /// -> present) in microseconds.
     perf: bool = false,
@@ -367,6 +354,8 @@ const ServerState = struct {
     request_activate_listener: wire.Listener(*wayland.xdg_activation.ActivateRequest),
     request_mode_listener: wire.Listener(*wayland.xdg_decoration.RequestMode),
     new_decoration_listener: wire.Listener(*wayland.xdg_decoration.Decoration),
+    /// wl_toplevel.activated follows the seat's keyboard focus (P1-9).
+    seat_focus_listener: wire.Listener(*wayland.seat.Seat),
     seat_key_listener: wire.Listener(*wayland.seat.Seat),
     /// M4 Phase B camera controls: seat listeners for the drag-pan
     /// (button + pointer_move signals) and the wheel-zoom (axis signal).
@@ -378,6 +367,74 @@ const ServerState = struct {
 /// M4 Phase B: the drag-pan gesture anchor — the pointer position while
 /// the left button is held.
 const DragPoint = struct { x: i32, y: i32 };
+
+/// The compositor's own pointer gestures: the interactive move
+/// (xdg_toplevel.move — the client's titlebar drag) and the camera pan.
+/// Both own ONE seat pointer grab — seat.swallow_pointer_grab, whose
+/// suppress_click_focus is what keeps the client under the pointer from
+/// seeing the gesture at all (seat.zig:206-218) — and the left-button
+/// release ends both, so their state lives together.
+///
+/// `own_grab` is the grab THIS server installed, and the release may end
+/// the seat grab only while the seat still carries it. Another subsystem
+/// can own the seat instead (a wl_data_device.start_drag drag grab, an
+/// xdg_popup.grab), and ending THAT one from a left release cancelled the
+/// drag (the target got leave with no drop) or dismissed the popup
+/// (P1-3). Identity is the ownership check Drag.end and popupGrabEnd
+/// already make (data_device.zig:399, xdg.zig:1640).
+const PointerGestures = struct {
+    /// The toplevel being moved, null when idle. The move owns the
+    /// pointer grab until the button release (the client sees no pointer
+    /// events during the move).
+    moving_toplevel: ?*wayland.shell.XdgToplevel = null,
+    /// The pointer's WORLD position at the last move tick; the node
+    /// moves by the delta between ticks.
+    move_anchor: geom.FPoint = .{ .x = 0, .y = 0 },
+    /// The last pointer position while the left button is held (the pan
+    /// anchor); null when not dragging. A click without motion never
+    /// produces a delta, so the seat's click-to-focus is unchanged.
+    camera_drag: ?DragPoint = null,
+    /// Whether the drag has crossed the movement threshold (a real pan has
+    /// started). A press alone only arms camera_drag; the pan (and the
+    /// fast-render blockiness) begins once the pointer moves > drag_threshold
+    /// px — so a click with a tiny micro-move doesn't pan the camera or
+    /// steal focus from the terminal (the reported 'click hangs the cursor').
+    drag_active: bool = false,
+    /// Progressive-quality fast render: set while a camera drag/pan is
+    /// active so compositeBase renders the canvas at a reduced stride
+    /// (blocky but ~stride² cheaper per frame — keeps panning responsive
+    /// on a slow CPU). Cleared when the drag ends; the next full-quality
+    /// render replaces the blocky frame.
+    fast_render: bool = false,
+    /// The pointer grab this compositor installed, or null when none of
+    /// its gestures is live.
+    own_grab: ?*const wayland.seat.PointerGrab = null,
+};
+
+/// Take the seat pointer for a compositor gesture (the interactive move
+/// or the camera pan) and record the grab, so the teardown can tell
+/// "ours" from "somebody else's" (PointerGestures.own_grab).
+fn grabPointerForGesture(seat: *wayland.seat.Seat, g: *PointerGestures) void {
+    seat.startPointerGrab(&wayland.seat.swallow_pointer_grab);
+    g.own_grab = &wayland.seat.swallow_pointer_grab;
+}
+
+/// End every compositor gesture: clear the gesture state unconditionally
+/// (the gesture is over whether or not the seat still carries our grab),
+/// then end the seat grab only when it is OURS. Returns true when the
+/// seat really carried our grab and it is now released, false when
+/// another subsystem's grab is installed — that one survives.
+fn endPointerGestures(seat: *wayland.seat.Seat, g: *PointerGestures) bool {
+    g.moving_toplevel = null;
+    g.camera_drag = null;
+    g.drag_active = false;
+    g.fast_render = false;
+    const ours = g.own_grab orelse return false;
+    g.own_grab = null;
+    if (seat.pointer_grab != ours) return false;
+    seat.endPointerGrab();
+    return true;
+}
 
 pub fn main(init: std.process.Init) !void {
     var debug_alloc = std.heap.DebugAllocator(.{}).init;
@@ -634,14 +691,7 @@ pub fn main(init: std.process.Init) !void {
         .viewporter = viewporter,
         .backend = backend,
         .framebuffer = framebuffer,
-        .camera = Camera{
-            .center_x = @as(f64, @floatFromInt(output_width)) / 2.0,
-            .center_y = @as(f64, @floatFromInt(output_height)) / 2.0,
-            .zoom = 1,
-            .rotation = 0,
-            .screen_w = @floatFromInt(output_width),
-            .screen_h = @floatFromInt(output_height),
-        },
+        .camera = default_camera,
         .camera_env = init.environ_map.get("WAYLAND_CAMERA"),
         .presentation = presentation,
         .toplevels = .empty,
@@ -664,6 +714,7 @@ pub fn main(init: std.process.Init) !void {
         .seat_button_listener = wire.Listener(*wayland.seat.Seat).init(onSeatButton),
         .seat_pointer_move_listener = wire.Listener(*wayland.seat.Seat).init(onSeatPointerMove),
         .seat_axis_listener = wire.Listener(*wayland.seat.Seat).init(onSeatAxis),
+        .seat_focus_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKeyboardFocus),
     };
     if (backend_is_drm) state.drm_backend = backend;
     defer state.synth_clicked.deinit(allocator);
@@ -707,6 +758,10 @@ pub fn main(init: std.process.Init) !void {
     seat.events.button.add(&state.seat_button_listener);
     seat.events.pointer_move.add(&state.seat_pointer_move_listener);
     seat.events.axis.add(&state.seat_axis_listener);
+    // wl_toplevel.activated is compositor-authored state driven by the
+    // seat's keyboard focus (P1-9), so a click — not only an
+    // xdg_activation request — updates the active titlebar.
+    seat.events.keyboard_focus.add(&state.seat_focus_listener);
     // xdg_activation_v1: activation requests with known tokens (focus
     // policy is out of scope — the handler logs and accepts) and the
     // token-creation hook (XA-1; the compositor can observe allowlists /
@@ -1018,6 +1073,7 @@ const ToplevelListeners = struct {
     set_title: wire.Listener(*wayland.shell.XdgToplevel),
     set_app_id: wire.Listener(*wayland.shell.XdgToplevel),
     request_minimize: wire.Listener(*wayland.shell.XdgToplevel),
+    request_maximize: wire.Listener(*wayland.shell.XdgToplevel),
     request_fullscreen: wire.Listener(*wayland.shell.FullscreenRequest),
     request_move: wire.Listener(*wayland.shell.MoveRequest),
     initial_commit: wire.Listener(*wayland.shell.XdgToplevel),
@@ -1044,54 +1100,203 @@ fn onToplevelAppId(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *way
     log.info("toplevel app_id changed: {s}", tl.state.io, tl.state.log_cfg, "server", .{t.app_id orelse "(none)"});
 }
 
-fn onToplevelMinimize(listener: *wire.Listener(*wayland.shell.XdgToplevel), _: *wayland.shell.XdgToplevel) void {
-    const tl: *ToplevelListeners = @fieldParentPtr("request_minimize", listener);
-    log.info("toplevel minimize requested", tl.state.io, tl.state.log_cfg, "server", .{});
+/// The output's FULL box (its mode rect at the origin): the area a
+/// fullscreen surface covers. Distinct from usableArea — a fullscreen
+/// window covers panels, only a maximized one does not (wlroots keeps
+/// the full and the usable box apart, types/wlr_output.c:1106-1114;
+/// tinywl answers set_fullscreen with the full output size and
+/// set_maximized with the usable area, tinywl.c handle_toplevel_configure).
+fn fullscreenBox(self: *ServerState, named: ?*wayland.server.wl.Output) ?geom.Rect {
+    // set_fullscreen may name the output; the wl_output resource is this
+    // compositor's only when WlOutput.owns says so (a resource of a
+    // foreign global is ignored — the same identity check the rest of the
+    // server uses for protocols that take a wl_output, e.g. screencopy).
+    if (named) |res| {
+        if (self.wl_output) |wo| {
+            if (wo.owns(res)) return outputRect(wo.output);
+        }
+    }
+    // No usable name (null, or an output that is gone): this server has
+    // a single output, so it is the one the surface belongs to
+    // (wlroots falls back to the output containing the surface).
+    return if (self.output) |out| outputRect(out) else null;
 }
 
+/// The output's mode rect at the origin: this server places its single
+/// output at (0,0) (one canvas, no multi-output layout yet).
+fn outputRect(out: *wayland.output.Output) geom.Rect {
+    return .{ .x = 0, .y = 0, .width = out.mode.width, .height = out.mode.height };
+}
+
+/// The output's USABLE area: its mode rect shrunk by every exclusive
+/// zone the layer shell reserved (wlroots wlr_output usable_area,
+/// types/wlr_output.c:1106-1114 — a mapped layer surface's exclusive
+/// zone takes its edge off the usable area, which is exactly why a
+/// maximized window must not hide under a panel). A negative zone
+/// reserves the layer surface's own extent along that edge
+/// (wlr_layer_surface_v1: a negative zone lets the compositor size it).
+///
+/// A reserved strip comes off BOTH ends of the axis it sits on: the top
+/// strip moves the origin down AND takes its pixels off the height (a
+/// rect that only moved its origin would still run off the bottom of
+/// the output). wlroots applies the reservation through the same
+/// two-sided shrink — `wlr_output_layout` reserves each edge with
+/// `output_layout_reserve` semantics, where a top reservation shifts
+/// `usable.y` and subtracts from `usable.height`
+/// (types/wlr_output_layout.c, `wlr_output_layout_get_usable_area`).
+fn usableArea(self: *ServerState) geom.Rect {
+    const out = self.output orelse return geom.Rect.empty();
+    var area = outputRect(out);
+    for (self.layer_shell.layer_surfaces.items) |ls| {
+        const edge = ls.exclusiveEdge() orelse continue;
+        const px: i32 = if (ls.current.exclusive_zone > 0)
+            ls.current.exclusive_zone
+        else switch (edge) {
+            .top, .bottom => @intCast(ls.current.actual_height),
+            .left, .right => @intCast(ls.current.actual_width),
+        };
+        if (px <= 0) continue;
+        switch (edge) {
+            .top => {
+                area.y += px;
+                area.height -= px;
+            },
+            .bottom => area.height -= px,
+            .left => {
+                area.x += px;
+                area.width -= px;
+            },
+            .right => area.width -= px,
+        }
+    }
+    return area;
+}
+
+/// xdg_toplevel.set_maximized / unset_maximized (P1-8). The client
+/// request is a REQUEST (xdg-shell.xml set_maximized: "Asks the window
+/// manager to maximize the surface"), so the compositor answers with a
+/// configure carrying the state it agrees with — never silence, which
+/// left the client waiting for a configure forever (a protocol deadlock:
+/// xdg_toplevel has no "request was denied" event).
+///
+/// Policy: this server has one output and imposes no size constraints,
+/// so it agrees, and configures the surface to the output's USABLE area
+/// (usableArea) — the answer tinywl gives (tinywl.c
+/// handle_toplevel_configure sends the usable width/height for a
+/// maximized surface). Unmaximizing hands the size back to the client:
+/// the protocol has no "restore size" state and this server stores no
+/// pre-maximize geometry, so 0,0 ("client decides",
+/// xdg_toplevel.configure width/height) is the honest answer.
+fn onToplevelMaximize(
+    listener: *wire.Listener(*wayland.shell.XdgToplevel),
+    t: *wayland.shell.XdgToplevel,
+) void {
+    const tl: *ToplevelListeners = @fieldParentPtr("request_maximize", listener);
+    const self = tl.state;
+    // The module stored the request in `pending` before emitting
+    // (xdg.zig:1231-1238); the compositor decides, so `scheduled` is what
+    // this handler writes.
+    const maximize = t.pending.maximized;
+    if (maximize) {
+        const area = usableArea(self);
+        t.scheduled.width = area.width;
+        t.scheduled.height = area.height;
+    } else {
+        t.scheduled.width = 0;
+        t.scheduled.height = 0;
+    }
+    t.scheduled.maximized = maximize;
+    log.info("toplevel maximize -> {s} ({d}x{d})", self.io, self.log_cfg, "server", .{
+        if (maximize) "on" else "off",
+        t.scheduled.width,
+        t.scheduled.height,
+    });
+    t.scheduleConfigure() catch {
+        log.warn("toplevel maximize configure failed", self.io, self.log_cfg, "server", .{});
+    };
+}
+
+/// xdg_toplevel.set_fullscreen / unset_fullscreen (P1-8 + F10). The
+/// same request/answer contract as maximize, with the FULL output box
+/// (fullscreen covers panels, wlroots / tinywl.c handle_toplevel_configure)
+/// taken from the output the client named, or from this server's single
+/// output when it named none.
 fn onToplevelFullscreen(
     listener: *wire.Listener(*wayland.shell.FullscreenRequest),
     req: *wayland.shell.FullscreenRequest,
 ) void {
     const tl: *ToplevelListeners = @fieldParentPtr("request_fullscreen", listener);
-    // F10: the client-named fullscreen output reaches the compositor.
-    log.info(
-        "toplevel fullscreen requested: {s}",
-        tl.state.io,
-        tl.state.log_cfg,
-        "server",
-        .{if (req.fullscreen) "on" else "off"},
-    );
-    _ = req.output;
+    const self = tl.state;
+    const t = req.toplevel;
+    t.scheduled.fullscreen = req.fullscreen;
+    // Leaving fullscreen hands the size back to the client (same reason
+    // as unmaximize: no stored pre-fullscreen geometry to restore).
+    t.scheduled.width = 0;
+    t.scheduled.height = 0;
+    if (req.fullscreen) {
+        if (fullscreenBox(self, req.output)) |box| {
+            t.scheduled.width = box.width;
+            t.scheduled.height = box.height;
+        }
+    }
+    log.info("toplevel fullscreen -> {s} ({d}x{d})", self.io, self.log_cfg, "server", .{
+        if (req.fullscreen) "on" else "off",
+        t.scheduled.width,
+        t.scheduled.height,
+    });
+    t.scheduleConfigure() catch {
+        log.warn("toplevel fullscreen configure failed", self.io, self.log_cfg, "server", .{});
+    };
+}
+
+/// xdg_toplevel.set_minimized (P1-8). The protocol carries no minimized
+/// STATE (xdg-shell.xml set_minimized: "There is no way to tell the
+/// client that it is minimized"), so the compositor records the request
+/// — the module keeps it in ToplevelState.minimized for exactly this —
+/// and takes the surface off screen: a minimized window is a window the
+/// user cannot see. This server has no iconifier to un-hide it, so the
+/// window comes back when the client commits again (the surface node's
+/// own update re-enables it, surface_node.zig:172).
+fn onToplevelMinimize(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
+    const tl: *ToplevelListeners = @fieldParentPtr("request_minimize", listener);
+    const self = tl.state;
+    log.info("toplevel minimize requested (recorded)", self.io, self.log_cfg, "server", .{});
+    const scene = self.scene orelse return;
+    const sn = wayland.surface_node.surfaceNodeFor(scene, t.xdg_surface.surface) orelse return;
+    if (sn.node) |node| node.enable(false);
+    if (self.scene_output) |so| {
+        so.addDamage(.{ .x = 0, .y = 0, .width = self.framebuffer.width, .height = self.framebuffer.height });
+    }
+    requestRender(self);
 }
 
 fn onToplevelMove(listener: *wire.Listener(*wayland.shell.MoveRequest), req: *wayland.shell.MoveRequest) void {
     const tl: *ToplevelListeners = @fieldParentPtr("request_move", listener);
     const self = tl.state;
     const seat = req.seat;
-    const client = req.toplevel.xdg_surface.surface.resource.getClient();
+    const toplevel_client = req.toplevel.xdg_surface.surface.resource.getClient();
     // The serial must be a recent input-event serial on the request's
     // seat (wlroots wlr_xdg_toplevel_move validates the same way).
-    if (!seat.validateEventSerial(client, req.serial)) return;
+    if (!seat.validateEventSerial(toplevel_client, req.serial)) return;
     // The move owns the gesture: cancel any armed camera drag.
-    self.camera_drag = null;
-    self.drag_active = false;
-    self.fast_render = false;
-    self.moving_toplevel = req.toplevel;
+    self.gestures.camera_drag = null;
+    self.gestures.drag_active = false;
+    self.gestures.fast_render = false;
+    self.gestures.moving_toplevel = req.toplevel;
     const wp = self.camera.screenToWorld(@floatFromInt(seat.pointer_x), @floatFromInt(seat.pointer_y));
-    self.move_anchor = .{ .x = wp.x, .y = wp.y };
-    seat.startPointerGrab(&wayland.seat.swallow_pointer_grab);
+    self.gestures.move_anchor = .{ .x = wp.x, .y = wp.y };
+    grabPointerForGesture(seat, &self.gestures);
     const surface_id = req.toplevel.xdg_surface.surface.resource.getId();
     log.info("interactive move start surface@{d}", self.io, self.log_cfg, "server", .{surface_id});
 }
 
 fn onToplevelDestroy(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
     const tl: *ToplevelListeners = @fieldParentPtr("destroy", listener);
-    // The moved toplevel died mid-gesture: end the move and release the
-    // grab so the pointer returns to the clients.
-    if (tl.state.moving_toplevel == t) {
-        tl.state.moving_toplevel = null;
-        tl.state.seat.endPointerGrab();
+    // The moved toplevel died mid-gesture: end the move and release
+    // OUR grab so the pointer returns to the clients (a grab another
+    // subsystem installed since the move survives — PointerGestures).
+    if (tl.state.gestures.moving_toplevel == t) {
+        _ = endPointerGestures(tl.state.seat, &tl.state.gestures);
         log.info("interactive move cancelled (toplevel destroyed)", tl.state.io, tl.state.log_cfg, "server", .{});
     }
     tl.state.allocator.destroy(tl);
@@ -1113,6 +1318,7 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
         .set_title = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelTitle),
         .set_app_id = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelAppId),
         .request_minimize = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelMinimize),
+        .request_maximize = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelMaximize),
         .request_fullscreen = wire.Listener(*wayland.shell.FullscreenRequest).init(onToplevelFullscreen),
         .request_move = wire.Listener(*wayland.shell.MoveRequest).init(onToplevelMove),
         .initial_commit = wire.Listener(*wayland.shell.XdgToplevel).init(onToplevelInitialCommit),
@@ -1121,6 +1327,7 @@ fn onNewToplevel(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayla
     t.events.set_title.add(&tl.set_title);
     t.events.set_app_id.add(&tl.set_app_id);
     t.events.request_minimize.add(&tl.request_minimize);
+    t.events.request_maximize.add(&tl.request_maximize);
     t.events.request_fullscreen.add(&tl.request_fullscreen);
     t.events.request_move.add(&tl.request_move);
     t.events.initial_commit.add(&tl.initial_commit);
@@ -1274,18 +1481,68 @@ fn onPopupDestroy(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland
     pl.state.allocator.destroy(pl);
 }
 
+/// xdg_activation_v1: a client asks to activate a surface (the token
+/// was already validated by the activation module). Activation MEANS the
+/// keyboard focus on this server, so the request is honored by moving
+/// the focus — and the focus change is what publishes
+/// wl_toplevel.activated (syncToplevelActivation). Keeping ONE notion of
+/// "active" (the seat's) is the point: a second, independently tracked
+/// activated flag is what drifts out of sync with the real focus.
 fn onRequestActivate(
     listener: *wire.Listener(*wayland.xdg_activation.ActivateRequest),
     req: *wayland.xdg_activation.ActivateRequest,
 ) void {
     const self: *ServerState = @fieldParentPtr("request_activate_listener", listener);
-    // Focus policy is out of scope for this phase: accept the activation
-    // request by logging it (the token was already validated by the
-    // activation module; the toplevel is not actually focused). See
-    // notes/129-shell-protocols-impl.md.
     log.info("xdg_activation: request_activate surface={*} token={s}", self.io, self.log_cfg, "server", .{
         req.surface, req.token,
     });
+    // The focus gate is the compositor's policy for what may hold
+    // keyboard focus (a keyboard_interactivity=none layer surface may
+    // not, L-D7), so activation goes through it too.
+    if (layerKeyboardFocusAllowed(self, req.surface)) {
+        self.seat.setKeyboardFocus(req.surface);
+    }
+}
+
+/// The seat's keyboard focus changed (it fires after the leave/enter/
+/// modifiers wire events, seat.zig:1270): republish wl_toplevel.
+/// activated for every toplevel whose activated state flipped.
+fn onSeatKeyboardFocus(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
+    const self: *ServerState = @fieldParentPtr("seat_focus_listener", listener);
+    syncToplevelActivation(self, seat);
+}
+
+/// wl_toplevel.activated follows the seat's KEYBOARD FOCUS (P1-9). The
+/// protocol makes it compositor-authored state — xdg_toplevel.state
+/// "activated": "the surface ... is the one that has the focus" — and a
+/// CSD toolkit renders its active titlebar from it, so a server that
+/// never sends it never shows an active titlebar.
+///
+/// Driven from seat.events.keyboard_focus, so a CLICK updates it, not
+/// only an xdg_activation request. Both ends of the change are
+/// reconfigured in the same pass: an unfocused window must report
+/// activated=false, or the client keeps drawing it active forever.
+///
+/// The focus gate is re-checked here (layerKeyboardFocusAllowed): a
+/// surface that cannot take keyboard focus must never be reported
+/// activated, whoever routed the focus at it.
+fn syncToplevelActivation(self: *ServerState, seat: *wayland.seat.Seat) void {
+    // shell.toplevels is pruned when a role object is destroyed
+    // (xdg.zig:1317-1318), so every entry here is live.
+    for (self.shell.toplevels.items) |t| {
+        const surface = t.xdg_surface.surface;
+        const activated = surface == seat.keyboard_focus and layerKeyboardFocusAllowed(self, surface);
+        // The module never self-configures: the server writes `scheduled`
+        // and schedules the configure, the same contract as the initial
+        // commit. Only a CHANGE schedules — the seat emits this signal
+        // for every focus change, and re-configuring every window each
+        // time would be pure wire traffic.
+        if (t.scheduled.activated == activated) continue;
+        t.scheduled.activated = activated;
+        t.scheduleConfigure() catch {
+            log.warn("activation configure failed", self.io, self.log_cfg, "server", .{});
+        };
+    }
 }
 
 /// xdg_activation_v1 events.new_token (XA-1): a client token was created
@@ -1624,6 +1881,9 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // stack above it (menus render where the positioner asked and
     // hit-test there).
     syncPopupNodes(self);
+    // P2-12: the wl_data_device.start_drag icon follows the pointer in
+    // scene coordinates while its drag lives.
+    syncDragIconNodes(self);
 
     const so = self.scene_output orelse {
         log.err("render: no scene output", self.io, self.log_cfg, "server", .{});
@@ -1871,7 +2131,14 @@ fn compositeBase(self: *ServerState) void {
         if (cursor_res) |cr| {
             if (sn.*.surface.resource == cr) continue;
         }
+        // A drag icon is drawn at the POINTER (syncDragIconNodes), never
+        // as content at its own node position — which is where it used to
+        // land, a drag "cursor" stuck at the scene origin.
+        if (isDragIconSurface(sn.*.surface)) continue;
         const node = sn.*.node orelse continue;
+        // A disabled node is not on screen: the minimize policy hides a
+        // window that way (onToplevelMinimize).
+        if (!node.enabled) continue;
         const bn = node.kind.buffer;
         const texture = bn.texture orelse continue;
         const rect = node.absolutePosition();
@@ -1887,7 +2154,7 @@ fn compositeBase(self: *ServerState) void {
             log.warn("canvas item append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         };
     }
-    wayland.canvas.render(self.allocator, base, &self.camera, items.items, if (self.fast_render) 3 else 1);
+    wayland.canvas.render(self.allocator, base, &self.camera, items.items, if (self.gestures.fast_render) 3 else 1);
 }
 
 /// Create the base framebuffer (matching the display framebuffer's size)
@@ -2364,18 +2631,23 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
     if (seat.last_button_pressed) {
         // Arm the pan anchor but DON'T start it (drag_active stays false):
         // a click without enough movement must keep click-to-focus.
-        self.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
-        self.drag_active = false;
-        self.fast_render = false;
+        self.gestures.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
+        self.gestures.drag_active = false;
+        self.gestures.fast_render = false;
     } else {
-        self.camera_drag = null;
-        self.drag_active = false;
-        self.fast_render = false;
-        if (self.moving_toplevel != null) {
-            self.moving_toplevel = null;
+        // The release ends OUR gesture and OUR grab, and only ours: an
+        // unconditional endPointerGrab here cancelled an in-flight DnD
+        // drag (the target got leave with no drop) and dismissed popup
+        // grabs (P1-3).
+        const was_moving = self.gestures.moving_toplevel != null;
+        _ = endPointerGestures(seat, &self.gestures);
+        if (was_moving) {
             log.info("interactive move end", self.io, self.log_cfg, "server", .{});
         }
-        seat.endPointerGrab();
+        // A drag that just dropped took its icon off the canvas, so the
+        // next frame must recomposite (the hover path below would only
+        // repaint the cursor region).
+        if (self.data_device.currentDragIcon() == null) requestRender(self);
     }
 }
 
@@ -2397,11 +2669,11 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
     // (world coords — the screen delta divided by the zoom, matching the
     // pick transform). The whole output is damaged so the partial upload
     // cannot smear the old position.
-    if (self.moving_toplevel) |t| {
+    if (self.gestures.moving_toplevel) |t| {
         const wp = self.camera.screenToWorld(@floatFromInt(seat.pointer_x), @floatFromInt(seat.pointer_y));
-        const dx = wp.x - self.move_anchor.x;
-        const dy = wp.y - self.move_anchor.y;
-        self.move_anchor = .{ .x = wp.x, .y = wp.y };
+        const dx = wp.x - self.gestures.move_anchor.x;
+        const dy = wp.y - self.gestures.move_anchor.y;
+        self.gestures.move_anchor = .{ .x = wp.x, .y = wp.y };
         if (self.scene) |scene| {
             if (wayland.surface_node.surfaceNodeFor(scene, t.xdg_surface.surface)) |sn| {
                 if (sn.node) |node| {
@@ -2419,10 +2691,26 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
     // A drag is armed (button held). If it hasn't crossed the threshold
     // yet, a sub-threshold move is a hover (cursor follows, no pan); once
     // it crosses, start the pan.
-    if (self.camera_drag) |anchor| {
+    //
+    // Never pan while ANOTHER subsystem owns the pointer: a
+    // wl_data_device drag or an xdg popup grab installed its grab at its
+    // own request, and grabPointerForGesture would replace it — the
+    // replaced grab's cancel ends that gesture, so panning the canvas
+    // silently killed the drag under the pointer. Same "ours vs theirs"
+    // rule endPointerGestures applies on the release (P1-3): our arming
+    // is dropped and the move falls through to the hover path, which
+    // keeps a live drag icon following the pointer.
+    if (self.gestures.camera_drag != null and seat.pointer_grab != null and
+        seat.pointer_grab != self.gestures.own_grab)
+    {
+        self.gestures.camera_drag = null;
+        self.gestures.drag_active = false;
+        self.gestures.fast_render = false;
+    }
+    if (self.gestures.camera_drag) |anchor| {
         const dx = seat.pointer_x - anchor.x;
         const dy = seat.pointer_y - anchor.y;
-        if (!self.drag_active and dx * dx + dy * dy < drag_threshold_sq) {
+        if (!self.gestures.drag_active and dx * dx + dy * dy < drag_threshold_sq) {
             self.cursor_repaint = true;
             requestRender(self);
             return;
@@ -2431,12 +2719,12 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
         // implicit pointer grab starts here: the client under the pointer
         // must not see the motion (it would extend a text selection while
         // the user pans the canvas).
-        self.drag_active = true;
-        self.fast_render = true;
-        seat.startPointerGrab(&wayland.seat.swallow_pointer_grab);
+        self.gestures.drag_active = true;
+        self.gestures.fast_render = true;
+        grabPointerForGesture(seat, &self.gestures);
         self.camera.center_x -= @as(f64, @floatFromInt(dx)) / self.camera.zoom;
         self.camera.center_y -= @as(f64, @floatFromInt(dy)) / self.camera.zoom;
-        self.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
+        self.gestures.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
         log.debug("camera center -> {d},{d}", self.io, self.log_cfg, "camera", .{
             self.camera.center_x, self.camera.center_y,
         });
@@ -2445,6 +2733,12 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
     }
     // No drag armed: hover — the canvas is static, so just move the
     // cursor (repaint only the cursor region, not the full composite).
+    // A live drag icon moves the canvas too, so that frame must
+    // recomposite for the icon to follow the pointer.
+    if (self.data_device.currentDragIcon() != null) {
+        requestRender(self);
+        return;
+    }
     self.cursor_repaint = true;
     requestRender(self);
 }
@@ -2507,8 +2801,62 @@ fn syncPopupNodes(self: *ServerState) void {
             popup_tree.x = p.geometry.x;
             popup_tree.y = p.geometry.y;
             popup_tree.enable(true);
+            // P1-5b: publish the popup's ABSOLUTE scene position. The
+            // popup grab converts the seat's scene coordinates into
+            // surface-local ones with this origin, and the seat never
+            // hit-tests while a grab is installed — so this sync is the
+            // only place that can know it. `absolutePosition` sums the
+            // node's own offset and every ancestor's (scene.zig:264),
+            // and `p` (the shell.popups entry) is the role object.
+            const abs = popup_tree.absolutePosition();
+            p.setPopupOrigin(abs.x, abs.y);
         }
     }
+}
+
+/// True for a surface carrying the wl_data_device-icon role: the icon
+/// of an in-flight wl_data_device.start_drag, which the role assigns at
+/// the request (data_device.zig, wlr_drag.c:411-415). A drag icon is
+/// not window content — it is composited at the POINTER and it vanishes
+/// with the drag, so the canvas pass must never stamp it at its own node
+/// position. wlroots instead parents the icon surface node under the
+/// cursor node (wlr_drag.c:402-442); the equivalent here is the pointer
+/// position written by syncDragIconNodes.
+fn isDragIconSurface(s: *Surface) bool {
+    const role = s.role orelse return false;
+    return std.mem.eql(u8, role.name, "wl_data_device-icon");
+}
+
+/// Keep the drag icon's scene node at the pointer while its drag lives
+/// (P2-12). Same pass shape as syncPopupNodes / syncSubsurfaceNodes: it
+/// runs every frame from renderFrame, before the composite, and is a
+/// no-op when no drag is running (a null check).
+///
+/// The icon is an ordinary tracked surface (syncSurfaces tracks every
+/// compositor surface), so this pass positions its tree in SCENE
+/// coordinates — the space the seat reports the pointer in — at
+/// seat.pointer_x/pointer_y, and keeps the tree at the scene root (a
+/// role surface has no parent tree) so it stacks with the other
+/// top-level surfaces. An unmapped icon has no tree yet (SurfaceNode
+/// creates it on the first buffer commit), so an icon that has not
+/// committed costs nothing here. Once the drag ends the icon is no
+/// longer drawn at all: isDragIconSurface keeps the canvas pass from
+/// stamping it at the position it was left at.
+fn syncDragIconNodes(self: *ServerState) void {
+    const scene = self.scene orelse return;
+    const icon = self.data_device.currentDragIcon() orelse return;
+    const sn = wayland.surface_node.surfaceNodeFor(scene, icon) orelse return;
+    const tree = sn.tree orelse return; // unmapped: nothing to draw yet
+    if (tree.parent != scene.root) {
+        scene.root.appendChild(scene.allocator, tree) catch |err| {
+            log.warn("drag icon parenting failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            tree.enable(false);
+            return;
+        };
+    }
+    tree.x = self.seat.pointer_x;
+    tree.y = self.seat.pointer_y;
+    tree.enable(true);
 }
 
 fn syncSubsurfaceNodes(self: *ServerState) void {
@@ -2645,4 +2993,973 @@ fn parseLogConfig(
         }
     }
     return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the compositor's own policy (pointer-grab ownership, the
+// xdg_toplevel state answers, the popup origin, the drag icon).
+//
+// They drive the REAL ServerState and the REAL policy functions above, so
+// they need main()'s module stack minus the render loop (the fake backend
+// below never starts and in_render keeps requestRender inert).
+// build.zig runs this file's tests through src/server/main_test.zig.
+// ---------------------------------------------------------------------------
+
+const client = wayland.client;
+const testing = std.testing;
+
+/// A never-started backend: the policy tests render no frame, they only
+/// need a real Output object for the fullscreen / maximize geometry.
+const TestBackendImpl = struct {
+    fn start(_: *wayland.backend.Backend) error{BackendFailed}!void {}
+    fn destroy(_: std.mem.Allocator, _: *anyopaque) void {}
+};
+
+const test_backend_impl: wayland.backend.Backend.Impl = .{
+    .start = TestBackendImpl.start,
+    .destroy = TestBackendImpl.destroy,
+};
+
+const TestOutputImpl = struct {
+    fn setState(_: *wayland.output.Output, _: *const wayland.output.Output.State) error{InvalidState}!void {}
+    fn commit(_: *wayland.output.Output, _: *const wayland.output.Output.State) error{CommitFailed}!void {}
+    fn destroy(_: std.mem.Allocator, _: *anyopaque) void {}
+};
+
+const test_output_impl: wayland.output.Output.Impl = .{
+    .@"test" = TestOutputImpl.setState,
+    .commit = TestOutputImpl.commit,
+    .destroy = TestOutputImpl.destroy,
+};
+
+/// The client's xdg_toplevel events, recording the payload of the LAST
+/// configure (the one under test).
+const ClientToplevelEvents = struct {
+    configures: usize = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    states: [13]u32 = [_]u32{0} ** 13,
+    states_len: usize = 0,
+
+    fn listener(toplevel: *client.xdg.Toplevel, event: client.xdg.Toplevel.Event, data: *ClientToplevelEvents) void {
+        _ = toplevel;
+        switch (event) {
+            .configure => |c| {
+                data.configures += 1;
+                data.width = c.width;
+                data.height = c.height;
+                const s = c.states.slice(u32);
+                const n = @min(s.len, data.states.len);
+                data.states_len = s.len;
+                @memcpy(data.states[0..n], s[0..n]);
+            },
+            .close => {},
+            // configure_bounds / wm_capabilities are not armed by the
+            // compositor here; ignore them so `width`/`height` keep
+            // meaning the configure's size.
+            .configure_bounds => |c| {
+                _ = c;
+            },
+            .wm_capabilities => |c| {
+                _ = c;
+            },
+        }
+    }
+
+    /// True when the last configure carried the xdg_toplevel.state
+    /// `state` (the wire numbering xdg.zig's stateValues emits).
+    fn carries(data: *const ClientToplevelEvents, state: u32) bool {
+        for (data.states[0..data.states_len]) |v| {
+            if (v == state) return true;
+        }
+        return false;
+    }
+};
+
+/// xdg_toplevel.state wire values (xdg-shell.xml enumeration order).
+const state_maximized: u32 = 1;
+const state_fullscreen: u32 = 2;
+const state_activated: u32 = 4;
+
+const ClientXdgSurfaceEvents = struct {
+    configures: usize = 0,
+    serial: u32 = 0,
+
+    fn listener(xdg_surface: *client.xdg.Surface, event: client.xdg.Surface.Event, data: *ClientXdgSurfaceEvents) void {
+        _ = xdg_surface;
+        switch (event) {
+            .configure => |c| {
+                data.configures += 1;
+                data.serial = c.serial;
+            },
+        }
+    }
+};
+
+const ClientPopupEvents = struct {
+    done_count: usize = 0,
+
+    fn listener(popup: *client.xdg.Popup, event: client.xdg.Popup.Event, data: *ClientPopupEvents) void {
+        _ = popup;
+        switch (event) {
+            .popup_done => data.done_count += 1,
+            else => {},
+        }
+    }
+};
+
+/// The client's wl_data_source events: which end of the drag-and-drop the
+/// client was told about. dnd_finished is the drop/finish half (a mouse
+/// drag ends on the origin button's release), so it separates that from
+/// the cancel half, which sends nothing (Drag.end, data_device.zig).
+const ClientDataSourceEvents = struct {
+    dnd_finished: usize = 0,
+    dnd_drop_performed: usize = 0,
+    cancelled: usize = 0,
+
+    fn listener(source: *client.wl.DataSource, event: client.wl.DataSource.Event, data: *ClientDataSourceEvents) void {
+        _ = source;
+        switch (event) {
+            .dnd_finished => data.dnd_finished += 1,
+            .dnd_drop_performed => data.dnd_drop_performed += 1,
+            .cancelled => data.cancelled += 1,
+            .target => |t| {
+                _ = t;
+            },
+            .send => |s| {
+                _ = s;
+            },
+            .action => |a| {
+                _ = a;
+            },
+        }
+    }
+};
+
+fn ignoreOutputEvents(_: *client.wl.Output, _: client.wl.Output.Event, _: *u8) void {}
+
+fn ignoreLayerEvents(_: *client.zwlr.LayerSurfaceV1, _: client.zwlr.LayerSurfaceV1.Event, _: *u8) void {}
+
+const PolicyRegistryCapture = struct {
+    compositor_name: ?u32 = null,
+    wm_base_name: ?u32 = null,
+    shm_name: ?u32 = null,
+    seat_name: ?u32 = null,
+    ddm_name: ?u32 = null,
+    output_name: ?u32 = null,
+    layer_shell_name: ?u32 = null,
+
+    fn listener(registry: *client.wl.Registry, event: client.wl.Registry.Event, data: *PolicyRegistryCapture) void {
+        _ = registry;
+        switch (event) {
+            .global => |g| {
+                const name = std.mem.span(g.interface);
+                if (std.mem.eql(u8, name, "wl_compositor")) {
+                    data.compositor_name = g.name;
+                } else if (std.mem.eql(u8, name, "xdg_wm_base")) {
+                    data.wm_base_name = g.name;
+                } else if (std.mem.eql(u8, name, "wl_shm")) {
+                    data.shm_name = g.name;
+                } else if (std.mem.eql(u8, name, "wl_seat")) {
+                    data.seat_name = g.name;
+                } else if (std.mem.eql(u8, name, "wl_data_device_manager")) {
+                    data.ddm_name = g.name;
+                } else if (std.mem.eql(u8, name, "wl_output")) {
+                    data.output_name = g.name;
+                } else if (std.mem.eql(u8, name, "zwlr_layer_shell_v1")) {
+                    data.layer_shell_name = g.name;
+                }
+            },
+            .global_remove => {},
+        }
+    }
+};
+
+/// main()'s module stack (minus the render loop) with an in-memory client,
+/// so the policy functions under test run against the real modules. The
+/// ServerState is the REAL one: the tests call the production policy
+/// functions directly, so no part of the behaviour is restated here.
+const PolicyServer = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_cfg: log.Config,
+    /// Every module the policy functions read is built by init() in
+    /// dependency order and may fail anywhere along the way, so each slot
+    /// starts null and the `errdefer if (ts.x) |x| x.deinit()` unwinds
+    /// exactly the ones that exist (the TestServer idiom, data_device.zig
+    /// :1763 and xdg.zig:2979). Nothing is read before init() assigns it:
+    /// a field's non-null value is the proof the module it names was
+    /// constructed, so no field is ever observed uninitialized.
+    state: ?*ServerState = null,
+    display: ?*wayland.core.display.CompositorDisplay = null,
+    shm_state: ?*wayland.shm.ShmState = null,
+    compositor: ?*wayland.compositor.Compositor = null,
+    shell: ?*wayland.shell.XdgShell = null,
+    layer_shell: ?*wayland.layer_shell.LayerShell = null,
+    seat: ?*wayland.seat.Seat = null,
+    xdg_activation: ?*wayland.xdg_activation.XdgActivation = null,
+    xdg_decoration: ?*wayland.xdg_decoration.XdgDecoration = null,
+    fractional_scale: ?*wayland.fractional_scale.FractionalScale = null,
+    viewporter: ?*wayland.viewporter.Viewporter = null,
+    subcompositor: ?*wayland.subsurface.Subcompositor = null,
+    data_device: ?*wayland.data_device.DataDeviceManager = null,
+    primary_selection: ?*wayland.primary_selection.PrimarySelection = null,
+    renderer: ?*wayland.renderer.Renderer = null,
+    presentation: ?*wayland.presentation.Presentation = null,
+    backend: ?*wayland.backend.Backend = null,
+    output: ?*wayland.output.Output = null,
+    wl_output: ?*wayland.wl_output.WlOutput = null,
+    scene: ?*wayland.scene.Scene = null,
+    /// Backend / Output impl context (never dereferenced).
+    dummy: u8 = 0,
+    /// The surface the harness pick returns (the drag origin).
+    pick_surface: ?*Surface = null,
+    client: ?*wire.Client = null,
+    c_display: ?*client.wl.Display = null,
+    wl_compositor: ?*client.wl.Compositor = null,
+    wm_base: ?*client.xdg.WmBase = null,
+    wl_shm: ?*client.wl.Shm = null,
+    wl_seat: ?*client.wl.Seat = null,
+    ddm: ?*client.wl.DataDeviceManager = null,
+    wl_output_client: ?*client.wl.Output = null,
+    layer_shell_client: ?*client.zwlr.LayerShellV1 = null,
+    output_listener_data: u8 = 0,
+    layer_listener_data: u8 = 0,
+    shm_pool: ?*client.wl.ShmPool = null,
+    buffer: ?*client.wl.Buffer = null,
+
+    /// The display framebuffer handle. Real (the minimize policy reads
+    /// its size for the output damage) but never rendered into.
+    fb: ?*pixman.Framebuffer = null,
+
+    /// The compositor hit test for the tests: always the one surface the
+    /// test armed it with (a drag's origin check needs the pointer to be
+    /// over the origin surface).
+    fn pick(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
+        const ts: *PolicyServer = @ptrCast(@alignCast(ctx));
+        const s = ts.pick_surface orelse return null;
+        return .{ .surface = s, .sx = x, .sy = y };
+    }
+
+    fn init(allocator: std.mem.Allocator) !*PolicyServer {
+        const ts = try allocator.create(PolicyServer);
+        errdefer allocator.destroy(ts);
+        ts.* = .{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .log_cfg = .{ .min_level = .err },
+        };
+        ts.display = try wayland.core.display.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
+        errdefer if (ts.display) |d| d.deinit();
+        try ts.display.?.initShm();
+        ts.shm_state = try wayland.shm.ShmState.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.shm_state) |s| s.deinit();
+        ts.compositor = try wayland.compositor.Compositor.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.compositor) |c| c.deinit();
+        ts.compositor.?.setShm(ts.shm_state.?);
+        ts.shell = try wayland.shell.XdgShell.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, ts.compositor.?);
+        errdefer if (ts.shell) |s| s.deinit();
+        ts.layer_shell = try wayland.layer_shell.LayerShell.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, ts.compositor.?);
+        errdefer if (ts.layer_shell) |ls| ls.deinit();
+        ts.seat = try wayland.seat.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, .{});
+        errdefer if (ts.seat) |s| s.deinit();
+        ts.xdg_activation = try wayland.xdg_activation.XdgActivation.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.seat.?,
+            ts.compositor.?,
+        );
+        errdefer if (ts.xdg_activation) |xa| xa.deinit();
+        ts.xdg_decoration = try wayland.xdg_decoration.XdgDecoration.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.shell.?,
+        );
+        errdefer if (ts.xdg_decoration) |xd| xd.deinit();
+        ts.fractional_scale = try wayland.fractional_scale.FractionalScale.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.fractional_scale) |fs| fs.deinit();
+        ts.viewporter = try wayland.viewporter.Viewporter.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.viewporter) |v| v.deinit();
+        ts.subcompositor = try wayland.subsurface.Subcompositor.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.compositor.?,
+        );
+        errdefer if (ts.subcompositor) |sc| sc.deinit();
+        ts.data_device = try wayland.data_device.DataDeviceManager.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.seat.?,
+        );
+        errdefer if (ts.data_device) |dd| dd.deinit();
+        ts.primary_selection = try wayland.primary_selection.PrimarySelection.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.seat.?,
+        );
+        errdefer if (ts.primary_selection) |ps| ps.deinit();
+        ts.renderer = try pixman.PixmanRenderer.create(allocator, &ts.io, &ts.log_cfg);
+        errdefer if (ts.renderer) |r| r.destroy();
+        ts.presentation = try wayland.presentation.Presentation.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.presentation) |p| p.deinit();
+        ts.backend = try wayland.backend.Backend.init(allocator, &ts.io, &ts.log_cfg, &test_backend_impl, &ts.dummy);
+        errdefer if (ts.backend) |b| b.destroy();
+        ts.output = try wayland.output.Output.create(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.backend.?,
+            &test_output_impl,
+            &ts.dummy,
+            .{ .width = 800, .height = 600, .refresh_msec = 16 },
+        );
+        errdefer if (ts.output) |o| o.destroy();
+        // No errdefer: Output's destroy signal owns the WlOutput global.
+        ts.wl_output = try wayland.wl_output.WlOutput.create(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.output.?,
+            "test",
+            "test output",
+        );
+        ts.scene = try wayland.scene.Scene.init(allocator, &ts.io, &ts.log_cfg);
+        errdefer if (ts.scene) |sc| sc.deinit();
+        ts.scene.?.subcompositor = ts.subcompositor.?;
+        ts.scene.?.wl_output = ts.wl_output.?;
+
+        // The real ServerState: the tests drive the production policy
+        // functions, so the fields they read must be the real modules.
+        const state = try allocator.create(ServerState);
+        errdefer allocator.destroy(state);
+        // A real framebuffer object: the minimize policy damages the
+        // output through its size. Nothing composites into it here
+        // (in_render keeps the render loop out of the way).
+        ts.fb = try pixman.Framebuffer.create(allocator, 800, 600);
+        errdefer if (ts.fb) |fb| fb.deinit();
+        state.* = .{
+            .allocator = allocator,
+            .io = &ts.io,
+            .log_cfg = &ts.log_cfg,
+            .display = ts.display.?,
+            .compositor = ts.compositor.?,
+            .shm_state = ts.shm_state.?,
+            .shell = ts.shell.?,
+            .layer_shell = ts.layer_shell.?,
+            .xdg_activation = ts.xdg_activation.?,
+            .xdg_decoration = ts.xdg_decoration.?,
+            .fractional_scale = ts.fractional_scale.?,
+            .viewporter = ts.viewporter.?,
+            .renderer = ts.renderer.?,
+            .backend = ts.backend.?,
+            .camera = default_camera,
+            .camera_env = null,
+            .scene = ts.scene.?,
+            .seat = ts.seat.?,
+            .subcompositor = ts.subcompositor.?,
+            .data_device = ts.data_device.?,
+            .primary_selection = ts.primary_selection.?,
+            .presentation = ts.presentation.?,
+            .output = ts.output.?,
+            .wl_output = ts.wl_output.?,
+            .toplevels = .empty,
+            .layer_surfaces = .empty,
+            .layer_popups = .empty,
+            .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
+            .new_input_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onNewInput),
+            .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
+            .content_dirty_listener = wire.Listener(*wayland.scene.Scene).init(onSceneContentDirty),
+            .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
+            .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
+            .new_activation_token_listener = wire.Listener(*wayland.xdg_activation.ActivationToken)
+                .init(onNewActivationToken),
+            .new_layer_surface_listener = wire.Listener(*wayland.layer_shell.LayerSurface).init(onNewLayerSurface),
+            .new_layer_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewLayerPopup),
+            .request_activate_listener = wire.Listener(*wayland.xdg_activation.ActivateRequest).init(onRequestActivate),
+            .request_mode_listener = wire.Listener(*wayland.xdg_decoration.RequestMode).init(onDecorationMode),
+            .new_decoration_listener = wire.Listener(*wayland.xdg_decoration.Decoration).init(onNewDecoration),
+            .seat_focus_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKeyboardFocus),
+            .seat_key_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKey),
+            .seat_button_listener = wire.Listener(*wayland.seat.Seat).init(onSeatButton),
+            .seat_pointer_move_listener = wire.Listener(*wayland.seat.Seat).init(onSeatPointerMove),
+            .seat_axis_listener = wire.Listener(*wayland.seat.Seat).init(onSeatAxis),
+            // No frame is ever rendered here: requestRender (from the
+            // minimize policy) must only mark repaint_pending instead of
+            // driving the output's frame chain.
+            .in_render = true,
+            .framebuffer = ts.fb.?,
+        };
+        ts.state = state;
+
+        // The production subscriptions the tests exercise.
+        ts.shell.?.events.new_toplevel.add(&state.new_toplevel_listener);
+        ts.shell.?.events.new_popup.add(&state.new_popup_listener);
+        ts.seat.?.events.keyboard_focus.add(&state.seat_focus_listener);
+        ts.seat.?.events.button.add(&state.seat_button_listener);
+        ts.seat.?.events.pointer_move.add(&state.seat_pointer_move_listener);
+        ts.seat.?.setPick(PolicyServer.pick, ts);
+        ts.seat.?.setKeyboardFocusGate(layerKeyboardFocusAllowed, state);
+
+        // In-memory client: one socketpair end for the server, the other
+        // for the client library.
+        var fds: [2]std.posix.socket_t = undefined;
+        const rc = std.posix.system.socketpair(
+            std.posix.AF.UNIX,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            0,
+            &fds,
+        );
+        if (std.posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+        ts.client = wire.Client.create(ts.display.?.getServer(), fds[0]) orelse return error.ClientCreateFailed;
+        ts.c_display = client.wl.Display.connectToFd(fds[1]) catch return error.ClientConnectFailed;
+
+        const registry = try ts.c_display.?.getRegistry();
+        var capture: PolicyRegistryCapture = .{};
+        registry.setListener(*PolicyRegistryCapture, PolicyRegistryCapture.listener, &capture);
+        try ts.pump();
+        if (capture.compositor_name == null or capture.wm_base_name == null or
+            capture.shm_name == null or capture.seat_name == null or
+            capture.ddm_name == null or capture.output_name == null or
+            capture.layer_shell_name == null)
+        {
+            return error.GlobalMissing;
+        }
+        ts.wl_compositor = try registry.bind(capture.compositor_name.?, client.wl.Compositor, 7);
+        ts.wm_base = try registry.bind(capture.wm_base_name.?, client.xdg.WmBase, 7);
+        ts.wl_shm = try registry.bind(capture.shm_name.?, client.wl.Shm, 1);
+        ts.wl_seat = try registry.bind(capture.seat_name.?, client.wl.Seat, 7);
+        ts.ddm = try registry.bind(capture.ddm_name.?, client.wl.DataDeviceManager, 3);
+        ts.wl_output_client = try registry.bind(capture.output_name.?, client.wl.Output, 1);
+        ts.layer_shell_client = try registry.bind(capture.layer_shell_name.?, client.zwlr.LayerShellV1, 4);
+        // libwayland-client aborts on an event with no listener.
+        ts.wl_output_client.?.setListener(*u8, ignoreOutputEvents, &ts.output_listener_data);
+        try ts.pump();
+        return ts;
+    }
+
+    fn deinit(ts: *PolicyServer) void {
+        // Clients first: their resource destroy handlers must run while
+        // the modules they call into are alive.
+        if (ts.c_display) |d| d.disconnect();
+        if (ts.client) |c| c.destroy();
+        // Unlink the state BEFORE the modules deinit (their teardown emits
+        // signals the listeners would otherwise receive with the state
+        // already freed).
+        if (ts.state) |state| {
+            unlink(*wayland.shell.XdgToplevel, &state.new_toplevel_listener);
+            unlink(*wayland.shell.XdgPopup, &state.new_popup_listener);
+            unlink(*wayland.seat.Seat, &state.seat_focus_listener);
+            unlink(*wayland.seat.Seat, &state.seat_button_listener);
+            unlink(*wayland.seat.Seat, &state.seat_pointer_move_listener);
+            state.toplevels.deinit(ts.allocator);
+            state.layer_surfaces.deinit(ts.allocator);
+            state.layer_popups.deinit(ts.allocator);
+            state.synth_clicked.deinit(ts.allocator);
+            ts.allocator.destroy(state);
+        }
+        if (ts.scene) |sc| sc.deinit();
+        if (ts.fb) |fb| fb.deinit();
+        // The Output's destroy signal frees the WlOutput global.
+        if (ts.output) |o| o.destroy();
+        if (ts.backend) |b| b.destroy();
+        if (ts.presentation) |p| p.deinit();
+        if (ts.renderer) |r| r.destroy();
+        if (ts.primary_selection) |ps| ps.deinit();
+        if (ts.data_device) |dd| dd.deinit();
+        if (ts.subcompositor) |sc| sc.deinit();
+        if (ts.viewporter) |v| v.deinit();
+        if (ts.fractional_scale) |fs| fs.deinit();
+        if (ts.xdg_decoration) |xd| xd.deinit();
+        if (ts.xdg_activation) |xa| xa.deinit();
+        if (ts.seat) |s| s.deinit();
+        if (ts.layer_shell) |ls| ls.deinit();
+        if (ts.shell) |s| s.deinit();
+        if (ts.compositor) |c| c.deinit();
+        if (ts.shm_state) |s| s.deinit();
+        if (ts.display) |d| d.deinit();
+        ts.allocator.destroy(ts);
+    }
+
+    /// Client flush -> server dispatch -> server flush -> client dispatch.
+    fn pump(ts: *PolicyServer) !void {
+        if (ts.c_display.?.flush() != .SUCCESS) return error.ClientFlushFailed;
+        try ts.display.?.getServer().getEventLoop().dispatch(0);
+        ts.display.?.flushClients();
+        var fds = [_]std.posix.pollfd{.{
+            .fd = ts.c_display.?.getFd(),
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&fds, 0) > 0) {
+            if (ts.c_display.?.dispatch() != .SUCCESS) return error.ClientDispatchFailed;
+        }
+    }
+
+    /// Unlink a signal listener init() added (the seat does the same
+    /// before re-arming its focus listener, seat.zig:1251). A listener
+    /// that was never added is left alone.
+    fn unlink(comptime T: type, l: *wire.Listener(T)) void {
+        if (l.link.prev != null) l.link.remove();
+    }
+
+    /// A real 64x64 shm buffer (the pool is retained so the buffer stays
+    /// valid for the whole test).
+    fn createBuffer(ts: *PolicyServer) !*client.wl.Buffer {
+        if (ts.buffer) |b| return b;
+        const width: i32 = 64;
+        const height: i32 = 64;
+        const fd = try std.posix.memfd_create("policy-test-buffer", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(fd);
+        const pool_size = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+        const rc = std.os.linux.ftruncate(fd, @intCast(pool_size));
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
+        ts.shm_pool = try ts.wl_shm.?.createPool(fd, @intCast(pool_size));
+        ts.buffer = try ts.shm_pool.?.createBuffer(0, width, height, width * 4, .argb8888);
+        return ts.buffer.?;
+    }
+
+    const Toplevel = struct {
+        wl_surface: *client.wl.Surface,
+        xdg_surface: *client.xdg.Surface,
+        toplevel: *client.xdg.Toplevel,
+        tl_events: ClientToplevelEvents,
+        xs_events: ClientXdgSurfaceEvents,
+    };
+
+    /// A mapped toplevel: xdg_surface + xdg_toplevel, the initial commit
+    /// the compositor answers with a configure, then a buffer so the
+    /// surface has a scene node.
+    fn createToplevel(ts: *PolicyServer) !*Toplevel {
+        // Heap-allocated: the client listeners take the address of the
+        // event state, so it must outlive this call (a returned-by-value
+        // copy would leave them pointing at the dead local).
+        const out = try ts.allocator.create(Toplevel);
+        errdefer ts.allocator.destroy(out);
+        // SAFETY: the three proxy slots are filled by the create* calls
+        // below before anything reads them, and a failure in one of those
+        // runs the errdefer, which frees `out` without exposing it.
+        out.* = .{
+            .wl_surface = undefined,
+            .xdg_surface = undefined,
+            .toplevel = undefined,
+            .tl_events = .{},
+            .xs_events = .{},
+        };
+        out.wl_surface = try ts.wl_compositor.?.createSurface();
+        out.xdg_surface = try ts.wm_base.?.getXdgSurface(out.wl_surface);
+        out.toplevel = try out.xdg_surface.getToplevel();
+        out.toplevel.setListener(*ClientToplevelEvents, ClientToplevelEvents.listener, &out.tl_events);
+        out.xdg_surface.setListener(*ClientXdgSurfaceEvents, ClientXdgSurfaceEvents.listener, &out.xs_events);
+        try ts.pump();
+        // Initial commit: the compositor's initial_commit handler replies
+        // with the configure the client acks.
+        out.wl_surface.commit();
+        try ts.pump();
+        // Attach a buffer + ack: the surface maps and gets a scene node.
+        out.wl_surface.attach(try ts.createBuffer(), 0, 0);
+        out.xdg_surface.ackConfigure(out.xs_events.serial);
+        out.wl_surface.commit();
+        try ts.pump();
+        syncSurfaces(ts.state.?);
+        return out;
+    }
+
+    /// The server-side XdgToplevel created by `t`.
+    fn serverToplevel(ts: *PolicyServer, t: *client.xdg.Toplevel) *wayland.shell.XdgToplevel {
+        for (ts.shell.?.toplevels.items) |st| {
+            if (st.resource.getId() == t.getId()) return st;
+        }
+        unreachable;
+    }
+
+    /// The server-side Surface the client's wl_surface maps to.
+    fn serverSurface(ts: *PolicyServer, wl_surface: *client.wl.Surface) *Surface {
+        for (ts.compositor.?.surfaces.items) |s| {
+            if (s.resource.getId() == wl_surface.getId()) return s;
+        }
+        unreachable;
+    }
+};
+
+test "left release does not cancel an in-flight DnD drag (P1-3)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const origin = try ts.createToplevel();
+    defer ts.allocator.destroy(origin);
+    const origin_surface = ts.serverSurface(origin.wl_surface);
+    ts.pick_surface = origin_surface;
+    ts.seat.?.pointerMotion(40, 40);
+    ts.seat.?.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+
+    const device = try ts.ddm.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.ddm.?.createDataSource();
+    src.offer("text/plain");
+    var src_events: ClientDataSourceEvents = .{};
+    src.setListener(*ClientDataSourceEvents, ClientDataSourceEvents.listener, &src_events);
+    try ts.pump();
+    device.startDrag(src, origin.wl_surface, null, ts.seat.?.last_serial);
+    try ts.pump();
+    // The drag owns the seat pointer: its own grab, not the compositor's.
+    try testing.expect(ts.data_device.?.drag != null);
+    try testing.expect(ts.seat.?.pointer_grab != null);
+    try testing.expect(ts.seat.?.pointer_grab != &wayland.seat.swallow_pointer_grab);
+
+    // The release ENDS the drag — that is the drag's own end, not the
+    // compositor's (a mouse drag drops on the origin button's release,
+    // wlroots drag_handle_pointer_button, wlr_drag.c:113-125), so what
+    // P1-3 pins is WHICH end ran. The release must reach the drag's grab
+    // and run the drop/finish protocol: dnd_finished is what an
+    // unconditional endPointerGrab on the release skipped by calling the
+    // drag's cancel instead ("the target got leave with no drop").
+    ts.seat.?.pointerButton(wayland.seat.btn_left, false);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), src_events.dnd_finished);
+    try testing.expect(ts.data_device.?.drag == null);
+    try testing.expect(ts.seat.?.pointer_grab == null);
+}
+
+test "left release does not dismiss a popup grab (P1-3)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const parent = try ts.createToplevel();
+    defer ts.allocator.destroy(parent);
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const popup_wl_surface = try ts.wl_compositor.?.createSurface();
+    const popup_xdg_surface = try ts.wm_base.?.getXdgSurface(popup_wl_surface);
+    var popup_events: ClientPopupEvents = .{};
+    const client_popup = try popup_xdg_surface.getPopup(parent.xdg_surface, positioner);
+    client_popup.setListener(*ClientPopupEvents, ClientPopupEvents.listener, &popup_events);
+    positioner.destroy();
+    try ts.pump();
+    const p = ts.shell.?.popups.items[0];
+
+    // Grab with a serial the client was just handed.
+    ts.seat.?.setKeyboardFocus(p.xdg_surface.surface);
+    client_popup.grab(ts.wl_seat.?, ts.seat.?.last_serial);
+    try ts.pump();
+    try testing.expect(p.grab_state != null);
+    try testing.expect(ts.seat.?.pointer_grab != null);
+
+    // The release must not cancel the popup grab: no popup_done, and the
+    // popup keeps the pointer.
+    ts.seat.?.pointerButton(wayland.seat.btn_left, false);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), popup_events.done_count);
+    try testing.expect(ts.seat.?.pointer_grab != null);
+}
+
+test "left release ends the interactive move and the camera pan (P1-3)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    // The interactive move: a compositor gesture holding the swallow
+    // grab, installed exactly as onToplevelMove installs it.
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const st = ts.serverToplevel(t.toplevel);
+    const gestures = &ts.state.?.gestures;
+    gestures.moving_toplevel = st;
+    grabPointerForGesture(ts.seat.?, gestures);
+    try testing.expect(ts.seat.?.pointer_grab == &wayland.seat.swallow_pointer_grab);
+
+    try testing.expect(endPointerGestures(ts.seat.?, gestures));
+    try testing.expect(gestures.moving_toplevel == null);
+    try testing.expect(gestures.own_grab == null);
+    try testing.expect(ts.seat.?.pointer_grab == null);
+
+    // The camera pan: the same grab, armed by the button press.
+    ts.seat.?.pointerMotion(10, 10);
+    ts.seat.?.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+    gestures.camera_drag = .{ .x = 10, .y = 10 };
+    gestures.drag_active = true;
+    gestures.fast_render = true;
+    grabPointerForGesture(ts.seat.?, gestures);
+    try testing.expect(ts.seat.?.pointer_grab == &wayland.seat.swallow_pointer_grab);
+
+    try testing.expect(endPointerGestures(ts.seat.?, gestures));
+    try testing.expect(gestures.camera_drag == null);
+    try testing.expect(!gestures.drag_active);
+    try testing.expect(!gestures.fast_render);
+    try testing.expect(ts.seat.?.pointer_grab == null);
+
+    // No gesture of ours is live: the release still clears the armed pan
+    // anchor (a sub-threshold click never started one) and ends nothing.
+    gestures.camera_drag = .{ .x = 20, .y = 20 };
+    try testing.expect(!endPointerGestures(ts.seat.?, gestures));
+    try testing.expect(gestures.camera_drag == null);
+    try testing.expect(ts.seat.?.pointer_grab == null);
+}
+
+test "set_maximized / unset_maximized are answered with a configure (P1-8)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const st = ts.serverToplevel(t.toplevel);
+    t.toplevel.setMaximized();
+    try ts.pump();
+    // The answer carries the state AND the size the output's usable area
+    // implies — not an echo of the request alone.
+    try testing.expect(t.tl_events.carries(state_maximized));
+    try testing.expectEqual(@as(i32, 800), t.tl_events.width);
+    try testing.expectEqual(@as(i32, 600), t.tl_events.height);
+    try testing.expect(st.scheduled.maximized);
+
+    t.toplevel.unsetMaximized();
+    try ts.pump();
+    try testing.expect(!t.tl_events.carries(state_maximized));
+    try testing.expect(!st.scheduled.maximized);
+    // The size goes back to the client (no restore size exists).
+    try testing.expectEqual(@as(i32, 0), t.tl_events.width);
+    try testing.expectEqual(@as(i32, 0), t.tl_events.height);
+}
+
+test "an exclusive layer zone shrinks the maximized area (P1-8)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const layer_wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell_client.?.getLayerSurface(layer_wl_surface, null, .top, "panel");
+    layer_surface.setListener(*u8, ignoreLayerEvents, &ts.layer_listener_data);
+    layer_surface.setSize(800, 24);
+    // zwlr_layer_surface_v1.anchor is a bitmask and the scanner binds it as
+    // the raw u32; bit 0 is `top` (layer-shell.xml anchor values).
+    layer_surface.setAnchor(@bitCast(@as(u32, 1)));
+    layer_surface.setExclusiveZone(24);
+    try ts.pump();
+    // The layer module applies pending at commit.
+    layer_wl_surface.commit();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ts.layer_shell.?.layer_surfaces.items.len);
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    t.toplevel.setMaximized();
+    try ts.pump();
+    // 800x600 minus the 24px exclusive strip at the top.
+    try testing.expect(t.tl_events.carries(state_maximized));
+    try testing.expectEqual(@as(i32, 800), t.tl_events.width);
+    try testing.expectEqual(@as(i32, 576), t.tl_events.height);
+}
+
+test "set_fullscreen fills the named output; set_minimized is recorded (P1-8)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const st = ts.serverToplevel(t.toplevel);
+
+    t.toplevel.setFullscreen(ts.wl_output_client.?);
+    try ts.pump();
+    // The FULL output box (800x600), not the usable area: a fullscreen
+    // window covers a panel.
+    try testing.expect(t.tl_events.carries(state_fullscreen));
+    try testing.expectEqual(@as(i32, 800), t.tl_events.width);
+    try testing.expectEqual(@as(i32, 600), t.tl_events.height);
+    try testing.expect(st.scheduled.fullscreen);
+
+    t.toplevel.unsetFullscreen();
+    try ts.pump();
+    try testing.expect(!t.tl_events.carries(state_fullscreen));
+    try testing.expect(!st.scheduled.fullscreen);
+
+    // Minimize: recorded on the toplevel state and taken off screen.
+    t.toplevel.setMinimized();
+    try ts.pump();
+    try testing.expect(st.pending.minimized);
+    const sn = wayland.surface_node.surfaceNodeFor(ts.scene.?, ts.serverSurface(t.wl_surface)).?;
+    try testing.expect(!sn.node.?.enabled);
+}
+
+test "a keyboard-focus change publishes wl_toplevel.activated (P1-9)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const first = try ts.createToplevel();
+    defer ts.allocator.destroy(first);
+    const second = try ts.createToplevel();
+    defer ts.allocator.destroy(second);
+
+    // Focusing the first toplevel: its next configure carries activated.
+    ts.seat.?.setKeyboardFocus(ts.serverSurface(first.wl_surface));
+    try ts.pump();
+    try testing.expect(first.tl_events.carries(state_activated));
+    try testing.expect(!second.tl_events.carries(state_activated));
+
+    // Moving the focus away clears it: an unfocused window must not keep
+    // drawing an active titlebar.
+    ts.seat.?.setKeyboardFocus(ts.serverSurface(second.wl_surface));
+    try ts.pump();
+    try testing.expect(!first.tl_events.carries(state_activated));
+    try testing.expect(second.tl_events.carries(state_activated));
+}
+
+test "a surface the focus gate refuses never reports activated (P1-9)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const st = ts.serverToplevel(t.toplevel);
+
+    // A layer surface the gate refuses: keyboard_interactivity=none must
+    // never take focus, so it can never be activated. The anchors matter
+    // only to keep the layer surface VALID: set_size was never called, so
+    // both desired dimensions are 0 and the commit-time rule ("You must
+    // set your anchor to opposite edges in the dimensions you omit",
+    // layer-shell.xml) demands all four anchors — layer-shell.xml:520-536
+    // posts invalid_size otherwise. The point of the test is the focus
+    // gate, not the layer-shell sizing rules.
+    const layer_wl_surface = try ts.wl_compositor.?.createSurface();
+    const layer_surface = try ts.layer_shell_client.?.getLayerSurface(layer_wl_surface, null, .top, "none");
+    layer_surface.setListener(*u8, ignoreLayerEvents, &ts.layer_listener_data);
+    layer_surface.setAnchor(@bitCast(@as(u32, 1 | 2 | 4 | 8)));
+    layer_surface.setKeyboardInteractivity(.none);
+    try ts.pump();
+    layer_wl_surface.commit();
+    try ts.pump();
+    const refused = ts.layer_shell.?.layer_surfaces.items[0].surface;
+    try testing.expect(!layerKeyboardFocusAllowed(ts.state.?, refused));
+
+    // A click cannot route focus to it...
+    ts.pick_surface = refused;
+    ts.seat.?.pointerMotion(5, 5);
+    ts.seat.?.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+    ts.seat.?.pointerButton(wayland.seat.btn_left, false);
+    try ts.pump();
+    try testing.expect(ts.seat.?.keyboard_focus != refused);
+    try testing.expect(!st.scheduled.activated);
+
+    // ...and even if a focus reaches it by another route, the activation
+    // policy re-checks the gate: no configure carries activated.
+    const before = t.tl_events.configures;
+    ts.seat.?.setKeyboardFocus(refused);
+    try ts.pump();
+    try testing.expectEqual(before, t.tl_events.configures);
+    try testing.expect(!st.scheduled.activated);
+    try testing.expect(!t.tl_events.carries(state_activated));
+}
+
+test "syncPopupNodes publishes the popup's absolute scene origin (P1-5b)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const parent = try ts.createToplevel();
+    defer ts.allocator.destroy(parent);
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const popup_wl_surface = try ts.wl_compositor.?.createSurface();
+    const popup_xdg_surface = try ts.wm_base.?.getXdgSurface(popup_wl_surface);
+    var popup_events: ClientPopupEvents = .{};
+    var popup_xs: ClientXdgSurfaceEvents = .{};
+    popup_xdg_surface.setListener(*ClientXdgSurfaceEvents, ClientXdgSurfaceEvents.listener, &popup_xs);
+    const client_popup = try popup_xdg_surface.getPopup(parent.xdg_surface, positioner);
+    client_popup.setListener(*ClientPopupEvents, ClientPopupEvents.listener, &popup_events);
+    positioner.destroy();
+    try ts.pump();
+    const p = ts.shell.?.popups.items[0];
+    popup_wl_surface.commit(); // initial commit -> the module's configure
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), popup_xs.configures);
+    popup_wl_surface.attach(try ts.createBuffer(), 0, 0);
+    popup_xdg_surface.ackConfigure(popup_xs.serial);
+    popup_wl_surface.commit();
+    try ts.pump();
+    syncSurfaces(ts.state.?);
+
+    // Move the PARENT away from the origin, so the popup's absolute
+    // position is not simply its parent-relative offset.
+    const parent_tree = wayland.surface_node.surfaceNodeFor(
+        ts.scene.?,
+        ts.serverSurface(parent.wl_surface),
+    ).?.tree.?;
+    parent_tree.x = 300;
+    parent_tree.y = 150;
+
+    syncPopupNodes(ts.state.?);
+    const popup_tree = wayland.surface_node.surfaceNodeFor(
+        ts.scene.?,
+        ts.serverSurface(popup_wl_surface),
+    ).?.tree.?;
+    const abs = popup_tree.absolutePosition();
+    // The published origin is the popup's ABSOLUTE scene position: the
+    // parent chain plus the parent-relative geometry.
+    try testing.expectEqual(parent_tree.x + p.geometry.x, p.origin.x);
+    try testing.expectEqual(parent_tree.y + p.geometry.y, p.origin.y);
+    try testing.expectEqual(abs.x, p.origin.x);
+    try testing.expectEqual(abs.y, p.origin.y);
+}
+
+test "syncDragIconNodes puts the drag icon at the pointer and drops it (P2-12)" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const origin = try ts.createToplevel();
+    defer ts.allocator.destroy(origin);
+    const origin_surface = ts.serverSurface(origin.wl_surface);
+    ts.pick_surface = origin_surface;
+    ts.seat.?.pointerMotion(40, 40);
+    ts.seat.?.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+
+    const device = try ts.ddm.?.getDataDevice(ts.wl_seat.?);
+    const src = try ts.ddm.?.createDataSource();
+    src.offer("text/plain");
+    const icon_wl_surface = try ts.wl_compositor.?.createSurface();
+    try ts.pump();
+    // The icon carries a buffer, so it has a scene node to place.
+    icon_wl_surface.attach(try ts.createBuffer(), 0, 0);
+    icon_wl_surface.commit();
+    try ts.pump();
+    device.startDrag(src, origin.wl_surface, icon_wl_surface, ts.seat.?.last_serial);
+    try ts.pump();
+    const icon_surface = ts.data_device.?.currentDragIcon().?;
+    try testing.expect(icon_surface != origin_surface);
+    syncSurfaces(ts.state.?);
+
+    // While the drag lives the icon sits at the pointer.
+    ts.seat.?.pointerMotion(400, 300);
+    syncDragIconNodes(ts.state.?);
+    const icon_tree = wayland.surface_node.surfaceNodeFor(ts.scene.?, icon_surface).?.tree.?;
+    try testing.expectEqual(@as(i32, 400), icon_tree.x);
+    try testing.expectEqual(@as(i32, 300), icon_tree.y);
+    const abs = icon_tree.absolutePosition();
+    try testing.expectEqual(@as(i32, 400), abs.x);
+    try testing.expectEqual(@as(i32, 300), abs.y);
+
+    // The drag ends: the icon is no longer at the pointer, and the canvas
+    // pass no longer composites it as content.
+    ts.seat.?.pointerButton(wayland.seat.btn_left, false);
+    try ts.pump();
+    try testing.expect(ts.data_device.?.currentDragIcon() == null);
+    ts.seat.?.pointerMotion(500, 350);
+    syncDragIconNodes(ts.state.?);
+    try testing.expectEqual(@as(i32, 400), icon_tree.x);
+    try testing.expectEqual(@as(i32, 300), icon_tree.y);
+    try testing.expect(isDragIconSurface(icon_surface));
 }
