@@ -945,6 +945,11 @@ const TestOptions = struct {
     /// wl_pointer (never in Seat.pointers), which is exactly the input that
     /// makes a constraint INERT.
     pointer_capability: bool = true,
+    /// Seat keymap layout override. Only a test that needs the harness to
+    /// FAIL sets it: a name no installed xkeyboard-config can satisfy
+    /// makes Xkb.init fail exactly the way a machine with no rules data
+    /// does. null: seat_mod.Options' own default ("us").
+    layout: ?[]const u8 = null,
 };
 
 /// A compositor + seat + pointer-constraints module + one in-memory client.
@@ -976,9 +981,11 @@ const TestServer = struct {
         try ts.display.?.initShm();
         ts.compositor = try compositor_mod.Compositor.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
         if (opts.with_seat) {
-            ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, .{
+            var seat_opts: seat_mod.Options = .{
                 .pointer = opts.pointer_capability,
-            });
+            };
+            if (opts.layout) |layout| seat_opts.layout = layout;
+            ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, seat_opts);
             ts.seat.?.setPick(testPick, &ts.pick_state);
         }
         ts.pc = try PointerConstraints.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, ts.compositor.?, ts.seat);
@@ -1065,14 +1072,43 @@ const TestServer = struct {
     }
 };
 
-/// Every seat-backed test needs a real Seat, which needs xkbcommon and a
-/// keymap; the seat's own tests skip with the same diagnostic when the
-/// keymap source is unavailable.
-fn testServer(allocator: std.mem.Allocator) !*TestServer {
-    return TestServer.init(allocator, .{}) catch |err| {
-        std.debug.print("pointer_constraints test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return err;
+/// The ONE way a test in this file starts the seat-backed harness. Every
+/// test binds the result with `try`, so an unstartable harness can only
+/// report SKIP or FAIL — never a pass with nothing asserted.
+fn testServer(allocator: std.mem.Allocator, opts: TestOptions) !*TestServer {
+    return TestServer.init(allocator, opts) catch |err| testInitError(err);
+}
+
+/// The one init failure a test may SKIP instead of fail on: a keymap that
+/// cannot be built, because the machine has no xkeyboard-config rules data
+/// (xkb_keymap_new_from_names returns NULL, xkb.zig:124 — the same
+/// limitation xkb.zig's own test skips on). Everything else — OOM,
+/// socketpair, the client connection, a missing global — is a real failure
+/// and must fail the test.
+///
+/// Split out as a function so the mapping is itself testable: the contract
+/// "an unbuildable keymap SKIPs, a real failure FAILS" IS the fix, and this
+/// is where it lives.
+fn testInitError(err: anyerror) anyerror {
+    return switch (err) {
+        error.XkbInitFailed, error.KeymapBuildFailed => error.SkipZigTest,
+        else => err,
     };
+}
+
+test "an unstartable harness is visible: no keymap source skips, a real failure fails" {
+    const allocator = std.testing.allocator;
+    // A layout name no installed xkeyboard-config can satisfy makes
+    // xkb_keymap_new_from_names return NULL — exactly what a machine with
+    // no rules data produces (xkb.zig:124). The environment cannot run
+    // these tests, so the honest report is SKIP; a pass here would be a
+    // green run claiming assertions that never ran.
+    try std.testing.expectError(error.SkipZigTest, testServer(allocator, .{ .layout = "zz-no-such-layout" }));
+    // A failure that is NOT a keymap-source limitation must stay a
+    // failure: laundering it into a skip would hide a real defect behind
+    // a green run.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, testServer(failing.allocator(), .{}));
 }
 
 test "pointer constraints init and teardown with no seat and no client" {
@@ -1097,7 +1133,7 @@ test "pointer constraints init and teardown with no seat and no client" {
 
 test "a client binds the manager with no seat behind it" {
     const allocator = std.testing.allocator;
-    var ts = try TestServer.init(allocator, .{ .with_seat = false });
+    const ts = try testServer(allocator, .{ .with_seat = false });
     defer ts.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), ts.pc.?.managers.items.len);
@@ -1108,7 +1144,7 @@ test "a client binds the manager with no seat behind it" {
 
 test "lock lifecycle: locked, cursor pinned, unlocked when focus is lost" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();
@@ -1160,7 +1196,7 @@ test "lock lifecycle: locked, cursor pinned, unlocked when focus is lost" {
 
 test "confine lifecycle with a region and exact geometry clamping" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();
@@ -1203,7 +1239,7 @@ test "confine lifecycle with a region and exact geometry clamping" {
 
 test "a lock with no region constrains the whole surface" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();
@@ -1228,7 +1264,7 @@ test "a lock with no region constrains the whole surface" {
 
 test "already_constrained is posted on the manager and kills the client" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     _ = try ts.createSurface();
@@ -1267,7 +1303,7 @@ test "already_constrained is posted on the manager and kills the client" {
 
 test "a oneshot constraint is destroyed on deactivation" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();
@@ -1294,7 +1330,7 @@ test "a oneshot constraint is destroyed on deactivation" {
 
 test "destroying the constrained surface while active sends unlocked" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();
@@ -1322,7 +1358,7 @@ test "destroying the constrained surface while active sends unlocked" {
 
 test "destroying the constraint object while active releases it" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();
@@ -1357,7 +1393,7 @@ test "destroying the constraint object while active releases it" {
 
 test "set_region is double-buffered and lands on the next commit" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();
@@ -1399,7 +1435,7 @@ test "set_region is double-buffered and lands on the next commit" {
 
 test "set_cursor_position_hint is double-buffered with exact 24.8 encoding" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     // The surface must exist, or lock_pointer leaves the object inert and
@@ -1428,7 +1464,7 @@ test "set_cursor_position_hint is double-buffered with exact 24.8 encoding" {
 
 test "a compositor grab blocks activation" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();
@@ -1465,7 +1501,7 @@ test "a compositor grab blocks activation" {
 
 test "a wl_pointer that is not a live seat pointer leaves the object inert" {
     const allocator = std.testing.allocator;
-    var ts = try TestServer.init(allocator, .{ .pointer_capability = false });
+    const ts = try testServer(allocator, .{ .pointer_capability = false });
     defer ts.deinit();
 
     _ = try ts.createSurface();
@@ -1498,7 +1534,7 @@ test "a wl_pointer that is not a live seat pointer leaves the object inert" {
 
 test "setSeat(null) releases every constraint with unlocked" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();
@@ -1528,7 +1564,7 @@ test "setSeat(null) releases every constraint with unlocked" {
 
 test "module teardown releases every constraint with unlocked" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface();

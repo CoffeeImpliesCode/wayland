@@ -456,8 +456,18 @@ const Peer = struct {
     }
 };
 
+const TestOptions = struct {
+    /// Build the module with NO seat at all.
+    with_seat: bool = true,
+    /// Seat keymap layout override. Only a test that needs the harness to
+    /// FAIL sets it: a name no installed xkeyboard-config can satisfy
+    /// makes Xkb.init fail exactly the way a machine with no rules data
+    /// does. null: seat_mod.Options' own default ("us").
+    layout: ?[]const u8 = null,
+};
+
 /// A compositor + seat + relative-pointer module + two in-memory clients.
-/// `with_seat` false builds the module with NO seat at all.
+/// `opts.with_seat` false builds the module with NO seat at all.
 const TestServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -470,23 +480,27 @@ const TestServer = struct {
     a: Peer = .{},
     b: Peer = .{},
 
-    fn init(allocator: std.mem.Allocator, with_seat: bool) !*TestServer {
+    fn init(allocator: std.mem.Allocator, opts: TestOptions) !*TestServer {
         const ts = try allocator.create(TestServer);
-        errdefer allocator.destroy(ts);
         ts.* = .{
             .allocator = allocator,
             .io = std.Io.Threaded.global_single_threaded.io(),
             .log_cfg = .{ .min_level = .err },
         };
-        // deinit() frees ts itself, so it is the only teardown errdefer.
+        // deinit() frees ts itself, so it is the ONLY teardown errdefer: a
+        // second allocator.destroy(ts) runs alongside it on the error path
+        // and double-frees — which is every path that reaches here on a
+        // machine with no xkeyboard-config.
         errdefer ts.deinit();
         ts.display = try display_mod.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
         // The internal wl_shm global (libwayland) must exist before the
         // clients' first registry roundtrips.
         try ts.display.?.initShm();
         ts.compositor = try compositor_mod.Compositor.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
-        if (with_seat) {
-            ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, .{});
+        if (opts.with_seat) {
+            var seat_opts: seat_mod.Options = .{};
+            if (opts.layout) |layout| seat_opts.layout = layout;
+            ts.seat = try seat_mod.Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, seat_opts);
             ts.seat.?.setPick(testPick, &ts.pick_state);
         }
         ts.relative = try RelativePointer.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, ts.seat);
@@ -496,11 +510,11 @@ const TestServer = struct {
         try ts.pump();
 
         if (ts.a.capture.manager_name == null or ts.a.capture.compositor_name == null) return error.GlobalMissing;
-        if (with_seat and ts.a.capture.seat_name == null) return error.SeatMissing;
+        if (opts.with_seat and ts.a.capture.seat_name == null) return error.SeatMissing;
 
         for ([_]*Peer{ &ts.a, &ts.b }) |p| {
             p.wl_compositor = try p.registry.?.bind(p.capture.compositor_name.?, client.wl.Compositor, 7);
-            if (with_seat) {
+            if (opts.with_seat) {
                 p.wl_seat = try p.registry.?.bind(p.capture.seat_name.?, client.wl.Seat, seat_mod.seat_version);
                 p.wl_pointer = try p.wl_seat.?.getPointer();
             }
@@ -575,14 +589,43 @@ const TestServer = struct {
     }
 };
 
-/// Every seat-backed test needs a real Seat, which needs xkbcommon and a
-/// keymap; the seat's own tests skip with the same diagnostic when the
-/// keymap source is unavailable.
-fn testServer(allocator: std.mem.Allocator) !*TestServer {
-    return TestServer.init(allocator, true) catch |err| {
-        std.debug.print("relative_pointer test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return err;
+/// The ONE way a test in this file starts the seat-backed harness. Every
+/// test binds the result with `try`, so an unstartable harness can only
+/// report SKIP or FAIL — never a pass with nothing asserted.
+fn testServer(allocator: std.mem.Allocator, opts: TestOptions) !*TestServer {
+    return TestServer.init(allocator, opts) catch |err| testInitError(err);
+}
+
+/// The one init failure a test may SKIP instead of fail on: a keymap that
+/// cannot be built, because the machine has no xkeyboard-config rules data
+/// (xkb_keymap_new_from_names returns NULL, xkb.zig:124 — the same
+/// limitation xkb.zig's own test skips on). Everything else — OOM,
+/// socketpair, the client connection, a missing global — is a real failure
+/// and must fail the test.
+///
+/// Split out as a function so the mapping is itself testable: the contract
+/// "an unbuildable keymap SKIPs, a real failure FAILS" IS the fix, and this
+/// is where it lives.
+fn testInitError(err: anyerror) anyerror {
+    return switch (err) {
+        error.XkbInitFailed, error.KeymapBuildFailed => error.SkipZigTest,
+        else => err,
     };
+}
+
+test "an unstartable harness is visible: no keymap source skips, a real failure fails" {
+    const allocator = std.testing.allocator;
+    // A layout name no installed xkeyboard-config can satisfy makes
+    // xkb_keymap_new_from_names return NULL — exactly what a machine with
+    // no rules data produces (xkb.zig:124). The environment cannot run
+    // these tests, so the honest report is SKIP; a pass here would be a
+    // green run claiming assertions that never ran.
+    try std.testing.expectError(error.SkipZigTest, testServer(allocator, .{ .layout = "zz-no-such-layout" }));
+    // A failure that is NOT a keymap-source limitation must stay a
+    // failure: laundering it into a skip would hide a real defect behind
+    // a green run.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, testServer(failing.allocator(), .{}));
 }
 
 test "relative pointer init and teardown with no seat and no client" {
@@ -631,7 +674,7 @@ test "relative pointer init and teardown with no seat and no client" {
 
 test "both entry points are inert with no seat and deliver once attached" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface(&ts.a);
@@ -683,7 +726,7 @@ test "both entry points are inert with no seat and deliver once attached" {
 
 test "a client binds and releases the manager with no seat behind it" {
     const allocator = std.testing.allocator;
-    var ts = try TestServer.init(allocator, false);
+    const ts = try testServer(allocator, .{ .with_seat = false });
     defer ts.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), ts.relative.?.managers.items.len);
@@ -700,7 +743,7 @@ test "a client binds and releases the manager with no seat behind it" {
 
 test "relative motion carries exact 24.8 deltas and a 64-bit utime" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface(&ts.a);
@@ -743,7 +786,7 @@ test "relative motion carries exact 24.8 deltas and a 64-bit utime" {
 
 test "relative motion reaches only the pointer-focus client" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface_a = try ts.createSurface(&ts.a);
@@ -783,7 +826,7 @@ test "relative motion reaches only the pointer-focus client" {
 
 test "no pointer focus means no relative motion" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface(&ts.a);
@@ -804,7 +847,7 @@ test "no pointer focus means no relative motion" {
 
 test "destroying the relative pointer stops delivery" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface(&ts.a);
@@ -825,7 +868,7 @@ test "destroying the relative pointer stops delivery" {
 
 test "a relative pointer outlives its manager" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface(&ts.a);
@@ -853,7 +896,7 @@ test "a relative pointer outlives its manager" {
 
 test "setSeat(null) detaches and re-attaching clears the delta baseline" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface(&ts.a);
@@ -884,7 +927,7 @@ test "setSeat(null) detaches and re-attaching clears the delta baseline" {
 
 test "the backend entry point delivers unclipped deltas verbatim" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     const surface = try ts.createSurface(&ts.a);
@@ -916,7 +959,7 @@ test "the backend entry point delivers unclipped deltas verbatim" {
 
 test "module teardown releases every live relative pointer" {
     const allocator = std.testing.allocator;
-    var ts = try TestServer.init(allocator, true);
+    const ts = try testServer(allocator, .{});
     defer ts.deinit();
 
     // The proxies are owned by the client display; the module holds the

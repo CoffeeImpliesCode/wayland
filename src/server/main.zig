@@ -694,6 +694,56 @@ fn endPointerGestures(seat: *wayland.seat.Seat, g: *PointerGestures) bool {
     return true;
 }
 
+/// Release every pointer button a client believes it is holding, to the
+/// client that RECEIVED the press (Seat.held_clients), then clear the
+/// set. This is the flush Seat.startPointerGrab runs when it installs a
+/// grab, and it exists for the same reason there: a client's own gesture
+/// state must not extend into the compositor's gesture (wlroots resets
+/// the seat buttons when the grab focus changes,
+/// wlr_seat_pointer.c:435-437).
+///
+/// The session latch needs that flush with NO grab around it.
+/// ext_session_lock_v1:81-84 makes the lock client the only input
+/// destination, so from the latch on no release can reach the client
+/// that took the press: the seat routes a physical release by its
+/// cached pointer_focus, and the latch's own pointerMotion has either
+/// cleared that focus (the lock-aware pick drops user content) or moved
+/// it onto the lock surface — where the release would land on a client
+/// that never saw a press. Either way the pressed client keeps a button
+/// it can never release, and Seat.held_button_count stays non-zero, so
+/// the NEXT grab start invents a release for a button that is already
+/// up.
+///
+/// The loop is the one inside startPointerGrab (seat.zig:1044-1060),
+/// kept here because the seat exposes no entry point that flushes the
+/// held buttons without also installing a grab. Its seat-side home is a
+/// `resetHeldButtons` factored out of startPointerGrab and called from
+/// here; until that exists this is the one place that flushes without
+/// a grab, and it must stay the same loop.
+fn flushHeldPointerButtons(seat: *wayland.seat.Seat) void {
+    const count = seat.held_button_count;
+    if (count == 0) return;
+    const time = seat.nowMs();
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const button = seat.held_buttons[i];
+        const held_client = seat.held_clients[i];
+        // A FRESH per-client serial, exactly as a grab start mints it:
+        // this is a new input event, not the press coming back.
+        const serial = seat.serialFor(held_client);
+        var delivered = false;
+        for (seat.pointers.items) |ptr| {
+            if (ptr.getClient() != held_client) continue;
+            ptr.sendButton(serial, time, button, .released);
+            delivered = true;
+        }
+        if (delivered) seat.markFramePending(held_client);
+    }
+    // The buttons are logically released whether or not a client got the
+    // release, so a later physical release cannot strand the set.
+    seat.held_button_count = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Startup phases
 // ---------------------------------------------------------------------------
@@ -1710,6 +1760,13 @@ fn subscribe(state: *ServerState) void {
     // pickSurface does. Uninstalled it assumes the identity map, which is
     // only true until the first zoom or pan.
     state.shell.setScreenToWorld(screenToWorld, state);
+    // A grab is the ONE input route that skips every gate above: the seat
+    // returns into the grab's handlers before the pick, the focus gate and
+    // the touch gate are reached. So the boundary needs a fourth gate,
+    // consulted when a grab is INSTALLED rather than when input is
+    // delivered. Same live-state callback shape, so unlocking restores
+    // grabs by itself.
+    state.seat.setGrabGate(grabAllowed, state);
     // ext_session_lock_manager_v1: the four signals main owns. `locked`
     // runs inside the lock surface's commit dispatch, so the grabs are
     // ended and the focus forced onto a lock surface BEFORE any frame can
@@ -2364,6 +2421,18 @@ fn onToplevelMove(listener: *wire.Listener(*wayland.shell.MoveRequest), req: *wa
     const tl: *ToplevelListeners = @fieldParentPtr("request_move", listener);
     const self = tl.state;
     const seat = req.seat;
+    // ext_session_lock_manager_v1: a locked session is the lock client's,
+    // not the compositor's gestures'. The move installs the swallow grab,
+    // and the release that would end it is gated on the lock itself
+    // (onSeatButton), so a move armed here swallows the lock screen's
+    // pointer for the rest of the locked session — no motion, no click,
+    // and no release that can ever clear it (ext_session_lock_v1:81-84:
+    // the lock client must be the only input destination). The request is
+    // REFUSED, not deferred: xdg-shell.xml:761-763 lets the server ignore
+    // a move request, and nothing replays it after the unlock.
+    if (self.session_lock) |sl| {
+        if (sl.isLocked()) return;
+    }
     const toplevel_client = req.toplevel.xdg_surface.surface.resource.getClient();
     // The serial must be a recent input-event serial on the request's
     // seat (wlroots wlr_xdg_toplevel_move validates the same way).
@@ -4203,6 +4272,25 @@ fn touchAllowed(ctx: *anyopaque, surface: *Surface) bool {
     return sl.acceptsInput(surface.resource.getClient());
 }
 
+/// The seat's grab gate: may a grab be INSTALLED right now.
+///
+/// ext_session_lock_v1:81-84 — once `locked` is sent the lock client is
+/// the only input destination, and a grab diverts every input stream away
+/// from the delivery path entirely. Enforcing that only in `onSessionLocked`
+/// (which ends every grab once) leaves the latch unenforced: a client that
+/// installs a grab afterwards takes every keystroke and pointer event on
+/// the machine. `xdg_surface.get_popup`'s `grab` validates only a serial,
+/// and the serial ring carries no time window, so the serial is no barrier.
+///
+/// Read from LIVE lock state, so unlocking restores grabs by itself —
+/// the same teardown story as setPick / setKeyboardFocusGate /
+/// setTouchGate.
+fn grabAllowed(ctx: *anyopaque, _: *wayland.seat.Seat) bool {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    const sl = self.session_lock orelse return true;
+    return !sl.isLocked();
+}
+
 // ---------------------------------------------------------------------------
 // ext_session_lock_manager_v1 + wp_cursor_shape_manager_v1 wiring
 //
@@ -4221,6 +4309,21 @@ fn onSessionLocked(
     sl: *wayland.session_lock.SessionLock,
 ) void {
     const self: *ServerState = @fieldParentPtr("session_locked_listener", listener);
+    // The buttons a client believes it is holding are the FIRST thing the
+    // latch takes, and they must go BEFORE the pointer focus moves below:
+    // from here on the lock client is the only input destination
+    // (ext_session_lock_v1:81-84), so the release a pressed client is owed
+    // can no longer be routed to it — the seat sends a physical release by
+    // its cached pointer_focus, and that focus is about to be cleared (or
+    // moved onto the lock surface, where the release would reach a client
+    // that never saw a press).
+    flushHeldPointerButtons(self.seat);
+    // A compositor gesture armed before the latch ends HERE, beside the
+    // grab teardown below. It cannot end on its own later: the release
+    // branch in onSeatButton is gated on the very lock that armed it, so a
+    // live camera drag or interactive move keeps its seat grab — and with
+    // it the swallowed pointer the lock client must be getting.
+    _ = endPointerGestures(self.seat, &self.gestures);
     // End EVERY compositor grab: a grab routes input to whoever it names,
     // and the lock client must be the only input destination
     // (ext_session_lock_v1:81-84). endPointerGrab/endKeyboardGrab are
@@ -5569,6 +5672,10 @@ const PolicyServer = struct {
         // screen->world conversion.
         ts.foreign_toplevel.?.setFocusGate(state, keyboardFocusAllowed);
         ts.shell.?.setScreenToWorld(screenToWorld, state);
+        // main()'s grab gate: the fourth seam, consulted on INSTALL
+        // rather than on delivery. A locked session must refuse the grab
+        // outright, exactly as the running server does.
+        ts.seat.?.setGrabGate(grabAllowed, state);
         // The production subscriptions main() makes for the new modules.
         ts.session_lock.?.events.locked.add(&state.session_locked_listener);
         ts.session_lock.?.events.unlocked.add(&state.session_unlocked_listener);
@@ -7129,6 +7236,230 @@ test "a touch point that was down when the session locked stops moving on user c
     try ts.pump();
     try testing.expectEqual(@as(usize, 1), events.ups);
     try testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+}
+
+test "the session-lock latch ends an armed camera gesture and hands the lock client the pointer" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const seat = ts.seat.?;
+    const gestures = &ts.state.?.gestures;
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const user_surface = ts.serverSurface(t.wl_surface);
+
+    const pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: ClientPointerEvents = .{};
+    pointer.setListener(*ClientPointerEvents, ClientPointerEvents.listener, &ptr_events);
+    try ts.pump();
+
+    // A left press on the window, then a drag past the threshold: the pan
+    // arms and takes the pointer with the swallow grab (onSeatButton, then
+    // onSeatPointerMove).
+    ts.pick_surface = user_surface;
+    seat.pointerMotion(10, 10);
+    seat.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ptr_events.button);
+    try testing.expect(gestures.camera_drag != null);
+    seat.pointerMotion(300, 300);
+    try ts.pump();
+    try testing.expect(gestures.drag_active);
+    try testing.expect(seat.pointer_grab == &wayland.seat.swallow_pointer_grab);
+
+    // The session locks mid-pan.
+    var lock_events: LockClientEvents = .{};
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    const lock_surface = try ts.lockSession(&lock_events, &lock_surface_events);
+    try ts.pump();
+    try testing.expect(ts.session_lock.?.isLocked());
+
+    // The gesture is over and so is its record. It cannot end on its own
+    // later: the release branch in onSeatButton is gated on the very lock
+    // that armed it, so a live gesture would keep its seat grab (and an
+    // interactive move would swallow the lock screen's pointer outright),
+    // and a stale camera_drag pans the canvas on the first motion after
+    // the unlock with no button held.
+    try testing.expect(gestures.camera_drag == null);
+    try testing.expect(!gestures.drag_active);
+    try testing.expect(!gestures.fast_render);
+    try testing.expect(gestures.moving_toplevel == null);
+    try testing.expect(gestures.own_grab == null);
+    try testing.expect(seat.pointer_grab == null);
+
+    // The lock client has the pointer, and keeps it: motion and a click
+    // are delivered, and neither installs a grab.
+    const motion_before = ptr_events.motion;
+    const buttons_before = ptr_events.button;
+    ts.pick_surface = lock_surface;
+    seat.pointerMotion(400, 400);
+    try ts.pump();
+    try testing.expect(seat.pointer_focus == lock_surface);
+    try testing.expect(seat.pointer_grab == null);
+    try testing.expect(ptr_events.motion > motion_before);
+    seat.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+    try testing.expect(seat.pointer_grab == null);
+    try testing.expectEqual(buttons_before + 1, ptr_events.button);
+}
+
+test "a button held when the session locks is released to the client that took the press" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const seat = ts.seat.?;
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const user_surface = ts.serverSurface(t.wl_surface);
+
+    const pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: ClientPointerEvents = .{};
+    pointer.setListener(*ClientPointerEvents, ClientPointerEvents.listener, &ptr_events);
+    try ts.pump();
+
+    // The user client presses the left button on its own window: the press
+    // is delivered and the seat remembers what that client now believes it
+    // is holding.
+    ts.pick_surface = user_surface;
+    seat.pointerMotion(10, 10);
+    seat.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ptr_events.button);
+    try testing.expectEqual(@as(usize, 1), seat.held_button_count);
+    try testing.expect(seat.held_buttons[0] == wayland.seat.btn_left);
+    try testing.expect(seat.held_clients[0] == ts.client.?);
+
+    // The session locks with the pointer still over the user window. The
+    // latch's own pointerMotion runs the lock-aware pick, which drops user
+    // content, so the seat's cached pointer focus is CLEARED — from here on
+    // a physical release has nowhere to go (ext_session_lock_v1:81-84: the
+    // lock client is the only input destination).
+    var lock_events: LockClientEvents = .{};
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    _ = try ts.lockSession(&lock_events, &lock_surface_events);
+    try ts.pump();
+    try testing.expect(ts.session_lock.?.isLocked());
+    try testing.expect(seat.pointer_focus == null);
+
+    // The latch flushed the button: exactly ONE release, to the client
+    // that received the press (not to whatever holds focus now), and the
+    // held-button set is empty.
+    try testing.expectEqual(@as(usize, 2), ptr_events.button);
+    try testing.expectEqual(@as(usize, 0), seat.held_button_count);
+
+    // The physical release now reaches nobody and re-arms nothing. Had
+    // the latch left the entry, the pressed client would have been
+    // stranded mid-gesture for the rest of the locked session, and the
+    // next grab start would have invented a release for a button that was
+    // already up.
+    seat.pointerButton(wayland.seat.btn_left, false);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 2), ptr_events.button);
+    try testing.expectEqual(@as(usize, 0), seat.held_button_count);
+}
+
+test "a button held when the session locks is released with the pointer over the lock surface" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const seat = ts.seat.?;
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const user_surface = ts.serverSurface(t.wl_surface);
+
+    const pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: ClientPointerEvents = .{};
+    pointer.setListener(*ClientPointerEvents, ClientPointerEvents.listener, &ptr_events);
+    try ts.pump();
+
+    ts.pick_surface = user_surface;
+    seat.pointerMotion(10, 10);
+    seat.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), ptr_events.button);
+    try testing.expectEqual(@as(usize, 1), seat.held_button_count);
+
+    // The lock client, up to but NOT including the latch — the harness
+    // pick is armed with the lock surface first, so the latch's own
+    // pointerMotion leaves the pointer focus ON the lock surface. That is
+    // the other branch: here a physical release would reach the client
+    // under the pointer, which never saw the press.
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const entry = capture.find("ext_session_lock_manager_v1") orelse return error.GlobalMissing;
+    const manager = try registry.bind(entry.name, client.ext.SessionLockManagerV1, entry.version);
+    try ts.pump();
+    var lock_events: LockClientEvents = .{};
+    const lock = try manager.lock();
+    lock.setListener(*LockClientEvents, LockClientEvents.listener, &lock_events);
+    const lock_wl_surface = try ts.wl_compositor.?.createSurface();
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    const lock_surface = try lock.getLockSurface(lock_wl_surface, ts.wl_output_client.?);
+    lock_surface.setListener(*LockSurfaceClientEvents, LockSurfaceClientEvents.listener, &lock_surface_events);
+    try ts.pump();
+    lock_surface.ackConfigure(lock_surface_events.serial);
+    lock_wl_surface.attach(try ts.createFilledBuffer(800, 600, 0x80), 0, 0);
+    ts.pick_surface = ts.serverSurface(lock_wl_surface);
+    lock_wl_surface.commit();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), lock_events.locked);
+    try testing.expect(ts.session_lock.?.isLocked());
+    try testing.expect(seat.pointer_focus == ts.serverSurface(lock_wl_surface));
+
+    // The release still went to the client that took the press, keyed on
+    // held_clients rather than on the surface the pointer is over.
+    try testing.expectEqual(@as(usize, 2), ptr_events.button);
+    try testing.expectEqual(@as(usize, 0), seat.held_button_count);
+}
+
+test "a locked session refuses an interactive move request" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const seat = ts.seat.?;
+    const gestures = &ts.state.?.gestures;
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+
+    const pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: ClientPointerEvents = .{};
+    pointer.setListener(*ClientPointerEvents, ClientPointerEvents.listener, &ptr_events);
+    try ts.pump();
+
+    var lock_events: LockClientEvents = .{};
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    const lock_surface = try ts.lockSession(&lock_events, &lock_surface_events);
+    try ts.pump();
+    ts.pick_surface = lock_surface;
+    seat.pointerMotion(400, 400);
+    try ts.pump();
+
+    // A well-formed move request while the session is locked: serialFor
+    // mints a serial the seat's own validateEventSerial accepts, so the
+    // lock is the only thing that can refuse it (xdg-shell.xml:761-763 lets
+    // the server ignore a move request).
+    t.toplevel.move(ts.wl_seat.?, seat.serialFor(ts.client.?));
+    try ts.pump();
+
+    // No interactive move, and above all no grab: a move armed here owns
+    // the pointer until the button release, and that release is gated on
+    // the lock itself — the lock screen's pointer would stay swallowed for
+    // the rest of the locked session.
+    try testing.expect(gestures.moving_toplevel == null);
+    try testing.expect(gestures.own_grab == null);
+    try testing.expect(seat.pointer_grab == null);
+
+    // The lock client still has a live pointer: motion and a click land.
+    const motion_before = ptr_events.motion;
+    const buttons_before = ptr_events.button;
+    seat.pointerMotion(410, 410);
+    try ts.pump();
+    try testing.expect(seat.pointer_grab == null);
+    try testing.expect(ptr_events.motion > motion_before);
+    seat.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+    try testing.expect(seat.pointer_grab == null);
+    try testing.expectEqual(buttons_before + 1, ptr_events.button);
 }
 
 /// A hit test that does NOT consult the session lock, for the one test

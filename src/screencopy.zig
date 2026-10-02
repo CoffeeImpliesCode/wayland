@@ -46,6 +46,20 @@
 //! of the driver's mapping rather than of anything the client sent.
 //! The wl_shm rejections are untouched and still post invalid_buffer.
 //!
+//! # The capture region
+//! `capture_output_region` puts an origin AND an extent on the wire,
+//! both client-controlled, and the far edge is their sum. That sum is
+//! weighed against the output ONCE, here, at frame creation, and in
+//! i64: wlroots compares the same box (`:313-319`) but at COPY time,
+//! after the client has already allocated a destination for a region
+//! the compositor cannot read. A region that does not fit fails the
+//! frame here instead — before a FrameState exists and before any
+//! buffer type is advertised — so x = INT32_MAX buys a client
+//! `failed` and not a capture that traps the process in the row loop
+//! at the next presenting commit. The copy-time check is kept, against
+//! the framebuffer the row loop actually reads: that is the bound that
+//! still holds when the output has been resized since.
+//!
 //! # Wiring the dmabuf destination
 //! `Screencopy.init` takes no dmabuf argument, so the server hands
 //! the path over afterwards with `setDmabufDestination`:
@@ -382,8 +396,11 @@ fn capture(
     // The region is in output LOGICAL coordinates; map it through the
     // inverse transform and the scale into buffer coordinates (wlroots
     // :576-580). The full-output form is the effective resolution
-    // directly. Boxes are NOT clamped: one that exceeds the source fails
-    // at copy time (wlroots :313-319).
+    // directly. Boxes are NOT clamped: wlroots judges the box against
+    // the output and fails the frame when it does not fit (:313-319),
+    // so a region that does not fit is FAILED here, at creation, where
+    // the client learns of it before it has allocated anything — and
+    // again at copy time, against the framebuffer that is really read.
     var rx: i32 = undefined;
     var ry: i32 = undefined;
     var rw: i32 = undefined;
@@ -408,6 +425,19 @@ fn capture(
     if (rw <= 0 or rh <= 0) {
         // A non-positive region is nonsense on the wire: fail rather than
         // advertise an unusable buffer size.
+        const failed = server.zwlr.ScreencopyFrameV1.create(cli, 1, frame_id) catch return;
+        failed.sendFailed();
+        return;
+    }
+
+    if (!regionInBounds(rx, ry, rw, rh, output.width, output.height)) {
+        // A region outside the output fails the frame HERE, before the
+        // FrameState exists and before a buffer type is advertised:
+        // this is the ONE place the origin and the extent off the wire
+        // are judged against the output, and both are client input.
+        // Leaving it to the copy-time guard is what made a region like
+        // x = INT32_MAX abort the process there instead (see
+        // regionInBounds).
         const failed = server.zwlr.ScreencopyFrameV1.create(cli, 1, frame_id) catch return;
         failed.sendFailed();
         return;
@@ -480,6 +510,25 @@ fn capture(
         frame.sendLinuxDmabuf(fourcc, @intCast(rw), @intCast(rh));
     }
     if (frame.getVersion() >= 3) frame.sendBufferDone();
+}
+
+/// True when the capture region lies inside a `src_width` x
+/// `src_height` source (wlroots :313-319, the bounds wlroots itself
+/// compares at copy time).
+///
+/// The far edge is computed in i64, never i32: the origin AND the
+/// extent are client-supplied, and `x + width` in i32 overflows for a
+/// region like x = INT32_MAX, width = 1 — which PANICS here in
+/// ReleaseSafe (the project default) and wraps negative in ReleaseFast,
+/// where the comparison would pass and the copy would then index the
+/// framebuffer out of bounds. Both destinations abort. Same class of
+/// trap the `rowLen` product had, for the same reason: a value that
+/// came off the wire.
+fn regionInBounds(x: i32, y: i32, width: i32, height: i32, src_width: i32, src_height: i32) bool {
+    if (x < 0 or y < 0 or width <= 0 or height <= 0) return false;
+    const far_x = @as(i64, x) + @as(i64, width);
+    const far_y = @as(i64, y) + @as(i64, height);
+    return far_x <= @as(i64, src_width) and far_y <= @as(i64, src_height);
 }
 
 fn frameRequest(
@@ -682,11 +731,14 @@ fn onFrameOutputCommit(listener: *wire.Listener(*CommitEvent), event: *CommitEve
         frameFailed(state);
         return;
     };
-    // The box must lie inside the source (wlroots :313-319).
-    if (state.x < 0 or state.y < 0 or
-        state.x + state.width > src.width or state.y + state.height > src.height or
-        state.width <= 0 or state.height <= 0)
-    {
+    // The box must lie inside the source (wlroots :313-319). Compared
+    // in i64, NOT i32: the origin and the extent both came off the
+    // wire, and their sum overflows for a region like x = INT32_MAX,
+    // which panics in ReleaseSafe and wraps negative in ReleaseFast —
+    // where the guard would pass and the copy would walk off the
+    // framebuffer. `capture` refuses such a region at creation, so
+    // this is the second line, not the only one.
+    if (!regionInBounds(state.x, state.y, state.width, state.height, src.width, src.height)) {
         frameFailed(state);
         return;
     }
@@ -1997,4 +2049,95 @@ test "a v1 frame is neither offered nor served a dmabuf destination" {
     var error_id: u32 = 0;
     _ = wl_display_get_protocol_error(ts.c_display.?, null, &error_id);
     try testing.expectEqual(frame.getId(), error_id);
+}
+
+test "a capture region outside the output fails the frame at creation" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    fillCapturePattern(ts.fb.?);
+
+    // Four regions a client can put on the wire, none of which lies
+    // inside the 64x64 source. The first puts the origin at INT32_MAX,
+    // so the far edge is not representable in i32 at all; the second
+    // is simply negative; the third and fourth carry an ordinary-looking
+    // origin past INT32_MAX on their own. The last one is the sharpest:
+    // its extent is a 64x64 the client can really allocate a
+    // destination for, so before the fix it passed every check and
+    // reached the shared row loop — the one both destinations use — on
+    // the next presenting commit.
+    const regions = [_]struct { x: i32, y: i32, width: i32, height: i32 }{
+        .{ .x = std.math.maxInt(i32), .y = 0, .width = 1, .height = 1 },
+        .{ .x = -1, .y = 0, .width = 1, .height = 1 },
+        .{ .x = std.math.maxInt(i32) - 7, .y = 0, .width = 16, .height = 1 },
+        .{ .x = std.math.maxInt(i32) - 63, .y = 0, .width = 64, .height = 64 },
+    };
+    for (regions) |region| {
+        const frame = try ts.screencopy_mgr.?.captureOutputRegion(
+            0,
+            ts.wl_output_client.?,
+            region.x,
+            region.y,
+            region.width,
+            region.height,
+        );
+        var events: FrameEvents = .{};
+        frame.setListener(*FrameEvents, FrameEvents.listener, &events);
+        try ts.pump();
+        // failed, and nothing else. No buffer type was advertised, so
+        // the client never allocated a destination for a region the
+        // compositor will not read, and no copy request can be armed
+        // against a frame that is already inert.
+        try testing.expectEqual(@as(usize, 1), events.failed_count);
+        try testing.expectEqual(@as(usize, 0), events.buffer_count);
+        try testing.expectEqual(@as(usize, 0), events.buffer_done_count);
+        try testing.expectEqual(@as(usize, 0), events.linux_dmabuf_count);
+    }
+
+    // The connection survived all three and the source is intact: the
+    // whole output still advertises its buffer and still copies. A
+    // server that aborted on any of the three is not running this
+    // line, and a client the server had killed cannot send this
+    // request.
+    const frame = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var events: FrameEvents = .{};
+    frame.setListener(*FrameEvents, FrameEvents.listener, &events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.buffer_count);
+    const buffer = try ts.createBuffer();
+    frame.copy(buffer);
+    try ts.pump();
+    try commitOutput(ts);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.ready_count);
+    try testing.expectEqual(@as(usize, 0), events.failed_count);
+}
+
+test "the region gate compares the far edge in i64" {
+    // The client controls the origin AND the extent, and it is their
+    // sum that has to be weighed against the source. Every pair here
+    // sums past i32, so a gate that did the add in i32 would panic on
+    // it in ReleaseSafe — and in ReleaseFast the wrap would read as
+    // "inside the framebuffer", letting the copy index out of bounds.
+    const big = std.math.maxInt(i32);
+    try testing.expect(!regionInBounds(big, 0, 1, 1, 64, 64));
+    try testing.expect(!regionInBounds(0, big, 1, 1, 64, 64));
+    try testing.expect(!regionInBounds(big - 7, 0, 16, 1, 64, 64));
+    try testing.expect(!regionInBounds(big, big, big, big, 64, 64));
+
+    // In range: the whole source, its last pixel, and a region whose
+    // far edge lands exactly on the source edge (the gate is <=, so a
+    // region that fills the output to the last pixel is served).
+    try testing.expect(regionInBounds(0, 0, 64, 64, 64, 64));
+    try testing.expect(regionInBounds(63, 63, 1, 1, 64, 64));
+    try testing.expect(regionInBounds(0, 0, 32, 32, 64, 64));
+
+    // Out of range for the ordinary reasons as well: a negative
+    // origin, a non-positive extent, and a box past either edge.
+    try testing.expect(!regionInBounds(-1, 0, 1, 1, 64, 64));
+    try testing.expect(!regionInBounds(0, -1, 1, 1, 64, 64));
+    try testing.expect(!regionInBounds(0, 0, 0, 1, 64, 64));
+    try testing.expect(!regionInBounds(0, 0, 1, 0, 64, 64));
+    try testing.expect(!regionInBounds(0, 63, 1, 2, 64, 64));
+    try testing.expect(!regionInBounds(0, 0, 65, 1, 64, 64));
 }

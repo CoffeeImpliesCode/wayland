@@ -118,6 +118,22 @@
 //! pressed_count, so a seat with no pointer focus anywhere still
 //! reports gestures to the touch-focus client.
 //!
+//! TARGET OF A LIVE GESTURE, one rule for both sources. The client a
+//! gesture BEGAN against owns the rest of it — updates and `end`
+//! alike — and the target is captured at that begin, never resolved
+//! again from the live focus. The seat takes a pointer focus away the
+//! moment a motion picks nothing (seat.zig:1125-1126) and the moment
+//! the focused surface is destroyed (seat.zig:1929), and it takes the
+//! touch focus away the moment it closes a point sequence; every one of
+//! those is an ordinary compositor event, not a compositor grab.
+//! Resolving live in that window either drops the closing `end` on the
+//! floor or hands it to a DIFFERENT client that never received the
+//! `begin`, and both leave the first client holding a gesture open for
+//! the life of its connection (XML:135-149, :207-222, :259-272 end
+//! every gesture that has begun). Capturing at the begin is what makes
+//! the promise this module already makes about a grab hold for focus
+//! loss too.
+//!
 //! TOUCH DETECTION, in the pointer path's own terms so the two cannot
 //! drift apart:
 //! - A candidate arms on the 0 -> 1 transition of the DOWN TOUCH POINTS
@@ -486,6 +502,15 @@ pub const PointerGestures = struct {
     prev_y: i32 = 0,
     /// The touch path's own bookkeeping, in the same whole-pixel space.
     touch: TouchState = .{},
+    /// The target a live POINTER gesture's events are addressed to,
+    /// captured when the gesture BEGINS. The seat clears pointer_focus
+    /// the moment the pointer leaves every surface (Seat.pointerMotion,
+    /// :1125-1126) and when the focused surface is destroyed
+    /// (Seat.surfaceDestroyed, :1929), so the closing `end` — and the
+    /// updates before it — still have to reach the client whose
+    /// `begin` is open, exactly as the touch path already guarantees
+    /// through TouchState.target.
+    pointer_target: ?FocusTarget = null,
     /// The hold delay timer; live only while phase == .pending.
     hold_timer: ?*wire.EventSource = null,
 
@@ -608,6 +633,7 @@ pub const PointerGestures = struct {
     fn resetGesture(self: *PointerGestures) void {
         self.phase = .idle;
         self.source = .none;
+        self.pointer_target = null;
         self.touch.target = null;
         self.touch.origin_x = 0;
         self.touch.origin_y = 0;
@@ -642,6 +668,11 @@ pub const PointerGestures = struct {
         };
         self.phase = .pinch;
         self.source = .pointer;
+        // Captured for the same reason the touch path captures its
+        // target: the seat may drop its pointer focus before pinchEnd
+        // arrives, and the end has to reach the client the begin went
+        // to.
+        self.pointer_target = focus;
         self.prev_x = seat.pointer_x;
         self.prev_y = seat.pointer_y;
         const serial = seat.serialFor(focus.client);
@@ -673,7 +704,7 @@ pub const PointerGestures = struct {
         // A touch pinch is a different gesture driven by touch points;
         // the backend's own pinch may not update it (GESTURE SOURCE).
         if (self.source != .pointer) return;
-        const focus = focusTarget(seat) orelse return;
+        const focus = self.gestureTarget(seat) orelse return;
         const fdx = fixedFromDouble(dx);
         const fdy = fixedFromDouble(dy);
         const fscale = fixedFromDouble(scale);
@@ -813,7 +844,7 @@ pub const PointerGestures = struct {
                 const dy = fixedFromPixels(@as(i64, y) - @as(i64, self.prev_y));
                 self.prev_x = x;
                 self.prev_y = y;
-                const focus = focusTarget(seat) orelse return;
+                const focus = self.gestureTarget(seat) orelse return;
                 for (self.swipes.items) |st| {
                     if (st.seat != seat) continue;
                     if (st.res.getClient() != focus.client) continue;
@@ -880,6 +911,11 @@ pub const PointerGestures = struct {
         // it would let a finger re-base a pointer gesture's deltas.
         self.phase = .swipe;
         self.source = .pointer;
+        // The client that receives this begin owns the rest of the
+        // gesture, updates and end included: the seat can drop its
+        // pointer focus mid-swipe, and resolving the target live would
+        // then send the end to a client that got no begin.
+        self.pointer_target = focus;
         const serial = seat.serialFor(focus.client);
         for (self.swipes.items) |st| {
             if (st.seat != seat) continue;
@@ -1010,7 +1046,22 @@ pub const PointerGestures = struct {
                     self.cancel(true);
                     return;
                 };
-                self.sendTouchPinchUpdate(seat, spread2, to.x - from.x, to.y - from.y);
+                // Widened BEFORE the subtraction, exactly like the
+                // sibling swipe updates at :843-844 and :1115-1116:
+                // `to` and `from` are i32 pixels, and the logical
+                // center can sit at either end of that range
+                // (touchPixel takes the whole range, touchCentroid
+                // averages over it), so a center crossing from one end
+                // to the other between two pure-motion events does not
+                // fit an i32. The .pinch arm has no max_step_px guard —
+                // the SLOP bound lives only in .pending (:1081-1087) —
+                // so nothing upstream has ruled that step out.
+                self.sendTouchPinchUpdate(
+                    seat,
+                    spread2,
+                    @as(i64, to.x) - @as(i64, from.x),
+                    @as(i64, to.y) - @as(i64, from.y),
+                );
             },
             .hold => {
                 if (atLeast(to.x, to.y, self.touch.origin_x, self.touch.origin_y, swipe_threshold_px)) {
@@ -1113,6 +1164,22 @@ pub const PointerGestures = struct {
         if (self.touch.pair) |pair| {
             // Still both down: keep the baseline.
             if (touchPixelById(points, pair.a) != null and touchPixelById(points, pair.b) != null) return;
+            // The pinned PAIR lost a finger while other fingers are
+            // still down: the point count is still at least two, so the
+            // branch above did not take the gesture down. A live pinch
+            // ends here — its scale is ABSOLUTE against begin
+            // (XML:200-206), so re-pinning against the survivors would
+            // silently divide the next update by a fresh baseline and
+            // report a scale the client never pinched to (and a
+            // coincident survivor pair pins base_dist2 = 0, which the
+            // send helper then reports as 1.0 forever). Re-pinning is
+            // only meaningful while the candidate is still PENDING,
+            // which has told the client nothing yet.
+            if (self.phase == .pinch) {
+                self.touch.pair = null;
+                self.cancel(false);
+                return;
+            }
         }
         const a = points[0];
         const b = points[1];
@@ -1182,15 +1249,19 @@ pub const PointerGestures = struct {
     }
 
     /// dx/dy are the logical center's travel since the previous event,
-    /// in 24.8 fixed, exactly like the pointer path's swipe update
-    /// (XML:191-206). `scale` is ABSOLUTE against begin (XML:200-206)
-    /// and is the ratio of two EXACT squared separations, so it never
-    /// inherits the whole-pixel baseline's rounding; a pair pinned
-    /// coincident has no scale at all, and the identity is then the
-    /// only honest value. `rotation` is zero: a touchscreen reports
-    /// positions, never an angle — the same missing rotation source
-    /// the file header records for the pointer path.
-    fn sendTouchPinchUpdate(self: *PointerGestures, seat: *seat_mod.Seat, spread2: u64, dx: i32, dy: i32) void {
+    /// as i64 PIXEL deltas — not i32 ones, because they are the
+    /// difference of two i32 centroids and that difference spans twice
+    /// the i32 range (see touchTravel's .pinch arm). fixedFromPixels
+    /// does the saturating conversion to the 24.8 the wire carries,
+    /// exactly like the pointer path's swipe update (XML:191-206).
+    /// `scale` is ABSOLUTE against begin (XML:200-206) and is the ratio
+    /// of two EXACT squared separations, so it never inherits the
+    /// whole-pixel baseline's rounding; a pair pinned coincident has no
+    /// scale at all, and the identity is then the only honest value.
+    /// `rotation` is zero: a touchscreen reports positions, never an
+    /// angle — the same missing rotation source the file header records
+    /// for the pointer path.
+    fn sendTouchPinchUpdate(self: *PointerGestures, seat: *seat_mod.Seat, spread2: u64, dx: i64, dy: i64) void {
         const focus = self.gestureTarget(seat) orelse return;
         const pair = self.touch.pair orelse return;
         const scale: f64 = if (pair.base_dist2 == 0)
@@ -1211,19 +1282,30 @@ pub const PointerGestures = struct {
     /// goes to the TOUCH focus and its client — `Seat.touchFocus()`,
     /// which a finger sets and no pointer button ever sets — so a
     /// touchscreen-only seat with no pointer focus anywhere still
-    /// reports gestures. A pointer gesture keeps the pointer focus it
-    /// has always used, so nothing about the pointer path changes.
+    /// reports gestures. A pointer gesture goes to the pointer focus.
     ///
-    /// A touch gesture that has BEGUN is answered at the target it
-    /// began against, even after the seat has taken the points away:
-    /// the seat clears the touch focus the moment it closes a sequence
-    /// (Seat.touchLeave), and the closing `end` still
-    /// has to reach the client whose `begin` is open — the same promise
-    /// the pointer path makes about a compositor grab.
+    /// Both sources then keep the target their gesture BEGAN against,
+    /// updates and `end` alike. The seat drops a pointer focus on any
+    /// motion that picks nothing (seat.zig:1125-1126) and on the
+    /// destruction of the focused surface (seat.zig:1929), and it drops
+    /// the touch focus the moment it closes a sequence
+    /// (Seat.touchLeave). Resolving live in that window sends the
+    /// closing `end` nowhere at all, or to a DIFFERENT client that never
+    /// got the `begin` — either way the client's gesture stays open for
+    /// the life of the connection, where the XML ends every gesture that
+    /// has begun (pointer-gestures-unstable-v1.xml:135-149, :207-222,
+    /// :259-272). So the promise is the one this module already makes
+    /// about a compositor grab: whatever took the focus away, the client
+    /// that was told `begin` is the client that is told `end`.
+    ///
+    /// The `orelse` fallbacks cover the PRE-BEGIN direction: a pending
+    /// candidate has no captured target yet, so the live focus is the
+    /// only thing there is to resolve when the hold fires.
     fn gestureTarget(self: *PointerGestures, seat: *seat_mod.Seat) ?FocusTarget {
         return switch (self.source) {
             .touch => self.touch.target orelse touchFocusTarget(seat),
-            else => focusTarget(seat),
+            .pointer => self.pointer_target orelse focusTarget(seat),
+            .none => focusTarget(seat),
         };
     }
 
@@ -1309,7 +1391,10 @@ fn holdTimeout(self: *PointerGestures) c_int {
         self.resetGesture();
         return 1;
     };
-    if (self.source == .touch) self.touch.target = focus;
+    // The begin's client owns the rest of the gesture, the end
+    // included: the seat can drop the focus it resolved here before the
+    // buttons release, so the capture is what makes hold.end reachable.
+    if (self.source == .touch) self.touch.target = focus else self.pointer_target = focus;
     self.phase = .hold;
     const serial = seat.serialFor(focus.client);
     for (self.holds.items) |st| {
@@ -1790,7 +1875,10 @@ const TestServer = struct {
 
 /// Every seat-backed test needs a real Seat, which needs xkbcommon and a
 /// keymap; the seat's own tests skip with the same diagnostic when the
-/// keymap source is unavailable.
+/// keymap source is unavailable. Callers turn the failure into
+/// `error.SkipZigTest` rather than a bare `return`, so an environment
+/// that cannot run the harness is reported as a skip instead of a pass
+/// that asserted nothing (src/buffers/dmabuf.zig does the same).
 fn testServer(allocator: std.mem.Allocator) !*TestServer {
     return TestServer.init(allocator, true) catch |err| {
         std.debug.print("pointer_gestures test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
@@ -1842,7 +1930,7 @@ test "a client binds and releases the manager with no seat behind it" {
 
 test "swipe lifecycle: begin, update, end with exact deltas and serials" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     const surface_res = try ts.focusSurface();
@@ -1897,7 +1985,7 @@ test "swipe lifecycle: begin, update, end with exact deltas and serials" {
 
 test "a single held button never swipes: it is a drag" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -1921,7 +2009,7 @@ test "a single held button never swipes: it is a drag" {
 
 test "a warp (one step past max_step_px) cancels the candidate" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -1947,7 +2035,7 @@ test "a warp (one step past max_step_px) cancels the candidate" {
 
 test "cancel() ends a live swipe with cancelled = 1" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -1976,9 +2064,165 @@ test "cancel() ends a live swipe with cancelled = 1" {
     try std.testing.expectEqual(@as(usize, 1), ev.ends);
 }
 
+test "a swipe's end reaches the client that got its begin after the pointer focus is cleared" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
+    defer ts.deinit();
+
+    _ = try ts.focusSurface();
+    const swipe = try ts.wl_gestures.?.getSwipeGesture(ts.wl_pointer.?);
+    var ev: SwipeEvents = .{};
+    swipe.setListener(*SwipeEvents, SwipeEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    seat.pointerButton(seat_mod.btn_left, true);
+    seat.pointerButton(seat_mod.btn_right, true);
+    seat.pointerMotion(100 + swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expect(seat.pointer_focus != null);
+
+    // The pointer leaves every surface while both buttons are still
+    // held. The seat drops its focus here (Seat.pointerMotion's null-pick
+    // branch, seat.zig:1125-1126) — an ordinary motion event, not a
+    // grab — so the module has no live focus to resolve any more.
+    ts.pick_state.surface = null;
+    seat.pointerMotion(400, 400);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == null);
+    try std.testing.expect(ts.gestures.?.tracking());
+
+    // The gesture is still live, and the very motion that took the
+    // focus away is still an update for the client that got the begin:
+    // it is 400 - 150 px from the promotion point. (Once the focus is
+    // already null the seat stops emitting pointer_move altogether —
+    // seat.zig:1127-1128 "no focus, no motion target" — so this is the
+    // last event that can carry one.)
+    try std.testing.expectEqual(@as(usize, 1), ev.updates);
+    try std.testing.expectEqual(@as(i32, 250), ev.last_dx.toInt());
+
+    // Releasing the last button must close the gesture at the client
+    // whose begin is open. Resolving the target live would find no
+    // focus at all and drop the end, leaving the client's swipe open
+    // for the life of the connection.
+    seat.pointerButton(seat_mod.btn_left, false);
+    seat.pointerButton(seat_mod.btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(seat.validateEventSerial(ts.client.?, ev.end_serial));
+    try std.testing.expect(!ts.gestures.?.tracking());
+}
+
+test "a swipe's end reaches the client that got its begin when the focused surface is destroyed" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
+    defer ts.deinit();
+
+    _ = try ts.focusSurface();
+    const swipe = try ts.wl_gestures.?.getSwipeGesture(ts.wl_pointer.?);
+    var ev: SwipeEvents = .{};
+    swipe.setListener(*SwipeEvents, SwipeEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    seat.pointerButton(seat_mod.btn_left, true);
+    seat.pointerButton(seat_mod.btn_right, true);
+    seat.pointerMotion(100 + swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+
+    // The surface the swipe began on dies under the pointer. This is
+    // the second way a focus goes away (Seat.surfaceDestroyed,
+    // seat.zig:1929), and the one that arrives with no input event at
+    // all: nothing here can be mistaken for a grab.
+    const focused = ts.pick_state.surface.?;
+    seat.surfaceDestroyed(focused);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == null);
+    try std.testing.expect(ts.gestures.?.tracking());
+
+    seat.pointerButton(seat_mod.btn_left, false);
+    seat.pointerButton(seat_mod.btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(seat.validateEventSerial(ts.client.?, ev.end_serial));
+    try std.testing.expect(!ts.gestures.?.tracking());
+}
+
+test "a hold's end reaches the client that got its begin when the focused surface is destroyed" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
+    defer ts.deinit();
+
+    _ = try ts.focusSurface();
+    const hold = try ts.wl_gestures.?.getHoldGesture(ts.wl_pointer.?);
+    var ev: HoldEvents = .{};
+    hold.setListener(*HoldEvents, HoldEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    seat.pointerButton(seat_mod.btn_left, true);
+    try ts.pumpWith(2 * @as(c_int, @intCast(hold_threshold_ms)));
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+
+    // holdTimeout resolved the focus out of the pending candidate, so
+    // the hold's end depends on that resolution being captured: the
+    // surface can die before the button is released.
+    const focused = ts.pick_state.surface.?;
+    seat.surfaceDestroyed(focused);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == null);
+    try std.testing.expect(ts.gestures.?.tracking());
+
+    seat.pointerButton(seat_mod.btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(!ts.gestures.?.tracking());
+}
+
+test "a pinch's update and end follow its begin when the focused surface is destroyed" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
+    defer ts.deinit();
+
+    _ = try ts.focusSurface();
+    const pinch = try ts.wl_gestures.?.getPinchGesture(ts.wl_pointer.?);
+    var ev: PinchEvents = .{};
+    pinch.setListener(*PinchEvents, PinchEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    const gestures = ts.gestures.?;
+    gestures.pinchBegin(1000, 2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+
+    const focused = ts.pick_state.surface.?;
+    seat.surfaceDestroyed(focused);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == null);
+    try std.testing.expect(gestures.tracking());
+
+    // `scale` is ABSOLUTE against begin (XML:200-206), so an update
+    // after the focus is gone must still be the same client's, and the
+    // backend's own pinchEnd must still find the client to close.
+    gestures.pinchUpdate(1010, 5, 5, 2, 0);
+    gestures.pinchEnd(1020, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.updates);
+    try std.testing.expectEqual(@as(i32, 5), ev.dx.toInt());
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(!gestures.tracking());
+}
+
 test "hold begins after the delay and ends on release" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2006,7 +2250,7 @@ test "hold begins after the delay and ends on release" {
 
 test "motion past the hold slop cancels the pending hold" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2029,7 +2273,7 @@ test "motion past the hold slop cancels the pending hold" {
 
 test "a live hold past the slop but short of the swipe threshold is cancelled" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2052,7 +2296,7 @@ test "a live hold past the slop but short of the swipe threshold is cancelled" {
 
 test "a live hold that reaches the swipe threshold ends with hold.end, one finger" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2089,7 +2333,7 @@ test "a live hold that reaches the swipe threshold ends with hold.end, one finge
 
 test "a live hold promoted to a swipe ends the hold before the swipe begins" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2132,7 +2376,7 @@ test "a live hold promoted to a swipe ends the hold before the swipe begins" {
 
 test "a compositor pointer grab reaches no client as a gesture" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2211,7 +2455,7 @@ test "a compositor pointer grab reaches no client as a gesture" {
 
 test "a grab installed mid-hold closes the open hold exactly once" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2250,7 +2494,7 @@ test "a grab installed mid-hold closes the open hold exactly once" {
 
 test "pinch runs on the compositor API with exact 24.8 encoding" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2289,7 +2533,7 @@ test "pinch runs on the compositor API with exact 24.8 encoding" {
 
 test "pinchBegin cancels a live hold: only one gesture at a time" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2315,7 +2559,7 @@ test "pinchBegin cancels a live hold: only one gesture at a time" {
 
 test "gesture objects survive the manager's release" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2351,7 +2595,7 @@ test "gesture objects survive the manager's release" {
 
 test "destroying a gesture object mid-gesture stops delivery" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2389,7 +2633,7 @@ test "destroying a gesture object mid-gesture stops delivery" {
 
 test "setSeat(null) ends a live gesture and detaches the listeners" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2461,7 +2705,7 @@ test "module teardown releases every live gesture object" {
 
 test "a two-finger touch swipe reaches the touch-focus client with no pointer at all" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     const surface_res = try ts.touchSurface();
@@ -2525,7 +2769,7 @@ test "a two-finger touch swipe reaches the touch-focus client with no pointer at
 
 test "a two-finger touch pinch reports a scale away from 1.0" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.touchSurface();
@@ -2570,9 +2814,118 @@ test "a two-finger touch pinch reports a scale away from 1.0" {
     try std.testing.expect(!ts.gestures.?.tracking());
 }
 
+test "a touch pinch ends when the pinned pair lifts while other fingers stay down" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
+    defer ts.deinit();
+
+    _ = try ts.touchSurface();
+    const pinch = try ts.wl_gestures.?.getPinchGesture(ts.wl_pointer.?);
+    var ev: PinchEvents = .{};
+    pinch.setListener(*PinchEvents, PinchEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    // Fingers 1 and 2 land 100 px apart, which pins the pair (1, 2);
+    // finger 3 then joins far below, so it changes the logical center
+    // but not the baseline (updateTouchPair keeps a pair whose two
+    // fingers are still down).
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 200, 100);
+    seat.touchDown(3, 150, 500);
+    // Pulling the pinned pair 40 px wider is past the pinch threshold
+    // and short of the swipe threshold, so the pinch begins at scale
+    // against a 100 px baseline.
+    seat.touchMotion(2, 240, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    seat.touchMotion(2, 260, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.updates);
+    try std.testing.expect(ev.scale.toDouble() > 1.5);
+
+    // Finger 2 — half of the PINNED pair — lifts while fingers 1 and 3
+    // are still down. The point count stays at two, so this is not the
+    // "fewer than two points" teardown; it is the baseline losing a
+    // finger, and `scale` is absolute against begin (XML:200-206).
+    // Re-pinning against the survivors would divide the next update by
+    // a FRESH baseline and report a scale the client never pinched to.
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(!ts.gestures.?.tracking());
+
+    // The survivors keep moving. Nothing may follow the end: a gesture
+    // the module closed cannot report another update, and a scale jump
+    // would be the client seeing one.
+    seat.touchMotion(3, 150, 560);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.updates);
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+
+    seat.touchUp(1);
+    seat.touchUp(3);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expect(!ts.gestures.?.tracking());
+}
+
+test "a touch pinch delta across the whole i32 range saturates instead of overflowing" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
+    defer ts.deinit();
+
+    _ = try ts.touchSurface();
+    const pinch = try ts.wl_gestures.?.getPinchGesture(ts.wl_pointer.?);
+    var ev: PinchEvents = .{};
+    pinch.setListener(*PinchEvents, PinchEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    const gestures = ts.gestures.?;
+    // A real pinch, begun through the ordinary path, so the update
+    // below travels the same send helper every client update does.
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 200, 100);
+    seat.touchMotion(2, 240, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), ev.updates);
+
+    // The module's own numeric envelope: touchPixel accepts the whole
+    // i32 range and touchCentroid averages over it, so the logical
+    // center can sit at either extreme, and a live pinch has no
+    // max_step_px guard to rule out the step between them (.pinch has
+    // no such check; only .pending does). The seat cannot hand the
+    // module such a pair — its own wl_touch encoding saturates long
+    // before the pixel range is exhausted — so the two extremes are
+    // handed to the travel stage directly, which is exactly the
+    // boundary under test: the DELTA between two centers.
+    const extremes = [_]seat_mod.TouchPoint{
+        .{ .id = 1, .x = -2147483648.0, .y = 0.0 },
+        .{ .id = 2, .x = 2147483647.0, .y = 0.0 },
+    };
+    // Their center is 0: (-2^31 + 2^31 - 1) / 2 truncates toward zero.
+    // Measured against the far negative extreme the delta is 2^31,
+    // which does not fit an i32: computed in one it is a safety panic
+    // in ReleaseSafe and a wrapped negative in ReleaseFast. Widened to
+    // i64 first, it saturates at fixedFromPixels' 24.8 ceiling.
+    gestures.touchTravel(
+        seat,
+        &extremes,
+        Point{ .x = -2147483648, .y = 0 },
+        Point{ .x = 0, .y = 0 },
+    );
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.updates);
+    try std.testing.expectEqual(@as(i32, (1 << 23) - 1), ev.dx.toInt());
+    try std.testing.expectEqual(@as(i32, 0), ev.dy.toInt());
+}
+
 test "one touch point never swipes: min_swipe_fingers counts points, not buttons" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.touchSurface();
@@ -2612,7 +2965,7 @@ test "one touch point never swipes: min_swipe_fingers counts points, not buttons
 
 test "touch and pointer cannot run competing gestures at once" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.focusSurface();
@@ -2746,7 +3099,7 @@ test "touch and pointer cannot run competing gestures at once" {
 
 test "the backend pinch API cannot close a live touch pinch" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.touchSurface();
@@ -2795,7 +3148,7 @@ test "the backend pinch API cannot close a live touch pinch" {
 
 test "a compositor pointer grab suppresses touch gestures exactly as it suppresses pointer ones" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.touchSurface();
@@ -2866,7 +3219,7 @@ test "a compositor pointer grab suppresses touch gestures exactly as it suppress
 
 test "a single touch point holds: the hold comes from fingers too" {
     const allocator = std.testing.allocator;
-    var ts = testServer(allocator) catch return;
+    var ts = testServer(allocator) catch return error.SkipZigTest;
     defer ts.deinit();
 
     _ = try ts.touchSurface();

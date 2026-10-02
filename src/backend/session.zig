@@ -72,7 +72,9 @@
 //!   - no system bus -> error.BusUnavailable. Still starts.
 //!   - a Manager method refused -> error.LogindRejected, after everything
 //!     created so far has been torn down again. Still starts.
-//!   - no /dev/tty0 -> no VT switch; `target_vt` stays 0.
+//!   - no /dev/tty0 -> there is no console to switch: activateVt answers
+//!     error.NoConsole, the session keeps the VT it already had, and the
+//!     backend proceeds.
 //!   - a VT_ACTIVATE that is never acknowledged -> error.AckTimeout AFTER
 //!     the console has been put back; the backend proceeds.
 //! The only outcome the backend must treat as "do not take the card" is
@@ -209,8 +211,13 @@ pub const Seat = struct {
     active_session: []const u8 = "",
     /// uid of that session's leader (sd_seat_get_active).
     active_uid: u32 = 0,
-    /// `Session.VTNumber` of the active session (sd_session_get_vt): the VT
-    /// the console is showing right now.
+    /// The VT the console is showing right now, and the VT `restoreVt` puts
+    /// it back on. ONE source for both halves of the VT decision: the live
+    /// kernel answer from /sys/class/tty/tty0/active (drivers/tty/vt/vt.c
+    /// registers the `active` attribute on tty0) first, logind's cached
+    /// `Session.VTNumber` (sd_session_get_vt) when sysfs says nothing.
+    /// 0 means "not known", and a switch must not be taken without one
+    /// (planVtSwitch).
     active_vt: u16 = 0,
     /// True when `active_session` is this compositor's own session, i.e.
     /// nobody else is holding the console.
@@ -249,7 +256,8 @@ pub const Plan = struct {
     /// the DRM device on it, and watch PrepareForSleep.
     open_session: bool = false,
     /// VT_ACTIVATE the target VT and wait for the DRM driver's VT_ACK
-    /// before taking DRM master. False when there is no VT to switch to.
+    /// before taking DRM master. False when there is no VT to switch to, and
+    /// false when there is no VT to switch BACK from (planVtSwitch).
     switch_vt: bool = false,
     /// Do not touch the card: logind says this seat will not host us.
     /// Reported, not fatal to the process.
@@ -281,8 +289,41 @@ pub fn planAcquire(seat: Seat, have_logind: bool, our_vt: u16) Plan {
     }
     return .{
         .open_session = true,
-        .switch_vt = seat.can_tty and needsVtSwitch(seat.active_vt, our_vt),
+        .switch_vt = planVtSwitch(seat, our_vt, seat.active_vt),
         .reason = if (seat.can_tty) .seat_available else .seat_has_no_tty,
+    };
+}
+
+/// What `Session.open` holds once it has read the seat and the caller's
+/// options: the VT to take, the VT to hand the console back to, and the plan
+/// that says whether to switch at all.
+///
+/// One value, not three separately assigned fields in `Session`, because all
+/// three are decided from ONE read of the seat. `open` used to pass the
+/// chosen VT to `planAcquire` and drop it on the floor: the plan knew a VT
+/// the session did not, `target_vt` kept its default 0, and every VT step
+/// below it - Session.TTY, switchVt, restoreVt, reacquire - was unreachable.
+/// Deciding all three together is what makes that unrepresentable: there is
+/// no way to build a `Plan` without handing over the VT it was made for, and
+/// no way to hold a VT the `Plan` was not made for.
+pub const Acquire = struct {
+    /// The VT to hand the console to; 0 for none.
+    target_vt: u16 = 0,
+    /// The VT the console is on right now: the number `planVtSwitch`
+    /// compared the target against, and the one `restoreVt` puts it back on.
+    previous_vt: u16 = 0,
+    plan: Plan = .{},
+};
+
+/// Decide the VT to hold and the plan that follows from it, from one read of
+/// the seat and one look at the caller's options - everything `open` knows
+/// before it touches the bus.
+pub fn acquireFor(seat: Seat, opts: Options) Acquire {
+    const target_vt = chooseTargetVt(opts);
+    return .{
+        .target_vt = target_vt,
+        .previous_vt = seat.active_vt,
+        .plan = planAcquire(seat, seat.name.len != 0, target_vt),
     };
 }
 
@@ -293,6 +334,68 @@ pub fn planAcquire(seat: Seat, have_logind: bool, our_vt: u16) Plan {
 /// would only produce a redisplay storm.
 pub fn needsVtSwitch(active: u16, target: u16) bool {
     return target != 0 and target != active;
+}
+
+/// Must the console be moved to `target`, from the seat's side?
+///
+/// Three gates, all of them necessary:
+///
+///   1. `Seat.CanTTY` (sd_seat_can_tty): without virtual terminals there is
+///      no console to move.
+///   2. A known VT to move it back to. This is the gate that a plain
+///      "console is not already on our VT" test does not have, and it is the
+///      one that keeps the user out of a locked machine: `restoreVt` gives up
+///      when it does not know the VT it was on, so a switch taken with
+///      `previous` == 0 parks the console on the compositor's VT with no
+///      session on it, and every exit path leaves it there. Nothing has to
+///      gain from that, so the console stays exactly where it is.
+///   3. `needsVtSwitch(previous, target)`: no target, or already there.
+///
+/// `previous` is the same number `restoreVt` will act on, which is the
+/// point - the switch and the restore must not read the VT from different
+/// sources, or the one that decided to move the console cannot say where to
+/// put it back.
+pub fn planVtSwitch(seat: Seat, target: u16, previous: u16) bool {
+    if (!seat.can_tty) return false;
+    if (previous == 0) return false;
+    return needsVtSwitch(previous, target);
+}
+
+/// Which VT switch is being done. There are exactly two call sites and they
+/// differ in exactly one thing - whether the DRM fd may be read from - so
+/// they are named rather than merged.
+pub const SwitchMode = enum {
+    /// The first takeover, from `Session.open`, before any commit.
+    startup,
+    /// Re-activation from `reacquire`, after the machine woke up: long
+    /// after the first page flip was queued. Not spelled `resume`, which is
+    /// a Zig keyword.
+    wakeup,
+};
+
+/// Must a VT switch in `mode` wait for the driver's VT_ACK on the DRM fd?
+///
+/// Only the startup switch may. `waitVtAck` reads that fd RAW, and the DRM
+/// core queues every event of an open card - page-flip completions and
+/// `struct vt_event` alike - onto ONE queue per `drm_file` behind ONE read
+/// offset (drm_fops.c drm_queue_event / drm_handle_event; the queue is
+/// `struct drm_file_priv`'s `event_list`, drained by drm_read). Before the
+/// first flip the VT event is the only thing the fd can produce, which is
+/// the window libseat takes for the same reason (libseat session-vt.c
+/// session_vt_wait_for_ack). After it, the same raw read either never
+/// produces a VT event or stops between two records and leaves the backend's
+/// own drmHandleEvent drain (drm.zig dispatch) mid-event.
+///
+/// So the resume switch does not wait. It does not have to: VT_ACTIVATE is
+/// synchronous - the kernel has already moved the console when the ioctl
+/// returns (drivers/tty/vt.c do_activate_vt) - and logind activates the
+/// session that owns the VT from the kernel's own `SWITCH=1` uevent
+/// (vt_switch -> kobject_uevent_env, consumed by src/login/logind-seat.c
+/// seat_active_session_changed), which `switchVt` also asks for directly.
+/// A switch nobody acked is cosmetic; a flip event eaten by the ack wait is
+/// a stuck output.
+pub fn waitsForVtAck(mode: SwitchMode) bool {
+    return mode == .startup;
 }
 
 /// Where the compositor is in the suspend/resume handshake with logind.
@@ -371,6 +474,57 @@ pub fn planSleep(from: Phase, sleeping: bool, have_logind: bool) SleepPlan {
     };
 }
 
+/// Apply one PrepareForSleep, in the only order that works.
+///
+/// `phase` is the session's phase, BY POINTER, because where it sits in the
+/// sequence is the whole contract:
+///
+///   1. `planSleep` resolves the signal against the phase it arrived in.
+///   2. `session_work` runs this module's half.
+///   3. `backend_work` runs the backend's half - while `phase` STILL holds
+///      the pre-transition value. The backend resolves its half through
+///      `planSleep(sleepPhase(), ...)` (drm.zig handlePrepareForSleep), so the
+///      phase it reads must be the one this plan was made from, or it re-plans
+///      a transition that has already happened: a suspend from `.running` was
+///      re-read as `.suspending`, which `planSleep` answers with empty work, so
+///      `DRM_IOCTL_DROP_MASTER` was never issued - and `is_master` stayed set,
+///      which made the resume-side re-acquire a no-op too.
+///   4. Only now does the phase advance, so a repeated signal re-plans from
+///      the state the machine is really in and does no work twice.
+///
+/// Its own function because that order must be testable without a bus, an fd
+/// or a card. `dispatch` drains the bus and calls this; nothing else.
+fn applySleep(
+    phase: *Phase,
+    sleeping: bool,
+    have_logind: bool,
+    session_work: OnWork,
+    backend_work: OnSleep,
+    ctx: ?*anyopaque,
+) void {
+    const plan = planSleep(phase.*, sleeping, have_logind);
+    session_work(ctx, plan.work);
+    // `phase` is deliberately unmoved: see step 3 above.
+    backend_work(ctx, sleeping);
+    phase.* = plan.next;
+}
+
+/// This module's half of a transition: the device work the plan resolved,
+/// with the same context the backend's half gets. Top-level rather than a
+/// `Session` method because `applySleep` takes it as a plain function
+/// pointer - Zig resolves a method only as a call, never as a value.
+fn sessionWork(ctx: ?*anyopaque, work: SleepWork) void {
+    const self: *Session = @ptrCast(@alignCast(ctx.?));
+    if (work.release_device) {
+        log_mod.info("drm: suspend: releasing the DRM device to logind", self.io, self.log_cfg, "drm", .{});
+        self.releaseDevice();
+    }
+    if (work.reacquire) {
+        log_mod.info("drm: resume: re-taking the DRM device and VT", self.io, self.log_cfg, "drm", .{});
+        self.reacquire();
+    }
+}
+
 /// Decode a kernel `tty_nr` (field 7 of /proc/self/stat) into a VT number,
 /// or null when it is not a VT.
 ///
@@ -390,13 +544,34 @@ pub fn vtFromTtyNr(tty_nr: u64) ?u16 {
     return @intCast(minor_bits);
 }
 
-/// Parse the contents of /sys/class/tty/tty0/active ("7\n"). Strict on
-/// purpose: a malformed value means the kernel told us nothing, and
-/// guessing a VT number would switch the console to the wrong one.
+/// Parse the contents of /sys/class/tty/tty0/active into a VT number, or
+/// null when that is not something usable.
+///
+/// The file holds a DEVICE NAME, not a bare number: `show_tty_active`
+/// (drivers/tty/vt/vt.c) is `sprintf(buf, "tty%d\n", fg_console + 1)`, so a
+/// machine whose console is on VT 2 has the five bytes "tty2\n" in it and
+/// has had since the attribute was added. A parser that accepts digits only
+/// therefore rejects every value the kernel actually writes, `readActiveVt`
+/// answers null on every machine, and `previous_vt` falls back to logind's
+/// `Session.VTNumber` - which speaks only for the seat's ACTIVE session. On
+/// a seat with no session that is 0, and planVtSwitch then refuses the
+/// switch for want of somewhere to put the console back.
+///
+/// Both spellings are accepted here, so the file's own format and a plain
+/// number both work; `targetVtFromEnv` shares this parser for WAYLAND_VT,
+/// which wlroots reads with strtoul (backend/session/direct.c
+/// getenv("WAYLAND_VT")) and therefore expects bare digits. Everything else
+/// - a PTY name, a serial console, "n/a", a number past the kernel's MAX_VT
+/// - is refused rather than guessed at: a console moved to a VT nobody
+/// asked for is a machine the user cannot log into.
 pub fn parseActiveVt(text: []const u8) ?u16 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0 or trimmed.len > 2) return null;
-    const n = std.fmt.parseUnsigned(u16, trimmed, 10) catch return null;
+    const digits = if (std.mem.startsWith(u8, trimmed, "tty"))
+        trimmed["tty".len..]
+    else
+        trimmed;
+    if (digits.len == 0 or digits.len > 2) return null;
+    const n = std.fmt.parseUnsigned(u16, digits, 10) catch return null;
     if (n == 0 or n > 63) return null;
     return n;
 }
@@ -419,6 +594,19 @@ pub fn targetVtFromEnv(env_vt: ?[*:0]const u8, tty_nr: ?u64) u16 {
         if (vtFromTtyNr(nr)) |vt| return vt;
     }
     return 0;
+}
+
+/// The VT to ask for: the caller's explicit choice, else WAYLAND_VT, else
+/// the VT of this process's controlling terminal, else none.
+///
+/// `opts` is the whole policy, so this is a plain function rather than a
+/// `Session` method: the number it returns must be decidable before a
+/// Session exists, and it is the one number `acquireFor` makes every other
+/// decision from.
+pub fn chooseTargetVt(opts: Options) u16 {
+    if (opts.target_vt != 0) return opts.target_vt;
+    if (!opts.derive_vt) return 0;
+    return targetVtFromEnv(std.c.getenv("WAYLAND_VT"), processTtyNr());
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +822,10 @@ const session_type_wayland: [:0]const u8 = "wayland";
 /// it and re-arm the flip pipeline coming up).
 pub const OnSleep = *const fn (ctx: ?*anyopaque, sleeping: bool) void;
 
+/// This module's own half of a transition - `sessionWork` - in the shape
+/// `OnSleep` has, so `applySleep` can hand one context to both halves.
+const OnWork = *const fn (ctx: ?*anyopaque, work: SleepWork) void;
+
 /// What the backend hands to `Session.open`.
 pub const Options = struct {
     /// DRM primary minor of the card being modeset ("cardN" -> N). Passed to
@@ -686,12 +878,14 @@ pub const Session = struct {
     drm_minor: u32 = 0,
     device_taken: bool = false,
 
-    /// The VT we asked for (0 for none), the VT the console was on when we
-    /// started, and the one `restoreVt` puts it back on.
+    /// The VT we asked for (0 for none), and the VT the console was on when
+    /// the session opened - the one `restoreVt` puts it back on, read from
+    /// the same place `planVtSwitch` read it.
     target_vt: u16 = 0,
     previous_vt: u16 = 0,
-    /// /dev/tty0 opened for VT_ACTIVATE; -1 when there is no console.
-    console_fd: std.posix.fd_t = -1,
+    /// /dev/tty0 for VT_ACTIVATE. Holds at most one descriptor for the life
+    /// of the session, whoever asks.
+    console: Console = .{},
     /// The DRM fd a VT_ACK arrives on; -1 disables the ack wait.
     ack_fd: std.posix.fd_t = -1,
 
@@ -762,20 +956,7 @@ pub const Session = struct {
         }
         const sleeping = self.pending_sleep orelse return;
         self.pending_sleep = null;
-        const plan = planSleep(self.phase, sleeping, self.plan.open_session);
-        if (plan.work.release_device) {
-            log_mod.info("drm: suspend: releasing the DRM device to logind", self.io, self.log_cfg, "drm", .{});
-            self.releaseDevice();
-        }
-        if (plan.work.reacquire) {
-            log_mod.info("drm: resume: re-taking the DRM device and VT", self.io, self.log_cfg, "drm", .{});
-            self.reacquire();
-        }
-        self.phase = plan.next;
-        // The backend's half runs after ours: the device is already back in
-        // logind's hands when it drops DRM master, and already ours when it
-        // re-takes it.
-        self.on_sleep(self.ctx, sleeping);
+        applySleep(&self.phase, sleeping, self.plan.open_session, sessionWork, self.on_sleep, self.ctx);
     }
 
     /// Mark this session idle (or not) in logind's accounting
@@ -826,13 +1007,8 @@ pub const Session = struct {
     /// the rest of the teardown (device release, session termination, bus
     /// close), which would leave the seat worse off than before.
     pub fn restoreVt(self: *Session) void {
-        defer {
-            if (self.console_fd >= 0) {
-                _ = std.os.linux.close(self.console_fd);
-                self.console_fd = -1;
-            }
-        }
-        if (self.console_fd < 0) return;
+        defer self.console.close();
+        if (self.console.fd < 0) return;
         if (self.previous_vt == 0) return;
         if (self.target_vt == 0 or self.target_vt == self.previous_vt) return;
         activateVt(self, self.previous_vt) catch {
@@ -916,8 +1092,16 @@ pub const Session = struct {
         errdefer self.release();
 
         self.seat = try self.readSeat();
-        const our_vt = self.chooseTargetVt(opts);
-        self.plan = planAcquire(self.seat, self.seat.name.len != 0, our_vt);
+        // The VT to take, the VT the console is on now, and the plan that
+        // follows: decided together, from one read of the seat, and stored
+        // together. Handing planAcquire a chosen VT without keeping it left
+        // target_vt at 0 for the life of the session, and everything below
+        // that reads it - Session.TTY, switchVt, restoreVt, reacquire - was
+        // dead code behind a field that read as load-bearing.
+        const acq = acquireFor(self.seat, opts);
+        self.target_vt = acq.target_vt;
+        self.previous_vt = acq.previous_vt;
+        self.plan = acq.plan;
         if (self.plan.blocked) {
             log_mod.warn(
                 "drm: seat {s} will not host a compositor ({s}); running without a session",
@@ -964,9 +1148,29 @@ pub const Session = struct {
         // Only now is it safe to move the console: the session owns the VT,
         // logind knows about it, and any failure leaves the console exactly
         // where it was (restoreVt runs from the errdefer).
+        //
+        // The VT to move it BACK to came from the same read as the plan's,
+        // so the switch and the restore cannot disagree about where the
+        // console was left.
+        // A switch the seat wanted and the restore target forbids: neither
+        // logind nor sysfs ever named a VT, so there is none to put the
+        // console back on. restoreVt gives up on previous_vt == 0, so moving
+        // it now would park the console on the compositor's VT with no
+        // session on it and leave it there on every exit path - which is
+        // what "locked out of my machine" looks like. Worth a line: the
+        // operator asked for a VT and is not getting one.
+        const wanted_switch = self.seat.can_tty and needsVtSwitch(self.previous_vt, self.target_vt);
+        if (wanted_switch and !self.plan.switch_vt) {
+            log_mod.warn(
+                "drm: no VT to put the console back on; leaving it where it is rather than taking tty{d}",
+                io,
+                log_cfg,
+                "drm",
+                .{self.target_vt},
+            );
+        }
         if (self.plan.switch_vt) {
-            self.previous_vt = readActiveVt() orelse self.seat.active_vt;
-            self.switchVt() catch |err| {
+            self.switchVt(.startup) catch |err| {
                 log_mod.warn(
                     "drm: VT switch to tty{d} failed ({s}); continuing on the current VT",
                     io,
@@ -1025,11 +1229,20 @@ pub const Session = struct {
         var active_uid: u32 = 0;
         const have_active = self.sysd.seat_get_active(seat_z, &active_raw, &active_uid) >= 0 and active_raw != null;
 
+        // The VT the console is on, from ONE source for the whole module:
+        // sysfs first, because it is the kernel's live answer and the thing
+        // `restoreVt` must put back; logind's cached Session.VTNumber only
+        // when sysfs says nothing (a container, an unreadable
+        // /sys/class/tty/tty0/active). `session_get_vt` answers for the
+        // ACTIVE SESSION, so on a seat with no session it says nothing at
+        // all - and a console moved on that answer has nowhere to go back
+        // to.
         var active_vt: u16 = 0;
         if (have_active) {
             var vt: c_uint = 0;
             if (self.sysd.session_get_vt(active_raw.?, &vt) >= 0 and vt <= 63) active_vt = @intCast(vt);
         }
+        active_vt = readActiveVt() orelse active_vt;
 
         const active_session = try self.own(if (have_active) std.mem.span(active_raw.?) else "");
         const seat_name = try self.own(seat_z);
@@ -1055,18 +1268,6 @@ pub const Session = struct {
         errdefer self.allocator.free(copy[0 .. copy.len + 1]);
         try self.owned.append(self.allocator, copy);
         return copy;
-    }
-
-    /// The VT to ask for: the caller's explicit choice, else WAYLAND_VT,
-    /// else the VT of this process's controlling terminal, else none.
-    fn chooseTargetVt(self: *Session, opts: Options) u16 {
-        // The Session is not consulted: `opts` is the whole policy, and
-        // taking the VT as a plain argument means it can be decided before a
-        // Session exists.
-        _ = self;
-        if (opts.target_vt != 0) return opts.target_vt;
-        if (!opts.derive_vt) return 0;
-        return targetVtFromEnv(std.c.getenv("WAYLAND_VT"), processTtyNr());
     }
 
     fn openBus(self: *Session) Error!void {
@@ -1280,8 +1481,14 @@ pub const Session = struct {
     fn reacquire(self: *Session) void {
         self.takeDevice();
         if (self.target_vt == 0) return;
+        // The same veto as the startup switch: this VT is ours to move back
+        // to only if there is one to move it back from. With no known
+        // previous VT the console was never moved at startup either
+        // (planVtSwitch said no), so a resume must not move it now - it
+        // would take a VT it cannot hand back.
+        if (self.previous_vt == 0) return;
         openConsole(self);
-        self.switchVt() catch |err| {
+        self.switchVt(.wakeup) catch |err| {
             log_mod.warn(
                 "drm: could not re-activate tty{d} after resume ({s})",
                 self.io,
@@ -1295,15 +1502,13 @@ pub const Session = struct {
     /// VT_ACTIVATE the target VT, wait for the DRM driver's VT_ACK, then ask
     /// logind to make this session the seat's active one.
     ///
-    /// The ack wait is only sound before the first page flip is queued: the
-    /// raw read on a DRM fd consumes whatever the driver wrote, and after
-    /// the first flip that could be a flip-completion event instead. This
-    /// runs during start(), before any commit, where the VT event is the
-    /// only thing the fd can produce - the same window libseat takes for the
-    /// same reason.
-    fn switchVt(self: *Session) VtError!void {
+    /// Whether the ack is waited for at all is `mode`'s decision, and it is
+    /// the only thing the two call sites differ in: `waitsForVtAck` says
+    /// why a raw read on the DRM fd is sound during start() and unsound
+    /// during a resume.
+    fn switchVt(self: *Session, mode: SwitchMode) VtError!void {
         try activateVt(self, self.target_vt);
-        try waitVtAck(self);
+        if (waitsForVtAck(mode)) try waitVtAck(self);
         // logind's own activation of the session that now owns the VT is a
         // separate, asynchronous step. Asking for it explicitly makes the
         // takeover deterministic instead of waiting for the seat uevent the
@@ -1392,8 +1597,8 @@ fn onPrepareForSleep(
 /// syscall wrapper: the same syscall glibc issues, and this module already
 /// depends on raw syscalls (dlopen, /proc reads).
 fn activateVt(self: *Session, vt: u16) VtError!void {
-    if (self.console_fd < 0) return error.NoConsole;
-    const rc = std.os.linux.ioctl(self.console_fd, vt_activate, vt);
+    if (self.console.fd < 0) return error.NoConsole;
+    const rc = std.os.linux.ioctl(self.console.fd, vt_activate, vt);
     switch (std.os.linux.errno(rc)) {
         .SUCCESS => {},
         else => |err| {
@@ -1416,6 +1621,10 @@ fn activateVt(self: *Session, vt: u16) VtError!void {
 /// VT_ACK 4" is sent when the VT switch has completed). The loop accepts at
 /// most `max_vt_events` notifications and then gives up, so a driver that
 /// never acknowledges cannot wedge start().
+///
+/// This reads the ack fd RAW, which is only sound before the first page
+/// flip: `waitsForVtAck` is where that is decided, and it is why a resume
+/// never reaches this function.
 fn waitVtAck(self: *Session) VtError!void {
     if (self.ack_fd < 0) return;
     var fds = [_]std.posix.pollfd{.{
@@ -1452,30 +1661,62 @@ fn waitVtAck(self: *Session) VtError!void {
     return error.AckTimeout;
 }
 
+/// The /dev/tty0 descriptor the VT_ACTIVATE ioctls go through.
+///
+/// At most one, for the life of the session, whoever asks: `reacquire` runs
+/// on every resume and the only closer is `restoreVt`, which closes one
+/// descriptor. An open that did not check first leaked a /dev/tty0 per
+/// suspend/resume cycle until RLIMIT_NOFILE ran out, and from then on the
+/// open failed, `activateVt` answered error.NoConsole and VT re-activation
+/// stopped working - the precise outcome `reacquire` is written to avoid.
+const Console = struct {
+    /// -1 when there is no console to talk to.
+    fd: std.posix.fd_t = -1,
+
+    /// Open `node` unless a console is already open. True when this Console
+    /// holds a usable descriptor afterwards.
+    fn ensure(self: *Console, node: []const u8) bool {
+        if (self.fd >= 0) return true;
+        const fd = std.posix.openat(
+            std.posix.AT.FDCWD,
+            node,
+            .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true },
+            0,
+        ) catch return false;
+        self.fd = fd;
+        return true;
+    }
+
+    /// Close the console, if one is open. Idempotent, like everything in
+    /// teardown.
+    fn close(self: *Console) void {
+        if (self.fd < 0) return;
+        _ = std.os.linux.close(self.fd);
+        self.fd = -1;
+    }
+};
+
 /// Open /dev/tty0 for VT_ACTIVATE. Best-effort: a machine with no VT (a
 /// container, a kernel built without virtual terminals) simply does not get
-/// a switch, and says so once.
+/// a switch, and says so whenever it finds none.
 fn openConsole(self: *Session) void {
-    self.console_fd = std.posix.openat(
-        std.posix.AT.FDCWD,
-        console_node,
-        .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true },
-        0,
-    ) catch blk: {
-        log_mod.info(
-            "drm: no {s}; VT switching disabled",
-            self.io,
-            self.log_cfg,
-            "drm",
-            .{console_node},
-        );
-        break :blk -1;
-    };
+    // Already open (the common case on a resume): nothing to do, and no
+    // second descriptor to leak.
+    if (self.console.fd >= 0) return;
+    if (self.console.ensure(console_node)) return;
+    log_mod.info(
+        "drm: no {s}; VT switching disabled",
+        self.io,
+        self.log_cfg,
+        "drm",
+        .{console_node},
+    );
 }
 
-/// The VT the console is showing right now, from
-/// /sys/class/tty/tty0/active (drivers/tty/vt.c registers the `active`
-/// attribute on tty0). Null when sysfs says nothing usable.
+/// The VT the console is showing right now, from /sys/class/tty/tty0/active
+/// (drivers/tty/vt/vt.c registers the `active` attribute on tty0 and
+/// `show_tty_active` writes the foreground VT into it). Null when sysfs is
+/// unreadable or says nothing usable.
 fn readActiveVt() ?u16 {
     var buf: [16]u8 = undefined;
     const n = readSmallFile(active_vt_sysfs, &buf) orelse return null;
@@ -1838,6 +2079,114 @@ test "needsVtSwitch only for a real, different target" {
     try testing.expect(!needsVtSwitch(3, 3));
 }
 
+test "no VT to restore: the console is not moved, and the plan says so" {
+    // A graphics seat with a TTY, but nothing anywhere that says which VT
+    // the console is on: logind has no session on it (so Session.VTNumber
+    // answers for nobody) and sysfs was unreadable. Moving the console here
+    // would take a VT that restoreVt cannot hand back, and every exit path
+    // leaves the console stranded on the compositor's own VT with no
+    // session on it.
+    const seat: Seat = .{
+        .name = "seat0",
+        .can_tty = true,
+        .can_graphical = true,
+        .can_multi_session = true,
+        .active_session = "",
+        .active_vt = 0,
+    };
+    try testing.expect(!planVtSwitch(seat, 2, 0));
+
+    // The plan Session.open acts on must agree, or the console still moves.
+    const plan = planAcquire(seat, true, 2);
+    try testing.expect(plan.open_session);
+    try testing.expect(!plan.switch_vt);
+    try testing.expectEqual(Reason.seat_available, plan.reason);
+
+    // With a known VT - which is what readSeat fills in, from sysfs or from
+    // logind - the same seat switches exactly as before.
+    const known: Seat = .{ .name = seat.name, .can_tty = true, .can_graphical = true, .can_multi_session = true, .active_session = "c3", .active_vt = 1 };
+    try testing.expect(planVtSwitch(known, 2, 1));
+    try testing.expect(planAcquire(known, true, 2).switch_vt);
+    // Already there: nothing to move, nothing to restore.
+    try testing.expect(!planVtSwitch(seat, 2, 2));
+    // No target of our own (a daemon, a pty): nothing to steal.
+    try testing.expect(!planVtSwitch(seat, 0, 1));
+    // A seat without a TTY has no console to move, whatever the numbers say.
+    try testing.expect(!planVtSwitch(.{ .name = "seat0", .can_graphical = true }, 2, 1));
+}
+
+/// Stands in for the backend's sleep callback: `acquireFor` never calls it,
+/// and a required field with no default still has to be filled in.
+fn probeOnSleep(ctx: ?*anyopaque, sleeping: bool) void {
+    _ = ctx;
+    _ = sleeping;
+}
+
+test "the VT the session holds is the one its plan was made from" {
+    const seat: Seat = .{
+        .name = "seat0",
+        .can_tty = true,
+        .can_graphical = true,
+        .can_multi_session = true,
+        .active_session = "c3",
+        .active_vt = 1,
+    };
+    // An explicit request is decided from `opts` alone: chooseTargetVt
+    // reaches for the environment and /proc only on the derive path.
+    const opts: Options = .{ .target_vt = 2, .on_sleep = probeOnSleep };
+    const acq = acquireFor(seat, opts);
+
+    // The VT held is the VT that was chosen...
+    try testing.expectEqual(chooseTargetVt(opts), acq.target_vt);
+    try testing.expectEqual(@as(u16, 2), acq.target_vt);
+    // ...and the plan the session will act on is the one THAT number makes.
+    // These two used to disagree: the plan moved a VT while the field kept
+    // its default, so no switch, no restore and no resume ever happened.
+    try testing.expectEqual(planAcquire(seat, true, acq.target_vt), acq.plan);
+    try testing.expect(acq.plan.switch_vt);
+    // A plan made from the dropped number would say otherwise, which is why
+    // this comparison is not a tautology.
+    try testing.expect(!planAcquire(seat, true, 0).switch_vt);
+
+    // The console moves only because it is on a known VT, and it goes back
+    // to that same number.
+    try testing.expectEqual(seat.active_vt, acq.previous_vt);
+    try testing.expectEqual(@as(u16, 1), acq.previous_vt);
+    try testing.expect(needsVtSwitch(acq.previous_vt, acq.target_vt));
+
+    // A caller with no business moving a console decides 0, and 0 produces
+    // the plan that moves nothing.
+    const quiet = acquireFor(seat, .{ .derive_vt = false, .on_sleep = probeOnSleep });
+    try testing.expectEqual(@as(u16, 0), quiet.target_vt);
+    try testing.expectEqual(planAcquire(seat, true, 0), quiet.plan);
+    try testing.expect(!quiet.plan.switch_vt);
+
+    // No seat: the VT is still chosen and still held - it is what the
+    // session would claim - but there is no session to claim it on, and no
+    // known VT to move the console back to, so nothing moves.
+    const vm = acquireFor(.{}, .{ .target_vt = 2, .on_sleep = probeOnSleep });
+    try testing.expectEqual(@as(u16, 2), vm.target_vt);
+    try testing.expectEqual(@as(u16, 0), vm.previous_vt);
+    try testing.expect(!vm.plan.open_session);
+    try testing.expect(!vm.plan.switch_vt);
+    try testing.expectEqual(Reason.no_session_manager, vm.plan.reason);
+}
+
+test "only the startup switch waits for the VT ack" {
+    // start() runs before the first commit, so the DRM fd can only produce
+    // the console's VT event (drm_fops.c queues one event list per drm_file,
+    // and no flip has been committed yet). The ack is worth reading.
+    try testing.expect(waitsForVtAck(.startup));
+
+    // A resume runs long after the first flip was queued: the same fd also
+    // carries page-flip completions behind the same read offset, so the raw
+    // read would either never see the VT event or stop between records and
+    // break the backend's own drmHandleEvent drain. VT_ACTIVATE is
+    // synchronous and logind re-activates the VT from the kernel's uevent,
+    // so nothing is waited for.
+    try testing.expect(!waitsForVtAck(.wakeup));
+}
+
 test "suspend releases, resume re-acquires, repeats do nothing" {
     // Going down from running: give the device back and drop the master.
     const down = planSleep(.running, true, true);
@@ -1871,6 +2220,152 @@ test "suspend releases, resume re-acquires, repeats do nothing" {
     try testing.expectEqual(Phase.running, cancelled.next);
 }
 
+test "planSleep answers every phase, for both signals" {
+    inline for ([_]Phase{ .startup, .running, .suspending, .suspended, .resuming }) |from| {
+        // Sleeping. From anywhere but the bottom of the ladder the machine
+        // really goes to sleep: the device goes back to logind and the DRM
+        // master is dropped. From the bottom, logind is repeating a signal
+        // we have already answered, and the plan must be empty - that is
+        // what stops a second DROP_MASTER.
+        const down = planSleep(from, true, true);
+        switch (from) {
+            .startup, .running, .resuming => {
+                try testing.expect(down.work.release_device);
+                try testing.expect(down.work.drop_master);
+                try testing.expectEqual(Phase.suspending, down.next);
+            },
+            .suspending, .suspended => {
+                try testing.expectEqual(SleepWork{}, down.work);
+                try testing.expectEqual(Phase.suspended, down.next);
+            },
+        }
+
+        // Waking. Everything that could have been given up is given back,
+        // except a wake from a phase that never slept.
+        const up = planSleep(from, false, true);
+        switch (from) {
+            .startup, .running => {
+                try testing.expectEqual(SleepWork{}, up.work);
+                try testing.expectEqual(Phase.running, up.next);
+            },
+            .suspending, .suspended, .resuming => {
+                try testing.expect(up.work.reacquire);
+                try testing.expect(!up.work.drop_master);
+                try testing.expectEqual(Phase.resuming, up.next);
+            },
+        }
+
+        // Without a logind session there is no device to release, but the
+        // master is still dropped - and the phase still moves the same way.
+        const no_logind = planSleep(from, true, false);
+        try testing.expectEqual(down.next, no_logind.next);
+        if (down.work.release_device) try testing.expect(!no_logind.work.release_device);
+        if (down.work.drop_master) try testing.expect(no_logind.work.drop_master);
+    }
+}
+
+/// What the backend half of a transition observed: the phase it read - the
+/// LIVE one, exactly as drm.zig's handlePrepareForSleep reads it through
+/// `sleepPhase()` - and how many times it ran.
+const SleepProbe = struct {
+    phase: *Phase,
+    seen_phase: Phase = .startup,
+    calls: usize = 0,
+};
+
+/// Stands in for the backend half of a transition.
+fn probeBackendSleep(ctx: ?*anyopaque, sleeping: bool) void {
+    const probe: *SleepProbe = @ptrCast(@alignCast(ctx.?));
+    _ = sleeping;
+    probe.seen_phase = probe.phase.*;
+    probe.calls += 1;
+}
+
+/// This module's half is a no-op here: releasing and re-taking the device
+/// needs a logind bus, and the work it would be given is planSleep's, which
+/// the test below pins.
+fn probeSessionWork(ctx: ?*anyopaque, work: SleepWork) void {
+    _ = ctx;
+    _ = work;
+}
+
+test "the backend half runs while the phase still reports the plan's own starting point" {
+    var phase: Phase = .running;
+    var probe: SleepProbe = .{ .phase = &phase };
+
+    // Suspend. The backend resolves its half through
+    // planSleep(sleepPhase(), ...), so the phase it reads has to be the one
+    // the plan was made from - otherwise it re-plans a transition that has
+    // already run, which for a suspend means no work at all and no
+    // DRM_IOCTL_DROP_MASTER.
+    applySleep(&phase, true, true, probeSessionWork, probeBackendSleep, &probe);
+    try testing.expectEqual(Phase.running, probe.seen_phase);
+    try testing.expectEqual(Phase.suspending, phase);
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    try testing.expect(planSleep(probe.seen_phase, true, true).work.drop_master);
+
+    // Because the phase moved, logind repeating the signal is a REPEAT and
+    // not a second suspend: no second drop, no second release.
+    applySleep(&phase, true, true, probeSessionWork, probeBackendSleep, &probe);
+    try testing.expectEqual(Phase.suspending, probe.seen_phase);
+    try testing.expectEqual(SleepWork{}, planSleep(probe.seen_phase, true, true).work);
+    try testing.expectEqual(Phase.suspended, phase);
+
+    // The wake is acted on for real: the backend sees the transition that
+    // actually re-takes DRM master and re-arms the flip pipeline.
+    applySleep(&phase, false, true, probeSessionWork, probeBackendSleep, &probe);
+    try testing.expectEqual(Phase.suspended, probe.seen_phase);
+    try testing.expect(planSleep(probe.seen_phase, false, true).work.reacquire);
+    try testing.expectEqual(Phase.resuming, phase);
+
+    // A second wake repeats the work, which the backend absorbs (becomeMaster
+    // early-returns while it holds the master), and the phase stays put.
+    applySleep(&phase, false, true, probeSessionWork, probeBackendSleep, &probe);
+    try testing.expectEqual(Phase.resuming, probe.seen_phase);
+    try testing.expect(planSleep(probe.seen_phase, false, true).work.reacquire);
+    try testing.expectEqual(Phase.resuming, phase);
+    try testing.expectEqual(@as(usize, 4), probe.calls);
+}
+
+test "the console descriptor is opened once, however often it is asked for" {
+    // /dev/null stands in for /dev/tty0: what matters is the descriptor
+    // COUNT, not which node it points at, and /dev/null opens on a machine
+    // with no console at all (a container, a CI box).
+    var console: Console = .{};
+    const before = countOpenFds() orelse return error.SkipZigTest;
+
+    try testing.expect(console.ensure("/dev/null"));
+    const first = console.fd;
+    try testing.expect(first >= 0);
+    try testing.expectEqual(before + 1, countOpenFds().?);
+
+    // Every resume asks again - that is the path that used to leak one
+    // /dev/tty0 per suspend/resume cycle until RLIMIT_NOFILE ran out.
+    try testing.expect(console.ensure("/dev/null"));
+    try testing.expect(console.ensure("/dev/null"));
+    try testing.expectEqual(first, console.fd);
+    try testing.expectEqual(before + 1, countOpenFds().?);
+
+    // One closer, one descriptor: the count goes back where it started.
+    console.close();
+    try testing.expectEqual(before, countOpenFds().?);
+    try testing.expectEqual(@as(std.posix.fd_t, -1), console.fd);
+    console.close();
+    try testing.expectEqual(before, countOpenFds().?);
+}
+
+/// How many descriptors this process holds, from the kernel's own
+/// per-process table (/proc/self/fd, fs/proc/fd.c). Null when it cannot be
+/// read, which is the only case where a leak count cannot be believed.
+fn countOpenFds() ?usize {
+    var dir = std.Io.Dir.openDirAbsolute(std.testing.io, "/proc/self/fd", .{ .iterate = true }) catch return null;
+    defer dir.close(std.testing.io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (it.next(std.testing.io) catch null) |_| n += 1;
+    return n;
+}
+
 test "VT number decoding" {
     // tty2: new_encode_dev(4 << 8 | 2) == (4 << 8) | 2.
     try testing.expectEqual(@as(?u16, 2), vtFromTtyNr((4 << 8) | 2));
@@ -1884,16 +2379,31 @@ test "VT number decoding" {
     try testing.expectEqual(@as(?u16, null), vtFromTtyNr((4 << 8) | 64));
 }
 
-test "active VT parsing is strict" {
+test "active VT parsing is strict, and reads the kernel's own spelling" {
+    // What show_tty_active writes: "tty7\n", the name of the VT the console
+    // is on. This is the whole point of the test - a digits-only parser
+    // rejects every value the kernel emits, and the VT path goes quiet.
+    try testing.expectEqual(@as(?u16, 7), parseActiveVt("tty7\n"));
+    try testing.expectEqual(@as(?u16, 2), parseActiveVt("tty2"));
+    try testing.expectEqual(@as(?u16, 63), parseActiveVt("tty63\n"));
+    // A bare number is accepted too: it is what WAYLAND_VT carries, and
+    // this one parser reads both.
     try testing.expectEqual(@as(?u16, 7), parseActiveVt("7\n"));
     try testing.expectEqual(@as(?u16, 3), parseActiveVt("3"));
-    // 0 is not a VT; 64 is past the kernel's MAX_VT.
+    // 0 is not a VT; 64 is past the kernel's MAX_VT, named or bare.
     try testing.expectEqual(@as(?u16, null), parseActiveVt("0\n"));
     try testing.expectEqual(@as(?u16, null), parseActiveVt("64\n"));
-    // Garbage is not guessed at.
+    try testing.expectEqual(@as(?u16, null), parseActiveVt("tty0\n"));
+    try testing.expectEqual(@as(?u16, null), parseActiveVt("tty64\n"));
+    // Garbage is not guessed at, and neither is a console that is not a VT:
+    // a serial or virtual console is a name this parser must refuse, not
+    // a number to switch to.
     try testing.expectEqual(@as(?u16, null), parseActiveVt(""));
-    try testing.expectEqual(@as(?u16, null), parseActiveVt("tty2"));
+    try testing.expectEqual(@as(?u16, null), parseActiveVt("tty"));
+    try testing.expectEqual(@as(?u16, null), parseActiveVt("pts/3\n"));
+    try testing.expectEqual(@as(?u16, null), parseActiveVt("ttyAMA0\n"));
     try testing.expectEqual(@as(?u16, null), parseActiveVt("100"));
+    try testing.expectEqual(@as(?u16, null), parseActiveVt("tty100\n"));
 }
 
 test "target VT: environment wins, then the controlling tty, then none" {

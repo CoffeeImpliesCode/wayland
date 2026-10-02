@@ -2671,6 +2671,41 @@ fn xdgSurfaceMap(surface: *surface_mod.Surface) void {
 fn xdgSurfaceUnmap(surface: *surface_mod.Surface) void {
     const xdg = xdgFromSurface(surface) orelse return;
     xdg.resetConfigureState();
+    // X04b: the popup's OWN grab ends with the surface it grabbed. A
+    // NULL-buffer commit unmaps WITHOUT destroying the role object, so
+    // none of popupGrabEnd's other paths runs: not popupDestroy (the
+    // xdg_popup lives on), not the pointer/keyboard cancel (nobody
+    // replaced the grab) and not the press-outside check. Both seat
+    // slots would stay installed for the life of the connection — the
+    // press the grab delivered is never released, its wl_pointer.enter
+    // is never left, and Seat.keyEvent keeps routing every keystroke
+    // into popupGrabKey (seat.zig:1698-1707): one client capturing the
+    // keyboard from every other client.
+    //
+    // wlroots ends it here too: reset_xdg_surface takes the popup role
+    // down on unmap (wlr_xdg_surface.c:26-45) and wlr_xdg_popup_destroy
+    // ends the grab on the way out (wlr_xdg_popup.c:444-464) — exactly
+    // the ending popupDestroy performs. Ours keeps the role, because
+    // the client may remap the same xdg_popup, so the grab end is made
+    // explicit here.
+    //
+    // `dismiss` is false for the same reason it is false in popupDestroy:
+    // the client unmapped its own popup, so nothing was dismissed. The
+    // XML reserves popup_done for a compositor dismissal — "sent out
+    // when a popup is dismissed by the compositor", after which "the
+    // client should destroy the xdg_popup object" (xdg-shell.xml:
+    // 1358-1363) — and that object is still valid for a remap.
+    //
+    // It runs BEFORE the child-popup loop, while this surface is still
+    // the one being unmapped: the owed button(released) and
+    // wl_pointer.leave are addressed to the popup's own wl_surface,
+    // which an unmap does not destroy (only the destroy paths do), so
+    // the client is still there to receive them. popupGrabEnd is
+    // idempotent (the grab's `active` flag), so an already-ended grab
+    // — one a CHILD of this surface holds and popupDestroy is about to
+    // clean up, or one another subsystem already replaced — is a no-op.
+    if (xdg.role == .popup) if (xdg.popup) |p| if (p.grab_state) |g| popupGrabEnd(g, false);
+
     // F12: parent unmap dismisses child popups (wlroots reset_xdg_surface
     // destroys the popups in surface->popups, wlr_xdg_surface.c:26-45 —
     // popup_done first, then the resource dies; wlr_xdg_popup_destroy
@@ -5576,6 +5611,218 @@ test "popup grab releases a held button to its client when the popup is destroye
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), ptr_events.releases);
     try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+}
+
+test "popup grab ends when the popup's own surface unmaps (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    // The popup client's seat resources: the grab routes to these, so
+    // both streams are countable after the unmap.
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    const wl_keyboard = try ts.wl_seat.?.getKeyboard();
+    var kbd_events: PopupGrabKeyboardEvents = .{};
+    wl_keyboard.setListener(*PopupGrabKeyboardEvents, PopupGrabKeyboardEvents.listener, &kbd_events);
+    try ts.pump();
+
+    // The fixture is inlined rather than installTestPopupGrab because
+    // this test needs the client-side proxies to map and unmap.
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    var parent_events: XdgSurfaceEvents = .{};
+    parent_xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &parent_events);
+    const parent_buffer = try ts.createBuffer();
+    try ts.pump();
+    parent_wl_surface.commit();
+    try ts.pump();
+    parent_xdg_surface.ackConfigure(parent_events.serial);
+    parent_wl_surface.attach(parent_buffer, 0, 0);
+    parent_wl_surface.commit();
+    try ts.pump();
+
+    var popup_events: PopupEvents = .{};
+    var xs_events: XdgSurfaceEvents = .{};
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    positioner.destroy();
+    const popup_buffer = try ts.createBuffer2();
+    try ts.pump();
+
+    // Grab the unmapped popup with a serial the client was just handed:
+    // the keyboard focus change mints one.
+    const p = ts.shell.?.popups.items[0];
+    ts.seat.?.setKeyboardFocus(p.xdg_surface.surface);
+    popup.grab(ts.wl_seat.?, ts.seat.?.last_serial);
+    try ts.pump();
+    try std.testing.expect(p.grab_state != null);
+
+    // Nothing else holds the keyboard, so the grab is the ONLY route a
+    // keystroke can take. With it stuck past the popup's map, this one
+    // client captures the keyboard from every other client for the rest
+    // of the connection. (The pre-grab focus sent its own modifiers,
+    // hence the reset.)
+    ts.seat.?.setKeyboardFocus(null);
+    kbd_events = .{};
+
+    // Map: initial commit -> configure -> ack -> attach -> commit.
+    wl_surface.commit();
+    try ts.pump();
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(popup_buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(p.xdg_surface.surface.mapped);
+
+    // The grab survives the map. The seat never hit-tests under a grab,
+    // so the enter for the popup surface is the grab's own, delivered on
+    // the first motion; the press inside then reaches the client.
+    p.setPopupOrigin(100, 200);
+    ts.seat.?.pointerMotion(150, 220);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    ts.seat.?.pointerButton(seat_mod.btn_left, true);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expect(ptr_events.entered);
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.presses);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+    try std.testing.expect(p.grab_state.?.active);
+    // A key is routed by the grab while it lives.
+    ts.seat.?.keyEvent(38, true); // 'a'
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), kbd_events.key);
+
+    // The client commits attach(null): the popup unmaps, and its
+    // xdg_popup object survives. No client destroy, no grab cancel and
+    // no press outside, so nothing else reaches popupGrabEnd.
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expect(!p.xdg_surface.surface.mapped);
+
+    // Both seat slots are free again — the grab must not outlive the
+    // surface it grabbed.
+    try std.testing.expect(ts.seat.?.pointer_grab == null);
+    try std.testing.expect(ts.seat.?.keyboard_grab == null);
+    try std.testing.expect(!p.grab_state.?.active);
+
+    // The press the grab delivered is released to the client that got
+    // it, and the enter it sent is balanced by a leave. Both are owed
+    // BEFORE the seat's default path takes over, which would deliver
+    // the release to a pointer focus this grab never picked
+    // (seat.zig:877-883) and leave the button stuck down.
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.leaves);
+    // No popup_done: the client unmapped its own popup, so nothing was
+    // dismissed (xdg-shell.xml:1358-1363).
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+
+    // The keyboard is free: with no grab and no focus, the key reaches
+    // nobody — the popup client no longer captures it.
+    ts.seat.?.keyEvent(39, true); // 's'
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), kbd_events.key);
+
+    // The physical release that follows finds an empty set: no second
+    // release is invented, and the enter is not left twice.
+    ts.seat.?.pointerButton(seat_mod.btn_left, false);
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 1), ptr_events.leaves);
+}
+
+test "a popup that unmaps with no grab installed is unaffected (X04b)" {
+    const allocator = std.testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    var ptr_events: PopupGrabPointerEvents = .{};
+    wl_pointer.setListener(*PopupGrabPointerEvents, PopupGrabPointerEvents.listener, &ptr_events);
+    const wl_keyboard = try ts.wl_seat.?.getKeyboard();
+    var kbd_events: PopupGrabKeyboardEvents = .{};
+    wl_keyboard.setListener(*PopupGrabKeyboardEvents, PopupGrabKeyboardEvents.listener, &kbd_events);
+    try ts.pump();
+
+    const parent_wl_surface = try ts.wl_compositor.?.createSurface();
+    const parent_xdg_surface = try ts.wm_base.?.getXdgSurface(parent_wl_surface);
+    _ = try parent_xdg_surface.getToplevel();
+    try ts.pump();
+    var popup_events: PopupEvents = .{};
+    var xs_events: XdgSurfaceEvents = .{};
+    const positioner = try ts.wm_base.?.createPositioner();
+    positioner.setSize(100, 50);
+    positioner.setAnchorRect(10, 20, 200, 100);
+    positioner.setAnchor(.bottom_right);
+    positioner.setGravity(.bottom_right);
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    const xdg_surface = try ts.wm_base.?.getXdgSurface(wl_surface);
+    xdg_surface.setListener(*XdgSurfaceEvents, XdgSurfaceEvents.listener, &xs_events);
+    const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+    popup.setListener(*PopupEvents, PopupEvents.listener, &popup_events);
+    positioner.destroy();
+    const popup_buffer = try ts.createBuffer2();
+    try ts.pump();
+
+    // Map: initial commit -> configure -> ack -> attach -> commit. No
+    // xdg_popup.grab anywhere: this popup owns no grab to end.
+    wl_surface.commit();
+    try ts.pump();
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(popup_buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    const p = ts.shell.?.popups.items[0];
+    try std.testing.expect(p.xdg_surface.surface.mapped);
+    try std.testing.expect(p.grab_state == null);
+
+    // Unmap. The role hook now ends an own-surface grab, and there is
+    // none: nothing is invented for a grab that never delivered a
+    // press or an enter.
+    wl_surface.attach(null, 0, 0);
+    wl_surface.commit();
+    ts.seat.?.pointerFrame();
+    try ts.pump();
+    try std.testing.expect(!p.xdg_surface.surface.mapped);
+    try std.testing.expect(p.grab_state == null);
+    try std.testing.expect(ts.seat.?.pointer_grab == null);
+    try std.testing.expect(ts.seat.?.keyboard_grab == null);
+    try std.testing.expect(!ptr_events.entered);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.presses);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.releases);
+    try std.testing.expectEqual(@as(usize, 0), ptr_events.leaves);
+    try std.testing.expectEqual(@as(usize, 0), kbd_events.key);
+
+    // The role survives an own-surface unmap (only a PARENT unmap
+    // destroys a child popup), and the unmap is not a dismissal.
+    try std.testing.expectEqual(@as(usize, 1), ts.shell.?.popups.items.len);
+    try std.testing.expectEqual(@as(usize, 0), popup_events.done_count);
+
+    // And the same xdg_popup maps again: the client redoes the initial
+    // commit, acks the fresh configure and attaches a buffer.
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), popup_events.configure_count);
+    xdg_surface.ackConfigure(xs_events.serial);
+    wl_surface.attach(popup_buffer, 0, 0);
+    wl_surface.commit();
+    try ts.pump();
+    try std.testing.expect(p.xdg_surface.surface.mapped);
 }
 
 test "popupGrabEnd leaves a keyboard grab it does not own installed (X04b)" {

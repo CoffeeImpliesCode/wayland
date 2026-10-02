@@ -41,7 +41,7 @@
 //! signals so the compositor can bind keys (the server quits on
 //! Mod4+Escape).
 //!
-//! Composator gates (the compositor's policy seams; all three default to
+//! Compositor gates (the compositor's policy seams; all four default to
 //! "off" and change nothing until the server installs them):
 //! - `setPick(fn, ctx)`: the hit test itself — output coordinates to
 //!   PickResult. Every pointer and touch position is translated through
@@ -58,6 +58,15 @@
 //!   ext_session_lock_v1:77-85 forbids. Up and cancel are not gated:
 //!   they finalize a gesture the client was already told about, and
 //!   swallowing them strands client state (see touchUp).
+//! - `setGrabGate(fn, ctx)`: may a grab be INSTALLED right now. The
+//!   three gates above are consulted on the DELIVERY path; a grab is
+//!   the one input route that skips delivery entirely — motion,
+//!   buttons, axis and keys return into the grab's handlers before the
+//!   pick, the focus gate and the touch gate are ever reached, so a
+//!   client that owns a grab is delivered to whatever it names no
+//!   matter what those gates say. Consulted by startPointerGrab AND
+//!   startKeyboardGrab; a refused grab is simply not installed, and
+//!   nothing else about the seat changes.
 //!
 //! Event delivery follows wlroots: keyboard and pointer events (enter,
 //! leave, key, modifiers, motion, button, axis) reach only the focused
@@ -459,15 +468,17 @@ pub const Seat = struct {
     last_button: u32 = 0,
     last_button_pressed: bool = false,
     /// Pointer buttons the focused client believes is held (delivered
-    /// pressed without a delivered release). startPointerGrab
+    /// presses without a delivered release). resetHeldButtons
     /// synthesizes releases for these (wlroots reset_buttons on grab
     /// focus change, wlr_seat_pointer.c:435-437) so a client gesture
-    /// cannot extend into the compositor's grab (S2).
+    /// cannot extend into the compositor's grab (S2) — and it is what
+    /// a physical RELEASE routes by, so that release reaches the client
+    /// which received the press even after the focus has moved.
     // SAFETY: only held_buttons[0..held_button_count] is read; the count
-    // gates every access and startPointerGrab zeroes it.
+    // gates every access and resetHeldButtons zeroes it.
     held_buttons: [16]u32 = undefined,
     /// The client each held_buttons entry was delivered to, index
-    /// parallel to held_buttons. startPointerGrab releases to THESE
+    /// parallel to held_buttons. resetHeldButtons releases to THESE
     /// clients, not to whoever holds pointer focus when the grab is
     /// installed: the pointer can cross onto another surface while a
     /// button is down (main.zig arms the camera pan from a MOTION
@@ -648,6 +659,46 @@ pub const Seat = struct {
     /// by itself.
     touch_gate_fn: ?*const fn (ctx: *anyopaque, surface: *Surface) bool = null,
     touch_gate_ctx: ?*anyopaque = null,
+
+    /// Optional compositor gate for GRAB INSTALLATION — the fourth of
+    /// the seat's compositor gates, and the only one consulted on the
+    /// INSTALL path rather than the delivery path. Return false for
+    /// "no client may install a grab right now": the grab is then not
+    /// installed, and NOTHING else changes — the current grab keeps
+    /// running, no synthetic button releases are sent, no live touch
+    /// gesture is closed.
+    ///
+    /// It exists because a grab is the one input route that bypasses
+    /// every other gate: pointerMotion, pointerButton, pointerAxisDir
+    /// and keyEvent all return into the grab's handlers BEFORE the
+    /// pick, the focus gate and the touch gate are reached, so whoever
+    /// owns a grab is delivered to whatever it names, whatever the
+    /// gates say. The session lock closes that at the latch by ending
+    /// every grab (main.zig onSessionLocked — "a grab routes input to
+    /// whoever it names, and the lock client must be the only input
+    /// destination"), which is an INVARIANT nothing enforced after it:
+    /// xdg_surface.get_popup's `grab` validates only a serial
+    /// (xdg.zig:2038-2079), the serial ring has no time window
+    /// (validateEventSerial), and the popup need never be mapped. A
+    /// locked session could therefore be handed a brand-new grab by
+    /// any client that still holds any serial it was ever given.
+    ///
+    /// ext_session_lock_v1:81-84 is the rule this gate carries: once
+    /// `locked` is sent, the lock client is the only input destination.
+    ///
+    /// It is NOT a surface predicate like focus_gate_fn and
+    /// touch_gate_fn: a grab names no surface, and the decision is the
+    /// same for every installer — may a grab be installed on this seat
+    /// right now — so the callback takes the seat instead.
+    ///
+    /// No gate registered (null): every grab installs, the behaviour
+    /// this seat has always had. As with the other gates the server
+    /// installs one callback once and it reads LIVE state
+    /// (session_lock.isLocked()), so unlocking restores grabs by
+    /// itself; setGrabGate(null, null) removes it outright for a seat
+    /// outliving its policy object.
+    grab_gate_fn: ?*const fn (ctx: *anyopaque, seat: *Seat) bool = null,
+    grab_gate_ctx: ?*anyopaque = null,
 
     /// The active pointer grab (wlroots wlr_seat_pointer.c:19-53): while
     /// installed, pointer motion/buttons/axis route through the grab's
@@ -914,6 +965,39 @@ pub const Seat = struct {
         return gate(self.touch_gate_ctx.?, surface);
     }
 
+    /// Register (or, with a null `gate_fn`, REMOVE) the grab gate (see
+    /// grab_gate_fn): `gate_fn` decides whether a grab may be installed
+    /// on this seat right now. Same optional-callback + ctx shape as
+    /// setKeyboardFocusGate and setTouchGate, same permissive default
+    /// when nothing is installed, same live-read teardown story (the
+    /// callback reads live lock state; there is no need to uninstall
+    /// it to unlock).
+    ///
+    /// Unlike those two, removal is part of the API: a grab silently
+    /// diverts every input stream, so a seat that outlives the policy
+    /// object that gated it must be able to drop the gate rather than
+    /// keep consulting a dangling context. `setGrabGate(null, null)`.
+    pub fn setGrabGate(
+        self: *Seat,
+        gate_fn: ?*const fn (ctx: *anyopaque, seat: *Seat) bool,
+        ctx: ?*anyopaque,
+    ) void {
+        self.grab_gate_fn = gate_fn;
+        self.grab_gate_ctx = ctx;
+    }
+
+    /// Whether the compositor's grab gate lets a grab be installed now
+    /// (see grab_gate_fn). No gate registered: allowed — a seat that
+    /// never installed one behaves exactly as it did before the gate
+    /// existed.
+    ///
+    /// Private: only startPointerGrab / startKeyboardGrab ask, and they
+    /// ask before touching any grab state.
+    fn grabAllowed(self: *Seat) bool {
+        const gate = self.grab_gate_fn orelse return true;
+        return gate(self.grab_gate_ctx.?, self);
+    }
+
     /// Next seat serial: wraps the display counter and records the value,
     /// so serial-bearing client requests (set_cursor, set_selection,
     /// start_drag) can be validated against the seat's last serial.
@@ -1018,14 +1102,34 @@ pub const Seat = struct {
     /// Install a pointer grab (wlroots wlr_seat_pointer_start_grab,
     /// wlr_seat_pointer.c:563-576): ends the current grab (cancel),
     /// installs the new one. Starting ANY grab synthesizes a release
-    /// (+ closing frame) for every button the client believes is held,
-    /// with a fresh per-client serial (wlroots reset_buttons on grab
-    /// focus change, wlr_seat_pointer.c:435-437): the client's own
-    /// gesture state must not extend into the compositor's gesture (S2).
+    /// (+ closing frame) for every button the client believes is held
+    /// (resetHeldButtons), with a fresh per-client serial (wlroots
+    /// reset_buttons on grab focus change, wlr_seat_pointer.c:435-437):
+    /// the client's own gesture state must not extend into the
+    /// compositor's gesture (S2).
     /// The seat keeps delivering motion/buttons to the compositor
     /// listeners so the gesture keeps working; the grab gates client
     /// delivery only.
+    ///
+    /// The compositor's grab gate is asked FIRST, before anything is
+    /// touched (see grab_gate_fn): a refused grab is not installed and
+    /// is otherwise a complete no-op — the grab still installed keeps
+    /// running, no held button is released, no live touch gesture is
+    /// closed. A refused request that cancelled the current grab would
+    /// hand the compositor's own gesture (camera pan, interactive
+    /// move) to whoever owns the default path, which is the opposite
+    /// of what "this request is not allowed" means.
     pub fn startPointerGrab(self: *Seat, grab: *const PointerGrab) void {
+        if (!self.grabAllowed()) {
+            log.warn(
+                "pointer grab refused by the compositor gate",
+                self.io,
+                self.log_cfg,
+                "seat",
+                .{},
+            );
+            return;
+        }
         if (self.pointer_grab) |old| old.cancel(self, old);
         self.pointer_grab = grab;
         // Touch shares the grab gate (see touchDown): the client must not
@@ -1034,30 +1138,15 @@ pub const Seat = struct {
         // buttons are released below (wlroots resets the touch points on
         // grab start exactly as it resets the buttons).
         self.touchCloseSequence();
-        if (self.held_button_count == 0) return;
-        // The synthetic release goes to the client that RECEIVED the
-        // press (held_clients), not to whoever holds pointer focus
-        // now: those are two different clients whenever the pointer
-        // crossed onto another surface while the button was down, and a
-        // release sent to the wrong client both strands the press on the
-        // first one and invents a release on the second.
-        const time = nowMs(self);
-        const held = self.held_buttons[0..self.held_button_count];
-        const held_clients = self.held_clients[0..self.held_button_count];
-        for (held, held_clients) |button, held_client| {
-            const serial = serialFor(self, held_client);
-            var delivered = false;
-            for (self.pointers.items) |ptr| {
-                if (ptr.getClient() != held_client) continue;
-                ptr.sendButton(serial, time, button, .released);
-                delivered = true;
-            }
-            if (delivered) self.markFramePending(held_client);
-        }
-        // The buttons are logically released whether or not a client
-        // got the release; a later physical release is then a no-op for
-        // the set (the pointerButton gate swallows it anyway).
-        self.held_button_count = 0;
+        // The synthetic releases for the held buttons — the same
+        // resetHeldButtons the session lock runs at its latch. It goes
+        // to the client that RECEIVED each press (held_clients), not to
+        // whoever holds pointer focus now: those are two different
+        // clients whenever the pointer crossed onto another surface
+        // while the button was down, and a release sent to the wrong
+        // client both strands the press on the first one and invents a
+        // release on the second.
+        self.resetHeldButtons();
     }
 
     /// End the current pointer grab and restore the default (forward to
@@ -1089,7 +1178,23 @@ pub const Seat = struct {
 
     /// Install a keyboard grab (wlroots wlr_seat_keyboard_start_grab,
     /// wlr_seat_keyboard.c:110-114).
+    ///
+    /// The same grab gate as startPointerGrab, asked first and with the
+    /// same all-or-nothing effect (see grab_gate_fn): a keyboard grab
+    /// diverts every keystroke to the client that owns it, so a
+    /// compositor that stops input for locked sessions must be able to
+    /// refuse its installation.
     pub fn startKeyboardGrab(self: *Seat, grab: *const KeyboardGrab) void {
+        if (!self.grabAllowed()) {
+            log.warn(
+                "keyboard grab refused by the compositor gate",
+                self.io,
+                self.log_cfg,
+                "seat",
+                .{},
+            );
+            return;
+        }
         if (self.keyboard_grab) |old| old.cancel(self, old);
         self.keyboard_grab = grab;
     }
@@ -1240,13 +1345,12 @@ pub const Seat = struct {
                 }
             }
         }
-        const time = nowMs(self);
         const state: server.wl.Pointer.ButtonState = if (pressed) .pressed else .released;
         // Button delivery: under a compositor grab the grab's handler
         // owns it (a swallow grab sends neither press nor release, S2 —
         // the camera drag / interactive move owns the buttons, and the
         // client's gesture state is cleared by the synthetic releases
-        // startPointerGrab sends — a swallowed release cannot leave it
+        // resetHeldButtons sends — a swallowed release cannot leave it
         // extending a text selection). The button signal still fires for
         // compositor listeners (main.zig's drag arming reads it).
         // The serial the event was delivered with, if any. Under a grab
@@ -1256,44 +1360,36 @@ pub const Seat = struct {
         var delivered_serial: u32 = 0;
         if (self.pointer_grab) |grab| {
             grab.button(self, grab, button, pressed);
-        } else if (self.pointer_focus) |focus| {
-            const focus_client = focus.resource.getClient();
-            const serial = serialFor(self, focus_client);
-            delivered_serial = serial;
-            var delivered = false;
-            for (self.pointers.items) |ptr| {
-                if (ptr.getClient() != focus_client) continue;
-                ptr.sendButton(serial, time, button, state);
-                delivered = true;
+        } else if (pressed) {
+            // A PRESS routes by the pointer focus, and is recorded
+            // against the client that actually received it — that
+            // record is the only thing its RELEASE can be routed by.
+            if (self.pointer_focus) |focus| {
+                const focus_client = focus.resource.getClient();
+                const sent = self.sendPointerButton(focus_client, button, state);
+                delivered_serial = sent.serial;
+                // Recorded only when the press really went out: an
+                // entry here is a PROMISE of exactly one release to
+                // that client, and a press no wl_pointer received must
+                // not become one.
+                if (sent.delivered) self.holdButton(button, focus_client);
             }
-            if (delivered) self.markFramePending(focus_client);
-
-            // Track what the client believes is held (delivered presses
-            // without a delivered release) for the grab-start synthetic
-            // releases. Gated events never touch the set — the client
-            // did not see them (S2).
-            if (pressed) {
-                if (self.held_button_count < self.held_buttons.len and
-                    std.mem.indexOfScalar(u32, self.held_buttons[0..self.held_button_count], button) == null)
-                {
-                    self.held_buttons[self.held_button_count] = button;
-                    self.held_clients[self.held_button_count] = focus_client;
-                    self.held_button_count += 1;
-                }
-            } else {
-                if (self.held_button_count > 0) {
-                    const idx = std.mem.indexOfScalar(
-                        u32,
-                        self.held_buttons[0..self.held_button_count],
-                        button,
-                    ) orelse 0;
-                    if (idx < self.held_button_count and self.held_buttons[idx] == button) {
-                        self.held_buttons[idx] = self.held_buttons[self.held_button_count - 1];
-                        self.held_clients[idx] = self.held_clients[self.held_button_count - 1];
-                        self.held_button_count -= 1;
-                    }
-                }
-            }
+        } else if (self.heldIndex(button)) |idx| {
+            // A RELEASE routes by the HELD SET — the client that
+            // received the press — and never by the pointer focus,
+            // which is a different client whenever the pointer crossed
+            // onto another surface while the button was down, and is a
+            // client that never pressed anything at all at a session
+            // latch, where the focus moves onto the lock surface
+            // (onSessionLocked). Routing by that focus invents a
+            // release nobody pressed and strands the press on the
+            // client that did; the bookkeeping used to live inside the
+            // focus branch, so it did not even run on that path and
+            // held_button_count stayed stuck — which sent the press a
+            // SECOND release at the next grab start.
+            const held_client = self.held_clients[idx];
+            delivered_serial = self.sendPointerButton(held_client, button, state).serial;
+            self.releaseHeldButton(idx);
         }
         // Mint the grab serial on the 0→1 pressed-count transition: the
         // serial the press event was delivered with (wlroots
@@ -1308,6 +1404,96 @@ pub const Seat = struct {
             self.grab_button = button;
         }
         self.events.button.emit(self);
+    }
+
+    /// What one button delivery produced: the serial it carried, and
+    /// whether any live wl_pointer of that client actually received it.
+    const ButtonSend = struct {
+        serial: u32,
+        delivered: bool,
+    };
+
+    /// Send one wl_pointer.button to `client`'s live pointer resources
+    /// and open that client's input batch. ONE serial per event, minted
+    /// for the TARGET client — whether or not it turns out to own a
+    /// wl_pointer: the seat mints from the routing decision (the focus
+    /// client for a press, the held client for a release) and the grab
+    /// serial a drag origin validates against IS that serial, so it
+    /// must not depend on how many pointer resources the client
+    /// happens to have. A client with two resources gets that one
+    /// serial on both.
+    fn sendPointerButton(
+        self: *Seat,
+        wl_client: *wire.Client,
+        button: u32,
+        state: server.wl.Pointer.ButtonState,
+    ) ButtonSend {
+        const time = nowMs(self);
+        const serial = serialFor(self, wl_client);
+        var delivered = false;
+        for (self.pointers.items) |ptr| {
+            if (ptr.getClient() != wl_client) continue;
+            ptr.sendButton(serial, time, button, state);
+            delivered = true;
+        }
+        if (delivered) self.markFramePending(wl_client);
+        return .{ .serial = serial, .delivered = delivered };
+    }
+
+    /// The held-set entry for `button`, or null when no client holds it:
+    /// a release whose press was never delivered, or whose entry a grab
+    /// start / resetHeldButtons already flushed. The release is then
+    /// dropped rather than routed to whoever holds focus now.
+    fn heldIndex(self: *Seat, button: u32) ?usize {
+        return std.mem.indexOfScalar(u32, self.held_buttons[0..self.held_button_count], button);
+    }
+
+    /// Record a DELIVERED press against the client that received it: an
+    /// entry here is a promise of exactly one release to exactly that
+    /// client, so an event no wl_pointer received must never become
+    /// one. A duplicate press and a full set are dropped — 16
+    /// concurrent buttons is the same bound the grab-start flush has
+    /// always had.
+    fn holdButton(self: *Seat, button: u32, wl_client: *wire.Client) void {
+        if (self.held_button_count >= self.held_buttons.len) return;
+        if (self.heldIndex(button) != null) return;
+        self.held_buttons[self.held_button_count] = button;
+        self.held_clients[self.held_button_count] = wl_client;
+        self.held_button_count += 1;
+    }
+
+    /// Drop the held entry at `idx` (the caller has just delivered its
+    /// release): swap the last entry into the hole so the set stays
+    /// dense and the count is the only bound.
+    fn releaseHeldButton(self: *Seat, idx: usize) void {
+        const last = self.held_button_count - 1;
+        self.held_buttons[idx] = self.held_buttons[last];
+        self.held_clients[idx] = self.held_clients[last];
+        self.held_button_count = last;
+    }
+
+    /// Release every button the clients still believe is held, to the
+    /// client each press went to, then empty the set (wlroots resets the
+    /// buttons when the grab focus changes, wlr_seat_pointer.c:435-437).
+    ///
+    /// startPointerGrab calls it, so a client gesture cannot extend
+    /// into the compositor's gesture. The session lock calls it at the
+    /// latch for the same reason the release above routes by the held
+    /// set: the lock client can become the pointer focus while a button
+    /// is down, and it must not be handed a release for a press it
+    /// never saw.
+    pub fn resetHeldButtons(self: *Seat) void {
+        if (self.held_button_count == 0) return;
+        const held = self.held_buttons[0..self.held_button_count];
+        const held_clients = self.held_clients[0..self.held_button_count];
+        for (held, held_clients) |button, held_client| {
+            _ = self.sendPointerButton(held_client, button, .released);
+        }
+        // The buttons are logically released whether or not a client
+        // got the release; a later physical release then finds no
+        // entry (the release branch in pointerButton) and sends
+        // nothing, so the press is never released twice.
+        self.held_button_count = 0;
     }
 
     /// Vertical/horizontal wheel or scroll axis. `source` is the input
@@ -3143,14 +3329,11 @@ const TestServer = struct {
     b: TestClient = undefined,
     clients: usize = 0,
 
-    /// Heap-allocated (the `io` pointer must outlive the stack frame; the
-    /// display, compositor and seat all store it).
-    fn init(allocator: std.mem.Allocator) !*TestServer {
-        return initOptions(allocator, .{});
-    }
-
-    /// Same, with explicit seat Options — the touch tests need a seat
-    /// that never had the touch capability, which only Options can say.
+    /// With explicit seat Options — the touch tests need a seat that
+    /// never had the touch capability, which only Options can say.
+    /// Tests enter through initTestServer (below), never through this
+    /// directly, so that an environment limitation is reported as a
+    /// SKIP and never swallowed.
     fn initOptions(allocator: std.mem.Allocator, options: Options) !*TestServer {
         const ts = try allocator.create(TestServer);
         ts.* = .{
@@ -3217,6 +3400,53 @@ const TestServer = struct {
         if (ts.clients >= 2) try dispatchClient(&ts.b);
     }
 };
+
+/// TestServer.init for a test body: a failure that is NOT an
+/// environment limitation propagates and FAILS the test, so no test in
+/// this file can report PASS without having asserted something. A
+/// `test` block returns !void, so the old
+/// `catch |err| { print(...); return; }` shape turned every init
+/// failure into a green run that asserted nothing — on any machine
+/// where the harness cannot start, all 45 of them passed silently.
+fn initTestServer(allocator: std.mem.Allocator) !*TestServer {
+    return initTestServerOptions(allocator, .{});
+}
+
+/// initTestServer with explicit seat Options (see TestServer.initOptions).
+fn initTestServerOptions(allocator: std.mem.Allocator, options: Options) !*TestServer {
+    return TestServer.initOptions(allocator, options) catch |err| testInitError(err);
+}
+
+/// The one init failure a test may SKIP instead of fail on: a keymap
+/// that cannot be built, because the machine has no xkeyboard-config
+/// rules data (xkb_keymap_new_from_names returns NULL, xkb.zig:124 —
+/// the same limitation xkb.zig's own test skips on). Everything else —
+/// OOM, socketpair, the client connection, the display — is a real
+/// failure and must fail the test.
+///
+/// Split out as a function so the mapping is itself testable: the
+/// contract "an unbuildable keymap SKIPs, a real failure FAILS" IS the
+/// fix, and this is where it lives.
+fn testInitError(err: anyerror) anyerror {
+    return switch (err) {
+        error.XkbInitFailed, error.KeymapBuildFailed => error.SkipZigTest,
+        else => err,
+    };
+}
+
+test "an unbuildable keymap SKIPs the harness, any other init failure FAILS" {
+    // The two xkbcommon failures are the environment limitation
+    // (xkeyboard-config missing): they are the ONLY skip, and they are
+    // reported as SKIP, which the test runner prints. Everything else
+    // propagates unchanged, so a test whose harness cannot start for
+    // any other reason is red, not green.
+    try std.testing.expectEqual(error.SkipZigTest, testInitError(error.KeymapBuildFailed));
+    try std.testing.expectEqual(error.SkipZigTest, testInitError(error.XkbInitFailed));
+    try std.testing.expectEqual(error.OutOfMemory, testInitError(error.OutOfMemory));
+    try std.testing.expectEqual(error.KeymapMemfdFailed, testInitError(error.KeymapMemfdFailed));
+    try std.testing.expectEqual(error.SocketpairFailed, testInitError(error.SocketpairFailed));
+    try std.testing.expectEqual(error.ClientConnectFailed, testInitError(error.ClientConnectFailed));
+}
 
 /// Flush + roundtrip for one client display. Used while a client is
 /// still connecting, i.e. before it is registered in ts.a/ts.b.
@@ -3319,12 +3549,7 @@ fn surfaceForClient(ts: *TestServer, server_client: *wire.Client) *Surface {
 
 test "keyboard and pointer events reach only the focused client" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        // xkeyboard-config must be available in the test environment
-        // (same skip as xkb.zig's test).
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -3413,10 +3638,7 @@ test "keyboard and pointer events reach only the focused client" {
 
 test "click-to-focus gate: a denied surface keeps the current focus (L-D7)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const seat = ts.seat.?;
@@ -3449,10 +3671,7 @@ test "click-to-focus gate: a denied surface keeps the current focus (L-D7)" {
 
 test "server-side key repeat: press, delay, repeat, release stops" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
     // 1ms delay + 1000/s rate so the first repeat fires immediately
     // after the delay elapses.
@@ -3496,10 +3715,7 @@ test "server-side key repeat: press, delay, repeat, release stops" {
 
 test "v10 clients get repeat_info rate 0 and repeated-state repeats (S1)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -3544,10 +3760,7 @@ test "v10 clients get repeat_info rate 0 and repeated-state repeats (S1)" {
 
 test "pre-v10 clients get repeat_info rate 25 and pressed-state repeats (S1)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -3594,10 +3807,7 @@ test "pre-v10 clients get repeat_info rate 25 and pressed-state repeats (S1)" {
 
 test "implicit pointer grab gates axis and button release (S2)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -3641,10 +3851,7 @@ test "implicit pointer grab gates axis and button release (S2)" {
 
 test "press mints a grab_serial on the 0->1 transition, release closes it (S-F5)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const seat = ts.seat.?;
@@ -3676,10 +3883,7 @@ test "press mints a grab_serial on the 0->1 transition, release closes it (S-F5)
 
 test "two held buttons invalidate the grab serial (S-F5)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const seat = ts.seat.?;
@@ -3716,10 +3920,7 @@ test "two held buttons invalidate the grab serial (S-F5)" {
 
 test "a re-press mints a fresh grab serial (S-F5)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const seat = ts.seat.?;
@@ -3753,10 +3954,7 @@ test "a re-press mints a fresh grab serial (S-F5)" {
 
 test "click-to-focus arms the grab serial against the focused surface (S-F5)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const seat = ts.seat.?;
@@ -3817,10 +4015,7 @@ fn cancelGrabCancel(seat: *Seat, grab: *const PointerGrab) void {
 
 test "pointer grab lifecycle: start routes, end cancels and restores delivery (F2)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -3868,10 +4063,7 @@ test "pointer grab lifecycle: start routes, end cancels and restores delivery (F
 
 test "a swallow grab suppresses click-to-focus: the press leaves the focus alone (P1-7)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -3925,10 +4117,7 @@ test "a swallow grab suppresses click-to-focus: the press leaves the focus alone
 
 test "a drag-and-drop grab keeps click-to-focus (P1-7)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const seat = ts.seat.?;
@@ -3977,10 +4166,7 @@ test "a drag-and-drop grab keeps click-to-focus (P1-7)" {
 
 test "grab start releases the held buttons to the client that got the press (P1-7)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4027,6 +4213,122 @@ test "grab start releases the held buttons to the client that got the press (P1-
     try std.testing.expectEqual(@as(u32, 0), seat.pressed_count);
 }
 
+test "a release whose focus moved reaches the client that got the press" {
+    const allocator = std.testing.allocator;
+    const ts = try initTestServer(allocator);
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server.?);
+    const surface_b = surfaceForClient(ts, b.server.?);
+
+    // A takes the press.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 1), seat.held_button_count);
+
+    // The pointer crosses onto B while the button is down: the
+    // interactive move / camera pan case, and the shape of the session
+    // latch, where the focus moves onto a surface that never saw the
+    // press.
+    ts.pick_state.surface = surface_b;
+    seat.pointerMotion(50, 50);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == surface_b);
+
+    // The release belongs to A — one release there, none at all on B,
+    // which pressed nothing — and the held set empties exactly once.
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 0), seat.held_button_count);
+
+    // A repeated physical release sends nothing: the press was
+    // released once, and only once.
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.button);
+
+    // The same with the focus GONE: a lock-aware pick drops every
+    // non-lock surface, so the latch can leave no pointer focus at all
+    // while a button is down. The release still belongs to whoever
+    // pressed.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_right, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), seat.held_button_count);
+    ts.pick_state.surface = null;
+    seat.pointerMotion(60, 60);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == null);
+    seat.pointerButton(btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 4), a.ptr_events.button); // press, release, press, release
+    try std.testing.expectEqual(@as(usize, 0), b.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 0), seat.held_button_count);
+}
+
+test "resetHeldButtons releases each held button to its own client, once" {
+    const allocator = std.testing.allocator;
+    const ts = try initTestServer(allocator);
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server.?);
+    const surface_b = surfaceForClient(ts, b.server.?);
+
+    // One button held on each client: this is what the session latch
+    // flushes, with the focus sitting on a surface neither of those two
+    // presses belongs to any more.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    ts.pick_state.surface = surface_b;
+    seat.pointerMotion(50, 50);
+    try ts.pump();
+    seat.pointerButton(btn_right, true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), seat.held_button_count);
+
+    // Each release goes to the client that was given the press.
+    seat.resetHeldButtons();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), seat.held_button_count);
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 2), b.ptr_events.button);
+
+    // A second flush releases nothing more.
+    seat.resetHeldButtons();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 2), b.ptr_events.button);
+
+    // ... and the physical releases that follow add NOTHING: each
+    // client was already told its own button is up, so a second
+    // release would be an event the client never pressed.
+    seat.pointerButton(btn_left, false);
+    seat.pointerButton(btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 2), b.ptr_events.button);
+    try std.testing.expectEqual(@as(u32, 0), seat.pressed_count);
+}
+
 /// Cancel-capturing keyboard grab for the F2 keyboard-grab test.
 const KbdGrabState = struct {
     keys: usize = 0,
@@ -4053,10 +4355,7 @@ fn kbdGrabOnCancel(seat: *Seat, grab: *const KeyboardGrab) void {
 
 test "keyboard grab routes key events and modifiers, cancel on end (F2)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4100,12 +4399,155 @@ test "keyboard grab routes key events and modifiers, cancel on end (F2)" {
     try std.testing.expect(a.kbd_events.keys > 0);
 }
 
+/// The grab gate's context: whether a grab may be installed right now,
+/// and how many times the seat asked.
+const TestGrabGateState = struct {
+    allowed: bool = true,
+    asks: usize = 0,
+};
+
+fn testGrabGate(ctx: *anyopaque, seat: *Seat) bool {
+    const st: *TestGrabGateState = @ptrCast(@alignCast(ctx));
+    _ = seat;
+    st.asks += 1;
+    return st.allowed;
+}
+
+test "a grab the compositor's gate refuses is not installed (session lock)" {
+    const allocator = std.testing.allocator;
+    const ts = try initTestServer(allocator);
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server.?);
+
+    // A holds the pointer and the keyboard — a grab is the one input
+    // route that diverts BOTH streams away from here.
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.setKeyboardFocus(surface_a);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_focus == surface_a);
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+
+    var kst: KbdGrabState = .{};
+    const kgrab: KeyboardGrab = .{
+        .data = &kst,
+        .key = kbdGrabOnKey,
+        .modifiers = kbdGrabOnMods,
+        .cancel = kbdGrabOnCancel,
+    };
+
+    // The compositor refuses every grab: the session lock's answer
+    // while `locked` (ext_session_lock_v1:81-84), where the lock client
+    // must be the only input destination.
+    var gate: TestGrabGateState = .{ .allowed = false };
+    seat.setGrabGate(testGrabGate, &gate);
+
+    const motion_before = a.ptr_events.motion;
+    const keys_before = a.kbd_events.keys;
+    seat.startPointerGrab(&swallow_pointer_grab);
+    seat.startKeyboardGrab(&kgrab);
+    try std.testing.expectEqual(@as(usize, 2), gate.asks);
+    try std.testing.expect(seat.pointer_grab == null);
+    try std.testing.expect(seat.keyboard_grab == null);
+
+    // Nothing is diverted, so the focused client still receives both
+    // streams: a refused grab takes nothing away from the default path.
+    seat.pointerMotion(20, 20);
+    seat.keyEvent(38, true);
+    try ts.pump();
+    try std.testing.expectEqual(motion_before + 1, a.ptr_events.motion);
+    try std.testing.expectEqual(keys_before + 1, a.kbd_events.keys);
+    try std.testing.expectEqual(@as(usize, 0), kst.keys);
+
+    // Clearing the gate (unlock, or the lock object going away) puts
+    // the seat back on today's behaviour: both grabs install and take
+    // the input from the client.
+    seat.setGrabGate(null, null);
+    try std.testing.expectEqual(@as(usize, 2), gate.asks);
+    seat.startPointerGrab(&swallow_pointer_grab);
+    seat.startKeyboardGrab(&kgrab);
+    try std.testing.expect(seat.pointer_grab != null);
+    try std.testing.expect(seat.keyboard_grab != null);
+    seat.pointerMotion(30, 30);
+    seat.keyEvent(39, true);
+    try ts.pump();
+    try std.testing.expectEqual(motion_before + 1, a.ptr_events.motion);
+    try std.testing.expectEqual(keys_before + 1, a.kbd_events.keys);
+    try std.testing.expectEqual(@as(usize, 1), kst.keys);
+}
+
+test "a refused grab is a complete no-op: no release, no cancel, no touch close" {
+    const allocator = std.testing.allocator;
+    const ts = try initTestServer(allocator);
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+
+    // The press needs a pointer focus to land on: without a pick the
+    // seat delivers nothing (the same null-pick policy a locked
+    // session relies on).
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+
+    // A button held and a touch gesture live, on a seat with no grab
+    // installed: starting one would release the button and close the
+    // gesture (wlroots resets both on grab start).
+    seat.pointerButton(btn_left, true);
+    seat.touchDown(1, 10, 10);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.button);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 1), seat.held_button_count);
+    try std.testing.expectEqual(@as(usize, 1), seat.activeTouchPoints().len);
+
+    var gate: TestGrabGateState = .{ .allowed = false };
+    seat.setGrabGate(testGrabGate, &gate);
+    seat.startPointerGrab(&swallow_pointer_grab);
+    try ts.pump();
+    try std.testing.expect(seat.pointer_grab == null);
+    try std.testing.expectEqual(@as(usize, 1), seat.held_button_count);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.button); // no synth release
+    try std.testing.expectEqual(@as(usize, 0), a.touch_events.up); // no close
+    try std.testing.expectEqual(@as(usize, 0), a.touch_events.cancel);
+    try std.testing.expectEqual(@as(usize, 1), seat.activeTouchPoints().len);
+
+    // The compositor's own grab (camera pan, interactive move) installs
+    // once the gate permits it...
+    var gst: CancelGrabState = .{};
+    const grab: PointerGrab = .{
+        .data = &gst,
+        .motion = cancelGrabMotion,
+        .button = cancelGrabButton,
+        .axis = cancelGrabAxis,
+        .cancel = cancelGrabCancel,
+    };
+    seat.setGrabGate(null, null);
+    seat.startPointerGrab(&grab);
+    try ts.pump();
+    try std.testing.expectEqual(&grab, seat.pointer_grab.?);
+
+    // ... and a later refusal does not END it. Cancelling the running
+    // grab would hand the compositor's gesture to whoever owns the
+    // default path, which is the opposite of "this request is not
+    // allowed".
+    gate.allowed = false;
+    seat.setGrabGate(testGrabGate, &gate);
+    seat.startPointerGrab(&swallow_pointer_grab);
+    try std.testing.expectEqual(&grab, seat.pointer_grab.?);
+    try std.testing.expectEqual(@as(usize, 0), gst.cancels);
+}
+
 test "repeat tick before the deadline is a no-op, after it emits exactly once (S7)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4146,10 +4588,7 @@ test "repeat tick before the deadline is a no-op, after it emits exactly once (S
 
 test "keyboard enter is followed by a modifiers event" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4204,10 +4643,7 @@ test "keyboard enter is followed by a modifiers event" {
 
 test "keyboard enter carries evdev scancodes, not xkb keycodes (F1)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4230,10 +4666,7 @@ test "keyboard enter carries evdev scancodes, not xkb keycodes (F1)" {
 
 test "serial validation is per client with a recent-serial ring (F2)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4274,10 +4707,7 @@ test "serial validation is per client with a recent-serial ring (F2)" {
 
 test "v8+ clients get axis_value120, v7 clients get accumulated discrete (F4)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4313,10 +4743,7 @@ test "v8+ clients get axis_value120, v7 clients get accumulated discrete (F4)" {
 
 test "axis events batch into one frame with a single axis_source (F7)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4346,10 +4773,7 @@ test "axis events batch into one frame with a single axis_source (F7)" {
 
 test "set_cursor requires focus, a valid serial and the cursor role (F9)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4433,10 +4857,7 @@ test "set_cursor requires focus, a valid serial and the cursor role (F9)" {
 
 test "keymap change re-broadcasts to all clients (F10)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4471,10 +4892,7 @@ test "keymap change re-broadcasts to all clients (F10)" {
 
 test "seat teardown sends leave to the focused client (F11)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4497,10 +4915,7 @@ test "seat teardown sends leave to the focused client (F11)" {
 
 test "focused-surface destroy sends leave before clearing (F12)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4525,10 +4940,7 @@ test "focused-surface destroy sends leave before clearing (F12)" {
 
 test "wl_seat.get_touch on a seat that never had touch kills the client (S3)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.initOptions(allocator, .{ .touch = false }) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServerOptions(allocator, .{ .touch = false });
     defer ts.deinit();
 
     // Options.touch = false means the seat NEVER had the touch
@@ -4546,10 +4958,7 @@ test "wl_seat.get_touch on a seat that never had touch kills the client (S3)" {
 
 test "wl_touch delivers down/motion/up with surface-local coords, enter and leave" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4630,10 +5039,7 @@ test "wl_touch delivers down/motion/up with surface-local coords, enter and leav
 
 test "wl_touch frame batching: one frame per batch, not one per point" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4682,10 +5088,7 @@ test "wl_touch frame batching: one frame per batch, not one per point" {
 
 test "wl_touch down/up serials validate in the receiving client's ring" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4723,10 +5126,7 @@ test "wl_touch down/up serials validate in the receiving client's ring" {
 
 test "a compositor grab closes the touch sequence and swallows later touch (S2)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4783,10 +5183,7 @@ test "a compositor grab closes the touch sequence and swallows later touch (S2)"
 
 test "a touch-down never moves keyboard focus (wlroots parity)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4829,10 +5226,7 @@ test "a touch-down never moves keyboard focus (wlroots parity)" {
 
 test "wl_touch.cancel ends every live point and closes the focus" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4873,10 +5267,7 @@ test "wl_touch.cancel ends every live point and closes the focus" {
 
 test "the touch focus surface dying closes the touch sequence (F12)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4902,10 +5293,7 @@ test "the touch focus surface dying closes the touch sequence (F12)" {
 
 test "setCapabilities drops the touch bit: the gesture closes and the resource inerts" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4944,10 +5332,7 @@ test "setCapabilities drops the touch bit: the gesture closes and the resource i
 
 test "a wl_touch created mid-gesture is handed the live points" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -4983,10 +5368,7 @@ test "a wl_touch created mid-gesture is handed the live points" {
 
 test "touch gate: a refused surface never sees a down" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -5053,10 +5435,7 @@ test "touch gate: a refused surface never sees a down" {
 
 test "touch gate: a point down before the lock stops moving" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -5113,10 +5492,7 @@ test "touch gate: a point down before the lock stops moving" {
 
 test "no touch gate installed: every picked point is delivered through the gesture" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -5156,10 +5532,7 @@ test "no touch gate installed: every picked point is delivered through the gestu
 
 test "touch gate: a late wl_touch is not handed a gesture the gate refuses" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -5204,10 +5577,7 @@ test "touch gate: a late wl_touch is not handed a gesture the gate refuses" {
 
 test "setCapabilities re-broadcasts and inerts removed-capability resources (S3)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -5251,10 +5621,7 @@ test "setCapabilities re-broadcasts and inerts removed-capability resources (S3)
 
 test "setName re-broadcasts to v2+ seat resources only (S3)" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -5286,10 +5653,7 @@ test "setName re-broadcasts to v2+ seat resources only (S3)" {
 
 test "a capability is withdrawn only on the LAST removal of that kind" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -5359,10 +5723,7 @@ test "a capability is withdrawn only on the LAST removal of that kind" {
 
 test "a device announced twice is withdrawn on its LAST removal" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -5398,10 +5759,7 @@ test "a device announced twice is withdrawn on its LAST removal" {
 
 test "removing the last touch device closes the gesture and inerts wl_touch" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;
@@ -5445,10 +5803,7 @@ test "removing the last touch device closes the gesture and inerts wl_touch" {
 
 test "a device removed while a client tears down keeps the accounting" {
     const allocator = std.testing.allocator;
-    const ts = TestServer.init(allocator) catch |err| {
-        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
-        return;
-    };
+    const ts = try initTestServer(allocator);
     defer ts.deinit();
 
     const a = &ts.a;

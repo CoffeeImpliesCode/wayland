@@ -140,7 +140,14 @@
 //!     comes into proximity before anything is focused under the cursor
 //!     is entered from the next tablet event instead of being dropped;
 //!     a pad has no libinput focus event at all, so it takes focus on
-//!     its first event and follows the pointer focus from there;
+//!     its first event and follows the pointer focus from there. The
+//!     backend KEEPS a copy of the pad's focus surface, and a copy is
+//!     not covered by the seat's own surface-destroy listener: the pad
+//!     watch (onPadFocusDestroy) clears it from inside the surface's
+//!     destroy signal, so a padLeave can never name a surface that is
+//!     already freed. A tool needs no such watch — proximity_out names
+//!     the tool, not a surface, so the tool's copy is only ever
+//!     compared;
 //!   - removal (either hotplug path) is the reverse order the protocol
 //!     requires: a tool in proximity gets proximity_out BEFORE removed
 //!     (tablet-v2.xml:361-373), a focused pad gets leave before removed,
@@ -218,8 +225,10 @@ const log_mod = @import("../utils/log.zig");
 const backend = @import("backend.zig");
 const seat_mod = @import("../compositor/seat.zig");
 const surface_mod = @import("../compositor/surface.zig");
+const wire = @import("../core/wire.zig");
 const tablet_mod = @import("../shell/tablet.zig");
 const server = @import("protocol").server;
+const client = @import("protocol").client;
 
 // ---------------------------------------------------------------------------
 // Constants — numeric values verified against the real headers:
@@ -1047,10 +1056,12 @@ const TabletToolBinding = struct {
     /// out, whether or not a protocol event could be sent yet.
     in_proximity: bool = false,
     /// The surface the last proximity_in named, or null when the tool is
-    /// not entered. Only ever COMPARED against the seat's pointer focus —
-    /// a focused-away surface is freed by the seat, so the pointer must
-    /// not be dereferenced; the surface a new proximity_in names is the
-    /// one the seat handed us.
+    /// not entered. Only ever COMPARED against the seat's pointer focus
+    /// and tested for null: proximity_out names the tool and not a
+    /// surface (tablet-v2.xml:361-373), so unlike a pad's this pointer
+    /// is never dereferenced and a surface that died under it is inert.
+    /// The surface a new proximity_in names is the one the seat handed
+    /// us, which is live.
     focus: ?*surface_mod.Surface = null,
 };
 
@@ -1068,11 +1079,74 @@ const TabletPadBinding = struct {
     group_buttons: []const []const u32,
     button_storage: []u32,
     /// The surface the pad is focused on, or null when it is not entered.
-    /// padLeave names the surface it leaves (tablet-v2.xml:1203-1210), so
-    /// unlike a tool's this one IS dereferenced — by the module, which
-    /// arms a destroy listener on it and forgets it when it dies.
+    /// padLeave NAMES the surface it leaves (tablet-v2.xml:1203-1210), so
+    /// unlike a tool's this one IS dereferenced — by the module, from the
+    /// leave this binding asks for. The module forgets ITS copy of the
+    /// focus when the surface dies — attachFocus arms
+    /// onFocusSurfaceDestroy in shell/tablet.zig for PadClient.focus —
+    /// but nobody forgets this one, so `watch` holds the surface's
+    /// destroy signal for the backend and clears the field while the
+    /// surface is still alive.
     focus: ?*surface_mod.Surface = null,
+    /// Heap watch on `focus`, never null: a pad without one would have
+    /// nowhere to learn that its focus surface died.
+    watch: *PadFocusWatch,
 };
+
+/// The surface-destroy listener that clears one pad's `focus` copy.
+/// Heap-allocated because a Device sits BY VALUE in the registry's
+/// std.ArrayList, which reallocates and copies its entries when a node is
+/// plugged in: a listener living in the binding would leave the
+/// surface's listener list pointing at a link node the realloc moved out
+/// from under it. A watch is a stable object, and it names its device by
+/// the libinput handle — the identity `findByHandle` matches on, and one
+/// that does not move when the entry does.
+const PadFocusWatch = struct {
+    listener: wire.Listener(*surface_mod.Surface),
+    backend: *Libinput,
+    device: *c.libinput_device,
+};
+
+/// A pad's focus surface is being destroyed: forget the backend's copy
+/// now, while the surface is still alive, so that no later padLeave or
+/// device removal names freed memory (tablet-v2.xml:1203-1210).
+///
+/// The seat dropping its own pointer focus does NOT do this. That
+/// clears Seat.pointer_focus, which this copy is merely compared
+/// against (Seat.surfaceDestroyed, wlr_seat_pointer.c:210-225); the two
+/// pointers agree about who is focused, never about when one died.
+fn onPadFocusDestroy(listener: *wire.Listener(*surface_mod.Surface), surface: *surface_mod.Surface) void {
+    const watch: *PadFocusWatch = @fieldParentPtr("listener", listener);
+    // The surface is tearing down and its list is about to be dropped:
+    // unhook, or the link points into a freed Surface. The emit is
+    // wl_signal_emit_safe (zig-wayland wayland.zig emitInner), which
+    // keeps iterating after a listener removes itself.
+    listener.link.remove();
+    const self = watch.backend;
+    const index = self.devices.findByHandle(watch.device) orelse return;
+    const binding = if (self.devices.items.items[index].pad) |*pad| pad else return;
+    if (binding.focus != surface) return;
+    binding.focus = null;
+}
+
+/// A listener that is on no signal. wire.Listener(T).init leaves `link`
+/// UNDEFINED, and detachPadWatch plus the destroy handler test
+/// link.prev: a removed link is {null, null}, a never-added one a wild
+/// pointer (shell/tablet.zig detachedListener, same reason).
+fn detachedListener(comptime T: type, comptime notify: wire.Listener(T).NotifyFn) wire.Listener(T) {
+    var listener = wire.Listener(T).init(notify);
+    listener.link = .{ .prev = null, .next = null };
+    return listener;
+}
+
+/// Unhook a pad focus watch from whatever surface it is watching. Every
+/// focus change calls this first, and so does the binding's teardown: a
+/// surface outlives the device entry it was focused on, and a freed link
+/// node still sitting in a live surface's list would be written to by
+/// that surface's next destroy.
+fn detachPadWatch(watch: *PadFocusWatch) void {
+    if (watch.listener.link.prev != null) watch.listener.link.remove();
+}
 
 /// A device announced to the compositor and tracked in the registry.
 const Device = struct {
@@ -1130,6 +1204,11 @@ fn freeTabletBinding(allocator: std.mem.Allocator, device: *Device) void {
     for (device.tools.items) |binding| allocator.free(binding.capabilities);
     device.tools.deinit(allocator);
     if (device.pad) |pad| {
+        // The watch may still be hooked into the focus surface's destroy
+        // signal, and that surface outlives the device entry: unhook
+        // before the link node is freed.
+        detachPadWatch(pad.watch);
+        allocator.destroy(pad.watch);
         allocator.free(pad.groups);
         allocator.free(pad.group_buttons);
         allocator.free(pad.button_storage);
@@ -1532,11 +1611,30 @@ const Libinput = struct {
             self.tabletRegistrationFailed(info.name, @errorName(err));
             return;
         };
+        // The watch is only hooked to a surface when the pad takes
+        // focus, but it has to exist from here on: the binding is a value
+        // the registry copies, so the watch is a heap object of its own.
+        // Without one there is nothing that could learn the focus
+        // surface died, and the pad's focus copy would outlive it.
+        const watch = allocator.create(PadFocusWatch) catch {
+            tablet.removePad(hw);
+            allocator.free(storage);
+            allocator.free(button_lists);
+            allocator.free(groups);
+            self.tabletRegistrationFailed(info.name, "pad focus watch allocation failed");
+            return;
+        };
+        watch.* = .{
+            .listener = detachedListener(*surface_mod.Surface, onPadFocusDestroy),
+            .backend = self,
+            .device = entry.handle,
+        };
         entry.pad = TabletPadBinding{
             .hw = hw,
             .groups = groups,
             .group_buttons = button_lists,
             .button_storage = storage,
+            .watch = watch,
         };
     }
 
@@ -1602,6 +1700,12 @@ const Libinput = struct {
             tablet.removeTool(binding.hw);
         }
         if (device.pad) |pad| {
+            // A focus surface that died before the node did is not in
+            // this binding: onPadFocusDestroy cleared it, so this names
+            // either a live surface or nothing. Nothing can be sent for
+            // the dead one — padLeave carries the surface
+            // (tablet-v2.xml:1203-1210) and there is no resource left to
+            // carry.
             if (pad.focus) |surface| tablet.padLeaveHw(pad.hw, surface);
             tablet.removePad(pad.hw);
         }
@@ -1847,13 +1951,22 @@ const Libinput = struct {
         if (device.pad) |*pad| {
             if (pad.focus == surface) return;
             // padLeave NAMES the surface it leaves (tablet-v2.xml:1203-
-            // 1210), so the module dereferences this pointer: it only
-            // reaches here from a pad event, and the seat drops its own
-            // focus when the surface dies, so a freed surface cannot be
-            // named twice.
+            // 1210), so the module dereferences `pad.focus`. The seat
+            // dropping ITS pointer focus does not clear this copy — the
+            // two are separate pointers that merely agree on who is
+            // focused — so the invariant is the watch's: onPadFocusDestroy
+            // clears `pad.focus` from inside the surface's destroy
+            // signal, while the surface is still alive. Everything that
+            // can read `pad.focus` therefore reads either a live surface
+            // or null.
             if (pad.focus) |old| tablet.padLeaveHw(pad.hw, old);
-            if (surface) |focused| tablet.padEnterHw(pad.hw, tablet_hw, focused, self.seat.nowMs());
-            pad.focus = surface;
+            detachPadWatch(pad.watch);
+            pad.focus = null;
+            if (surface) |focused| {
+                tablet.padEnterHw(pad.hw, tablet_hw, focused, self.seat.nowMs());
+                pad.focus = focused;
+                focused.events.destroy.add(&pad.watch.listener);
+            }
         }
     }
 
@@ -2763,6 +2876,9 @@ const TabletFixture = struct {
     libinput: *Libinput,
     base: *backend.Backend,
     surface: *surface_mod.Surface,
+    /// The client-side proxy of `surface`, so a test can make the CLIENT
+    /// destroy it, the way that surface dies in a real session.
+    proxy: *client.wl.Surface,
     /// Whether the hit test finds the surface. Clearing it models the
     /// pointer leaving every surface, which is how a tablet tool and a pad
     /// lose their focus surface.
@@ -2783,6 +2899,7 @@ const TabletFixture = struct {
             .libinput = undefined,
             .base = undefined,
             .surface = made.surface,
+            .proxy = made.proxy,
         };
         // The seat has no compositor hit test here; one surface covers
         // every point, which is all a tablet focus needs.
@@ -2828,6 +2945,15 @@ const TabletFixture = struct {
     /// event log.
     fn pump(self: *TabletFixture) !void {
         try self.test_server.pump();
+    }
+
+    /// Make a second client surface and make the hit test return it: a
+    /// test that needs the pad to follow the pointer somewhere else
+    /// after the surface it was focused on died.
+    fn replaceSurface(self: *TabletFixture) !void {
+        const made = try self.test_server.makeSurface();
+        self.surface = made.surface;
+        self.proxy = made.proxy;
     }
 
     /// The client's event log so far. EventLog.text is not `pub` in
@@ -3064,6 +3190,58 @@ test "a pad takes focus on its first event and leaves when the pointer does" {
     try fixture.pump();
     try testing.expectEqualStrings(
         "tablet_added name id bustype done pad_added group buttons ring group_done group buttons modes group_done pad_buttons pad_done enter mode_switch mode_switch leave enter mode_switch mode_switch leave removed removed ",
+        fixture.log(),
+    );
+    try testing.expectEqual(@as(usize, 0), fixture.test_server.tablet.?.pads.items.len);
+    try testing.expectEqual(@as(usize, 0), fixture.test_server.tablet.?.tablets.items.len);
+}
+
+test "a pad's focus copy dies with the surface it named" {
+    const allocator = testing.allocator;
+    const fixture = try TabletFixture.init(allocator);
+    defer fixture.deinit();
+    const index = try fixture.addDevice(capsBit(device_cap_tablet_pad));
+
+    // The pad takes focus on the surface under the pointer, and the
+    // backend keeps its own copy of it.
+    fixture.libinput.focusTabletPad(fixture.device(index));
+    try fixture.pump();
+    try testing.expectEqualStrings(
+        "tablet_added name id bustype done pad_added group buttons ring group_done group buttons modes group_done pad_buttons pad_done enter mode_switch mode_switch ",
+        fixture.log(),
+    );
+    try testing.expect(fixture.device(index).pad.?.focus == fixture.surface);
+
+    // The client destroys that surface. The seat drops ITS pointer focus
+    // on the same signal; the pad's copy is a second pointer and nothing
+    // else clears it, yet padLeave NAMES the surface it leaves
+    // (tablet-v2.xml:1203-1210) and the module dereferences it, so the
+    // copy must be gone before Surface.destroy returns the memory to the
+    // allocator.
+    fixture.proxy.destroy();
+    try fixture.pump();
+    try testing.expect(fixture.test_server.seat.?.pointer_focus == null);
+    try testing.expect(fixture.device(index).pad.?.focus == null);
+
+    // The pointer moves to another surface and the pad is used again: a
+    // plain enter. Naming the surface that died here would be a read of
+    // freed memory.
+    try fixture.replaceSurface();
+    fixture.test_server.seat.?.pointerMotion(40, 50);
+    fixture.libinput.focusTabletPad(fixture.device(index));
+    try fixture.pump();
+    try testing.expectEqualStrings(
+        "tablet_added name id bustype done pad_added group buttons ring group_done group buttons modes group_done pad_buttons pad_done enter mode_switch mode_switch enter mode_switch mode_switch ",
+        fixture.log(),
+    );
+
+    // Unplugging the node leaves the surface that is still focused, then
+    // retires the pad and the tablet it hangs off
+    // (tablet-v2.xml:1203-1211).
+    fixture.libinput.removeDeviceAt(index);
+    try fixture.pump();
+    try testing.expectEqualStrings(
+        "tablet_added name id bustype done pad_added group buttons ring group_done group buttons modes group_done pad_buttons pad_done enter mode_switch mode_switch enter mode_switch mode_switch leave removed removed ",
         fixture.log(),
     );
     try testing.expectEqual(@as(usize, 0), fixture.test_server.tablet.?.pads.items.len);
