@@ -3043,6 +3043,15 @@ fn finishFrame(self: *ServerState, out: *wayland.output.Output, perf: *FramePerf
     // the pending flag so the next flip event skips until a change.
     self.repaint_pending = false;
     tracy.frameMark(null);
+    // `surfaces` is this frame's FRAME-DONE FAN-OUT: the count the
+    // sendFrameDone loop above walked, off the same scene.presented
+    // with no rebuild in between. It is NOT the drawn count —
+    // collectCanvasItems drops the cursor surface, drag icons, disabled
+    // nodes and (GLES2) non-identity buffer transforms. A frame logging
+    // surfaces=0 sent no callback at all, so it cannot be the frame a
+    // client's wl_callback.done rode: that callback always rides a frame
+    // that composited first (compositeFrame) and committed to the output
+    // second (presentFrame), both above.
     log.debug("render frame={d} surfaces={d}", self.io, self.log_cfg, "server", .{
         self.frames_rendered,
         self.scene.?.presented.items.len,
