@@ -44,6 +44,24 @@ const Region = region_mod.Region;
 /// version of the interface; matches build.zig's scanner.generate).
 pub const compositor_version: u32 = 7;
 
+/// A producer registry's buffer lookup: given a client wl_buffer
+/// resource, return the Buffer the module already wrapped, or null when
+/// the resource is not one of that module's buffers. `ctx` is the module
+/// pointer the server handed to Compositor.setDmabufResolver.
+///
+/// A function pointer rather than a `?*linux_dmabuf.LinuxDmabuf` field on
+/// purpose. shell/linux_dmabuf.zig imports compositor/compositor.zig and
+/// compositor/surface.zig (its harness builds a real Compositor), so
+/// naming its type here would close a compositor<->shell cycle and pull a
+/// shell protocol module into wl_compositor's dependency set. This seam
+/// keeps the compositor protocol-agnostic: the server, which owns both
+/// modules, hands the lookup over at startup and takes it back before
+/// teardown.
+pub const DmabufResolver = struct {
+    ctx: *anyopaque,
+    resolve: *const fn (ctx: *anyopaque, resource: *wire.Resource) ?*shm_mod.Buffer,
+};
+
 pub const Compositor = struct {
     allocator: std.mem.Allocator,
     io: *std.Io,
@@ -56,6 +74,9 @@ pub const Compositor = struct {
     /// SHM buffer registry; attach() routes buffers through the tracked
     /// wrapper when set (release-delivering, deduped per resource).
     shm: ?*shm_mod.ShmState = null,
+    /// Optional lookup for wl_buffers that are NOT shm pool buffers
+    /// (today zwp_linux_dmabuf_v1). See DmabufResolver.
+    dmabuf_resolver: ?DmabufResolver = null,
     /// Compositor lifecycle events (wlroots events.new_surface /
     /// events.destroy, wlr_compositor.c:1318-1320, 1348-1350). Consumers
     /// observe surface creation instead of polling `surfaces`.
@@ -70,6 +91,28 @@ pub const Compositor = struct {
     /// Attach the SHM buffer registry to this compositor.
     pub fn setShm(c: *Compositor, state: *shm_mod.ShmState) void {
         c.shm = state;
+    }
+
+    /// Teach wl_surface.attach to resolve zwp_linux_dmabuf_v1 buffers
+    /// through `resolver`. The server calls this right after constructing
+    /// the module; `resolver.ctx` is that module.
+    pub fn setDmabufResolver(c: *Compositor, resolver: DmabufResolver) void {
+        c.dmabuf_resolver = resolver;
+    }
+
+    /// Drop the dmabuf resolver. The server calls this before the module
+    /// is destroyed, so a late wl_surface.attach can never reach a freed
+    /// LinuxDmabuf; attach falls back to the shm registry.
+    pub fn clearDmabufResolver(c: *Compositor) void {
+        c.dmabuf_resolver = null;
+    }
+
+    /// Ask the registered resolver for the Buffer that owns `resource`.
+    /// Null when no resolver is registered, or when the resource is not a
+    /// dmabuf buffer — the caller then takes the shm path.
+    pub fn resolveDmabuf(c: *Compositor, resource: *wire.Resource) ?*shm_mod.Buffer {
+        const r = c.dmabuf_resolver orelse return null;
+        return r.resolve(r.ctx, resource);
     }
 
     /// Create the compositor and register the wl_compositor global.
@@ -88,6 +131,7 @@ pub const Compositor = struct {
             .display = display,
             .global = null,
             .shm = null,
+            .dmabuf_resolver = null,
             // SAFETY: initialized via .init() immediately after construction, before any emit.
             .events = undefined,
         };

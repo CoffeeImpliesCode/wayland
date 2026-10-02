@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Build = std.Build;
 const Scanner = @import("zig_wayland").Scanner;
 
@@ -170,6 +171,26 @@ pub fn build(b: *Build) void {
         lib.addImport("drm_c", drm_c.createModule());
         lib.linkSystemLibrary("drm", .{ .use_pkg_config = .force });
     }
+
+    // GBM (src/buffers/dmabuf.zig + src/backend/drm.zig): libgbm from
+    // nixpkgs#mesa, through a translate-c shim (house pattern, cf.
+    // gles2_c/drm_c/raylib_c). There is no gbm.pc on this project's
+    // PKG_CONFIG_PATH - nixpkgs#mesa-libgbm ships one but no devenv
+    // package propagates it - so the include dir and the link dir are
+    // resolved by `gbmDirs` below instead of `pkg-config --cflags gbm`,
+    // and linked as raw -I/-L exactly like the DRM shim's flags.
+    const gbm = gbmDirs(b);
+    {
+        const gbm_c = b.addTranslateC(.{
+            .root_source_file = b.path("src/buffers/dmabuf_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        gbm_c.addSystemIncludePath(.{ .cwd_relative = gbm.include });
+        lib.addImport("gbm_c", gbm_c.createModule());
+        linkGbm(b, lib, gbm);
+    }
     // libinput backend (src/backend/libinput.zig): udev context, evdev
     // devices; the runtime lib is in the devenv/nix closure.
     lib.linkSystemLibrary("libinput", .{});
@@ -191,6 +212,10 @@ pub fn build(b: *Build) void {
             },
         }),
     });
+    // libgbm reaches `exe` through the wayland lib module import, but
+    // system-link propagation is not automatic - link it explicitly
+    // (same pattern as the raylib/egl links below).
+    linkGbm(b, exe.root_module, gbm);
     b.installArtifact(exe);
 
     // GLES2/EGL renderer (src/renderer/gles2.zig): GPU compositor via EGL +
@@ -319,6 +344,8 @@ pub fn build(b: *Build) void {
     server_exe.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
     server_exe.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
     b.installArtifact(server_exe);
+    // libgbm, for the same reason as exe above.
+    linkGbm(b, server_exe.root_module, gbm);
 
     const server_run_step = b.step("run-server", "Run the M1 test server");
     const server_run_cmd = b.addRunArtifact(server_exe);
@@ -411,6 +438,8 @@ pub fn build(b: *Build) void {
     // is not automatic — link egl/glesv2 explicitly (raylib pattern).
     exe_test_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
     exe_test_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
+    // libgbm, for the same reason as exe above.
+    linkGbm(b, exe_test_module, gbm);
     const exe_tests = b.addTest(.{ .root_module = exe_test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
@@ -439,4 +468,148 @@ pub fn build(b: *Build) void {
     });
     const docs_step = b.step("docs", "Generate documentation");
     docs_step.dependOn(&install_docs.step);
+}
+
+/// Where libgbm's headers and library live.
+const GbmDirs = struct {
+    include: []const u8,
+    lib: []const u8,
+};
+
+/// Link libgbm into one module. System-link propagation through a module
+/// import is not automatic in Zig 0.16 (the raylib/egl blocks in this file
+/// hit the same thing), so every artifact that compiles a file importing
+/// `gbm_c` needs the -lgbm, -L and rpath itself.
+fn linkGbm(b: *Build, module: *std.Build.Module, dirs: GbmDirs) void {
+    _ = b;
+    module.linkSystemLibrary("gbm", .{});
+    module.addLibraryPath(.{ .cwd_relative = dirs.lib });
+    module.addRPath(.{ .cwd_relative = dirs.lib });
+}
+
+/// Resolve libgbm's include dir and link dir.
+///
+/// pkg-config first: on a normal system (and in a devenv that propagates
+/// mesa-libgbm) `gbm` resolves from its .pc. This project's devenv does
+/// not - nixpkgs#mesa-libgbm ships a gbm.pc, but no devenv package
+/// propagates that output onto PKG_CONFIG_PATH, so
+/// `pkg-config --variable=includedir gbm` fails even though the header and
+/// the shared object are in the closure. The fallback picks the output
+/// straight out of the nix store, highest version first so the choice is
+/// deterministic, which is the raw -I/-L style the ticket calls for.
+fn gbmDirs(b: *Build) GbmDirs {
+    const includedir = probeGbm(b, "--variable=includedir") orelse
+        return nixGbmDirs(b);
+    const libdir = probeGbm(b, "--variable=libdir") orelse
+        return nixGbmDirs(b);
+    return .{ .include = b.dupe(includedir), .lib = b.dupe(libdir) };
+}
+
+/// `pkg-config <arg> gbm`, or null when gbm is not resolvable (the .pc
+/// is absent, or the package name is unknown to it).
+fn probeGbm(b: *Build, comptime arg: []const u8) ?[]const u8 {
+    var code: u8 = 0;
+    const out = b.runAllowFail(&.{ "pkg-config", arg, "gbm" }, &code, .ignore) catch return null;
+    if (code != 0) return null;
+    return std.mem.trim(u8, out, " \t\r\n");
+}
+
+/// The mesa-libgbm dev output from /nix/store.
+fn nixGbmDirs(b: *Build) GbmDirs {
+    const prefix = newestNixOutput(b, "mesa-libgbm", "gbm") orelse @panic(
+        "libgbm not found: no gbm.pc on PKG_CONFIG_PATH and no " ++
+            "mesa-libgbm output in /nix/store (add nixpkgs#mesa to the " ++
+            "devenv packages)",
+    );
+    return .{
+        .include = std.fs.path.join(b.allocator, &.{ prefix, "include" }) catch @panic("OOM"),
+        .lib = std.fs.path.join(b.allocator, &.{ prefix, "lib" }) catch @panic("OOM"),
+    };
+}
+
+/// The highest-versioned /nix/store directory whose name contains
+/// `-<output_name>-<version>` and which ships
+/// `lib/pkgconfig/<pc_name>`. Requiring the .pc keeps a
+/// differently-packaged output (a runtime-only one, say) from being
+/// picked; `output_name` and `pc_name` differ because nixpkgs names the
+/// derivation `mesa-libgbm` but ships the file as `gbm.pc`.
+fn newestNixOutput(b: *Build, output_name: []const u8, pc_name: []const u8) ?[]const u8 {
+    var dir = std.Io.Dir.openDirAbsolute(b.graph.io, "/nix/store", .{ .iterate = true }) catch return null;
+    defer dir.close(b.graph.io);
+    const marker = std.fmt.allocPrint(b.allocator, "-{s}-", .{output_name}) catch @panic("OOM");
+    const pc_file = std.fmt.allocPrint(b.allocator, "{s}.pc", .{pc_name}) catch @panic("OOM");
+    var best: ?[]const u8 = null;
+    var best_version: []const u8 = "";
+    var it = dir.iterate();
+    while (it.next(b.graph.io) catch null) |entry| {
+        // The d_type is not always populated, so `unknown` has to be
+        // accepted too; the .pc probe below is the real filter.
+        if (entry.kind != .directory and entry.kind != .unknown) continue;
+        const at = std.mem.indexOf(u8, entry.name, marker) orelse continue;
+        const version = entry.name[at + marker.len ..];
+        if (std.mem.lastIndexOfScalar(u8, version, '.') == null) continue;
+        if (!versionNewer(version, best_version)) continue;
+        const pc = std.fs.path.join(b.allocator, &.{
+            "/nix/store", entry.name, "lib", "pkgconfig", pc_file,
+        }) catch @panic("OOM");
+        const f = std.Io.Dir.openFileAbsolute(b.graph.io, pc, .{}) catch continue;
+        f.close(b.graph.io);
+        if (!elfMatchesTarget(b, entry.name)) continue;
+        best = std.fmt.allocPrint(b.allocator, "/nix/store/{s}", .{entry.name}) catch @panic("OOM");
+        best_version = version;
+    }
+    return best;
+}
+
+/// Is the output's `lib/libgbm.so` an ELF object this build can link?
+///
+/// The nix store holds one mesa-libgbm per platform the closure ever
+/// referenced: on this machine there is an x86-64 build AND an i386 one
+/// with the same name and version, and picking the wrong one gives
+/// "libgbm.so is incompatible with elf64-x86-64" at link time. The
+/// version comparison cannot tell them apart, so the ELF header decides.
+fn elfMatchesTarget(b: *Build, store_entry: []const u8) bool {
+    const lib = std.fs.path.join(b.allocator, &.{ "/nix/store", store_entry, "lib", "libgbm.so" }) catch
+        @panic("OOM");
+    var f = std.Io.Dir.openFileAbsolute(b.graph.io, lib, .{}) catch return false;
+    defer f.close(b.graph.io);
+    var hdr: [20]u8 = undefined;
+    const n = f.readStreaming(b.graph.io, &.{&hdr}) catch return false;
+    // e_ident: magic, EI_CLASS (2 = ELFCLASS64), EI_DATA (1 = little).
+    if (n < hdr.len or !std.mem.eql(u8, hdr[0..4], "\x7fELF")) return false;
+    if (hdr[4] != 2 or hdr[5] != 1) return false;
+    // e_machine at offset 18, little-endian.
+    const machine = std.mem.readInt(u16, hdr[18..20], .little);
+    return machine == elfMachineFor(builtin.cpu.arch);
+}
+
+fn elfMachineFor(arch: std.Target.Cpu.Arch) u16 {
+    return switch (arch) {
+        .x86_64 => 62, // EM_X86_64
+        .aarch64 => 183, // EM_AARCH64
+        .arm => 40, // EM_ARM
+        .riscv64 => 243, // EM_RISCV
+        .powerpc64 => 21, // EM_PPC64
+        .s390x => 22, // EM_S390
+        .loongarch64 => 258, // EM_LOONGARCH
+        // An arch we do not know the machine number for: refuse rather
+        // than link an object for the wrong platform.
+        else => 0xffff,
+    };
+}
+
+/// Dotted-numeric "is `a` newer than `b`" ("" is older than everything, so
+/// the first match always wins).
+fn versionNewer(a: []const u8, b: []const u8) bool {
+    if (b.len == 0) return true;
+    var ai = std.mem.splitScalar(u8, a, '.');
+    var bi = std.mem.splitScalar(u8, b, '.');
+    while (true) {
+        const an = ai.next();
+        const bn = bi.next();
+        if (an == null and bn == null) return false;
+        const av = if (an) |v| std.fmt.parseInt(u32, v, 10) catch return false else 0;
+        const bv = if (bn) |v| std.fmt.parseInt(u32, v, 10) catch return false else 0;
+        if (av != bv) return av > bv;
+    }
 }

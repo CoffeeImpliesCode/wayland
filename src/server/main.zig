@@ -89,6 +89,31 @@ const Subsurface = std.meta.Child(std.meta.Child(
 const Camera = wayland.camera.Camera;
 const CanvasItem = wayland.canvas.CanvasItem;
 
+// ---------------------------------------------------------------------------
+// zwp_linux_dmabuf_v1 -> wl_surface.attach
+// ---------------------------------------------------------------------------
+
+/// `LinuxDmabuf.fromResource` rewrapped as a Compositor.DmabufResolver.
+/// The compositor reaches it through a function pointer instead of
+/// naming the type, because shell/linux_dmabuf.zig imports
+/// compositor/compositor.zig: a direct field would close a
+/// compositor<->shell cycle.
+fn resolveDmabufBuffer(ctx: *anyopaque, resource: *wire.Resource) ?*wayland.shm.Buffer {
+    const linux: *wayland.linux_dmabuf.LinuxDmabuf = @ptrCast(@alignCast(ctx));
+    return linux.fromResource(resource);
+}
+
+/// Teach wl_surface.attach to resolve zwp_linux_dmabuf_v1 buffers.
+/// Without it every dmabuf attach lands in the shm wrap, which answers
+/// error.InvalidBuffer for a buffer it never created and the client dies
+/// with "unknown buffer type" (compositor/surface.zig handleAttach, F56).
+fn wireDmabufResolver(compositor: *wayland.compositor.Compositor, linux: *wayland.linux_dmabuf.LinuxDmabuf) void {
+    compositor.setDmabufResolver(.{
+        .ctx = linux,
+        .resolve = resolveDmabufBuffer,
+    });
+}
+
 /// L-D7: EXCLUSIVE layer keyboard grab state (see
 /// ServerState.layer_kbd_grab). The `layer` pointer is compared for
 /// identity only and never dereferenced: a destroyed surface clears the
@@ -149,6 +174,13 @@ const watchdog_timeout_ms: u64 = 5000;
 const xdg_ping_interval_ms: u64 = 5000;
 /// Background color (straight alpha RGBA).
 const background_color = [4]f32{ 0.1, 0.1, 0.12, 1.0 };
+/// The opaque fill a locked session shows where no lock surface covers
+/// the output. ext_session_lock_v1:74-91 requires "an opaque color such
+/// that their normal content is fully hidden"; black is the choice sway
+/// makes, and an alpha of 1 is what makes it opaque (the framebuffer is
+/// premultiplied ARGB8888, so a translucent fill would let the previous
+/// canvas's memory show through).
+const lock_blank_color = [4]f32{ 0.0, 0.0, 0.0, 1.0 };
 /// The pointer-move threshold (px, squared) before a left-button press
 /// becomes a camera drag. A click with sub-threshold micro-movement keeps
 /// the seat's click-to-focus (the terminal gets the keyboard) instead of
@@ -187,6 +219,48 @@ const ServerState = struct {
     fractional_scale: *wayland.fractional_scale.FractionalScale,
     /// wp_viewporter (crop/scale surface content).
     viewporter: *wayland.viewporter.Viewporter,
+    /// zwp_pointer_gestures_v1 (shell/pointer_gestures.zig): swipe,
+    /// pinch and hold recognition fed from the seat's pointer stream.
+    /// Owns its seat listeners; the module is the wiring (main only
+    /// hands it the seat).
+    pointer_gestures: ?*wayland.pointer_gestures.PointerGestures = null,
+    /// zwp_relative_pointer_manager_v1 (shell/relative_pointer.zig):
+    /// unclaccelerated relative motion.
+    relative_pointer: ?*wayland.relative_pointer.RelativePointer = null,
+    /// zwp_pointer_constraints_v1 (shell/pointer_constraints.zig):
+    /// locked and confined pointers.
+    pointer_constraints: ?*wayland.pointer_constraints.PointerConstraints = null,
+    /// zwp_tablet_manager_v2 (shell/tablet.zig): the tablet/tool/pad
+    /// hardware registry. No tablet input backend exists yet, so no
+    /// hardware is registered and the global announces nothing beyond
+    /// the per-client zwp_tablet_seat_v2 (the module's documented
+    /// "correct with no hardware" state).
+    tablet: ?*wayland.tablet.Tablet = null,
+    /// wp_cursor_shape_manager_v1 (shell/cursor_shape.zig): per-device
+    /// cursor shapes, gated on the enter serial this server records in
+    /// syncCursorShapeSerials. Needs the tablet module: a tablet-tool
+    /// device resolves its serial there.
+    cursor_shape: ?*wayland.cursor_shape.CursorShape = null,
+    /// wp_tearing_control_manager_v1 (shell/tearing_control.zig): the
+    /// per-surface async-presentation hint the present path consults in
+    /// consultTearingHints.
+    tearing_control: ?*wayland.tearing_control.TearingControl = null,
+    /// ext_session_lock_manager_v1 (shell/session_lock.zig): the
+    /// privilege boundary. Read on every input gate (isLocked) and on
+    /// every render decision (lockedFrameFor).
+    session_lock: ?*wayland.session_lock.SessionLock = null,
+    /// zwlr_data_control_manager_v1 (compositor/data_control.zig): the
+    /// compositor as data SOURCE — a client reads the seat selection
+    /// without holding keyboard focus.
+    data_control: ?*wayland.data_control.DataControlManager = null,
+    /// zwlr_foreign_toplevel_manager_v1 (shell/foreign_toplevel.zig):
+    /// our own xdg toplevels as client-visible handles.
+    foreign_toplevel: ?*wayland.foreign_toplevel.ForeignToplevelManager = null,
+    /// zwp_linux_dmabuf_v1 (shell/linux_dmabuf.zig): DMA-BUF buffer
+    /// import. Registered ONLY when a GBM device exists (the DRM
+    /// backend's); null on every backend without one, which is also the
+    /// documented "no global" state of the module.
+    linux_dmabuf: ?*wayland.linux_dmabuf.LinuxDmabuf = null,
     renderer: *wayland.renderer.Renderer,
     backend: *wayland.backend.Backend,
     framebuffer: *pixman.Framebuffer,
@@ -340,6 +414,38 @@ const ServerState = struct {
     /// WAYLAND_PERF=1: log per-frame pipeline timings (import -> render
     /// -> present) in microseconds.
     perf: bool = false,
+    /// ext_session_lock_v1 `locked`: the privilege boundary closed. The
+    /// handler runs inside the lock surface's commit dispatch, BEFORE
+    /// renderFrame can composite, which is what makes the next frame the
+    /// first locked frame (shell/session_lock.zig wiring item 1).
+    session_locked_listener: wire.Listener(*wayland.session_lock.SessionLock),
+    /// ext_session_lock_v1 unlock: the gates come off and the normal
+    /// focus policy resumes.
+    session_unlocked_listener: wire.Listener(*wayland.session_lock.SessionLock),
+    /// A lock surface was fully configured: track its wl_surface in the
+    /// scene and position it over its output.
+    new_lock_surface_listener: wire.Listener(*wayland.session_lock.LockSurface),
+    /// A lock surface stopped covering its output: drop its scene node so
+    /// an unlocked session cannot composite the stale lock screen.
+    lock_surface_gone_listener: wire.Listener(*wayland.session_lock.LockSurface),
+    /// wp_cursor_shape_device_v1.set_shape was accepted. This compositor
+    /// draws one cursor image for every shape (shell/cursor_shape.zig),
+    /// so the only reaction is the record in the log.
+    cursor_shape_changed_listener: wire.Listener(*wayland.cursor_shape.ShapeChange),
+    /// The wl_surface the pointer was last sent an enter for, for
+    /// syncCursorShapeSerials. Compared by identity only; null means
+    /// "no serial is recorded" — never dereferenced.
+    cursor_shape_focus: ?*Surface = null,
+    /// The number of wl_pointer resources syncCursorShapeSerials has
+    /// already visited. A client may bind more wl_pointers after an
+    /// enter, and a resource that never saw the enter has no serial;
+    /// watching the count re-scans when the set changes.
+    cursor_shape_pointers: usize = 0,
+    /// Whether the cursor is hidden while a session is locked
+    /// (shell/session_lock.zig wiring item 2). The cursor nodes are
+    /// re-enabled by Cursor.update on every frame, so the server hides
+    /// the cursor by never painting it (compositeCanvas draws it).
+    cursor_hidden: bool = false,
 
     new_output_listener: wire.Listener(*wayland.output.Output),
     frame_listener: wire.Listener(*wayland.output.Output),
@@ -562,6 +668,94 @@ pub fn main(init: std.process.Init) !void {
         seat,
     );
     defer primary_selection.deinit();
+    // --- the pointer-stream protocols ------------------------------------
+    // Dependency order: everything below is constructed AFTER the seat
+    // it may attach to, and each defer therefore runs BEFORE the seat's
+    // (LIFO), so no module can reach a freed seat during teardown.
+    //
+    // zwp_pointer_gestures_v1 (unstable): swipe/pinch/hold recognition.
+    // The module installs its own seat listeners (setSeat), so main's
+    // only job is handing it the seat.
+    const pointer_gestures = try wayland.pointer_gestures.PointerGestures.init(
+        allocator,
+        io,
+        &log_cfg,
+        display,
+        seat,
+    );
+    defer pointer_gestures.deinit();
+    // zwp_relative_pointer_manager_v1 (unstable): unclaccelerated
+    // relative motion (24.8 deltas + a 64-bit utime).
+    const relative_pointer = try wayland.relative_pointer.RelativePointer.init(
+        allocator,
+        io,
+        &log_cfg,
+        display,
+        seat,
+    );
+    defer relative_pointer.deinit();
+    // zwp_pointer_constraints_v1 (unstable): locked and confined
+    // pointers. Needs the compositor to resolve a wl_surface for
+    // lock_pointer / confine_pointer.
+    const pointer_constraints = try wayland.pointer_constraints.PointerConstraints.init(
+        allocator,
+        io,
+        &log_cfg,
+        display,
+        compositor,
+        seat,
+    );
+    defer pointer_constraints.deinit();
+    // zwp_tablet_manager_v2 (stable): the hardware registry. It needs no
+    // seat — a tablet announces its own zwp_tablet_seat_v2 — and no
+    // hardware is registered (this server has no tablet input backend),
+    // which is the module's documented "correct with no hardware" state.
+    const tablet = try wayland.tablet.Tablet.init(allocator, io, &log_cfg, display);
+    defer tablet.deinit();
+    // wp_cursor_shape_manager_v1 (staging): per-device cursor shapes.
+    // Built AFTER the tablet module: a tablet-tool cursor-shape device
+    // resolves its serial through it (shell/cursor_shape.zig), and a
+    // null tablet would make every such device permanently inert.
+    const cursor_shape = try wayland.cursor_shape.CursorShape.init(allocator, io, &log_cfg, display, tablet);
+    defer cursor_shape.deinit();
+    // wp_tearing_control_manager_v1 (staging): the per-surface async
+    // present hint. The present path reads it per surface per frame
+    // (consultTearingHints); the module itself only records.
+    const tearing_control = try wayland.tearing_control.TearingControl.init(allocator, io, &log_cfg, display);
+    defer tearing_control.deinit();
+    // ext_session_lock_manager_v1 (staging): the session-lock privilege
+    // boundary. The module owns the protocol state; main owns the gates
+    // (see lockedFrameFor, pickSurface, keyboardFocusAllowed and the
+    // session_lock_locked_listener handler below).
+    const session_lock = try wayland.session_lock.SessionLock.init(allocator, io, &log_cfg, display);
+    defer session_lock.deinit();
+    // zwlr_data_control_manager_v1 (wlroots/unstable): the compositor as
+    // data SOURCE. Needs the seat (a device is per seat), the ordinary
+    // wl_data_device_manager it mirrors (the read side) and the primary
+    // selection manager (v2's set_primary_selection).
+    const data_control = try wayland.data_control.DataControlManager.init(
+        allocator,
+        io,
+        &log_cfg,
+        display,
+        seat,
+        data_device,
+        primary_selection,
+    );
+    defer data_control.deinit();
+    // zwlr_foreign_toplevel_manager_v1 (wlroots/unstable): our own xdg
+    // toplevels as client-visible handles. Built after the shell (it
+    // subscribes to xdg_wm_base.new_toplevel) and after the seat (its
+    // `activate` request acts on the seat).
+    const foreign_toplevel = try wayland.foreign_toplevel.ForeignToplevelManager.init(
+        allocator,
+        io,
+        &log_cfg,
+        display,
+        shell,
+        seat,
+    );
+    defer foreign_toplevel.deinit();
     const renderer = try pixman.PixmanRenderer.create(allocator, io, &log_cfg);
     defer renderer.destroy();
     // Backend selection: WAYLAND_BACKEND=raylib uses the windowed raylib
@@ -642,6 +836,39 @@ pub fn main(init: std.process.Init) !void {
     };
     defer backend.destroy();
 
+    // zwp_linux_dmabuf_v1 (stable/linux-dmabuf): DMA-BUF buffer import.
+    // Constructed AFTER the backend because the module needs its GBM
+    // device, and its defer runs BEFORE backend.destroy(): the GBM device
+    // belongs to the DRM backend and must outlive the module.
+    //
+    // The module registers its global ONLY for a GBM device, and only the
+    // DRM backend has one — headless / raylib / nested pass null and get
+    // no zwp_linux_dmabuf_v1 global at all (the module's documented gate,
+    // shell/linux_dmabuf.zig). So this server advertises 25 globals and a
+    // DRM one advertises 26.
+    const linux_dmabuf = try wayland.linux_dmabuf.LinuxDmabuf.init(
+        allocator,
+        io,
+        &log_cfg,
+        display,
+        if (backend_is_drm) drm_mod.gbmDevice(drm_mod.DrmBackend.fromBackend(backend)) else null,
+    );
+    defer linux_dmabuf.deinit();
+
+    // From here on wl_surface.attach resolves dmabuf buffers through the
+    // module. The clear is registered AFTER the deinit defer, so LIFO runs
+    // it BEFORE linux_dmabuf.deinit(): no attach can ever call into a
+    // freed module. The window in between is unreachable in practice
+    // (the event loop has stopped), but the ordering makes it impossible
+    // rather than merely unlikely.
+    //
+    // The resolver is set even with no GBM device: LinuxDmabuf.init
+    // returns an inert module (no global, empty registry), so
+    // fromResource answers null for every resource and the shm path runs
+    // exactly as before on headless / raylib / nested.
+    wireDmabufResolver(compositor, linux_dmabuf);
+    defer compositor.clearDmabufResolver();
+
     const framebuffer = try pixman.Framebuffer.create(allocator, output_width, output_height);
     // NOTE: no defer framebuffer.deinit() here — the ServerState owns the
     // framebuffer (state.framebuffer), and onNewOutput resizes it by
@@ -689,6 +916,16 @@ pub fn main(init: std.process.Init) !void {
         .xdg_decoration = xdg_decoration,
         .fractional_scale = fractional_scale,
         .viewporter = viewporter,
+        .pointer_gestures = pointer_gestures,
+        .relative_pointer = relative_pointer,
+        .pointer_constraints = pointer_constraints,
+        .tablet = tablet,
+        .cursor_shape = cursor_shape,
+        .tearing_control = tearing_control,
+        .session_lock = session_lock,
+        .data_control = data_control,
+        .foreign_toplevel = foreign_toplevel,
+        .linux_dmabuf = linux_dmabuf,
         .backend = backend,
         .framebuffer = framebuffer,
         .camera = default_camera,
@@ -715,6 +952,11 @@ pub fn main(init: std.process.Init) !void {
         .seat_pointer_move_listener = wire.Listener(*wayland.seat.Seat).init(onSeatPointerMove),
         .seat_axis_listener = wire.Listener(*wayland.seat.Seat).init(onSeatAxis),
         .seat_focus_listener = wire.Listener(*wayland.seat.Seat).init(onSeatKeyboardFocus),
+        .session_locked_listener = wire.Listener(*wayland.session_lock.SessionLock).init(onSessionLocked),
+        .session_unlocked_listener = wire.Listener(*wayland.session_lock.SessionLock).init(onSessionUnlocked),
+        .new_lock_surface_listener = wire.Listener(*wayland.session_lock.LockSurface).init(onNewLockSurface),
+        .lock_surface_gone_listener = wire.Listener(*wayland.session_lock.LockSurface).init(onLockSurfaceGone),
+        .cursor_shape_changed_listener = wire.Listener(*wayland.cursor_shape.ShapeChange).init(onCursorShapeChanged),
     };
     if (backend_is_drm) state.drm_backend = backend;
     defer state.synth_clicked.deinit(allocator);
@@ -777,11 +1019,29 @@ pub fn main(init: std.process.Init) !void {
     // The compositor hit-tests over the scene graph: surfaces map to
     // scene nodes through the surface entries.
     seat.setPick(pickSurface, &state);
-    // L-D7: layer keyboard-interactivity focus policy — the seat's
-    // built-in click-to-focus must never give keyboard focus to a layer
-    // surface with keyboard_interactivity=none (the move-based routing
-    // in applyLayerKeyboardFocus enforces the same for hover).
-    seat.setKeyboardFocusGate(layerKeyboardFocusAllowed, &state);
+    // Click-to-focus gates, in the order they are consulted: the session
+    // lock first (while locked only a lock surface of the lock client may
+    // take focus), then L-D7's layer policy — a layer surface with
+    // keyboard_interactivity=none must never get focus, and the
+    // move-based routing in applyLayerKeyboardFocus enforces the same
+    // for hover.
+    seat.setKeyboardFocusGate(keyboardFocusAllowed, &state);
+    // ext_session_lock_manager_v1: the four signals main owns. `locked`
+    // runs inside the lock surface's commit dispatch, so the grabs are
+    // ended and the focus forced onto a lock surface BEFORE any frame can
+    // be composited (shell/session_lock.zig wiring item 1).
+    session_lock.events.locked.add(&state.session_locked_listener);
+    session_lock.events.unlocked.add(&state.session_unlocked_listener);
+    session_lock.events.new_lock_surface.add(&state.new_lock_surface_listener);
+    session_lock.events.lock_surface_gone.add(&state.lock_surface_gone_listener);
+    // Unlink before the module deinits run: their teardown emits
+    // lock_surface_gone, and these handlers dereference `state`, whose
+    // own teardown defers were registered later and have already run.
+    defer unlinkSessionLockListeners(&state);
+    // wp_cursor_shape_manager_v1: an accepted set_shape is recorded by the
+    // module; this compositor paints one cursor image for every shape, so
+    // the handler only says so.
+    cursor_shape.events.shape_changed.add(&state.cursor_shape_changed_listener);
 
     // zwlr_screencopy_v1: captures the compositor framebuffer (shm only).
     // The copy is deferred to the next output commit; requestFrame wakes
@@ -1873,6 +2133,13 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         return;
     }
     const perf_t0 = perfNs(self);
+    // ext_session_lock_manager_v1, wiring item 1: the latch is read HERE,
+    // once per frame, and every composite decision below uses this value.
+    // Nothing caches "was I unlocked" across a dispatch, so the first
+    // frame composited after the `locked` signal (which is emitted inside
+    // the lock surface's commit dispatch, before this runs) is already a
+    // locked frame.
+    const lock = lockedFrameFor(self, out);
 
     const perf_t_sync = perfNs(self);
     // Subsurfaces: position child nodes over their mapped parent.
@@ -1933,7 +2200,15 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     // the canvas pass (background fill + camera-transformed surface
     // textures + screen-space cursor) replaces the scene-output render;
     // the damage-ring accounting below is unchanged.
-    if (self.cursor_repaint) {
+    if (lock.locked) {
+        // A locked session never reuses the previous canvas: the two
+        // shortcuts below (hover cursor restore, present-unchanged) would
+        // show a frame composited BEFORE the latch, which is exactly what
+        // the privilege boundary forbids. Refill the output instead.
+        self.cursor_repaint = false;
+        self.frame_kick = false;
+        compositeCanvas(self, lock);
+    } else if (self.cursor_repaint) {
         // Hover cursor move: the canvas is static, so restore the old
         // cursor region from the persisted base + redraw the cursor at the
         // new pointer — no full-canvas recomposite (the ~450ms bilinear).
@@ -1950,7 +2225,7 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
                 if (r) |rr| copyRegion(base, self.framebuffer, rr);
             }
         }
-        self.cursor.?.draw(self.framebuffer);
+        if (!lock.cursor_hidden) self.cursor.?.draw(self.framebuffer);
     } else if (self.frame_kick) {
         // A client is ready for the next frame (pending wl_callback) but
         // the canvas is unchanged. Present the current framebuffer so the
@@ -1958,8 +2233,12 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
         // update — no recomposite.
         self.frame_kick = false;
     } else {
-        compositeCanvas(self);
+        compositeCanvas(self, lock);
     }
+
+    // wp_tearing_control_manager_v1: the present path consults the
+    // committed hint of every surface it is about to scan out, per frame.
+    _ = consultTearingHints(self, out);
     _ = so.damage_ring.rotate();
     const perf_t_render = perfNs(self);
 
@@ -2066,6 +2345,115 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
     }
 }
 
+/// What the present path decided about tearing for one frame
+/// (wp_tearing_control_manager_v1).
+const PresentTearing = struct {
+    /// The presented surfaces whose COMMITTED hint is `.async`. A hint is
+    /// a PERMISSION, not a command, so this count alone never changes the
+    /// commit.
+    async_surfaces: u32 = 0,
+    /// Whether the flip may actually be asynchronous, i.e. the client
+    /// asked AND the output tears. See consultTearingHints.
+    honoured: bool = false,
+};
+
+/// The present path's wp_tearing_control_v1 gate: read every surface's
+/// committed hint once per frame, for exactly the surfaces this frame is
+/// about to scan out (`scene.presented`, rebuilt by collectPresented
+/// earlier in renderFrame).
+///
+/// The OUTPUT GATE is the honest part. `.async` is a permission from the
+/// client (tearing-control-v1.xml:95-100), and wlroots only takes the
+/// asynchronous page-flip path for an output whose DRM commit carries
+/// DRM_MODE_PAGE_FLIP_ASYNC — without it the flip is vsync'd and the hint
+/// has no effect. No backend in this server has an asynchronous page
+/// flip: the DRM backend commits a dumb-buffer flip vsync'd
+/// (backend/drm.zig) and headless / raylib / nested-wayland have no page
+/// flip at all. So this server NEVER tears, and a `.async` hint is
+/// recorded and reported here but the commit below stays vsync'd — the
+/// hint is not silently upgraded into a command. Turning this on needs
+/// `tearing: bool` on output.Output.State plus DRM_MODE_PAGE_FLIP_ASYNC
+/// in backend/drm.zig; until then `honoured` is false by construction.
+fn consultTearingHints(self: *ServerState, out: *wayland.output.Output) PresentTearing {
+    const tc = self.tearing_control orelse return .{};
+    const scene = self.scene orelse return .{};
+    var async_surfaces: u32 = 0;
+    for (scene.presented.items) |surface| {
+        if (tc.hintFor(surface) == .async) async_surfaces += 1;
+    }
+    // The output gate: the client's `.async` is a permission, honoured
+    // only when the output actually tears (see outputTears).
+    const honoured = async_surfaces > 0 and outputTears(out);
+    if (async_surfaces > 0 and !honoured) {
+        log.debug(
+            "tearing: {d} surface(s) request async presentation; this backend flips vsync'd, hint not honoured",
+            self.io,
+            self.log_cfg,
+            "tearing_control",
+            .{async_surfaces},
+        );
+    }
+    return .{ .async_surfaces = async_surfaces, .honoured = honoured };
+}
+
+/// The output half of the wp_tearing_control_v1 gate: does a frame
+/// committed to `out` reach the screen without waiting for the vertical
+/// blank?
+///
+/// FALSE for every backend this server has. wlroots puts
+/// DRM_MODE_PAGE_FLIP_ASYNC on the page-flip DRM commit of an output
+/// configured for it, and only then does a `.async` hint shorten the
+/// frame time; the headless, raylib and nested-wayland backends present
+/// without a page flip at all (Output.emits_present is false for them).
+/// This server's DRM backend (backend/drm.zig) commits its dumb-buffer
+/// flip vsync'd and exposes no tearing switch, and Output.State has no
+/// tearing field to carry one — so a hint is recorded, reported per frame
+/// by consultTearingHints, and deliberately NOT honoured. Making it real
+/// needs `tearing` in output.Output.State (src/output/output.zig) plus
+/// DRM_MODE_PAGE_FLIP_ASYNC in backend/drm.zig; neither is this file.
+fn outputTears(out: *wayland.output.Output) bool {
+    _ = out; // every backend here flips vsync'd; see the doc comment.
+    return false;
+}
+
+/// What the render path must do about the session lock on one output
+/// (ext_session_lock_v1 wiring contract item 3, read fresh for every
+/// frame — the latch is never cached across a dispatch).
+const LockedFrame = struct {
+    /// The session is locked: the whole output rect is filled with the
+    /// opaque lock color BEFORE any node is drawn, and only lock
+    /// surfaces are composited. The cursor, normal surfaces, drag icons
+    /// and popups are all skipped.
+    locked: bool = false,
+    /// `outputIsBlank(out)`: this output has no lock surface, an
+    /// unmapped one, or one SMALLER than the output, so the solid color
+    /// STAYS and no lock content is drawn at all (composited lock
+    /// content must never be stretched to cover the gap —
+    /// ext_session_lock_surface_v1:277-280).
+    blank: bool = false,
+    /// Whether the cursor may be painted at all. A locked session never
+    /// paints it (the contract's "hide the cursor node"), and an explicit
+    /// hide (the same flag the lock handler sets) is honoured on its own,
+    /// so the two can never disagree about what is on screen.
+    cursor_hidden: bool = false,
+};
+
+/// The locked frame for `out`, read at the start of renderFrame. The
+/// `locked` signal is emitted inside the lock surface's commit dispatch
+/// (shell/session_lock.zig), so this read happens after the latch was
+/// written and the frame it decides IS the first locked frame — no
+/// input dispatch or render pass in that dispatch can observe the
+/// session as unlocked.
+fn lockedFrameFor(self: *ServerState, out: *wayland.output.Output) LockedFrame {
+    const sl = self.session_lock orelse return .{ .cursor_hidden = self.cursor_hidden };
+    if (!sl.isLocked()) return .{ .cursor_hidden = self.cursor_hidden };
+    return .{
+        .locked = true,
+        .blank = sl.outputIsBlank(out),
+        .cursor_hidden = true,
+    };
+}
+
 /// Composite one frame into the framebuffer with the M4 canvas pass:
 /// 1. background fill (fb.fill — the scene's background rect is gone),
 /// 2. every mapped surface's texture stamped at its world rect (the
@@ -2085,29 +2473,48 @@ fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
 /// first and copied out, so renderFrame's cursor_repaint path can restore
 /// a cursor region from the base without recompositing the whole canvas
 /// (the ~450ms full-canvas bilinear in the VM).
-fn compositeCanvas(self: *ServerState) void {
+fn compositeCanvas(self: *ServerState, lock: LockedFrame) void {
     ensureBaseFramebuffer(self);
-    compositeBase(self);
+    compositeBase(self, lock);
     copyWhole(self.base_framebuffer.?, self.framebuffer);
-    self.cursor.?.draw(self.framebuffer);
+    // ext_session_lock_v1:74-91 — a locked session draws no cursor.
+    // Cursor.update re-enables its scene nodes every frame, so hiding the
+    // cursor is the server not painting it (compositor/cursor.zig owns
+    // the nodes; main owns the draw).
+    if (!lock.cursor_hidden) self.cursor.?.draw(self.framebuffer);
 }
 
 /// Render the background + all mapped surfaces through the camera into the
 /// base framebuffer (the canvas WITHOUT the cursor). The expensive
 /// full-canvas bilinear; done only when the canvas actually changes.
-fn compositeBase(self: *ServerState) void {
+///
+/// `lock` is the session-lock decision for this frame (lockedFrameFor).
+/// While locked the fill is the OPAQUE lock color instead of the
+/// background and only lock surfaces reach the canvas pass — user
+/// content, the drag icon and the cursor are never drawn, which is the
+/// render half of the privilege boundary (ext_session_lock_v1:74-91).
+fn compositeBase(self: *ServerState, lock: LockedFrame) void {
     const base = self.base_framebuffer orelse return;
-    // 1. Background. Premultiplied ARGB8888, memory bytes B,G,R,A; the
-    //    scene's background rect drew the same color via addRect
+    // 1. Fill. Premultiplied ARGB8888, memory bytes B,G,R,A; the scene's
+    //    background rect drew the same color via addRect
     //    (round(color*a*255) per channel with straight alpha a=1), so
-    //    the bytes are identical.
+    //    the bytes are identical. A locked session fills with the opaque
+    //    lock color INSTEAD, before anything is drawn: an output with no
+    //    (or a too small) lock surface must never show what was there
+    //    before.
+    const fill = if (lock.locked) lock_blank_color else background_color;
     const bg: [4]u8 = .{
-        @intFromFloat(@round(background_color[2] * 255.0)),
-        @intFromFloat(@round(background_color[1] * 255.0)),
-        @intFromFloat(@round(background_color[0] * 255.0)),
-        @intFromFloat(@round(background_color[3] * 255.0)),
+        @intFromFloat(@round(fill[2] * 255.0)),
+        @intFromFloat(@round(fill[1] * 255.0)),
+        @intFromFloat(@round(fill[0] * 255.0)),
+        @intFromFloat(@round(fill[3] * 255.0)),
     };
     base.fill(bg);
+    // A blank output draws NOTHING: the solid color stays (outputIsBlank
+    // said the lock surface is missing, unmapped or smaller than the
+    // output, and composited lock content must never be stretched to
+    // cover the gap).
+    if (lock.blank) return;
 
     // 2. Surfaces: world rect = the node's absolute position + the
     //    SURFACE size (the node dst is the surface size — the buffer size
@@ -2128,6 +2535,16 @@ fn compositeBase(self: *ServerState) void {
     const scene = self.scene orelse return;
     var entry_it = scene.surface_nodes.valueIterator();
     while (entry_it.next()) |sn| {
+        // ext_session_lock_v1:74-91 — while the session is locked "the
+        // only surfaces that should be rendered ... are the lock
+        // surfaces created through this interface". Everything else
+        // (user content, popups, drag icons, the client cursor surface)
+        // is skipped here, the one place the canvas pass chooses what to
+        // draw.
+        if (lock.locked) {
+            const sl = self.session_lock.?;
+            if (!sl.isLockSurface(sn.*.surface)) continue;
+        }
         if (cursor_res) |cr| {
             if (sn.*.surface.resource == cr) continue;
         }
@@ -2317,6 +2734,11 @@ fn surfaceNodeBeforeUpdate(ctx: *anyopaque, sn: *wayland.surface_node.SurfaceNod
 fn surfaceNodeDestroyed(ctx: *anyopaque, s: *Surface) void {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
     self.seat.surfaceDestroyed(s);
+    // The seat just sent wl_pointer.leave for a dead focus surface: drop
+    // the cursor-shape serial NOW, while the stored focus pointer is
+    // still readable, instead of letting the next sync compare against
+    // freed memory.
+    if (self.cursor_shape_focus == s) dropCursorShapeSerials(self);
     self.presentation.discard(s);
 }
 
@@ -2447,6 +2869,17 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     // Back-map the picked node to its surface through the library's
     // surface→scene table.
     const surface = wayland.surface_node.surfaceForNode(scene, node) orelse return null;
+    // ext_session_lock_manager_v1, wiring item 2: while the session is
+    // locked the pointer may only ever land on a lock surface. Returning
+    // null makes the seat send wl_pointer.leave and deliver nothing, so
+    // no client outside the lock sees motion, buttons or an enter (the
+    // XML requires input suppression, not merely a hidden screen). This
+    // is the lock-aware pick the module's contract asks the server to
+    // install through seat.setPick — the compositor's own hit test, not
+    // a second seat.
+    if (self.session_lock) |sl| {
+        if (sl.isLocked() and !sl.isLockSurface(surface)) return null;
+    }
     const rect = node.absolutePosition();
     return .{
         .surface = surface,
@@ -2541,6 +2974,218 @@ fn layerKeyboardFocusAllowed(ctx: *anyopaque, surface: *Surface) bool {
     return ls.current.keyboard_interactive != 0;
 }
 
+/// The seat's click-to-focus gate: every surface that must never take
+/// keyboard focus from a click, in the order the gates are consulted.
+///
+/// ext_session_lock_manager_v1, wiring item 2: while the session is
+/// locked ONLY a lock surface may take focus, and `acceptsInput` is the
+/// assertion that the surface really belongs to the lock client — a
+/// click (the seat's built-in click-to-focus is the one path that can
+/// move focus without a pointer move) cannot therefore land on user
+/// content. ext_session_lock_surface_v1:252-256 leaves focus handling for
+/// lock surfaces to the compositor; refusing everything else is the
+/// policy sway and wlroots implement.
+fn keyboardFocusAllowed(ctx: *anyopaque, surface: *Surface) bool {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    if (self.session_lock) |sl| {
+        if (sl.isLocked()) {
+            if (!sl.isLockSurface(surface)) return false;
+            return sl.acceptsInput(surface.resource.getClient());
+        }
+    }
+    return layerKeyboardFocusAllowed(ctx, surface);
+}
+
+// ---------------------------------------------------------------------------
+// ext_session_lock_manager_v1 + wp_cursor_shape_manager_v1 wiring
+//
+// shell/session_lock.zig and shell/cursor_shape.zig hold the protocol
+// state and refuse to lie about it; the gates the client actually feels
+// (which surface the pointer hits, what may take keyboard focus, what
+// gets composited) live here. See each handler for the contract item it
+// implements.
+// ---------------------------------------------------------------------------
+
+/// `locked`: the privilege boundary closed. This runs INSIDE the lock
+/// surface's commit dispatch, before renderFrame can composite, so the
+/// first frame after it is already a locked frame (wiring item 1).
+fn onSessionLocked(
+    listener: *wire.Listener(*wayland.session_lock.SessionLock),
+    sl: *wayland.session_lock.SessionLock,
+) void {
+    const self: *ServerState = @fieldParentPtr("session_locked_listener", listener);
+    // End EVERY compositor grab: a grab routes input to whoever it names,
+    // and the lock client must be the only input destination
+    // (ext_session_lock_v1:81-84). endPointerGrab/endKeyboardGrab are
+    // unconditional — a grab installed by another subsystem (a DnD drag,
+    // an xdg_popup grab) must not survive the latch either.
+    self.seat.endPointerGrab();
+    self.seat.endKeyboardGrab();
+    // The layer keyboard grab is ours: release it without restoring its
+    // previous surface, which would put focus back on user content.
+    self.layer_kbd_grab = null;
+    // Force keyboard focus onto a lock surface. The seat delivers keys
+    // only to the focused surface's client (seat.zig:1339-1346), so this
+    // is what actually suppresses typing to every other client. The XML
+    // leaves focus policy for lock surfaces to the compositor
+    // (ext_session_lock_surface_v1:252-256); focusing the lock surface is
+    // the policy sway and wlroots implement.
+    if (sl.lockSurfaces().len > 0) {
+        self.seat.setKeyboardFocus(sl.lockSurfaces()[0].surface);
+    }
+    // Hide the cursor: a locked session must not show where the pointer
+    // is. The canvas pass consults `lock.locked` (compositeCanvas), and
+    // this flag is the assertion the server keeps for its own state.
+    self.cursor_hidden = true;
+    // The latch is set: schedule the frame that blanks the outputs. A
+    // frame built before the latch must never be composited afterwards.
+    requestRender(self);
+    log.info("session locked: input suppressed, outputs blanked", self.io, self.log_cfg, "server", .{});
+}
+
+/// `unlock_and_destroy`: the gates come off and normal service resumes.
+fn onSessionUnlocked(
+    listener: *wire.Listener(*wayland.session_lock.SessionLock),
+    _: *wayland.session_lock.SessionLock,
+) void {
+    const self: *ServerState = @fieldParentPtr("session_unlocked_listener", listener);
+    // Drop the focus we forced: only a LOCK surface may lose focus here,
+    // so a normal focus the client earned in the meantime is untouched.
+    if (self.session_lock) |sl| {
+        if (self.seat.keyboard_focus) |focus| {
+            if (sl.isLockSurface(focus)) self.seat.setKeyboardFocus(null);
+        }
+    }
+    self.layer_kbd_grab = null;
+    self.cursor_hidden = false;
+    requestRender(self);
+    log.info("session unlocked: input and rendering restored", self.io, self.log_cfg, "server", .{});
+}
+
+/// A lock surface is fully configured (role assigned, first configure
+/// sent). Track its wl_surface like any other surface and put its scene
+/// node over the output it covers — a lock surface is an ordinary
+/// wl_surface, so syncSurfaces picks it up, and the canvas pass draws it
+/// because compositeBase filters on isLockSurface.
+fn onNewLockSurface(
+    listener: *wire.Listener(*wayland.session_lock.LockSurface),
+    ls: *wayland.session_lock.LockSurface,
+) void {
+    const self: *ServerState = @fieldParentPtr("new_lock_surface_listener", listener);
+    syncSurfaces(self);
+    if (self.scene) |scene| {
+        if (wayland.surface_node.surfaceNodeFor(scene, ls.surface)) |sn| {
+            // The lock screen is configured to the output's logical size,
+            // so its node belongs at the output's origin. With one canvas
+            // at (0,0) that is the node's default; setting it explicitly
+            // keeps the placement correct if that ever changes.
+            const rect = outputRect(ls.output);
+            if (sn.node) |node| {
+                node.x = rect.x;
+                node.y = rect.y;
+            }
+        }
+    }
+    requestRender(self);
+}
+
+/// A lock surface stopped covering its output (its object, its
+/// wl_surface or its output died, or the lock ended). Its scene node must
+/// go with it: an unlocked session that still composited the lock screen
+/// would show a stale privilege boundary as ordinary content. detach()
+/// keeps the surface tracked, so a later remap (a new lock on the same
+/// wl_surface) gets its node back on the next commit.
+fn onLockSurfaceGone(
+    listener: *wire.Listener(*wayland.session_lock.LockSurface),
+    ls: *wayland.session_lock.LockSurface,
+) void {
+    const self: *ServerState = @fieldParentPtr("lock_surface_gone_listener", listener);
+    if (self.scene) |scene| {
+        if (wayland.surface_node.surfaceNodeFor(scene, ls.surface)) |sn| sn.detach();
+    }
+    // outputIsBlank now reports true for that output: composite it.
+    requestRender(self);
+}
+
+/// wp_cursor_shape_device_v1.set_shape was accepted. This compositor
+/// paints ONE cursor image for every shape (shell/cursor_shape.zig: the
+/// module records the request and isDrawableShape says whether a
+/// different image would be drawn — here only `.default` has artwork), so
+/// the handler records the change and nothing more.
+fn onCursorShapeChanged(
+    listener: *wire.Listener(*wayland.cursor_shape.ShapeChange),
+    change: *wayland.cursor_shape.ShapeChange,
+) void {
+    const self: *ServerState = @fieldParentPtr("cursor_shape_changed_listener", listener);
+    const drawable = wayland.cursor_shape.CursorShape.isDrawableShape(change.shape);
+    log.info(
+        "cursor shape {s} (serial {d}){s}",
+        self.io,
+        self.log_cfg,
+        "cursor_shape",
+        .{ @tagName(change.shape), change.serial, if (drawable) "" else " — no artwork for this shape, same sprite drawn" },
+    );
+}
+
+/// Detach a listener that may never have been added, or may already be
+/// detached (a link whose prev is null panics on remove). Teardown
+/// reaches a ServerState from two places — the harness tears the modules
+/// down early and again in deinit — so every unlink must be idempotent.
+fn unlinkOne(comptime T: type, l: *wire.Listener(T)) void {
+    if (l.link.prev != null) l.link.remove();
+}
+
+/// Unlink the session-lock listeners from a dying ServerState (main's
+/// teardown). The module outlives the state only through its own deinit,
+/// which can emit lock_surface_gone.
+fn unlinkSessionLockListeners(state: *ServerState) void {
+    unlinkOne(*wayland.session_lock.SessionLock, &state.session_locked_listener);
+    unlinkOne(*wayland.session_lock.SessionLock, &state.session_unlocked_listener);
+    unlinkOne(*wayland.session_lock.LockSurface, &state.new_lock_surface_listener);
+    unlinkOne(*wayland.session_lock.LockSurface, &state.lock_surface_gone_listener);
+    unlinkOne(*wayland.cursor_shape.ShapeChange, &state.cursor_shape_changed_listener);
+}
+
+/// Keep wp_cursor_shape_manager_v1's pointer-device serials in step with
+/// the seat's pointer enter/leave (shell/cursor_shape.zig: set_shape must
+/// quote the latest wl_pointer.enter serial or the request is ignored).
+///
+/// The seat exposes no enter/leave signal, so the server observes the one
+/// field that changes: `pointer_focus`. The seat has exactly ONE pointer
+/// focus, so at most one client can hold a valid serial at a time —
+/// recording it for the focused client's wl_pointers and dropping it for
+/// every other one is exact, not an approximation. A client may bind more
+/// wl_pointers after the enter, so the pointer count is part of the
+/// change test: a resource that never saw the enter must not inherit it.
+fn syncCursorShapeSerials(self: *ServerState) void {
+    const cs = self.cursor_shape orelse return;
+    const seat = self.seat;
+    const focus = seat.pointer_focus;
+    if (focus == self.cursor_shape_focus and seat.pointers.items.len == self.cursor_shape_pointers) return;
+    self.cursor_shape_focus = focus;
+    self.cursor_shape_pointers = seat.pointers.items.len;
+    for (seat.pointers.items) |ptr| {
+        const focused = if (focus) |f| ptr.getClient() == f.resource.getClient() else false;
+        if (focused) {
+            cs.enterPointer(ptr, seat.pointer_enter_serial);
+        } else {
+            cs.leavePointer(ptr);
+        }
+    }
+}
+
+/// Drop every recorded wp_cursor_shape serial: the pointer left the
+/// surface the serial was recorded for and that surface is about to be
+/// freed, so the stored focus is cleared here rather than compared again
+/// later.
+fn dropCursorShapeSerials(self: *ServerState) void {
+    self.cursor_shape_focus = null;
+    if (self.cursor_shape) |cs| {
+        for (self.seat.pointers.items) |ptr| cs.leavePointer(ptr);
+    }
+    self.cursor_shape_pointers = self.seat.pointers.items.len;
+}
+
 /// Capture source for zwlr_screencopy: the display framebuffer (cursor
 /// composited in) for overlay_cursor=1; the base framebuffer (canvas
 /// without the cursor, current because it is recomposited before the
@@ -2627,6 +3272,13 @@ fn onRepeatTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
 /// click-to-focus (already handled inside the seat).
 fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_button_listener", listener);
+    // ext_session_lock_manager_v1: a locked session is about the user's
+    // content, not the compositor's own gestures. The camera pan must not
+    // arm (and must not install the pointer grab that swallows input) on
+    // a press that belongs to the lock client.
+    if (self.session_lock) |sl| {
+        if (sl.isLocked()) return;
+    }
     if (seat.last_button != wayland.seat.btn_left) return;
     if (seat.last_button_pressed) {
         // Arm the pan anchor but DON'T start it (drag_active stays false):
@@ -2659,6 +3311,20 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
 /// not jump.
 fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_pointer_move_listener", listener);
+    // wp_cursor_shape_manager_v1: the seat has just updated its pointer
+    // focus (and minted the wl_pointer.enter serial) for this move, so
+    // this is where the server records it (shell/cursor_shape.zig).
+    syncCursorShapeSerials(self);
+    // ext_session_lock_manager_v1: a locked session suppresses the
+    // compositor's own pointer gestures as well. The layer focus routing
+    // is skipped too: focus belongs to the lock surface, and
+    // restoreLayerFocus would otherwise put a stale user surface back.
+    if (self.session_lock) |sl| {
+        if (sl.isLocked()) {
+            self.cursor_repaint = false;
+            return;
+        }
+    }
     // L-D7: layer keyboard-interactivity focus routing. The seat already
     // updated its pointer focus for this move; apply the layer policy on
     // top (exclusive grab / on_demand focus / none exclusion). During a
@@ -2749,6 +3415,10 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
 /// seat emits the axis signal for every axis event).
 fn onSeatAxis(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_axis_listener", listener);
+    // A locked session must not zoom the canvas under the lock client.
+    if (self.session_lock) |sl| {
+        if (sl.isLocked()) return;
+    }
     if (seat.last_axis != .vertical_scroll or seat.last_axis_discrete == 0) return;
     const factor: f64 = if (seat.last_axis_discrete > 0) 1.25 else 1.0 / 1.25;
     var steps: i32 = seat.last_axis_discrete;
@@ -3175,6 +3845,41 @@ const PolicyRegistryCapture = struct {
     }
 };
 
+/// The full (interface, name, version) list a fresh wl_registry is told
+/// about. The tearing-control module's RegistryCapture shape, widened to
+/// keep the version: a global is only advertised if it is advertised AT
+/// the version this server implements, and a removed global is
+/// observable because a NEW registry only receives the globals that
+/// still exist.
+const PolicyGlobalCapture = struct {
+    const max_globals = 64;
+    const Entry = struct {
+        interface: [*:0]const u8,
+        name: u32,
+        version: u32,
+    };
+    entries: [max_globals]Entry = undefined,
+    len: usize = 0,
+
+    fn listener(_: *client.wl.Registry, event: client.wl.Registry.Event, self: *PolicyGlobalCapture) void {
+        switch (event) {
+            .global => |g| {
+                if (self.len >= self.entries.len) return;
+                self.entries[self.len] = .{ .interface = g.interface, .name = g.name, .version = g.version };
+                self.len += 1;
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn find(self: *const PolicyGlobalCapture, interface: []const u8) ?Entry {
+        for (self.entries[0..self.len]) |e| {
+            if (std.mem.eql(u8, std.mem.span(e.interface), interface)) return e;
+        }
+        return null;
+    }
+};
+
 /// main()'s module stack (minus the render loop) with an in-memory client,
 /// so the policy functions under test run against the real modules. The
 /// ServerState is the REAL one: the tests call the production policy
@@ -3204,6 +3909,27 @@ const PolicyServer = struct {
     subcompositor: ?*wayland.subsurface.Subcompositor = null,
     data_device: ?*wayland.data_device.DataDeviceManager = null,
     primary_selection: ?*wayland.primary_selection.PrimarySelection = null,
+    /// The nine protocol modules main() constructs after the seat. The
+    /// harness builds them in the same order so the registry it shows a
+    /// client is main()'s registry (see init).
+    pointer_gestures: ?*wayland.pointer_gestures.PointerGestures = null,
+    relative_pointer: ?*wayland.relative_pointer.RelativePointer = null,
+    pointer_constraints: ?*wayland.pointer_constraints.PointerConstraints = null,
+    tablet: ?*wayland.tablet.Tablet = null,
+    cursor_shape: ?*wayland.cursor_shape.CursorShape = null,
+    tearing_control: ?*wayland.tearing_control.TearingControl = null,
+    session_lock: ?*wayland.session_lock.SessionLock = null,
+    data_control: ?*wayland.data_control.DataControlManager = null,
+    foreign_toplevel: ?*wayland.foreign_toplevel.ForeignToplevelManager = null,
+    /// zwp_linux_dmabuf_v1, registered only when a GBM device exists. The
+    /// test backend has none, so this stays null and the global is absent
+    /// — the module's documented gate, not a wiring gap.
+    linux_dmabuf: ?*wayland.linux_dmabuf.LinuxDmabuf = null,
+    /// zxdg_output_manager_v1 + zwlr_screencopy_manager_v1: main()
+    /// advertises both, so the harness mirrors them and a client sees the
+    /// same global set here as on the running server.
+    xdg_output: ?*wayland.xdg_output.XdgOutput = null,
+    screencopy: ?*wayland.screencopy.Screencopy = null,
     renderer: ?*wayland.renderer.Renderer = null,
     presentation: ?*wayland.presentation.Presentation = null,
     backend: ?*wayland.backend.Backend = null,
@@ -3227,6 +3953,15 @@ const PolicyServer = struct {
     layer_listener_data: u8 = 0,
     shm_pool: ?*client.wl.ShmPool = null,
     buffer: ?*client.wl.Buffer = null,
+    /// The pool of a createFilledBuffer buffer, retained like shm_pool so
+    /// the buffer stays valid for the whole test.
+    filled_pool: ?*client.wl.ShmPool = null,
+    /// A second SERVER-side client with nothing bound (the session-lock
+    /// input assertions need a client that is NOT the lock client), plus
+    /// its open peer fd: closing it would look like a disconnect at the
+    /// next dispatch.
+    idle_client: ?*wire.Client = null,
+    idle_peer: ?std.posix.socket_t = null,
 
     /// The display framebuffer handle. Real (the minimize policy reads
     /// its size for the output damage) but never rendered into.
@@ -3308,6 +4043,81 @@ const PolicyServer = struct {
             ts.seat.?,
         );
         errdefer if (ts.primary_selection) |ps| ps.deinit();
+        // main()'s post-seat module stack, in the same order (each
+        // errdefer unwinds exactly the modules that exist).
+        ts.pointer_gestures = try wayland.pointer_gestures.PointerGestures.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.seat.?,
+        );
+        errdefer if (ts.pointer_gestures) |pg| pg.deinit();
+        ts.relative_pointer = try wayland.relative_pointer.RelativePointer.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.seat.?,
+        );
+        errdefer if (ts.relative_pointer) |rp| rp.deinit();
+        ts.pointer_constraints = try wayland.pointer_constraints.PointerConstraints.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.compositor.?,
+            ts.seat.?,
+        );
+        errdefer if (ts.pointer_constraints) |pc| pc.deinit();
+        ts.tablet = try wayland.tablet.Tablet.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.tablet) |tb| tb.deinit();
+        ts.cursor_shape = try wayland.cursor_shape.CursorShape.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.tablet.?,
+        );
+        errdefer if (ts.cursor_shape) |cs| cs.deinit();
+        ts.tearing_control = try wayland.tearing_control.TearingControl.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.tearing_control) |tc| tc.deinit();
+        ts.session_lock = try wayland.session_lock.SessionLock.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.session_lock) |sl| sl.deinit();
+        ts.data_control = try wayland.data_control.DataControlManager.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.seat.?,
+            ts.data_device.?,
+            ts.primary_selection.?,
+        );
+        errdefer if (ts.data_control) |dc| dc.deinit();
+        ts.foreign_toplevel = try wayland.foreign_toplevel.ForeignToplevelManager.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.shell.?,
+            ts.seat.?,
+        );
+        errdefer if (ts.foreign_toplevel) |ft| ft.deinit();
+        // zwp_linux_dmabuf_v1: the module registers its global only for a
+        // GBM device, and the test backend has none — the documented
+        // "null device, no global" state. main() passes
+        // drm_backend.gbmDevice() for exactly the same reason.
+        ts.linux_dmabuf = try wayland.linux_dmabuf.LinuxDmabuf.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            null,
+        );
+        errdefer if (ts.linux_dmabuf) |ld| ld.deinit();
+        // zxdg_output_manager_v1: advertised by main() too.
+        ts.xdg_output = try wayland.xdg_output.XdgOutput.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.xdg_output) |xo| xo.deinit();
         ts.renderer = try pixman.PixmanRenderer.create(allocator, &ts.io, &ts.log_cfg);
         errdefer if (ts.renderer) |r| r.destroy();
         ts.presentation = try wayland.presentation.Presentation.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
@@ -3361,6 +4171,16 @@ const PolicyServer = struct {
             .xdg_decoration = ts.xdg_decoration.?,
             .fractional_scale = ts.fractional_scale.?,
             .viewporter = ts.viewporter.?,
+            .pointer_gestures = ts.pointer_gestures.?,
+            .relative_pointer = ts.relative_pointer.?,
+            .pointer_constraints = ts.pointer_constraints.?,
+            .tablet = ts.tablet.?,
+            .cursor_shape = ts.cursor_shape.?,
+            .tearing_control = ts.tearing_control.?,
+            .session_lock = ts.session_lock.?,
+            .data_control = ts.data_control.?,
+            .foreign_toplevel = ts.foreign_toplevel.?,
+            .linux_dmabuf = ts.linux_dmabuf.?,
             .renderer = ts.renderer.?,
             .backend = ts.backend.?,
             .camera = default_camera,
@@ -3394,6 +4214,11 @@ const PolicyServer = struct {
             .seat_button_listener = wire.Listener(*wayland.seat.Seat).init(onSeatButton),
             .seat_pointer_move_listener = wire.Listener(*wayland.seat.Seat).init(onSeatPointerMove),
             .seat_axis_listener = wire.Listener(*wayland.seat.Seat).init(onSeatAxis),
+            .session_locked_listener = wire.Listener(*wayland.session_lock.SessionLock).init(onSessionLocked),
+            .session_unlocked_listener = wire.Listener(*wayland.session_lock.SessionLock).init(onSessionUnlocked),
+            .new_lock_surface_listener = wire.Listener(*wayland.session_lock.LockSurface).init(onNewLockSurface),
+            .lock_surface_gone_listener = wire.Listener(*wayland.session_lock.LockSurface).init(onLockSurfaceGone),
+            .cursor_shape_changed_listener = wire.Listener(*wayland.cursor_shape.ShapeChange).init(onCursorShapeChanged),
             // No frame is ever rendered here: requestRender (from the
             // minimize policy) must only mark repaint_pending instead of
             // driving the output's frame chain.
@@ -3409,7 +4234,30 @@ const PolicyServer = struct {
         ts.seat.?.events.button.add(&state.seat_button_listener);
         ts.seat.?.events.pointer_move.add(&state.seat_pointer_move_listener);
         ts.seat.?.setPick(PolicyServer.pick, ts);
-        ts.seat.?.setKeyboardFocusGate(layerKeyboardFocusAllowed, state);
+        // main()'s gate: the session lock first, then L-D7's layer policy.
+        ts.seat.?.setKeyboardFocusGate(keyboardFocusAllowed, state);
+        // The production subscriptions main() makes for the new modules.
+        ts.session_lock.?.events.locked.add(&state.session_locked_listener);
+        ts.session_lock.?.events.unlocked.add(&state.session_unlocked_listener);
+        ts.session_lock.?.events.new_lock_surface.add(&state.new_lock_surface_listener);
+        ts.session_lock.?.events.lock_surface_gone.add(&state.lock_surface_gone_listener);
+        ts.cursor_shape.?.events.shape_changed.add(&state.cursor_shape_changed_listener);
+        // zwlr_screencopy_v1 (main() advertises it too): the copy source is
+        // this state, which is why the harness builds it.
+        ts.screencopy = try wayland.screencopy.Screencopy.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            ts.shm_state.?,
+            getFramebuffer,
+            state,
+            outputFromResource,
+            state,
+            requestFrame,
+            state,
+        );
+        errdefer if (ts.screencopy) |sc| sc.deinit();
 
         // In-memory client: one socketpair end for the server, the other
         // for the client library.
@@ -3453,19 +4301,36 @@ const PolicyServer = struct {
         // the modules they call into are alive.
         if (ts.c_display) |d| d.disconnect();
         if (ts.client) |c| c.destroy();
+        if (ts.idle_client) |c| c.destroy();
+        ts.idle_client = null;
+        if (ts.idle_peer) |fd| {
+            ts.idle_peer = null;
+            _ = std.os.linux.close(fd);
+        }
+        // zwlr_screencopy first: it was built with the ServerState's
+        // framebuffer/output callbacks, so it must go while that state is
+        // still whole (main() defers it after the state teardown because
+        // the clients are already gone by then).
+        if (ts.screencopy) |sc| sc.deinit();
+        ts.screencopy = null;
         // Unlink the state BEFORE the modules deinit (their teardown emits
         // signals the listeners would otherwise receive with the state
         // already freed).
         if (ts.state) |state| {
-            unlink(*wayland.shell.XdgToplevel, &state.new_toplevel_listener);
-            unlink(*wayland.shell.XdgPopup, &state.new_popup_listener);
-            unlink(*wayland.seat.Seat, &state.seat_focus_listener);
-            unlink(*wayland.seat.Seat, &state.seat_button_listener);
-            unlink(*wayland.seat.Seat, &state.seat_pointer_move_listener);
+            unlinkSessionLockListeners(state);
+            unlinkOne(*wayland.shell.XdgToplevel, &state.new_toplevel_listener);
+            unlinkOne(*wayland.shell.XdgPopup, &state.new_popup_listener);
+            unlinkOne(*wayland.seat.Seat, &state.seat_focus_listener);
+            unlinkOne(*wayland.seat.Seat, &state.seat_button_listener);
+            unlinkOne(*wayland.seat.Seat, &state.seat_pointer_move_listener);
             state.toplevels.deinit(ts.allocator);
             state.layer_surfaces.deinit(ts.allocator);
             state.layer_popups.deinit(ts.allocator);
             state.synth_clicked.deinit(ts.allocator);
+            // ensureBaseFramebuffer() lazily builds this (a test that
+            // composites has one); ServerState.deinit frees it in main(),
+            // so the harness has to as well.
+            if (state.base_framebuffer) |base| base.deinit();
             ts.allocator.destroy(state);
         }
         if (ts.scene) |sc| sc.deinit();
@@ -3475,6 +4340,32 @@ const PolicyServer = struct {
         if (ts.backend) |b| b.destroy();
         if (ts.presentation) |p| p.deinit();
         if (ts.renderer) |r| r.destroy();
+        // The new modules, in reverse dependency order: cursor_shape dies
+        // before the tablet registry it resolves serials from, data_control
+        // before the selection managers it mirrors, foreign_toplevel before
+        // the shell, and all of them before the seat they attach to.
+        if (ts.linux_dmabuf) |ld| ld.deinit();
+        ts.linux_dmabuf = null;
+        if (ts.foreign_toplevel) |ft| ft.deinit();
+        ts.foreign_toplevel = null;
+        if (ts.data_control) |dc| dc.deinit();
+        ts.data_control = null;
+        if (ts.session_lock) |sl| sl.deinit();
+        ts.session_lock = null;
+        if (ts.tearing_control) |tc| tc.deinit();
+        ts.tearing_control = null;
+        if (ts.cursor_shape) |cs| cs.deinit();
+        ts.cursor_shape = null;
+        if (ts.tablet) |tb| tb.deinit();
+        ts.tablet = null;
+        if (ts.pointer_constraints) |pc| pc.deinit();
+        ts.pointer_constraints = null;
+        if (ts.relative_pointer) |rp| rp.deinit();
+        ts.relative_pointer = null;
+        if (ts.pointer_gestures) |pg| pg.deinit();
+        ts.pointer_gestures = null;
+        if (ts.xdg_output) |xo| xo.deinit();
+        ts.xdg_output = null;
         if (ts.primary_selection) |ps| ps.deinit();
         if (ts.data_device) |dd| dd.deinit();
         if (ts.subcompositor) |sc| sc.deinit();
@@ -3506,27 +4397,105 @@ const PolicyServer = struct {
         }
     }
 
-    /// Unlink a signal listener init() added (the seat does the same
-    /// before re-arming its focus listener, seat.zig:1251). A listener
-    /// that was never added is left alone.
-    fn unlink(comptime T: type, l: *wire.Listener(T)) void {
-        if (l.link.prev != null) l.link.remove();
+    /// Tear the ten new protocol modules down the way main() does (the
+    /// globals removed, the modules freed in reverse dependency order)
+    /// while the display and the client stay up. A test uses it to prove
+    /// the globals are GONE from the registry afterwards; deinit() then
+    /// finds every slot null and skips them.
+    fn deinitNewGlobals(ts: *PolicyServer) void {
+        if (ts.state) |state| {
+            unlinkSessionLockListeners(state);
+            state.linux_dmabuf = null;
+            state.foreign_toplevel = null;
+            state.data_control = null;
+            state.session_lock = null;
+            state.tearing_control = null;
+            state.cursor_shape = null;
+            state.tablet = null;
+            state.pointer_constraints = null;
+            state.relative_pointer = null;
+            state.pointer_gestures = null;
+        }
+        if (ts.linux_dmabuf) |ld| ld.deinit();
+        ts.linux_dmabuf = null;
+        if (ts.foreign_toplevel) |ft| ft.deinit();
+        ts.foreign_toplevel = null;
+        if (ts.data_control) |dc| dc.deinit();
+        ts.data_control = null;
+        if (ts.session_lock) |sl| sl.deinit();
+        ts.session_lock = null;
+        if (ts.tearing_control) |tc| tc.deinit();
+        ts.tearing_control = null;
+        if (ts.cursor_shape) |cs| cs.deinit();
+        ts.cursor_shape = null;
+        if (ts.tablet) |tb| tb.deinit();
+        ts.tablet = null;
+        if (ts.pointer_constraints) |pc| pc.deinit();
+        ts.pointer_constraints = null;
+        if (ts.relative_pointer) |rp| rp.deinit();
+        ts.relative_pointer = null;
+        if (ts.pointer_gestures) |pg| pg.deinit();
+        ts.pointer_gestures = null;
     }
 
-    /// A real 64x64 shm buffer (the pool is retained so the buffer stays
-    /// valid for the whole test).
+    /// A real 64x64 shm buffer filled with opaque 0x40 gray (the pool is
+    /// retained so the buffer stays valid for the whole test). The fill
+    /// makes a composited pixel identify this surface: a frame that shows
+    /// 0x40 gray at the canvas origin has drawn it.
     fn createBuffer(ts: *PolicyServer) !*client.wl.Buffer {
         if (ts.buffer) |b| return b;
         const width: i32 = 64;
         const height: i32 = 64;
-        const fd = try std.posix.memfd_create("policy-test-buffer", std.os.linux.MFD.CLOEXEC);
+        const size: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+        const fd = try filledMemfd("policy-test-buffer", size, 0x40);
         defer _ = std.os.linux.close(fd);
-        const pool_size = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
-        const rc = std.os.linux.ftruncate(fd, @intCast(pool_size));
-        if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
-        ts.shm_pool = try ts.wl_shm.?.createPool(fd, @intCast(pool_size));
+        ts.shm_pool = try ts.wl_shm.?.createPool(fd, @intCast(size));
         ts.buffer = try ts.shm_pool.?.createBuffer(0, width, height, width * 4, .argb8888);
         return ts.buffer.?;
+    }
+
+    /// A filled ARGB8888 shm buffer of the requested size: every pixel is
+    /// the same OPAQUE gray `value` (alpha 0xFF, so the framebuffer keeps
+    /// the value after compositing). The pool is retained (like
+    /// createBuffer's) so the buffer stays valid for the whole test.
+    fn createFilledBuffer(ts: *PolicyServer, width: i32, height: i32, value: u8) !*client.wl.Buffer {
+        const size: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+        const fd = try filledMemfd("policy-test-filled", size, value);
+        defer _ = std.os.linux.close(fd);
+        ts.filled_pool = try ts.wl_shm.?.createPool(fd, @intCast(size));
+        return ts.filled_pool.?.createBuffer(0, width, height, width * 4, .argb8888);
+    }
+
+    /// A FRESH wl_registry roundtrip: libwayland sends the current global
+    /// list to a newly created registry, which is how a test observes a
+    /// global that appeared or disappeared since the last one. The
+    /// registry object itself is never destroyed (wl_registry has no
+    /// destroy request); the client display frees it at disconnect.
+    fn readGlobals(ts: *PolicyServer, capture: *PolicyGlobalCapture) !*client.wl.Registry {
+        const registry = try ts.c_display.?.getRegistry();
+        registry.setListener(*PolicyGlobalCapture, PolicyGlobalCapture.listener, capture);
+        try ts.pump();
+        return registry;
+    }
+
+    /// A second server-side client with nothing bound: the session-lock
+    /// input assertions need a client that is NOT the lock client.
+    fn addIdleClient(ts: *PolicyServer) !*wire.Client {
+        var fds: [2]std.posix.socket_t = undefined;
+        const rc = std.posix.system.socketpair(
+            std.posix.AF.UNIX,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            0,
+            &fds,
+        );
+        if (std.posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+        ts.idle_client = wire.Client.create(ts.display.?.getServer(), fds[0]) orelse {
+            _ = std.os.linux.close(fds[0]);
+            _ = std.os.linux.close(fds[1]);
+            return error.ClientCreateFailed;
+        };
+        ts.idle_peer = fds[1];
+        return ts.idle_client.?;
     }
 
     const Toplevel = struct {
@@ -3962,4 +4931,620 @@ test "syncDragIconNodes puts the drag icon at the pointer and drops it (P2-12)" 
     try testing.expectEqual(@as(i32, 400), icon_tree.x);
     try testing.expectEqual(@as(i32, 300), icon_tree.y);
     try testing.expect(isDragIconSurface(icon_surface));
+}
+
+/// The protocol globals this wave adds, each with the version its module
+/// registers (build.zig's scanner.generate bound, or the module's own
+/// version constant). A client must be able to bind every one of them.
+const new_protocol_globals = [_]struct { interface: []const u8, version: u32 }{
+    .{ .interface = "zwp_pointer_gestures_v1", .version = wayland.server.zwp.PointerGesturesV1.generated_version },
+    .{ .interface = "zwp_relative_pointer_manager_v1", .version = wayland.server.zwp.RelativePointerManagerV1.generated_version },
+    .{ .interface = "zwp_pointer_constraints_v1", .version = wayland.server.zwp.PointerConstraintsV1.generated_version },
+    .{ .interface = "zwp_tablet_manager_v2", .version = wayland.tablet.tablet_v2_version },
+    .{ .interface = "wp_cursor_shape_manager_v1", .version = wayland.cursor_shape.cursor_shape_manager_version },
+    .{ .interface = "wp_tearing_control_manager_v1", .version = wayland.server.wp.TearingControlManagerV1.generated_version },
+    .{ .interface = "ext_session_lock_manager_v1", .version = wayland.server.ext.SessionLockManagerV1.generated_version },
+    .{ .interface = "zwlr_data_control_manager_v1", .version = wayland.server.zwlr.DataControlManagerV1.generated_version },
+    .{ .interface = "zwlr_foreign_toplevel_manager_v1", .version = wayland.server.zwlr.ForeignToplevelManagerV1.generated_version },
+};
+
+/// The compositor framebuffer byte at (x, y). Premultiplied ARGB8888 in
+/// memory as B,G,R,A (compositeBase's fill layout).
+fn framebufferPixel(fb: *pixman.Framebuffer, x: i32, y: i32) [4]u8 {
+    const stride: usize = @intCast(fb.stride);
+    const off: usize = @as(usize, @intCast(y)) * stride + @as(usize, @intCast(x)) * 4;
+    return .{ fb.data[off], fb.data[off + 1], fb.data[off + 2], fb.data[off + 3] };
+}
+
+/// A memfd of `size` bytes in which every pixel is the OPAQUE gray
+/// `value` (alpha 0xFF). Alpha 1 matters: the framebuffer is
+/// premultiplied ARGB8888, so a translucent fill would darken whatever it
+/// is composited over and the pixel would no longer identify its surface.
+fn filledMemfd(name: []const u8, size: usize, value: u8) !std.posix.fd_t {
+    const fd = try std.posix.memfd_create(name, std.os.linux.MFD.CLOEXEC);
+    errdefer _ = std.os.linux.close(fd);
+    const rc = std.os.linux.ftruncate(fd, @intCast(size));
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
+    const pixels = try std.posix.mmap(
+        null,
+        size,
+        std.posix.PROT{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED },
+        fd,
+        0,
+    );
+    defer std.posix.munmap(pixels);
+    var off: usize = 0;
+    while (off < size) : (off += 4) {
+        pixels[off + 0] = value;
+        pixels[off + 1] = value;
+        pixels[off + 2] = value;
+        pixels[off + 3] = 0xFF;
+    }
+    return fd;
+}
+
+test "the new protocol globals are advertised at their implemented version and gone with their modules" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    var live: PolicyGlobalCapture = .{};
+    _ = try ts.readGlobals(&live);
+    // Exactly the globals a headless server advertises: the 16 main()
+    // registers (wl_shm, wl_compositor, xdg_wm_base, zwlr_layer_shell_v1,
+    // wl_seat, xdg_activation_v1, zxdg_decoration_manager_v1,
+    // wp_fractional_scale_manager_v1, zxdg_output_manager_v1, wp_viewporter,
+    // wl_subcompositor, wl_data_device_manager,
+    // zwp_primary_selection_device_manager_v1, wp_presentation, wl_output,
+    // zwlr_screencopy_manager_v1) plus the nine unconditional new ones.
+    // zwp_linux_dmabuf_v1 is the tenth and is conditional (see below).
+    try testing.expectEqual(@as(usize, 25), live.len);
+    for (new_protocol_globals) |want| {
+        const got = live.find(want.interface) orelse {
+            std.debug.print("missing global {s}\n", .{want.interface});
+            return error.GlobalMissing;
+        };
+        try testing.expectEqual(want.version, got.version);
+    }
+    // zwp_linux_dmabuf_v1: the module registers its global only for a GBM
+    // device, and the test backend has none — the same null device main()
+    // passes on every non-DRM backend. With WAYLAND_BACKEND=drm this is
+    // the 26th global.
+    try testing.expect(live.find("zwp_linux_dmabuf_v1") == null);
+    try testing.expect(ts.linux_dmabuf != null); // the module exists and is inert
+
+    // Teardown removes the globals: a registry created AFTER the modules
+    // are gone is only told about the ones that still exist.
+    ts.deinitNewGlobals();
+    var after: PolicyGlobalCapture = .{};
+    _ = try ts.readGlobals(&after);
+    try testing.expectEqual(live.len - new_protocol_globals.len, after.len);
+    for (new_protocol_globals) |want| {
+        try testing.expect(after.find(want.interface) == null);
+    }
+    // The rest of the server is untouched: the module teardown removed
+    // exactly its own global.
+    try testing.expect(after.find("wl_compositor") != null);
+    try testing.expect(after.find("wl_seat") != null);
+    try testing.expect(after.find("zwlr_screencopy_manager_v1") != null);
+}
+
+test "the present path consults wp_tearing_control_v1 per surface per frame" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const surface = ts.serverSurface(t.wl_surface);
+
+    // Nothing opted in: no presented surface asks for async presentation.
+    wayland.surface_node.collectPresented(ts.scene.?);
+    try testing.expectEqual(@as(u32, 0), consultTearingHints(ts.state.?, ts.output.?).async_surfaces);
+
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const entry = capture.find("wp_tearing_control_manager_v1") orelse return error.GlobalMissing;
+    const manager = try registry.bind(entry.name, client.wp.TearingControlManagerV1, entry.version);
+    try ts.pump();
+    const control = try manager.getTearingControl(t.wl_surface);
+    control.setPresentationHint(.async);
+    // Double-buffered: until the wl_surface commits, the hint is still the
+    // client's pending value and the present path must not see it
+    // (TearingControl.hintFor reads the COMMITTED hint,
+    // shell/tearing_control.zig:180-187).
+    try testing.expectEqual(@as(u32, 0), consultTearingHints(ts.state.?, ts.output.?).async_surfaces);
+    t.wl_surface.commit();
+    try ts.pump();
+
+    // Committed: the frame's present path reads it for that surface...
+    wayland.surface_node.collectPresented(ts.scene.?);
+    const async_frame = consultTearingHints(ts.state.?, ts.output.?);
+    try testing.expectEqual(@as(u32, 1), async_frame.async_surfaces);
+    // ...and the OUTPUT gate refuses to honour it: no backend in this
+    // server flips asynchronously (outputTears), so a `.async` permission
+    // never becomes a torn frame.
+    try testing.expect(!async_frame.honoured);
+
+    // A surface with no tearing object never asks: the hint is per surface,
+    // not per output.
+    const other = try ts.createToplevel();
+    defer ts.allocator.destroy(other);
+    wayland.surface_node.collectPresented(ts.scene.?);
+    try testing.expectEqual(@as(u32, 1), consultTearingHints(ts.state.?, ts.output.?).async_surfaces);
+
+    // The client takes the permission back; the next frame reads vsync.
+    control.setPresentationHint(.vsync);
+    t.wl_surface.commit();
+    try ts.pump();
+    wayland.surface_node.collectPresented(ts.scene.?);
+    try testing.expectEqual(@as(u32, 0), consultTearingHints(ts.state.?, ts.output.?).async_surfaces);
+    try testing.expectEqual(wayland.tearing_control.Hint.vsync, ts.tearing_control.?.hintFor(surface));
+}
+
+/// ext_session_lock_v1 client events (the test only counts them).
+const LockClientEvents = struct {
+    locked: usize = 0,
+    finished: usize = 0,
+
+    fn listener(_: *client.ext.SessionLockV1, event: client.ext.SessionLockV1.Event, self: *LockClientEvents) void {
+        switch (event) {
+            .locked => self.locked += 1,
+            .finished => self.finished += 1,
+        }
+    }
+};
+
+/// ext_session_lock_surface_v1.configure: the first configure carries the
+/// exact size the client must commit.
+const LockSurfaceClientEvents = struct {
+    configures: usize = 0,
+    serial: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+
+    fn listener(
+        _: *client.ext.SessionLockSurfaceV1,
+        event: client.ext.SessionLockSurfaceV1.Event,
+        self: *LockSurfaceClientEvents,
+    ) void {
+        switch (event) {
+            .configure => |c| {
+                self.configures += 1;
+                self.serial = c.serial;
+                self.width = c.width;
+                self.height = c.height;
+            },
+        }
+    }
+};
+
+test "a locked session denies input to every client but the lock one and blanks the output" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const state = ts.state.?;
+    const sl = ts.session_lock.?;
+    const other_client = try ts.addIdleClient();
+    // The framebuffer compositeBase fills (no frame is ever rendered in
+    // these tests).
+    ensureBaseFramebuffer(state);
+
+    // A mapped user toplevel: opaque 0x40 gray at the canvas origin.
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const user_surface = ts.serverSurface(t.wl_surface);
+
+    // Unlocked: normal content, normal input.
+    try testing.expect(!sl.isLocked());
+    try testing.expect(sl.acceptsInput(ts.client.?));
+    try testing.expect(sl.acceptsInput(other_client));
+    try testing.expectEqual(LockedFrame{ .locked = false, .blank = false }, lockedFrameFor(state, ts.output.?));
+    try testing.expect(keyboardFocusAllowed(state, user_surface));
+    try testing.expect(pickSurface(state, 10, 10) != null);
+    compositeBase(state, .{ .locked = false, .blank = false });
+    try testing.expectEqual([4]u8{ 0x40, 0x40, 0x40, 0xFF }, framebufferPixel(state.base_framebuffer.?, 10, 10));
+
+    // The lock client takes the session: a lock object plus a lock surface
+    // covering the output.
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const entry = capture.find("ext_session_lock_manager_v1") orelse return error.GlobalMissing;
+    const manager = try registry.bind(entry.name, client.ext.SessionLockManagerV1, entry.version);
+    try ts.pump();
+    var lock_events: LockClientEvents = .{};
+    const lock = try manager.lock();
+    lock.setListener(*LockClientEvents, LockClientEvents.listener, &lock_events);
+    const lock_wl_surface = try ts.wl_compositor.?.createSurface();
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    const lock_surface = try lock.getLockSurface(lock_wl_surface, ts.wl_output_client.?);
+    lock_surface.setListener(*LockSurfaceClientEvents, LockSurfaceClientEvents.listener, &lock_surface_events);
+    try ts.pump();
+    // get_lock_surface configures immediately, sized to the output.
+    try testing.expectEqual(@as(usize, 1), lock_surface_events.configures);
+    try testing.expectEqual(@as(u32, 800), lock_surface_events.width);
+    try testing.expectEqual(@as(u32, 600), lock_surface_events.height);
+    try testing.expect(!sl.isLocked());
+
+    // The acked, correctly sized first buffer IS the locked frame.
+    lock_surface.ackConfigure(lock_surface_events.serial);
+    lock_wl_surface.attach(try ts.createFilledBuffer(800, 600, 0x80), 0, 0);
+    lock_wl_surface.commit();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), lock_events.locked);
+    try testing.expect(sl.isLocked());
+
+    // Input reaches the lock client and nobody else.
+    try testing.expect(sl.acceptsInput(ts.client.?));
+    try testing.expect(!sl.acceptsInput(other_client));
+    // The pointer reaches the lock surface and never the user toplevel:
+    // the lock-aware pick drops every surface that is not a lock surface
+    // (pickSurface, ext_session_lock_manager_v1 wiring item 2), so what
+    // the hit test returns here is the lock surface, not user content.
+    const picked = pickSurface(state, 10, 10) orelse return error.LockSurfaceNotPicked;
+    try testing.expect(picked.surface == ts.serverSurface(lock_wl_surface));
+    try testing.expect(!keyboardFocusAllowed(state, user_surface));
+    try testing.expect(state.cursor_hidden);
+
+    // The output shows the lock surface and nothing else: the user
+    // toplevel's gray is gone even where it used to be.
+    const locked = lockedFrameFor(state, ts.output.?);
+    // A locked frame never paints the cursor (LockedFrame.cursor_hidden),
+    // so the expectation spells the whole struct out.
+    try testing.expectEqual(LockedFrame{ .locked = true, .blank = false, .cursor_hidden = true }, locked);
+    compositeBase(state, locked);
+    try testing.expectEqual([4]u8{ 0x80, 0x80, 0x80, 0xFF }, framebufferPixel(state.base_framebuffer.?, 10, 10));
+    try testing.expectEqual([4]u8{ 0x80, 0x80, 0x80, 0xFF }, framebufferPixel(state.base_framebuffer.?, 700, 500));
+
+    // The lock surface stops covering its output (its object dies): the
+    // fill stays opaque and NOTHING is drawn — user content must not come
+    // back while the session is locked (ext_session_lock_v1:74-91).
+    lock_surface.destroy();
+    try ts.pump();
+    try testing.expect(sl.isLocked());
+    try testing.expectEqual(LockedFrame{ .locked = true, .blank = true, .cursor_hidden = true }, lockedFrameFor(state, ts.output.?));
+    compositeBase(state, .{ .locked = true, .blank = true });
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0xFF }, framebufferPixel(state.base_framebuffer.?, 10, 10));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0xFF }, framebufferPixel(state.base_framebuffer.?, 700, 500));
+    // Input stays suppressed: unlocking is the only way out.
+    try testing.expect(!sl.acceptsInput(other_client));
+
+    // unlock_and_destroy: the gates come off and normal service resumes.
+    lock.unlockAndDestroy();
+    try ts.pump();
+    try testing.expect(!sl.isLocked());
+    try testing.expectEqual(LockedFrame{ .locked = false, .blank = false }, lockedFrameFor(state, ts.output.?));
+    try testing.expect(keyboardFocusAllowed(state, user_surface));
+    try testing.expect(!state.cursor_hidden);
+    try testing.expect(sl.acceptsInput(other_client));
+}
+
+// ---------------------------------------------------------------------------
+// zwp_linux_dmabuf_v1 -> wl_surface.attach
+// ---------------------------------------------------------------------------
+//
+// main()'s dmabuf wiring is two statements (wireDmabufResolver, then
+// clearDmabufResolver before the module dies). What they enable is only
+// observable over the wire: a client binds zwp_linux_dmabuf_v1, imports a
+// buffer and attaches it to a wl_surface. Without the resolver that
+// attach falls into the SHM wrap, which does not recognise a dmabuf
+// wl_buffer, and the client is killed with "unknown buffer type".
+
+/// A CPU-backed stand-in for the DRM backend's GBM device. The real
+/// importer needs a DRM node; what is under test is the attach path, so
+/// the import is a plain Buffer of the requested size. Mirrors the
+/// double in shell/linux_dmabuf.zig's own harness, which proves the
+/// protocol itself.
+const FakeImportDevice = struct {
+    formats: []const wayland.dmabuf.Format,
+    /// How many imports reached the device.
+    imports: u32 = 0,
+    /// The interface view. `ptr` is filled in by init, because it must be
+    /// this struct's own address.
+    iface: wayland.dmabuf.Device = undefined,
+
+    const Data = struct { width: i32, height: i32 };
+
+    const impl: wayland.buffers.Impl = .{ .destroy = destroy };
+
+    fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
+        allocator.destroy(@as(*Data, @ptrCast(@alignCast(data))));
+    }
+
+    fn mainDevice(_: *anyopaque) u64 {
+        // An arbitrary but stable dev_t; no test reads it back.
+        return 0x1234_5678;
+    }
+
+    fn formatsOf(ptr: *anyopaque) []const wayland.dmabuf.Format {
+        return @as(*FakeImportDevice, @ptrCast(@alignCast(ptr))).formats;
+    }
+
+    fn importBuffer(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        attrs_in: wayland.dmabuf.Attributes,
+    ) error{ OutOfMemory, ImportFailed }!*wayland.buffers.Buffer {
+        const self: *FakeImportDevice = @ptrCast(@alignCast(ptr));
+        self.imports += 1;
+        // The plane fds are ours on entry: a real importer closes them on
+        // failure and once the bo owns the object (buffers/dmabuf.zig).
+        var attrs = attrs_in;
+        defer attrs.closePlanes();
+        const d = try allocator.create(Data);
+        errdefer allocator.destroy(d);
+        d.* = .{ .width = attrs.width, .height = attrs.height };
+        return wayland.buffers.Buffer.init(allocator, &impl, d, attrs.width, attrs.height);
+    }
+
+    const vtable: wayland.dmabuf.Device.VTable = .{
+        .main_device = mainDevice,
+        .formats = formatsOf,
+        .import_buffer = importBuffer,
+    };
+
+    fn init(self: *FakeImportDevice, formats: []const wayland.dmabuf.Format) void {
+        self.* = .{ .formats = formats, .iface = .{ .ptr = undefined, .vtable = &vtable } };
+        self.iface.ptr = self;
+    }
+};
+
+/// The pairs the fake advertises: linear only, like the GBM device it
+/// stands in for (buffers/dmabuf.zig).
+const fake_import_formats = [_]wayland.dmabuf.Format{
+    .{ .format = wayland.dmabuf.drm_format_xrgb8888, .modifier = wayland.dmabuf.drm_format_mod_linear },
+    .{ .format = wayland.dmabuf.drm_format_argb8888, .modifier = wayland.dmabuf.drm_format_mod_linear },
+};
+
+/// A compositor + wl_shm + zwp_linux_dmabuf_v1 stack with one in-memory
+/// client: the smallest server main() builds that can answer a dmabuf
+/// attach. Built in main()'s order, with main()'s resolver wiring
+/// verbatim, so the code under test is the production one.
+const DmabufAttachServer = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_cfg: log.Config,
+    display: ?*wayland.core.display.CompositorDisplay = null,
+    shm_state: ?*wayland.shm.ShmState = null,
+    compositor: ?*wayland.compositor.Compositor = null,
+    linux_dmabuf: ?*wayland.linux_dmabuf.LinuxDmabuf = null,
+    device: ?*FakeImportDevice = null,
+    client: ?*wire.Client = null,
+    c_display: ?*client.wl.Display = null,
+    wl_compositor: ?*client.wl.Compositor = null,
+    wl_dmabuf: ?*client.zwp.LinuxDmabufV1 = null,
+    /// False once the server killed the connection (a protocol error).
+    alive: bool = true,
+
+    fn init(allocator: std.mem.Allocator) !*DmabufAttachServer {
+        const ts = try allocator.create(DmabufAttachServer);
+        errdefer allocator.destroy(ts);
+        ts.* = .{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .log_cfg = .{ .min_level = .err },
+        };
+        ts.display = try wayland.core.display.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
+        errdefer if (ts.display) |d| d.deinit();
+        try ts.display.?.initShm();
+        ts.shm_state = try wayland.shm.ShmState.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.shm_state) |s| s.deinit();
+        ts.compositor = try wayland.compositor.Compositor.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
+        errdefer if (ts.compositor) |c| c.deinit();
+        ts.compositor.?.setShm(ts.shm_state.?);
+        // The device is the ONLY stand-in here: the compositor, the shm
+        // state and the dmabuf module are the production ones.
+        const device = try allocator.create(FakeImportDevice);
+        errdefer allocator.destroy(device);
+        device.init(&fake_import_formats);
+        ts.device = device;
+        ts.linux_dmabuf = try wayland.linux_dmabuf.LinuxDmabuf.init(
+            allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.display.?,
+            &device.iface,
+        );
+        errdefer if (ts.linux_dmabuf) |l| l.deinit();
+        // main()'s wiring, unchanged.
+        wireDmabufResolver(ts.compositor.?, ts.linux_dmabuf.?);
+
+        // In-memory client: one socketpair end for the server, one for the
+        // client library.
+        var fds: [2]std.posix.socket_t = undefined;
+        const rc = std.posix.system.socketpair(
+            std.posix.AF.UNIX,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            0,
+            &fds,
+        );
+        if (std.posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+        ts.client = wire.Client.create(ts.display.?.getServer(), fds[0]) orelse {
+            _ = std.os.linux.close(fds[0]);
+            _ = std.os.linux.close(fds[1]);
+            return error.ClientCreateFailed;
+        };
+        ts.c_display = client.wl.Display.connectToFd(fds[1]) catch {
+            _ = std.os.linux.close(fds[1]);
+            ts.client.?.destroy();
+            ts.client = null;
+            return error.ClientConnectFailed;
+        };
+
+        const registry = try ts.c_display.?.getRegistry();
+        var capture: PolicyGlobalCapture = .{};
+        registry.setListener(*PolicyGlobalCapture, PolicyGlobalCapture.listener, &capture);
+        try ts.pump();
+        const compositor = capture.find("wl_compositor") orelse return error.GlobalMissing;
+        const dmabuf = capture.find("zwp_linux_dmabuf_v1") orelse return error.GlobalMissing;
+        ts.wl_compositor = try registry.bind(compositor.name, client.wl.Compositor, 7);
+        ts.wl_dmabuf = try registry.bind(dmabuf.name, client.zwp.LinuxDmabufV1, dmabuf.version);
+        try ts.pump();
+        return ts;
+    }
+
+    fn deinit(ts: *DmabufAttachServer) void {
+        // main()'s teardown order: the client first (its resource destroy
+        // handlers must run while the modules live), then the resolver is
+        // cleared, then the dmabuf module, then shm, the compositor and
+        // the display.
+        if (ts.c_display) |d| d.disconnect();
+        if (ts.client) |c| c.destroy();
+        ts.compositor.?.clearDmabufResolver();
+        ts.linux_dmabuf.?.deinit();
+        ts.compositor.?.deinit();
+        ts.shm_state.?.deinit();
+        ts.display.?.deinit();
+        if (ts.device) |d| ts.allocator.destroy(d);
+        ts.allocator.destroy(ts);
+    }
+
+    /// Client flush + server dispatch. Every server-side effect of the
+    /// queued requests has happened (including a protocol error), but
+    /// nothing has been flushed to the client yet, so the server-side
+    /// surfaces are still alive and readable.
+    fn toServer(ts: *DmabufAttachServer) !void {
+        if (!ts.alive) return;
+        if (ts.c_display.?.flush() != .SUCCESS) {
+            ts.alive = false;
+            return;
+        }
+        try ts.display.?.getServer().getEventLoop().dispatch(0);
+    }
+
+    /// Server flush + client dispatch. False once the server killed the
+    /// connection: libwayland reports the posted protocol error and tears
+    /// the client down, and so has the server (it destroyed the client at
+    /// flush time), so the wire.Client pointer is dropped.
+    fn toClient(ts: *DmabufAttachServer) bool {
+        if (!ts.alive) return false;
+        ts.display.?.flushClients();
+        var fds = [_]std.posix.pollfd{.{
+            .fd = ts.c_display.?.getFd(),
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready: usize = std.posix.poll(&fds, 0) catch 0;
+        if (ready > 0 and ts.c_display.?.dispatch() != .SUCCESS) {
+            ts.alive = false;
+            ts.client = null;
+            return false;
+        }
+        return true;
+    }
+
+    fn pump(ts: *DmabufAttachServer) !void {
+        try ts.toServer();
+        if (!ts.toClient()) return error.ClientGone;
+    }
+
+    /// The compositor Surface behind a client wl_surface.
+    fn serverSurface(ts: *DmabufAttachServer, wl_surface: *client.wl.Surface) *Surface {
+        for (ts.compositor.?.surfaces.items) |s| {
+            if (s.resource.getId() == wl_surface.getId()) return s;
+        }
+        unreachable;
+    }
+
+    /// Import one buffer the way a client does: a params object, one
+    /// plane, then `create`. Returns the wl_buffer the server made.
+    fn importBuffer(ts: *DmabufAttachServer, width: i32, height: i32) !*client.wl.Buffer {
+        const params = try ts.wl_dmabuf.?.createParams();
+        var capture: DmabufParamsCapture = .{};
+        params.setListener(*DmabufParamsCapture, DmabufParamsCapture.listener, &capture);
+        const stride: u32 = @intCast(width * 4);
+        const size: usize = @as(usize, stride) * @as(usize, @intCast(height));
+        const fd = try std.posix.memfd_create("dmabuf-attach-test", std.os.linux.MFD.CLOEXEC);
+        _ = std.os.linux.ftruncate(fd, @intCast(size));
+        // `add` takes the fd: paramsAdd closes it on every rejection and
+        // hands it to the importer otherwise.
+        params.add(fd, 0, 0, stride, 0, 0);
+        params.create(width, height, wayland.dmabuf.drm_format_xrgb8888, .{});
+        try ts.pump();
+        if (capture.failed) return error.ImportFailed;
+        return capture.created orelse error.NoBufferCreated;
+    }
+};
+
+/// What a client saw on its zwp_linux_buffer_params_v1.
+const DmabufParamsCapture = struct {
+    created: ?*client.wl.Buffer = null,
+    failed: bool = false,
+
+    fn listener(
+        _: *client.zwp.LinuxBufferParamsV1,
+        event: client.zwp.LinuxBufferParamsV1.Event,
+        self: *DmabufParamsCapture,
+    ) void {
+        switch (event) {
+            .created => |e| self.created = e.buffer,
+            .failed => self.failed = true,
+        }
+    }
+};
+
+test "a dmabuf buffer attaches to a wl_surface, maps at commit and damages through the pipeline" {
+    const allocator = testing.allocator;
+    const ts = try DmabufAttachServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    try ts.pump();
+    const s = ts.serverSurface(wl_surface);
+
+    const buffer = try ts.importBuffer(64, 64);
+    try testing.expectEqual(@as(u32, 1), ts.device.?.imports);
+
+    // The whole GPU-client path: attach, damage, commit. Nothing else in
+    // the pipeline knows or cares that this buffer came from
+    // zwp_linux_dmabuf_v1 instead of wl_shm.
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.damage(2, 3, 10, 10);
+    wl_surface.commit();
+    try ts.pump();
+
+    try testing.expect(s.mapped);
+    try testing.expect(s.buffer != null);
+    // The committed wrapper IS the module's: resolving the attached
+    // wl_buffer resource back through LinuxDmabuf.fromResource gives the
+    // very Buffer the surface holds, not a copy and not an shm wrap.
+    const committed = s.current_resource orelse return error.NoCommittedResource;
+    const resolved = ts.linux_dmabuf.?.fromResource(committed) orelse return error.NotADmabufBuffer;
+    try testing.expect(resolved == s.buffer.?);
+    try testing.expectEqual(@as(i32, 64), resolved.width);
+    try testing.expectEqual(@as(i32, 64), resolved.height);
+    // Damage made it through translateDamage into buffer coordinates.
+    try testing.expectEqual(@as(usize, 1), s.current.buffer_damage.rects.items.len);
+    try testing.expectEqual(
+        geom.Rect{ .x = 2, .y = 3, .width = 10, .height = 10 },
+        s.current.buffer_damage.rects.items[0],
+    );
+    try testing.expectEqual(@as(usize, 1), s.current.surface_damage.rects.items.len);
+}
+
+test "with the resolver cleared a dmabuf buffer is no longer attached (F56)" {
+    // main() clears the resolver BEFORE LinuxDmabuf.deinit, so an attach
+    // arriving afterwards must not reach the module: the buffer takes the
+    // shm path, which does not recognise it, and the client is killed with
+    // "unknown buffer type". The identical request sequence with the
+    // resolver in place is the test above — that pair is the point.
+    const allocator = testing.allocator;
+    const ts = try DmabufAttachServer.init(allocator);
+    defer ts.deinit();
+
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    try ts.pump();
+    const s = ts.serverSurface(wl_surface);
+    const buffer = try ts.importBuffer(32, 32);
+
+    ts.compositor.?.clearDmabufResolver();
+    wl_surface.attach(buffer, 0, 0);
+    wl_surface.commit();
+    // libwayland destroys a client the moment a protocol error is posted,
+    // so the Surface is gone before this returns and its pointer must not
+    // be dereferenced. The server-side proof that the attach was rejected
+    // rather than resolved is that the client, and every surface it owned,
+    // is gone.
+    try ts.toServer();
+    try testing.expect(std.mem.indexOfScalar(*Surface, ts.compositor.?.surfaces.items, s) == null);
+    // Client side: the protocol error took the connection down.
+    try testing.expect(!ts.toClient());
 }

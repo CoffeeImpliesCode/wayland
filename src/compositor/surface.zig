@@ -97,6 +97,11 @@
 //!
 //! Cross-module: src/compositor/compositor.zig (this cluster):
 //!   Compositor.removeSurface(*Surface) void — called by Surface.destroy.
+//!   Compositor.resolveDmabuf(*wire.Resource) ?*Buffer — asked FIRST in
+//!     handleAttach, before the shm registry: a zwp_linux_dmabuf_v1
+//!     wl_buffer is not an shm pool buffer, so the shm wrap would answer
+//!     error.InvalidBuffer and kill the client (F56). Null means "not a
+//!     dmabuf buffer", and the shm path runs exactly as before.
 
 const std = @import("std");
 const geom = @import("../utils/geom.zig");
@@ -798,7 +803,15 @@ pub const Surface = struct {
 
         if (buffer) |wl_buffer| {
             const res: *wire.Resource = @ptrCast(wl_buffer);
-            const wrapped: *Buffer = (if (s.compositor.shm) |st|
+            // The dmabuf registry is asked FIRST: a wl_buffer produced
+            // through zwp_linux_dmabuf_v1 is not an shm pool buffer, so
+            // the shm wrap answers error.InvalidBuffer for it and the
+            // F56 branch below kills a perfectly good client with
+            // "unknown buffer type". Only after the resolver declines do
+            // we take the shm path, unchanged. The order is the call
+            // contract documented on LinuxDmabuf.fromResource
+            // (shell/linux_dmabuf.zig:213-216).
+            const wrapped: *Buffer = s.compositor.resolveDmabuf(res) orelse (if (s.compositor.shm) |st|
                 st.fromResource(s.allocator, res)
             else
                 shm_mod.fromResource(s.allocator, res)) catch |err| switch (err) {
@@ -2557,4 +2570,144 @@ fn testUnmapOrderNotify(listener: *wire.Listener(*Surface), surface: *Surface) v
     _ = surface;
     test_unmap_seq[test_unmap_seq_len] = 2; // the unmap signal
     test_unmap_seq_len += 1;
+}
+
+// --- zwp_linux_dmabuf_v1 attach ------------------------------------------
+//
+// handleAttach asks Compositor.resolveDmabuf before the shm registry, so
+// a wl_buffer that shell/linux_dmabuf.zig created becomes a Buffer
+// instead of an error.InvalidBuffer. That module cannot be imported here
+// — it imports this file — so the stub below stands in for it. It
+// implements the same contract (Compositor.DmabufResolver), which is
+// what these tests pin: the resolver is consulted first, a resource it
+// does not own falls through to shm unchanged, and clearing it stops
+// the resolution.
+
+/// Stands in for a producer registry (shell/linux_dmabuf.zig): it owns
+/// exactly one wl_buffer resource and answers with the Buffer it
+/// wrapped for it.
+const StubDmabufRegistry = struct {
+    resource: *wire.Resource,
+    buffer: *Buffer,
+
+    fn resolve(ctx: *anyopaque, resource: *wire.Resource) ?*Buffer {
+        const self: *StubDmabufRegistry = @ptrCast(@alignCast(ctx));
+        if (resource != self.resource) return null;
+        return self.buffer;
+    }
+};
+
+test "a dmabuf buffer resolves through the compositor resolver, then maps and damages" {
+    // Before the resolver existed the attach only asked the SHM registry,
+    // which answers error.InvalidBuffer for a buffer it never created,
+    // and the client was killed with "unknown buffer type" (F56). The
+    // resolved wrapper must now travel the ordinary attach -> damage ->
+    // commit pipeline untouched.
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    var imported: Buffer = undefined;
+    testBuffer(allocator, &imported); // 10x10, like a real dmabuf buffer
+    const res = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    var registry: StubDmabufRegistry = .{ .resource = res, .buffer = &imported };
+    comp.setDmabufResolver(.{ .ctx = &registry, .resolve = StubDmabufRegistry.resolve });
+
+    s.handleAttach(@ptrCast(res), 0, 0);
+    try testing.expect(s.pending.buffer == &imported);
+    try testing.expect(s.pending_resource == res);
+    // The attach took its lock on the module's own wrapper.
+    try testing.expectEqual(@as(u32, 1), imported.n_locks);
+
+    s.handleDamageBuffer(1, 1, 3, 3);
+    s.handleDamage(1, 2, 3, 4);
+    s.commit();
+
+    try testing.expect(s.mapped);
+    try testing.expect(s.buffer == &imported);
+    try testing.expectEqual(@as(u32, 0), imported.n_locks); // commit unlocked it
+    // Damage reached the commit pipeline: the buffer rect as sent, the
+    // surface rect translated into buffer coordinates (scale 1, normal
+    // transform), and the surface list untouched.
+    try testing.expectEqual(@as(usize, 2), s.current.buffer_damage.rects.items.len);
+    try testing.expectEqual(Rect{ .x = 1, .y = 1, .width = 3, .height = 3 }, s.current.buffer_damage.rects.items[0]);
+    try testing.expectEqual(Rect{ .x = 1, .y = 2, .width = 3, .height = 4 }, s.current.buffer_damage.rects.items[1]);
+    try testing.expectEqual(@as(usize, 1), s.current.surface_damage.rects.items.len);
+}
+
+test "a wl_buffer the dmabuf resolver does not own still goes down the shm path (F56)" {
+    // The resolver is a lookup, not a claim on every wl_buffer in the
+    // process: a resource it does not know must reach the SHM registry
+    // exactly as before, and be rejected there for being an unknown
+    // buffer type. The previous pending buffer survives.
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    var pending: Buffer = undefined;
+    testBuffer(allocator, &pending);
+    s.attachBuffer(&pending);
+
+    var imported: Buffer = undefined;
+    testBuffer(allocator, &imported);
+    const mine = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    var registry: StubDmabufRegistry = .{ .resource = mine, .buffer = &imported };
+    comp.setDmabufResolver(.{ .ctx = &registry, .resolve = StubDmabufRegistry.resolve });
+
+    const foreign = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    s.handleAttach(@ptrCast(foreign), 0, 0);
+    try testing.expect(s.pending.buffer == &pending);
+    try testing.expect(s.pending_resource == null);
+}
+
+test "clearDmabufResolver stops the attach path resolving dmabuf buffers" {
+    // main() clears the resolver BEFORE LinuxDmabuf.deinit, so an attach
+    // that arrives afterwards must not reach the module. The same buffer
+    // that resolved a moment ago now falls through to shm and is
+    // rejected; the pending buffer the surface already had survives.
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
+
+    var imported: Buffer = undefined;
+    testBuffer(allocator, &imported);
+    const res = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    var registry: StubDmabufRegistry = .{ .resource = res, .buffer = &imported };
+    comp.setDmabufResolver(.{ .ctx = &registry, .resolve = StubDmabufRegistry.resolve });
+
+    s.handleAttach(@ptrCast(res), 0, 0);
+    try testing.expect(s.pending.buffer == &imported);
+
+    // Release the pending slot first: its F42 destroy listener is still
+    // watching `res`, and rejecting the attach destroys that resource,
+    // which would clear the pending slot through the listener and hide
+    // what is being asserted.
+    s.handleAttach(null, 0, 0);
+    comp.clearDmabufResolver();
+    var pending: Buffer = undefined;
+    testBuffer(allocator, &pending);
+    s.attachBuffer(&pending);
+    s.handleAttach(@ptrCast(res), 0, 0);
+    try testing.expect(s.pending.buffer == &pending);
 }

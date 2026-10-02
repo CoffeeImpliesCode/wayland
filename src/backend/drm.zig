@@ -56,6 +56,8 @@ const backend_mod = @import("backend.zig");
 const output_mod = @import("../output/output.zig");
 const pixman = @import("../renderer/pixman.zig");
 const c = @import("drm_c");
+const dmabuf = @import("../buffers/dmabuf.zig");
+const gbm_c = @import("gbm_c");
 
 /// DRM_FORMAT_XRGB8888 ('XR24' fourcc, 0x34325258): memory bytes
 /// B,G,R,X (little-endian u32; the alpha byte is ignored on scanout).
@@ -64,6 +66,22 @@ const c = @import("drm_c");
 /// stores B,G,R,A for rect fills, see addRect in renderer/pixman.zig),
 /// so rows copy verbatim.
 pub const drm_format_xrgb8888: u32 = 0x34325258;
+
+/// The fourccs whose (format, modifier) pairs the GBM device is asked
+/// about. This is the DRM backend's scanout list (drm_format_xrgb8888)
+/// plus the colour/alpha variants a client is most likely to hand us, in
+/// descending preference: the KMS plane here scans out a dumb XRGB8888
+/// buffer, so XRGB8888 must be first. wlroots takes the list from its
+/// renderer's format set instead (wlr_linux_dmabuf_v1_create_with_renderer
+/// -> wlr_linux_dmabuf_feedback_v1_init_with_options), which this
+/// compositor has no equivalent of; a query against the kernel's real
+/// plane modifiers (queryGbmFormats) keeps the answer honest even so.
+const gbm_candidate_formats = [_]u32{
+    drm_format_xrgb8888,
+    dmabuf.drm_format_argb8888,
+    dmabuf.drm_format_xrgb2101010,
+    dmabuf.drm_format_argb2101010,
+};
 
 const default_device_path = "/dev/dri/card0";
 
@@ -174,6 +192,13 @@ const DrmBackendData = struct {
     /// device/mod.rs:252-256). Read by commit() to pick the flip path.
     atomic: bool = true,
     drm_output: ?*DrmOutput = null,
+    /// The GBM device this backend can import client dmabufs into, or null
+    /// when the node offers no GBM (no render node, no gbm_create_device)
+    /// or no supported (format, modifier) pair. The buffer allocator
+    /// (buffers/dmabuf.zig) and the zwp_linux_dmabuf_v1 global
+    /// (shell/linux_dmabuf.zig) are both gated on this field: a global
+    /// without a device behind it is a promise the client can falsify.
+    gbm: ?*dmabuf.GbmDevice = null,
 };
 
 const backend_impl: backend_mod.Backend.Impl = .{
@@ -217,6 +242,17 @@ pub const DrmBackend = struct {
         return @ptrCast(@alignCast(base.data));
     }
 };
+
+/// The GBM device the server may advertise zwp_linux_dmabuf_v1 with, or
+/// null when this backend has none. Null is the correct answer for a
+/// headless/raylib/nested-wayland backend and for a DRM node whose GBM
+/// device or format set could not be brought up — the dmabuf global is
+/// bound only when this returns a device (shell/linux_dmabuf.zig).
+pub fn gbmDevice(self: *DrmBackendData) ?*dmabuf.Device {
+    const dev = self.gbm orelse return null;
+    if (!dev.iface.isLive()) return null;
+    return &dev.iface;
+}
 
 /// The fd to poll for DRM events (page-flip completions).
 pub fn pollFd(self: *DrmBackendData) std.posix.fd_t {
@@ -294,6 +330,13 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
     errdefer drmTeardown(self);
     selectKmsInterface(self);
     becomeMaster(self);
+
+    // --- phase 3b: the GBM device. Not fatal: a node without GBM (or with
+    // no format GBM accepts) still scans out, it just cannot offer
+    // zwp_linux_dmabuf_v1. It sits here, right after the node is open and
+    // before the modeset, because it re-resolves the node from the fd and
+    // that is the last moment the KMS fd is unambiguously ours.
+    try openGbm(self);
 
     // --- phases 4-5: what to drive. `var` (not const): the legacy
     // drmModeSetCrtc path passes &found.connector_id / &found.mode to C,
@@ -396,6 +439,96 @@ fn becomeMaster(self: *DrmBackendData) void {
     } else {
         log_mod.warn("drm: DRM_IOCTL_SET_MASTER failed (not master?)", self.io, self.log_cfg, "drm", .{});
     }
+}
+
+/// Phase 3b: bring up the GBM device this backend can import client
+/// dmabufs into, and enumerate the (format, modifier) pairs it accepts.
+///
+/// Node choice follows wlroots' allocator: prefer the RENDER node of the
+/// same DRM device, fall back to the primary one
+/// (`reopen_drm_node(drm_fd, /*allow_render_node=*/true)`,
+/// render/allocator/allocator.c:38-67). The node is re-opened rather than
+/// reusing the KMS fd for the reason wlroots gives: sharing GEM handle
+/// refcounts between the display and the allocator is what
+/// mesa/drm!110 is about, and a render node carries no modeset
+/// authority we would then have to defend.
+///
+/// Every failure here is NON-fatal. A node with no GBM (a virtual machine
+/// without a render node, a driver whose gbm_create_device refuses) must
+/// still scan out; it simply does not get a zwp_linux_dmabuf_v1 global.
+/// The reverse is not negotiable: a global without a device behind it is a
+/// promise the client can falsify on its first create request.
+fn openGbm(self: *DrmBackendData) error{OutOfMemory}!void {
+    const node = gbmNodePath(self) orelse {
+        log_mod.info("drm: no GBM node for {s}; dmabuf import disabled", self.io, self.log_cfg, "drm", .{
+            self.device_path,
+        });
+        return;
+    };
+    const dev = dmabuf.GbmDevice.create(self.allocator, node) catch |err| {
+        log_mod.warn("drm: gbm device on {s} failed ({s}); dmabuf import disabled", self.io, self.log_cfg, "drm", .{
+            node,
+            @errorName(err),
+        });
+        return;
+    };
+    errdefer dev.deinit();
+    dev.setFormats(try queryGbmFormats(self, dev));
+    if (dev.formats.len == 0) {
+        log_mod.info("drm: GBM on {s} advertises no supported format; dmabuf import disabled", self.io, self.log_cfg, "drm", .{node});
+        return;
+    }
+    self.gbm = dev;
+    log_mod.info("drm: GBM {s} on {s} with {d} format/modifier pairs", self.io, self.log_cfg, "drm", .{
+        dev.backendName(),
+        node,
+        dev.formats.len,
+    });
+}
+
+/// The node to open a GBM device on: this device's render node when it
+/// has one, its primary node otherwise. Both names come from the already
+/// open KMS fd, so they always name the same physical device
+/// (wlroots reopen_drm_node, render/allocator/allocator.c:53-65).
+fn gbmNodePath(self: *DrmBackendData) ?[:0]const u8 {
+    const fd = self.fd.?;
+    if (c.drmGetRenderDeviceNameFromFd(fd)) |name| {
+        defer std.c.free(name);
+        return std.mem.span(name);
+    }
+    if (c.drmGetDeviceNameFromFd2(fd)) |name| {
+        defer std.c.free(name);
+        return std.mem.span(name);
+    }
+    return null;
+}
+
+/// The (format, modifier) pairs this GBM device really accepts.
+///
+/// One modifier is considered: DRM_FORMAT_MOD_LINEAR. GBM is the authority
+/// for whether a (format, modifier) pair is importable at all
+/// (`gbm_device_get_format_modifier_plane_count`, the call that decides
+/// what wlroots' renderer would accept in render/allocator/gbm.c:71-87), and
+/// linear is the one layout that is meaningful for this compositor: the
+/// KMS scanout here is a dumb XRGB8888 buffer, and there is no tiled or
+/// compressed modifier anywhere in the pipeline that could present one.
+///
+/// The kernel's FULL per-format modifier list (the IN_FORMATS_MODIFIERS
+/// blob on each plane) is deliberately not walked: reading it needs a
+/// per-plane property walk this backend does not otherwise do, and
+/// advertising a tiled modifier we cannot scan out would be a promise the
+/// first page flip would break. A driver that can only do tiled layouts
+/// therefore ends up with no advertised pair, and with no
+/// zwp_linux_dmabuf_v1 global - which is the honest answer.
+fn queryGbmFormats(self: *DrmBackendData, dev: *dmabuf.GbmDevice) error{OutOfMemory}![]dmabuf.Format {
+    var list: std.ArrayList(dmabuf.Format) = .empty;
+    errdefer list.deinit(self.allocator);
+    for (gbm_candidate_formats) |format| {
+        if (gbm_c.gbm_device_get_format_modifier_plane_count(dev.device, format, dmabuf.drm_format_mod_linear) < 1) continue;
+        if (dmabuf.supports(list.items, format, dmabuf.drm_format_mod_linear)) continue;
+        try list.append(self.allocator, .{ .format = format, .modifier = dmabuf.drm_format_mod_linear });
+    }
+    return list.items;
 }
 
 /// Phase 4: find a connected connector with a mode, its encoder and a
@@ -1214,6 +1347,19 @@ fn copyRows(src: []const u8, src_stride: usize, dst: []u8, dst_stride: u32, widt
     }
 }
 
+/// The GBM device this backend imported client dmabufs into. It goes
+/// before the KMS fd: it was opened after it, and its gbm_bo objects
+/// belong to the buffers the compositor imported through it. Those buffers
+/// die with the zwp_linux_dmabuf_v1 module, so the server must deinit that
+/// module before it destroys this backend or a bo destruction would touch
+/// a freed device (wlroots orders it the same way,
+/// render/allocator/gbm.c:197-212).
+fn teardownGbm(self: *DrmBackendData) void {
+    const dev = self.gbm orelse return;
+    self.gbm = null;
+    dev.deinit();
+}
+
 /// Release DRM device resources in reverse acquisition order: RmFB,
 /// destroy dumb, munmap, drop master, close (task teardown order).
 /// Null-safe and idempotent so partial start() failures clean up.
@@ -1242,6 +1388,7 @@ fn drmTeardown(self: *DrmBackendData) void {
             }
         }
     }
+    teardownGbm(self);
     if (self.is_master) {
         _ = c.drmIoctl(fd, c.DRM_IOCTL_DROP_MASTER, null);
         self.is_master = false;

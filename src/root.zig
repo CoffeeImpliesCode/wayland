@@ -33,6 +33,10 @@ pub const core = struct {
 };
 
 pub const buffers = @import("buffers/buffer.zig");
+/// Linux dmabuf buffer import (buffers/dmabuf.zig): the GBM-backed
+/// buffer path a client reaches through zwp_linux_dmabuf_v1. Exported
+/// for consumers that present GPU buffers.
+pub const dmabuf = @import("buffers/dmabuf.zig");
 pub const shm = @import("buffers/shm.zig");
 pub const compositor = @import("compositor/compositor.zig");
 pub const seat = @import("compositor/seat.zig");
@@ -123,6 +127,10 @@ pub const session_lock = @import("shell/session_lock.zig");
 /// zwlr_foreign_toplevel_manager_v1 (shell/foreign_toplevel.zig): the
 /// compositor's own toplevels as client-visible handles.
 pub const foreign_toplevel = @import("shell/foreign_toplevel.zig");
+/// zwp_linux_dmabuf_v1 (shell/linux_dmabuf.zig): the dmabuf global,
+/// registered only when a GBM device exists — advertising it without
+/// one would be a lie a client can detect.
+pub const linux_dmabuf = @import("shell/linux_dmabuf.zig");
 pub const scene = @import("scene/scene.zig");
 /// Surface→scene binding (scene/surface_node.zig): the library's
 /// wl_surface→scene-node table. Tracks a surface through its
@@ -192,6 +200,8 @@ comptime {
     _ = tearing_control;
     _ = session_lock;
     _ = foreign_toplevel;
+    _ = dmabuf;
+    _ = linux_dmabuf;
     _ = scene;
     _ = surface_node;
     _ = camera;
