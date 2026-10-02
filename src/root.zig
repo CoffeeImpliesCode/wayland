@@ -62,6 +62,11 @@ pub const primary_selection = @import("compositor/primary_selection.zig");
 /// compositor as the data SOURCE — a client reads the selection out
 /// without ever providing a wl_data_source.
 pub const data_control = @import("compositor/data_control.zig");
+/// Logind session, VT and udev hotplug (backend/session.zig): the M6
+/// session lifecycle the DRM backend speaks over sd-bus. Every path
+/// degrades non-fatally when no session manager is present, which is the
+/// VM case this compositor still runs in.
+pub const session = @import("backend/session.zig");
 pub const backend = @import("backend/backend.zig");
 /// libinput input backend (backend/libinput.zig): evdev devices via
 /// libinput (udev context). Exported for the test server.
@@ -182,6 +187,7 @@ comptime {
     _ = backend;
     _ = libinput;
     _ = data_control;
+    _ = session;
     _ = drm;
     // raylib/raylib_input import "raylib_c", which build.zig only wires
     // with -Denable_raylib; force their analysis only when it exists.

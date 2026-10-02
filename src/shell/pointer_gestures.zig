@@ -1,5 +1,5 @@
 //! zwp_pointer_gestures_v1 (unstable/pointer-gestures, v3): swipe, pinch and
-//! hold gesture notification for the seat's pointer.
+//! hold gesture notification for the seat's pointer AND touchscreen.
 //!
 //! wlroots parity (0.20.2). types/wlr_pointer_gestures_v1.c performs NO
 //! gesture detection of its own — it forwards the backend's already
@@ -80,6 +80,95 @@
 //!   simultaneous gestures on one pointer/seat (XML:96-100, :159-163,
 //!   :232-236).
 //!
+//! GESTURE SOURCE (touch and pointer are two ways into one gesture).
+//! The premise for this section, corrected. The task described
+//! `wlr_pointer_gestures.c` as the place that tracks finger counts
+//! across both sources. There is no such file: at wlroots 0.20.2 the
+//! whole protocol implementation is `types/wlr_pointer_gestures_v1.c`
+//! (433 lines, plus `types/seat/{wlr_seat_pointer,wlr_seat_touch}.c`
+//! for the seat and `backend/libinput/pointer.c:186-293` for the
+//! events); nothing anywhere in the tree records which device produced
+//! a gesture. What upstream DOES have is ONE `fingers` count per
+//! gesture event — `libinput_event_gesture_get_finger_count`, filled
+//! the same way whether libinput classified a touchpad or a
+//! touchscreen (backend/libinput/pointer.c:194, :207, :235, :248,
+//! :277) — and one delivery path, `seat->pointer_state.focused_surface`
+//! (:160-163, :187-191, :218-222). So upstream's own answer to "which
+//! source owns the gesture" is: it does not answer, and the
+//! arbitration is left to its caller.
+//!
+//! This module therefore states the rule it enforces, and the rule is
+//! the XML's: "There cannot be multiple simultaneous hold, pinch or
+//! swipe gestures on a same pointer/seat" (XML:99-100, :161-163,
+//! :232-236) — per SEAT, not per device. The seat admits exactly ONE
+//! gesture, and it belongs to the source that armed it:
+//! - While a touch gesture is live, pointer motion and buttons are
+//!   INERT — they do not arm, promote, update or END it. While a
+//!   pointer gesture is live, touch points are inert the same way.
+//! - A source that starts while the other owns the gesture is dropped
+//!   whole, not queued: the losing source's first real motion is
+//!   still gated, because the owner must lift first.
+//! - The seat's backend pinch API is the pointer source, all three
+//!   calls of it: pinchBegin takes over a live pointer swipe or hold,
+//!   exactly as before, and pinchBegin, pinchUpdate AND pinchEnd are
+//!   refused while a TOUCH gesture owns the seat — the end included, so
+//!   a backend cannot close a touch pinch it never began.
+//! A touchscreen that is the only input therefore works from touch
+//! ALONE: nothing on the touch path reads pointer_focus or
+//! pressed_count, so a seat with no pointer focus anywhere still
+//! reports gestures to the touch-focus client.
+//!
+//! TOUCH DETECTION, in the pointer path's own terms so the two cannot
+//! drift apart:
+//! - A candidate arms on the 0 -> 1 transition of the DOWN TOUCH POINTS
+//!   (Seat.activeTouchPoints), driven by Seat.events.touch. A second
+//!   finger only raises the count.
+//! - min_swipe_fingers counts POINTS on this path, not pressed buttons.
+//!   One finger is a hold or a drag, never a swipe — the same rule the
+//!   pointer path applies to one held button (XML:88-92).
+//! - Positions are the point CENTROID: the mean of the live points, so
+//!   two fingers sliding together translate the gesture, which is what
+//!   a swipe is (XML:127-129: "the logical center of the gesture"). A
+//!   finger added to or lifted from a live gesture re-bases the delta
+//!   reference and sends NOTHING: the point SET changed, which is not
+//!   travel. While the candidate is still PENDING the same change also
+//!   re-bases its ORIGIN, so the travel measured is the center's move
+//!   since the fingers were last put down — the second finger landing
+//!   100 px away moves the center 50 px on its own, which is nobody
+//!   swiping anything.
+//! - Coordinates are converted to whole pixels ONCE, at the entry
+//!   boundary (touchPixel, below), so every threshold on this path is
+//!   the pointer path's exact integer square comparison on the same i32
+//!   pixel space — no float, no rounding, no second numeric model.
+//!   The seat stores whole pixels anyway (`@floatFromInt(p.sx)` of its
+//!   i32 pick, Seat.touchDown), so the conversion is the identity for
+//!   every point this compositor produces.
+//! - TOUCH PINCH: the pair (the two points that were down when the
+//!   second finger landed) is PINNED once and its exact squared
+//!   separation kept as the denominator of every later scale
+//!   (XML:185-206: scale is relative to begin). A candidate promotes
+//!   to a pinch when the pair's separation has moved at least
+//!   pinch_threshold_px from that baseline — compared as integers
+//!   against (base ± threshold)², and only when the logical center has
+//!   NOT travelled a full swipe threshold: a center that has is a
+//!   swipe (XML:88-92 "fingers moving in the same direction"), a spread
+//!   change the center did not travel into is a pinch (XML:154-158
+//!   "moving towards each other or away from each other"). Only a
+//!   PENDING candidate may become a pinch: once a swipe or a hold has
+//!   begun, its deltas have described translation, and a scale taken
+//!   from that moment would report travel the client never saw. A pinch
+//!   whose pinned point lifts ends — it has no baseline left, and the
+//!   XML ends a gesture "when one or more fingers are lifted"
+//!   (XML:138-140). Rotation is zero: a touchscreen reports
+//!   positions, never an angle.
+//! - GRAB: touch obeys grabOwned exactly as the pointer does. The seat
+//!   already gates the client side (Seat.touchDown / touchMotion /
+//!   touchUp return before emitting anything while a grab is
+//!   installed), and the one touch notification that DOES arrive under
+//!   a grab — Seat.startPointerGrab's close sequence — reaches this
+//!   module with the grab already installed, so it closes a live touch
+//!   gesture once with cancelled = 1 and reports nothing else.
+//!
 //! Cross-module contract: the manager binds per client
 //! (zwp_pointer_gestures_v1); get_swipe_gesture / get_pinch_gesture /
 //! get_hold_gesture each create one gesture object bound to the seat live
@@ -92,6 +181,10 @@
 //! Fixed.fromInt (24.8 signed, wayland.xml `fixed`), matching the
 //! wl_fixed_from_int of the same pixel distance wlroots sends as
 //! wl_fixed_from_double of its double delta (wlr_pointer_gestures_v1.c:94).
+//! The touch path sends the same 24.8 pixels by the same conversion: a
+//! touch position becomes whole pixels once at the entry boundary
+//! (touchPixel), and every delta is the same i32 pixel difference
+//! `fixedFromPixels` already converts.
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
@@ -112,8 +205,10 @@ const Fixed = wire.wl.Fixed;
 /// why wlroots 0.20.2 has no equivalent constant).
 pub const swipe_threshold_px: i32 = 50;
 
-/// Fingers (held pointer buttons) a swipe needs. The XML calls a swipe a
-/// "multi-finger swipe gesture" (XML:88-92).
+/// Fingers a swipe needs. Held POINTER BUTTONS on the pointer path,
+/// DOWN TOUCH POINTS on the touch path — the XML's own word is
+/// "multi-finger swipe gesture" (XML:88-92) and a finger on glass is a
+/// point, not a button.
 pub const min_swipe_fingers: u32 = 2;
 
 /// Travel a candidate may accumulate before the hold timer fires and still
@@ -125,6 +220,11 @@ pub const hold_threshold_ms: u32 = 180;
 
 /// Largest single motion step tolerated while the candidate has not begun.
 pub const max_step_px: i32 = 250;
+
+/// Change in the separation of the pinched touch pair that promotes a
+/// pending touch candidate to a pinch, in pixels (compositor policy —
+/// see the file header for the TOUCH DETECTION section).
+pub const pinch_threshold_px: i32 = 30;
 
 /// Square distance between two pointer positions. Saturating: |dx| reaches
 /// 2^32 across the whole i32 range and its square does not fit an i64,
@@ -157,6 +257,136 @@ fn fixedFromDouble(d: f64) Fixed {
     return Fixed.fromDouble(std.math.clamp(d, -8388608.0, 8388607.0));
 }
 
+/// A whole-pixel position in output coordinates — the same space as
+/// Seat.pointer_x / pointer_y, so squaredDistance and atLeast below
+/// compare touch travel with the pointer path's exact integer
+/// arithmetic and the two paths cannot drift apart.
+const Point = struct { x: i32, y: i32 };
+
+/// Seat.TouchPoint carries f64, but every comparator in this module is
+/// an exact integer square comparison, so a touch position is converted
+/// to WHOLE PIXELS exactly once, here, at the entry boundary. The
+/// conversion is the IDENTITY for every point this compositor produces
+/// — the seat stores `@floatFromInt(p.sx)` of its own i32 pick result
+/// (Seat.touchDown) — so the rounding matters only for a backend that
+/// reports sub-pixel positions, and it is the rule the seat itself
+/// applies to one (Seat.pickCoord, `@intFromFloat(@round(v))`). NaN
+/// fails every comparison and maps to zero with an out-of-range value
+/// rather than trapping @intFromFloat.
+fn touchPixel(v: f64) i32 {
+    // The bounds are the pointer path's i32 pixel range, so a converted
+    // touch position is the same kind of number squaredDistance and
+    // atLeast already take.
+    if (!(v >= -2147483648.0 and v <= 2147483647.0)) return 0;
+    return @intFromFloat(@round(v));
+}
+
+/// The live point `id` in whole pixels, or null when it is no longer
+/// down (wayland.xml:2774-2778: an id is only meaningful between its
+/// down and its up).
+fn touchPixelById(points: []const seat_mod.TouchPoint, id: c_int) ?Point {
+    for (points) |p| {
+        if (p.id == id) return .{ .x = touchPixel(p.x), .y = touchPixel(p.y) };
+    }
+    return null;
+}
+
+/// The logical center of the gesture (XML:127-129: the swipe's dx/dy
+/// are "the relative coordinates of the logical center"): the mean of
+/// the live points, truncated toward zero to the whole-pixel grid the
+/// comparators work in. The truncation is below a pixel per event and,
+/// because a run of deltas telescopes, never accumulates past the
+/// number of events.
+fn touchCentroid(points: []const seat_mod.TouchPoint) Point {
+    if (points.len == 0) return .{ .x = 0, .y = 0 };
+    var sum_x: i64 = 0;
+    var sum_y: i64 = 0;
+    for (points) |p| {
+        sum_x += touchPixel(p.x);
+        sum_y += touchPixel(p.y);
+    }
+    const n: i64 = @intCast(points.len);
+    // A mean of i32 values is an i32 value, so neither @intCast traps.
+    return .{ .x = @intCast(@divTrunc(sum_x, n)), .y = @intCast(@divTrunc(sum_y, n)) };
+}
+
+/// The two points whose separation defines a touch pinch's scale, and
+/// that separation at the moment the pair was pinned. `base_px` is the
+/// baseline as a whole-pixel distance so every threshold test below is
+/// an exact integer square comparison against (base ± threshold)²;
+/// `base_dist2` is the EXACT squared distance, so the reported scale is
+/// a ratio of two exact squared lengths and never inherits the baseline
+/// rounding. `base_px` is derived once per pair with @sqrt — the only
+/// float in the touch detection path, and never inside a comparator.
+const PinchPair = struct {
+    a: c_int,
+    b: c_int,
+    base_px: i32,
+    base_dist2: u64,
+};
+
+/// True when the pinched pair's separation has moved at least
+/// `threshold` pixels away from the separation the pair was pinned at —
+/// pulled apart (XML:154-158: fingers "moving towards each other or
+/// away from each other"). A pair pinned coincident has no separation
+/// to change, so it never opens a pinch.
+fn pinchSpreadChanged(spread2: u64, pair: PinchPair, threshold: i32) bool {
+    if (pair.base_px == 0) return false;
+    const t: i64 = threshold;
+    const up: u64 = @intCast(@as(i64, pair.base_px) + t);
+    if (spread2 >= up *| up) return true;
+    const down_i: i64 = @as(i64, pair.base_px) - t;
+    if (down_i > 0) {
+        const down: u64 = @intCast(down_i);
+        if (spread2 <= down * down) return true;
+    }
+    // Both fingers came together on one point: the separation collapsed
+    // to zero, which is the furthest a pinch can go.
+    return spread2 == 0;
+}
+
+/// The touch gesture's own bookkeeping (see the file header's TOUCH
+/// DETECTION section). Coordinates are whole pixels in the pointer
+/// path's space, so every comparator is the same exact integer square
+/// comparison the pointer path uses.
+const TouchState = struct {
+    /// The target the live touch gesture is addressed to: the TOUCH
+    /// focus surface's client and surface. Captured when the gesture
+    /// BEGINS, because the seat clears the touch focus whenever it
+    /// takes the points away (a grab closes them,
+    /// Seat.startPointerGrab) and the closing `end` still has to reach
+    /// the client whose `begin` is open — the same promise the pointer
+    /// path makes about a grab.
+    target: ?FocusTarget = null,
+    /// Live points the module last saw. It is the record that tells a
+    /// motion apart from a finger being added or lifted, so only the
+    /// seat emptying the point list clears it.
+    count: u32 = 0,
+    /// The centroid at the gesture's origin and at the previous touch
+    /// event; swipe and pinch deltas are taken against the latter.
+    origin_x: i32 = 0,
+    origin_y: i32 = 0,
+    prev_x: i32 = 0,
+    prev_y: i32 = 0,
+    /// The pinned scale pair, null until a second finger is down.
+    pair: ?PinchPair = null,
+};
+
+/// Which input owns the seat's single gesture slot. The XML forbids
+/// two gestures on one SEAT (XML:99-100, :161-163, :232-236), not two
+/// on one device, so a gesture belongs to the source that armed it and
+/// the other source is inert until the owner lifts — see the file
+/// header's GESTURE SOURCE section, including the correction to the
+/// task premise about wlroots.
+const Source = enum {
+    /// Nothing tracked.
+    none,
+    /// Held pointer buttons (Seat.pressed_count).
+    pointer,
+    /// Down touch points (Seat.activeTouchPoints).
+    touch,
+};
+
 /// The seat's pointer focus, which every gesture event is addressed to
 /// (wlroots uses focused_surface + focused_client throughout).
 const FocusTarget = struct {
@@ -169,19 +399,31 @@ fn focusTarget(seat: *seat_mod.Seat) ?FocusTarget {
     return .{ .client = focus.resource.getClient(), .surface = focus.resource };
 }
 
+/// The seat's TOUCH focus and its client: where a touch gesture is
+/// addressed. Touch focus is independent of pointer focus —
+/// Seat.touchDown sets it and no pointer button ever does — so this
+/// resolves on a seat with no pointer focus at all, which is exactly
+/// what a touchscreen-only input looks like.
+fn touchFocusTarget(seat: *seat_mod.Seat) ?FocusTarget {
+    const focus = seat.touchFocus() orelse return null;
+    return .{ .client = focus.resource.getClient(), .surface = focus.resource };
+}
+
 /// The detection state machine. The XML forbids two simultaneous gestures
 /// on one pointer/seat, so exactly one candidate or gesture exists at a
 /// time (XML:96-100).
 const Phase = enum {
     /// Nothing tracked.
     idle,
-    /// A button is down; the candidate has neither begun nor been killed.
+    /// The first button press / first touch point is down; the
+    /// candidate has neither begun nor been killed.
     pending,
     /// A hold is active (no update stage, XML:246-248).
     hold,
     /// A swipe is active; motion becomes update.
     swipe,
-    /// A pinch is active; driven through the public pinch* API.
+    /// A pinch is active: the seat's backend pinch API on the pointer
+    /// path, the pinned touch pair on the touch path.
     pinch,
 };
 
@@ -211,9 +453,9 @@ pub const PointerGestures = struct {
     io: *std.Io,
     log_cfg: *const log.Config,
     display: *display_mod.CompositorDisplay,
-    /// The seat whose pointer drives the gestures; null when the
-    /// compositor has no seat yet — the global still binds and every
-    /// gesture object is inert.
+    /// The seat whose pointer and touchscreen drive the gestures; null
+    /// when the compositor has no seat yet — the global still binds and
+    /// every gesture object is inert.
     seat: ?*seat_mod.Seat,
     /// The zwp_pointer_gestures_v1 global, for teardown.
     global: ?*wire.Global = null,
@@ -223,21 +465,27 @@ pub const PointerGestures = struct {
     pinches: std.ArrayList(*PinchState) = .empty,
     holds: std.ArrayList(*HoldState) = .empty,
 
-    /// Seat motion/button/seat-destroy listeners. They live exactly as
-    /// long as the module (removed by setSeat and deinit) and the module
-    /// owns the seat pointer they dereference.
+    /// Seat motion/button/touch/seat-destroy listeners. They live
+    /// exactly as long as the module (removed by setSeat and deinit)
+    /// and the module owns the seat pointer they dereference.
     motion_listener: wire.Listener(*seat_mod.Seat),
     button_listener: wire.Listener(*seat_mod.Seat),
+    touch_listener: wire.Listener(*seat_mod.Seat),
     seat_destroy_listener: wire.Listener(*seat_mod.Seat),
 
     // Detection state (see the file header).
     phase: Phase = .idle,
+    /// Which input owns the seat's single gesture slot; the other one
+    /// is inert until this one lifts (GESTURE SOURCE, file header).
+    source: Source = .none,
     /// Press point, in output coordinates.
     origin_x: i32 = 0,
     origin_y: i32 = 0,
     /// Previous motion position; swipe update deltas are taken against it.
     prev_x: i32 = 0,
     prev_y: i32 = 0,
+    /// The touch path's own bookkeeping, in the same whole-pixel space.
+    touch: TouchState = .{},
     /// The hold delay timer; live only while phase == .pending.
     hold_timer: ?*wire.EventSource = null,
 
@@ -262,6 +510,7 @@ pub const PointerGestures = struct {
             // undefined is never observed.
             .motion_listener = wire.Listener(*seat_mod.Seat).init(onSeatMotion),
             .button_listener = wire.Listener(*seat_mod.Seat).init(onSeatButton),
+            .touch_listener = wire.Listener(*seat_mod.Seat).init(onSeatTouch),
             .seat_destroy_listener = wire.Listener(*seat_mod.Seat).init(onSeatDestroy),
         };
         errdefer self.managers.deinit(allocator);
@@ -298,15 +547,17 @@ pub const PointerGestures = struct {
         allocator.destroy(self);
     }
 
-    /// Attach (or detach, with null) the seat whose pointer drives the
-    /// gestures. Re-attaching the same seat is a no-op. Detaching ends an
-    /// active gesture with cancelled = 1 and drops a pending candidate.
+    /// Attach (or detach, with null) the seat whose pointer and
+    /// touchscreen drive the gestures. Re-attaching the same seat is a
+    /// no-op. Detaching ends an active gesture with cancelled = 1 and
+    /// drops a pending candidate.
     pub fn setSeat(self: *PointerGestures, seat: ?*seat_mod.Seat) void {
         if (self.seat == seat) return;
         if (self.seat != null) {
             // wire.Signal has no remove(); the links are live exactly
             // while self.seat != null (added below, removed here).
             self.motion_listener.link.remove();
+            self.touch_listener.link.remove();
             self.button_listener.link.remove();
             self.seat_destroy_listener.link.remove();
         }
@@ -315,11 +566,15 @@ pub const PointerGestures = struct {
         self.cancel(true);
         self.cancelHoldTimer();
         self.phase = .idle;
+        // The touch bookkeeping belongs to the OLD seat's point list,
+        // which this module is no longer watching.
+        self.touch.count = 0;
         self.seat = seat;
         if (seat) |s| {
             s.events.pointer_move.add(&self.motion_listener);
             s.events.button.add(&self.button_listener);
             s.events.destroy.add(&self.seat_destroy_listener);
+            s.events.touch.add(&self.touch_listener);
         }
     }
 
@@ -331,7 +586,7 @@ pub const PointerGestures = struct {
     /// (wlr_pointer_gestures_v1.c:98-123).
     pub fn cancel(self: *PointerGestures, cancelled: bool) void {
         const seat = self.seat orelse {
-            self.phase = .idle;
+            self.resetGesture();
             return;
         };
         switch (self.phase) {
@@ -341,7 +596,24 @@ pub const PointerGestures = struct {
             .swipe => self.sendSwipeEnd(seat, cancelled),
             .pinch => self.sendPinchEnd(seat, seat.nowMs(), cancelled),
         }
+        self.resetGesture();
+    }
+
+    /// Idle and source-less: the state every entry point expects to
+    /// find before it arms anything, and the only way the gesture slot
+    /// is handed back to the other input source. `touch.count` is
+    /// deliberately NOT cleared — it is the module's record of how many
+    /// points the last seat notification carried, and only the seat
+    /// emptying the point list (handleTouch) may clear it.
+    fn resetGesture(self: *PointerGestures) void {
         self.phase = .idle;
+        self.source = .none;
+        self.touch.target = null;
+        self.touch.origin_x = 0;
+        self.touch.origin_y = 0;
+        self.touch.prev_x = 0;
+        self.touch.prev_y = 0;
+        self.touch.pair = null;
     }
 
     /// wlroots wlr_pointer_gestures_v1_send_pinch_begin
@@ -351,16 +623,25 @@ pub const PointerGestures = struct {
     /// becomes active (wlroots :165-170). Under a compositor pointer
     /// grab the whole call is dropped: the grab owns the pointer, so a
     /// pinch would reach a client that received no motion at all.
+    ///
+    /// This is the POINTER source's pinch (a backend that classifies
+    /// gestures from a pointer device, wlroots' own path). A live TOUCH
+    /// gesture owns the seat's single gesture slot and is NOT taken
+    /// over — the rule is the XML's per-seat rule, not a per-API
+    /// exception (XML:99-100, :161-163; see GESTURE SOURCE, file
+    /// header).
     pub fn pinchBegin(self: *PointerGestures, time_ms: u32, fingers: u32) void {
         const seat = self.seat orelse return;
         if (self.grabOwned(seat)) return;
+        if (self.source == .touch) return;
         self.cancelHoldTimer();
         if (self.phase == .swipe or self.phase == .hold) self.cancel(true);
         const focus = focusTarget(seat) orelse {
-            self.phase = .idle;
+            self.resetGesture();
             return;
         };
         self.phase = .pinch;
+        self.source = .pointer;
         self.prev_x = seat.pointer_x;
         self.prev_y = seat.pointer_y;
         const serial = seat.serialFor(focus.client);
@@ -389,6 +670,9 @@ pub const PointerGestures = struct {
         const seat = self.seat orelse return;
         if (self.grabOwned(seat)) return;
         if (self.phase != .pinch) return;
+        // A touch pinch is a different gesture driven by touch points;
+        // the backend's own pinch may not update it (GESTURE SOURCE).
+        if (self.source != .pointer) return;
         const focus = focusTarget(seat) orelse return;
         const fdx = fixedFromDouble(dx);
         const fdy = fixedFromDouble(dy);
@@ -403,11 +687,20 @@ pub const PointerGestures = struct {
 
     /// wlroots wlr_pointer_gestures_v1_send_pinch_end
     /// (wlr_pointer_gestures_v1.c:218-243).
+    ///
+    /// This is the POINTER source's end, like pinchBegin and
+    /// pinchUpdate, and the same rule applies: a touch pinch belongs to
+    /// the points that armed it and ends when a point lifts, when the
+    /// module cancels it, or when a grab takes over. A backend whose
+    /// pinch_end arrives while the points own the seat must not close a
+    /// gesture it never began — that would end the client's open begin
+    /// with a serial and an outcome describing a different gesture.
     pub fn pinchEnd(self: *PointerGestures, time_ms: u32, cancelled: bool) void {
         const seat = self.seat orelse return;
         if (self.phase != .pinch) return;
+        if (self.source != .pointer) return;
         self.sendPinchEnd(seat, time_ms, cancelled);
-        self.phase = .idle;
+        self.resetGesture();
     }
 
     /// True while a gesture is being tracked (pending or active). Test and
@@ -426,6 +719,14 @@ pub const PointerGestures = struct {
     /// pointer_focus, the only thing `focusTarget` requires. So every
     /// detection entry point gates here, exactly as a pointer
     /// constraint refuses to activate under one (pointer_constraints.zig:432).
+    ///
+    /// Touch obeys the same gate, by the same mechanism and not by a
+    /// second rule: Seat.touchDown / touchMotion / touchUp return before
+    /// emitting anything while a grab is installed, and the ONE touch
+    /// notification that does arrive under a grab — Seat.startPointerGrab's
+    /// close sequence — reaches this function with the grab installed,
+    /// so the live gesture is closed once here and nothing else is
+    /// reported.
     fn grabOwned(self: *PointerGestures, seat: *seat_mod.Seat) bool {
         if (seat.pointer_grab == null) return false;
         // A gesture live when the grab took over is closed once, here:
@@ -440,6 +741,10 @@ pub const PointerGestures = struct {
 
     fn handleButton(self: *PointerGestures, seat: *seat_mod.Seat) void {
         if (self.grabOwned(seat)) return;
+        // A touch gesture owns the seat's single gesture slot: the
+        // pointer neither starts nor ends one while it runs
+        // (GESTURE SOURCE, file header).
+        if (self.source == .touch) return;
         if (seat.pressed_count == 0) {
             // The release that drains the last held button ends the
             // gesture normally (cancelled = 0): "one or more fingers are
@@ -455,6 +760,9 @@ pub const PointerGestures = struct {
 
     fn handleMotion(self: *PointerGestures, seat: *seat_mod.Seat) void {
         if (self.grabOwned(seat)) return;
+        // Same rule as handleButton: while a touch gesture runs, the
+        // pointer moves nobody's gesture.
+        if (self.source == .touch) return;
         const x = seat.pointer_x;
         const y = seat.pointer_y;
         switch (self.phase) {
@@ -484,7 +792,7 @@ pub const PointerGestures = struct {
                 // SLOP BOUND: one step this large is a warp, not travel.
                 if (atLeast(x, y, self.prev_x, self.prev_y, max_step_px)) {
                     self.cancelHoldTimer();
-                    self.phase = .idle;
+                    self.resetGesture();
                     return;
                 }
                 self.prev_x = x;
@@ -497,7 +805,7 @@ pub const PointerGestures = struct {
                     // Moved too far to still be a hold, too little to be
                     // a swipe: this is a drag, not a gesture.
                     self.cancelHoldTimer();
-                    self.phase = .idle;
+                    self.resetGesture();
                 }
             },
             .swipe => {
@@ -517,10 +825,18 @@ pub const PointerGestures = struct {
 
     fn arm(self: *PointerGestures, seat: *seat_mod.Seat) void {
         self.phase = .pending;
+        self.source = .pointer;
         self.origin_x = seat.pointer_x;
         self.origin_y = seat.pointer_y;
         self.prev_x = seat.pointer_x;
         self.prev_y = seat.pointer_y;
+        self.startHoldTimer();
+    }
+
+    /// Arm the hold delay. Shared by both sources: the timer only ever
+    /// runs holdTimeout, which asks the module which source owns the
+    /// pending candidate.
+    fn startHoldTimer(self: *PointerGestures) void {
         const loop = self.display.getServer().getEventLoop();
         const timer = loop.addTimer(*PointerGestures, holdTimeout, self) catch {
             // No timer source: the hold never fires, the swipe path is
@@ -549,16 +865,21 @@ pub const PointerGestures = struct {
         // min_swipe_fingers the travel is a plain drag and no gesture is
         // reported at all.
         if (seat.pressed_count < min_swipe_fingers) {
-            self.phase = .idle;
+            self.resetGesture();
             return;
         }
         self.prev_x = seat.pointer_x;
         self.prev_y = seat.pointer_y;
         const focus = focusTarget(seat) orelse {
-            self.phase = .idle;
+            self.resetGesture();
             return;
         };
+        // The slot is the pointer's for the whole gesture, including
+        // when the swipe was promoted out of a live hold — cancel()
+        // above cleared the source, and a swipe that did not reclaim
+        // it would let a finger re-base a pointer gesture's deltas.
         self.phase = .swipe;
+        self.source = .pointer;
         const serial = seat.serialFor(focus.client);
         for (self.swipes.items) |st| {
             if (st.seat != seat) continue;
@@ -567,8 +888,347 @@ pub const PointerGestures = struct {
         }
     }
 
+    // --- touch detection ------------------------------------------------
+    //
+    // The touch path is the pointer path with two substitutions and no
+    // new geometry: the pointer position becomes the live points'
+    // centroid, and pressed_count becomes the number of down points.
+    // Every comparator below is the pointer path's own
+    // squaredDistance / atLeast on whole pixels.
+
+    /// Seat.events.touch fired. The seat has already applied the event:
+    /// a down appended its point, a motion moved it, an up removed it,
+    /// and a cancel / grab close sequence emptied the list (every one of
+    /// Seat.touchDown, touchMotion, touchUp, touchCancel and
+    /// Seat.startPointerGrab's close sequence emits). The point COUNT
+    /// is therefore the record of what just happened: unchanged means
+    /// the fingers moved, changed means one joined or left.
+    fn handleTouch(self: *PointerGestures, seat: *seat_mod.Seat) void {
+        const points = seat.activeTouchPoints();
+        const count: u32 = @intCast(points.len);
+        const previous_count = self.touch.count;
+        // Synced before the grab gate so the count always matches the
+        // seat, including on the close sequence a grab start emits.
+        self.touch.count = count;
+        if (self.grabOwned(seat)) return;
+        // A pointer gesture owns the seat's single gesture slot until
+        // it lifts (GESTURE SOURCE, file header).
+        if (self.source == .pointer) return;
+
+        if (count == 0) {
+            // Every point is gone. EXACTLY ONE of them vanishing in one
+            // step is the last finger lifting, which is the XML's own
+            // end condition and ends the gesture normally
+            // (XML:138-140). Two or more at once is the seat taking the
+            // gesture away (touchCancel, the capability drop, the focus
+            // surface's death): the client never saw those fingers lift,
+            // so it must undo. A single-point teardown is
+            // indistinguishable from a lift here and is reported as
+            // one, which costs a client nothing: the gesture ends and
+            // no update can follow. The one teardown that DOES carry a
+            // decision — the grab's close sequence — is decided by
+            // grabOwned above, before this branch, because it arrives
+            // with the grab already installed.
+            const cancelled = previous_count != 1;
+            if (self.phase != .idle) self.cancel(cancelled);
+            return;
+        }
+
+        const centroid = touchCentroid(points);
+        // The point SET changed: a finger went down or lifted. That is
+        // not travel, so the delta reference is re-based and nothing
+        // is sent — a finger joining a swipe must not appear as a jump
+        // in its deltas.
+        if (count != previous_count) {
+            if (self.phase == .idle) {
+                // Only the FIRST point of a gesture arms a candidate,
+                // exactly as only the 0 -> 1 pressed-button transition
+                // arms the pointer one. A second finger raises the
+                // count, which is read at emit time. A gesture the
+                // module already killed (a warp, a too-few-finger
+                // promotion) is NOT re-armed: like the pointer, it
+                // needs every finger to lift first.
+                if (previous_count == 0 and count == 1) {
+                    self.armTouch(centroid);
+                } else {
+                    self.touch.prev_x = centroid.x;
+                    self.touch.prev_y = centroid.y;
+                }
+                return;
+            }
+            self.touch.prev_x = centroid.x;
+            self.touch.prev_y = centroid.y;
+            if (self.phase == .pending) {
+                // A candidate measures its travel from where the
+                // fingers were LAST put down or lifted, not from the
+                // first finger's own position: the second finger
+                // landing 100 px away moves the logical center 50 px
+                // on its own, which is not the user swiping anything.
+                // Once the gesture has begun the origin is history —
+                // only the live gesture's own hold slop still reads
+                // it — so it is left alone from here.
+                self.touch.origin_x = centroid.x;
+                self.touch.origin_y = centroid.y;
+            }
+            self.updateTouchPair(points);
+            return;
+        }
+
+        // Pure motion: the swipe delta and the pinch scale are both
+        // taken against the previous position of THIS point set.
+        const from = Point{ .x = self.touch.prev_x, .y = self.touch.prev_y };
+        self.touch.prev_x = centroid.x;
+        self.touch.prev_y = centroid.y;
+        self.touchTravel(seat, points, from, centroid);
+    }
+
+    fn armTouch(self: *PointerGestures, at: Point) void {
+        self.phase = .pending;
+        self.source = .touch;
+        self.touch.origin_x = at.x;
+        self.touch.origin_y = at.y;
+        self.touch.prev_x = at.x;
+        self.touch.prev_y = at.y;
+        self.touch.target = null;
+        self.touch.pair = null;
+        self.startHoldTimer();
+    }
+
+    fn touchTravel(
+        self: *PointerGestures,
+        seat: *seat_mod.Seat,
+        points: []const seat_mod.TouchPoint,
+        from: Point,
+        to: Point,
+    ) void {
+        switch (self.phase) {
+            .idle => {},
+            .pinch => {
+                const spread2 = self.pinchSpread(points) orelse {
+                    // The pinned pair is gone between two events: the
+                    // scale has no baseline left to be measured from.
+                    self.cancel(true);
+                    return;
+                };
+                self.sendTouchPinchUpdate(seat, spread2, to.x - from.x, to.y - from.y);
+            },
+            .hold => {
+                if (atLeast(to.x, to.y, self.touch.origin_x, self.touch.origin_y, swipe_threshold_px)) {
+                    // Same handover as the pointer path
+                    // (handleMotion, .hold): the hold is OVER, so it
+                    // closes before the swipe opens (XML:262-265).
+                    self.cancel(true);
+                    self.promoteTouchToSwipe(seat);
+                    return;
+                }
+                if (atLeast(to.x, to.y, self.touch.origin_x, self.touch.origin_y, hold_slop_px)) {
+                    self.cancel(true);
+                    return;
+                }
+            },
+            .pending => {
+                // SLOP BOUND, the pointer path's rule verbatim: one
+                // step this large is a warp, not finger travel.
+                if (atLeast(to.x, to.y, from.x, from.y, max_step_px)) {
+                    self.cancelHoldTimer();
+                    self.resetGesture();
+                    return;
+                }
+                // SWIPE BEFORE PINCH, and the order is the policy: a
+                // logical center that has travelled a full swipe
+                // threshold is a swipe, whatever the fingers did to
+                // their spacing on the way (XML:88-92: a swipe is
+                // "fingers moving in the same direction"; XML:151-158:
+                // a pinch is "fingers moving towards each other or
+                // away from each other"). Two fingers sliding together
+                // translate the gesture, and translation is the
+                // swipe; a spread change the center did not travel
+                // into is the pinch.
+                if (atLeast(to.x, to.y, self.touch.origin_x, self.touch.origin_y, swipe_threshold_px)) {
+                    self.promoteTouchToSwipe(seat);
+                    return;
+                }
+                if (self.pinchPending(points)) {
+                    self.promoteToTouchPinch(seat);
+                    return;
+                }
+                if (atLeast(to.x, to.y, self.touch.origin_x, self.touch.origin_y, hold_slop_px)) {
+                    // Moved too far to still be a hold, too little to
+                    // be a swipe: this is a drag, not a gesture.
+                    self.cancelHoldTimer();
+                    self.resetGesture();
+                }
+            },
+            .swipe => {
+                const focus = self.gestureTarget(seat) orelse return;
+                const dx = fixedFromPixels(@as(i64, to.x) - @as(i64, from.x));
+                const dy = fixedFromPixels(@as(i64, to.y) - @as(i64, from.y));
+                for (self.swipes.items) |st| {
+                    if (st.seat != seat) continue;
+                    if (st.res.getClient() != focus.client) continue;
+                    st.res.sendUpdate(seat.nowMs(), dx, dy);
+                }
+            },
+        }
+    }
+
+    fn promoteTouchToSwipe(self: *PointerGestures, seat: *seat_mod.Seat) void {
+        self.cancelHoldTimer();
+        // A swipe is multi-finger (XML:88-92, :111-120) and a finger on
+        // glass is a POINT: with fewer than min_swipe_fingers live
+        // points the travel is a plain drag and no gesture is reported.
+        if (self.touch.count < min_swipe_fingers) {
+            self.resetGesture();
+            return;
+        }
+        const focus = touchFocusTarget(seat) orelse {
+            self.resetGesture();
+            return;
+        };
+        self.touch.target = focus;
+        self.phase = .swipe;
+        self.source = .touch;
+        const serial = seat.serialFor(focus.client);
+        for (self.swipes.items) |st| {
+            if (st.seat != seat) continue;
+            if (st.res.getClient() != focus.client) continue;
+            st.res.sendBegin(serial, seat.nowMs(), focus.surface, self.touch.count);
+        }
+    }
+
+    /// Keep the pinch pair consistent with the live point set. The pair
+    /// is pinned when a SECOND finger goes down, because only then does
+    /// the gesture have a scale baseline; a set that drops below two
+    /// points has none. A third finger joining leaves the baseline
+    /// alone — re-pinning it would make the scale jump by the new
+    /// point's distance. A live pinch whose pair disappears ends,
+    /// because a scale measured against a finger that is no longer
+    /// down describes nothing the client can apply.
+    fn updateTouchPair(self: *PointerGestures, points: []const seat_mod.TouchPoint) void {
+        if (points.len < 2) {
+            self.touch.pair = null;
+            if (self.phase == .pinch) self.cancel(false);
+            return;
+        }
+        if (self.touch.pair) |pair| {
+            // Still both down: keep the baseline.
+            if (touchPixelById(points, pair.a) != null and touchPixelById(points, pair.b) != null) return;
+        }
+        const a = points[0];
+        const b = points[1];
+        const dist2 = squaredDistance(
+            touchPixel(a.x),
+            touchPixel(a.y),
+            touchPixel(b.x),
+            touchPixel(b.y),
+        );
+        self.touch.pair = .{
+            .a = a.id,
+            .b = b.id,
+            // Clamped before the conversion for the same reason
+            // fixedFromPixels clamps: a saturated u64 distance squares
+            // out past i32, and @intFromFloat would trap.
+            .base_px = @intFromFloat(std.math.clamp(
+                @sqrt(@as(f64, @floatFromInt(dist2))),
+                0.0,
+                2147483647.0,
+            )),
+            .base_dist2 = dist2,
+        };
+    }
+
+    /// True when the pinned fingers have pulled apart (or together) by
+    /// at least pinch_threshold_px from the separation they were pinned
+    /// at, and there are enough of them for a multi-finger gesture
+    /// (XML:151-158). Only a PENDING candidate is asked: once a swipe
+    /// or a hold has begun, its events have described translation and
+    /// a scale taken from that moment would report travel the client
+    /// never saw.
+    fn pinchPending(self: *PointerGestures, points: []const seat_mod.TouchPoint) bool {
+        if (self.touch.count < min_swipe_fingers) return false;
+        const pair = self.touch.pair orelse return false;
+        const spread2 = self.pinchSpread(points) orelse return false;
+        return pinchSpreadChanged(spread2, pair, pinch_threshold_px);
+    }
+
+    /// The pinned pair's exact squared separation, or null when either
+    /// point is no longer down.
+    fn pinchSpread(self: *const PointerGestures, points: []const seat_mod.TouchPoint) ?u64 {
+        const pair = self.touch.pair orelse return null;
+        const a = touchPixelById(points, pair.a) orelse return null;
+        const b = touchPixelById(points, pair.b) orelse return null;
+        return squaredDistance(a.x, a.y, b.x, b.y);
+    }
+
+    fn promoteToTouchPinch(self: *PointerGestures, seat: *seat_mod.Seat) void {
+        self.cancelHoldTimer();
+        if (self.touch.pair == null) {
+            self.resetGesture();
+            return;
+        }
+        const focus = touchFocusTarget(seat) orelse {
+            self.resetGesture();
+            return;
+        };
+        self.touch.target = focus;
+        self.phase = .pinch;
+        self.source = .touch;
+        const serial = seat.serialFor(focus.client);
+        for (self.pinches.items) |st| {
+            if (st.seat != seat) continue;
+            if (st.res.getClient() != focus.client) continue;
+            st.res.sendBegin(serial, seat.nowMs(), focus.surface, self.touch.count);
+        }
+    }
+
+    /// dx/dy are the logical center's travel since the previous event,
+    /// in 24.8 fixed, exactly like the pointer path's swipe update
+    /// (XML:191-206). `scale` is ABSOLUTE against begin (XML:200-206)
+    /// and is the ratio of two EXACT squared separations, so it never
+    /// inherits the whole-pixel baseline's rounding; a pair pinned
+    /// coincident has no scale at all, and the identity is then the
+    /// only honest value. `rotation` is zero: a touchscreen reports
+    /// positions, never an angle — the same missing rotation source
+    /// the file header records for the pointer path.
+    fn sendTouchPinchUpdate(self: *PointerGestures, seat: *seat_mod.Seat, spread2: u64, dx: i32, dy: i32) void {
+        const focus = self.gestureTarget(seat) orelse return;
+        const pair = self.touch.pair orelse return;
+        const scale: f64 = if (pair.base_dist2 == 0)
+            1.0
+        else
+            @as(f64, @floatFromInt(spread2)) / @as(f64, @floatFromInt(pair.base_dist2));
+        const fdx = fixedFromPixels(dx);
+        const fdy = fixedFromPixels(dy);
+        const fscale = fixedFromDouble(scale);
+        for (self.pinches.items) |st| {
+            if (st.seat != seat) continue;
+            if (st.res.getClient() != focus.client) continue;
+            st.res.sendUpdate(seat.nowMs(), fdx, fdy, fscale, Fixed.fromInt(0));
+        }
+    }
+
+    /// Where the live gesture's events are addressed. A touch gesture
+    /// goes to the TOUCH focus and its client — `Seat.touchFocus()`,
+    /// which a finger sets and no pointer button ever sets — so a
+    /// touchscreen-only seat with no pointer focus anywhere still
+    /// reports gestures. A pointer gesture keeps the pointer focus it
+    /// has always used, so nothing about the pointer path changes.
+    ///
+    /// A touch gesture that has BEGUN is answered at the target it
+    /// began against, even after the seat has taken the points away:
+    /// the seat clears the touch focus the moment it closes a sequence
+    /// (Seat.touchLeave), and the closing `end` still
+    /// has to reach the client whose `begin` is open — the same promise
+    /// the pointer path makes about a compositor grab.
+    fn gestureTarget(self: *PointerGestures, seat: *seat_mod.Seat) ?FocusTarget {
+        return switch (self.source) {
+            .touch => self.touch.target orelse touchFocusTarget(seat),
+            else => focusTarget(seat),
+        };
+    }
+
     fn sendHoldEnd(self: *PointerGestures, seat: *seat_mod.Seat, cancelled: bool) void {
-        const focus = focusTarget(seat) orelse return;
+        const focus = self.gestureTarget(seat) orelse return;
         const serial = seat.serialFor(focus.client);
         for (self.holds.items) |st| {
             if (st.seat != seat) continue;
@@ -578,7 +1238,7 @@ pub const PointerGestures = struct {
     }
 
     fn sendSwipeEnd(self: *PointerGestures, seat: *seat_mod.Seat, cancelled: bool) void {
-        const focus = focusTarget(seat) orelse return;
+        const focus = self.gestureTarget(seat) orelse return;
         const serial = seat.serialFor(focus.client);
         for (self.swipes.items) |st| {
             if (st.seat != seat) continue;
@@ -593,7 +1253,7 @@ pub const PointerGestures = struct {
     /// wlr_pointer_gestures_v1.c:218-221). cancel() has no backend
     /// timestamp and passes the seat's own.
     fn sendPinchEnd(self: *PointerGestures, seat: *seat_mod.Seat, time_ms: u32, cancelled: bool) void {
-        const focus = focusTarget(seat) orelse return;
+        const focus = self.gestureTarget(seat) orelse return;
         const serial = seat.serialFor(focus.client);
         for (self.pinches.items) |st| {
             if (st.seat != seat) continue;
@@ -616,28 +1276,46 @@ pub const PointerGestures = struct {
 
 /// The hold delay elapsed. libwayland 1.24 disarms a timer before
 /// dispatching it, so the source is removed here (xdg_activation.zig:558-571).
-/// A grab installed between the press and this callback owns the pointer
+/// A grab installed between the arming and this callback owns the input
 /// by then, so the candidate is dropped instead of becoming a hold
-/// (grabOwned, :429).
+/// (grabOwned). Which source armed the candidate decides which travel
+/// is measured, which target the begin goes to and how many fingers it
+/// reports — the same hold, on either input.
 fn holdTimeout(self: *PointerGestures) c_int {
     self.cancelHoldTimer();
     const seat = self.seat orelse {
-        self.phase = .idle;
+        self.resetGesture();
         return 1;
     };
     if (self.grabOwned(seat)) return 1;
     if (self.phase != .pending) return 1;
-    if (atLeast(self.prev_x, self.prev_y, self.origin_x, self.origin_y, hold_slop_px)) return 1;
-    const focus = focusTarget(seat) orelse {
-        self.phase = .idle;
+    const fingers: u32 = switch (self.source) {
+        .pointer => blk: {
+            if (atLeast(self.prev_x, self.prev_y, self.origin_x, self.origin_y, hold_slop_px)) return 1;
+            break :blk seat.pressed_count;
+        },
+        .touch => blk: {
+            if (atLeast(self.touch.prev_x, self.touch.prev_y, self.touch.origin_x, self.touch.origin_y, hold_slop_px)) return 1;
+            break :blk self.touch.count;
+        },
+        // Nothing armed the candidate; the slot is free for either
+        // input again.
+        .none => {
+            self.resetGesture();
+            return 1;
+        },
+    };
+    const focus = self.gestureTarget(seat) orelse {
+        self.resetGesture();
         return 1;
     };
+    if (self.source == .touch) self.touch.target = focus;
     self.phase = .hold;
     const serial = seat.serialFor(focus.client);
     for (self.holds.items) |st| {
         if (st.seat != seat) continue;
         if (st.res.getClient() != focus.client) continue;
-        st.res.sendBegin(serial, seat.nowMs(), focus.surface, seat.pressed_count);
+        st.res.sendBegin(serial, seat.nowMs(), focus.surface, fingers);
     }
     return 1;
 }
@@ -652,6 +1330,11 @@ fn onSeatButton(listener: *wire.Listener(*seat_mod.Seat), seat: *seat_mod.Seat) 
     self.handleButton(seat);
 }
 
+fn onSeatTouch(listener: *wire.Listener(*seat_mod.Seat), seat: *seat_mod.Seat) void {
+    const self: *PointerGestures = @fieldParentPtr("touch_listener", listener);
+    self.handleTouch(seat);
+}
+
 /// The seat is dying: drop it and end any live gesture with cancelled = 1
 /// while the seat is still valid (seat.zig:519-525 emits at the top of
 /// Seat.deinit, "while the seat memory is still valid").
@@ -660,11 +1343,14 @@ fn onSeatDestroy(listener: *wire.Listener(*seat_mod.Seat), seat: *seat_mod.Seat)
     const self: *PointerGestures = @fieldParentPtr("seat_destroy_listener", listener);
     self.cancel(true);
     self.cancelHoldTimer();
-    self.phase = .idle;
+    self.resetGesture();
+    // The point count belongs to the seat that is going away.
+    self.touch.count = 0;
     // Every link attached while self.seat was non-null goes: the seat is
     // about to free its signal lists and the module may outlive it.
     self.motion_listener.link.remove();
     self.button_listener.link.remove();
+    self.touch_listener.link.remove();
     listener.link.remove();
     self.seat = null;
 }
@@ -969,6 +1655,11 @@ const TestServer = struct {
     wl_compositor: ?*client.wl.Compositor = null,
     wl_seat: ?*client.wl.Seat = null,
     wl_pointer: ?*client.wl.Pointer = null,
+    /// Needed by every touch test: Seat.touchMotion returns BEFORE it
+    /// updates the point and emits events.touch when no wl_touch of
+    /// the focus surface's client received the motion, so a client with
+    /// no wl_touch is invisible to this module.
+    wl_touch: ?*client.wl.Touch = null,
     wl_gestures: ?*client.zwp.PointerGesturesV1 = null,
     surface: ?*client.wl.Surface = null,
     /// The registry listener target lives HERE, not in init's frame: a
@@ -1022,6 +1713,7 @@ const TestServer = struct {
         if (with_seat) {
             ts.wl_seat = try ts.registry.?.bind(ts.capture.seat_name.?, client.wl.Seat, seat_mod.seat_version);
             ts.wl_pointer = try ts.wl_seat.?.getPointer();
+            ts.wl_touch = try ts.wl_seat.?.getTouch();
         }
         try ts.pump();
         return ts;
@@ -1076,6 +1768,21 @@ const TestServer = struct {
         ts.surface = s;
         ts.pick_state.surface = surface;
         ts.seat.?.pointerMotion(100, 100);
+        try ts.pump();
+        return s;
+    }
+
+    /// Create the test's wl_surface and make the seat's hit test return
+    /// it, WITHOUT moving the pointer. Touch tests need the state a
+    /// touchscreen-only input produces: a hit-testable surface, a
+    /// touch focus and NO pointer focus at all, because Seat.touchDown
+    /// never moves the pointer focus.
+    fn touchSurface(ts: *TestServer) !*client.wl.Surface {
+        const s = try ts.wl_compositor.?.createSurface();
+        try ts.pump();
+        const surface = ts.compositor.?.surfaces.items[ts.compositor.?.surfaces.items.len - 1];
+        ts.surface = s;
+        ts.pick_state.surface = surface;
         try ts.pump();
         return s;
     }
@@ -1745,4 +2452,444 @@ test "module teardown releases every live gesture object" {
     seat.pointerButton(seat_mod.btn_left, true);
     seat.pointerMotion(400, 400);
     try ts.pump();
+}
+
+// ---------------------------------------------------------------------------
+// Touch: the same gestures from fingers on glass. See the file header's
+// GESTURE SOURCE and TOUCH DETECTION sections for the policy under test.
+// ---------------------------------------------------------------------------
+
+test "a two-finger touch swipe reaches the touch-focus client with no pointer at all" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    const surface_res = try ts.touchSurface();
+    const seat = ts.seat.?;
+    // A touchscreen-only input: no pointer focus anywhere, and a
+    // gesture object the client could only create from its wl_pointer
+    // (the protocol has no other way to make one).
+    try std.testing.expect(seat.pointer_focus == null);
+
+    const swipe = try ts.wl_gestures.?.getSwipeGesture(ts.wl_pointer.?);
+    var ev: SwipeEvents = .{};
+    swipe.setListener(*SwipeEvents, SwipeEvents.listener, &ev);
+    try ts.pump();
+
+    // The first finger arms the candidate, the second supplies the
+    // fingers a multi-finger swipe needs (XML:88-92). Nothing about
+    // this reads pointer_focus or pressed_count.
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 100, 140);
+    try std.testing.expect(ts.gestures.?.tracking());
+    try std.testing.expect(seat.pointer_focus == null);
+
+    // Travel past the threshold promotes the candidate. The candidate's
+    // origin was re-based when the second finger landed, so the travel
+    // measured is the logical center's move since then.
+    seat.touchMotion(1, 210, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expectEqual(min_swipe_fingers, ev.begin_fingers);
+    try std.testing.expect(ev.begin_surface != null);
+    try std.testing.expect(ev.begin_surface.? == surface_res);
+    try std.testing.expect(seat.validateEventSerial(ts.client.?, ev.begin_serial));
+
+    // Further travel is an update: the delta of the logical center
+    // against the previous event, in exact pixels. Point 2 slides 40 px
+    // right while point 1 stays put, so the center moves half of that.
+    seat.touchMotion(2, 180, 140);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.updates);
+    try std.testing.expectEqual(@as(i32, 40), ev.last_dx.toInt());
+    try std.testing.expectEqual(@as(i32, 0), ev.last_dy.toInt());
+
+    // The release of the last point ends it normally: "one or more
+    // fingers are lifted" (XML:138-140).
+    seat.touchUp(1);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ev.ends);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(seat.validateEventSerial(ts.client.?, ev.end_serial));
+    try std.testing.expect(!ts.gestures.?.tracking());
+    try std.testing.expect(seat.pointer_focus == null);
+
+    // A motion with no point down reports nothing.
+    seat.touchMotion(1, 400, 400);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.updates);
+}
+
+test "a two-finger touch pinch reports a scale away from 1.0" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.touchSurface();
+    const pinch = try ts.wl_gestures.?.getPinchGesture(ts.wl_pointer.?);
+    var ev: PinchEvents = .{};
+    pinch.setListener(*PinchEvents, PinchEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    // 100 px apart: the pair is pinned here and that exact squared
+    // separation becomes the denominator of the scale.
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 200, 100);
+    try std.testing.expect(ts.gestures.?.tracking());
+    try std.testing.expectEqual(@as(usize, 0), ev.begins);
+
+    // Pulling the pair 40 px apart is past pinch_threshold_px and far
+    // short of the swipe threshold, so it is a pinch and not a swipe.
+    seat.touchMotion(2, 240, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expectEqual(min_swipe_fingers, ev.fingers);
+    try std.testing.expect(ts.gestures.?.tracking());
+
+    // 160 px apart against a 100 px baseline: scale 2.56, which is
+    // emphatically not the 1.0 a fresh gesture reports.
+    seat.touchMotion(2, 260, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.updates);
+    try std.testing.expect(ev.scale.toDouble() > 1.5);
+    try std.testing.expectEqual(@as(i32, 655), @as(i32, @intFromEnum(ev.scale)));
+    // The logical center still travels: dx is the centroid delta.
+    try std.testing.expectEqual(@as(i32, 10), ev.dx.toInt());
+    // A touchscreen reports positions, never an angle.
+    try std.testing.expectEqual(@as(i32, 0), @as(i32, @intFromEnum(ev.rotation)));
+
+    seat.touchUp(1);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(!ts.gestures.?.tracking());
+}
+
+test "one touch point never swipes: min_swipe_fingers counts points, not buttons" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.touchSurface();
+    const swipe = try ts.wl_gestures.?.getSwipeGesture(ts.wl_pointer.?);
+    var ev: SwipeEvents = .{};
+    swipe.setListener(*SwipeEvents, SwipeEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    // A full swipe-threshold of travel on ONE finger: the step is well
+    // under max_step_px, so this is ordinary travel, not a warp, and
+    // the promotion is decided purely by the finger count.
+    seat.touchDown(1, 100, 100);
+    seat.touchMotion(1, 100 + swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), ev.updates);
+    try std.testing.expect(!ts.gestures.?.tracking());
+
+    // A SECOND finger is what satisfies min_swipe_fingers. The killed
+    // candidate is deliberately NOT re-armed by the second finger —
+    // the pointer path needs a fresh press too — so lift the first and
+    // start again with two points down.
+    seat.touchUp(1);
+    try ts.pump();
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 100, 140);
+    seat.touchMotion(1, 210, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expectEqual(min_swipe_fingers, ev.begin_fingers);
+    try std.testing.expect(ts.gestures.?.tracking());
+    seat.touchUp(1);
+    seat.touchUp(2);
+    try ts.pump();
+}
+
+test "touch and pointer cannot run competing gestures at once" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.focusSurface();
+    const swipe = try ts.wl_gestures.?.getSwipeGesture(ts.wl_pointer.?);
+    var ev: SwipeEvents = .{};
+    swipe.setListener(*SwipeEvents, SwipeEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    const gestures = ts.gestures.?;
+
+    // --- TOUCH FIRST -------------------------------------------------------
+    // Touch owns the seat's single gesture slot.
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 100, 140);
+    seat.touchMotion(1, 260, 140);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), ev.ends);
+    try std.testing.expect(gestures.tracking());
+
+    // --- POINTER AFTER TOUCH: refused --------------------------------------
+    // Two pressed buttons and a full-threshold pointer drag while the
+    // touch swipe is live: the pointer arms nothing, promotes nothing
+    // and does NOT end the touch gesture.
+    seat.pointerButton(seat_mod.btn_left, true);
+    seat.pointerButton(seat_mod.btn_right, true);
+    seat.pointerMotion(100 + 2 * swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), ev.ends);
+    try std.testing.expect(gestures.tracking());
+
+    // Releasing the buttons changes nothing either — a pointer release
+    // cannot end a touch gesture.
+    seat.pointerButton(seat_mod.btn_left, false);
+    seat.pointerButton(seat_mod.btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), ev.ends);
+    try std.testing.expect(gestures.tracking());
+
+    // The touch owner lifts; the slot is free for the pointer again,
+    // which proves the gate is the policy and not a dead detector.
+    seat.touchUp(1);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(!gestures.tracking());
+
+    // --- POINTER FIRST -----------------------------------------------------
+    // The other direction, which the run above alone does not prove: the
+    // very same two buttons open the ONE swipe the seat admits.
+    seat.pointerButton(seat_mod.btn_left, true);
+    seat.pointerButton(seat_mod.btn_right, true);
+    seat.pointerMotion(100 + 3 * swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), ev.begins);
+    try std.testing.expect(gestures.tracking());
+
+    // --- TOUCH AFTER POINTER: refused --------------------------------------
+    // A fresh two-finger touch swipe reaches no client until the
+    // pointer's buttons are released. The touch swipe that ended above
+    // already spent `ev.ends`, so the proof is that NONE of the three
+    // counters moved — an absolute zero here would be a counter that
+    // contradicts the end this same test already observed.
+    const ends_before_touch = ev.ends;
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 100, 140);
+    seat.touchMotion(1, 260, 140);
+    seat.touchMotion(2, 260, 180);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), ev.updates);
+    try std.testing.expectEqual(ends_before_touch, ev.ends);
+    try std.testing.expect(gestures.tracking());
+
+    seat.pointerButton(seat_mod.btn_left, false);
+    seat.pointerButton(seat_mod.btn_right, false);
+    seat.touchUp(1);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(ends_before_touch + 1, ev.ends);
+    try std.testing.expect(!gestures.tracking());
+
+    // --- AN EXPLICIT CANCEL IS NOT A COMPETING GESTURE ---------------------
+    // cancel() is the current gesture ending, not a second one starting,
+    // so it must reach the client from EITHER source. A naive early
+    // return on the source field would swallow both of these silently.
+
+    // Pointer source: a live swipe closed with cancelled = 1.
+    seat.pointerButton(seat_mod.btn_left, true);
+    seat.pointerButton(seat_mod.btn_right, true);
+    seat.pointerMotion(100 + 4 * swipe_threshold_px, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 3), ev.begins);
+    try std.testing.expect(gestures.tracking());
+    gestures.cancel(true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 3), ev.ends);
+    try std.testing.expectEqual(@as(i32, 1), ev.cancelled);
+    try std.testing.expect(!gestures.tracking());
+    // The buttons are still held, and a release after the cancel ends
+    // nothing: there is no second end for one gesture.
+    seat.pointerButton(seat_mod.btn_left, false);
+    seat.pointerButton(seat_mod.btn_right, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 3), ev.ends);
+
+    // Touch source: identical, from the other side of the gate.
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 100, 140);
+    seat.touchMotion(1, 260, 140);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 4), ev.begins);
+    try std.testing.expect(gestures.tracking());
+    gestures.cancel(true);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 4), ev.ends);
+    try std.testing.expectEqual(@as(i32, 1), ev.cancelled);
+    try std.testing.expect(!gestures.tracking());
+    // Same again for the points: lifting them after the cancel is not a
+    // second end.
+    seat.touchUp(1);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 4), ev.ends);
+    try std.testing.expect(!gestures.tracking());
+}
+
+test "the backend pinch API cannot close a live touch pinch" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.touchSurface();
+    const pinch = try ts.wl_gestures.?.getPinchGesture(ts.wl_pointer.?);
+    var ev: PinchEvents = .{};
+    pinch.setListener(*PinchEvents, PinchEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    const gestures = ts.gestures.?;
+
+    // The pair is pinned 100 px apart and pulled 40 px wider, so the
+    // touch points — not the backend — own the seat's single pinch.
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 200, 100);
+    seat.touchMotion(2, 240, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expect(gestures.tracking());
+
+    // All THREE halves of the backend pinch API are the pointer
+    // source's, the end included: a pinchEnd that arrived here would
+    // close a gesture the backend never began, ending the client's
+    // open begin with an outcome that describes a different gesture.
+    gestures.pinchBegin(2000, 2);
+    gestures.pinchUpdate(2010, 0, 0, 1, 0);
+    gestures.pinchEnd(2020, false);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), ev.updates);
+    try std.testing.expectEqual(@as(usize, 0), ev.ends);
+    try std.testing.expect(gestures.tracking());
+
+    // The points still own it: the pinned pair's lift ends the pinch
+    // exactly once, and the last point adds no second end.
+    seat.touchUp(1);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(!gestures.tracking());
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expect(!gestures.tracking());
+}
+
+test "a compositor pointer grab suppresses touch gestures exactly as it suppresses pointer ones" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.touchSurface();
+    const hold = try ts.wl_gestures.?.getHoldGesture(ts.wl_pointer.?);
+    const swipe = try ts.wl_gestures.?.getSwipeGesture(ts.wl_pointer.?);
+    var hold_ev: HoldEvents = .{};
+    var swipe_ev: SwipeEvents = .{};
+    hold.setListener(*HoldEvents, HoldEvents.listener, &hold_ev);
+    swipe.setListener(*SwipeEvents, SwipeEvents.listener, &swipe_ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    // The interactive move / camera pan takes the pointer. Touch shares
+    // the grab gate (Seat.startPointerGrab, Seat.touchDown), so the
+    // client sees neither the points nor the travel.
+    seat.startPointerGrab(&seat_mod.swallow_pointer_grab);
+    try ts.pump();
+
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 100, 140);
+    seat.touchMotion(1, 100 + swipe_threshold_px, 100);
+    seat.touchMotion(2, 100 + swipe_threshold_px, 140);
+    seat.touchUp(1);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expect(!ts.gestures.?.tracking());
+    try std.testing.expectEqual(@as(usize, 0), swipe_ev.begins);
+    try std.testing.expectEqual(@as(usize, 0), swipe_ev.updates);
+    try std.testing.expectEqual(@as(usize, 0), swipe_ev.ends);
+
+    // The hold timer would fire hold_threshold_ms after the point went
+    // down; no candidate ever armed, so nothing is sent.
+    try ts.pumpWith(2 * @as(c_int, @intCast(hold_threshold_ms)));
+    try std.testing.expectEqual(@as(usize, 0), hold_ev.begins);
+
+    // With the grab released the very same input is detected again: the
+    // gate is the grab, not a detector that stopped working.
+    seat.endPointerGrab();
+    seat.touchDown(1, 100, 100);
+    seat.touchDown(2, 100, 140);
+    seat.touchMotion(1, 260, 140);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), swipe_ev.begins);
+    try std.testing.expect(ts.gestures.?.tracking());
+
+    // A grab installed mid-swipe closes the open swipe exactly once,
+    // with cancelled = 1 — the seat synthesized an up for every point
+    // the client held (Seat.startPointerGrab's close sequence), so
+    // leaving the begin unanswered would be the violation this module
+    // refuses everywhere else. Identical to the pointer path's
+    // mid-hold case.
+    seat.startPointerGrab(&seat_mod.swallow_pointer_grab);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), swipe_ev.ends);
+    try std.testing.expectEqual(@as(i32, 1), swipe_ev.cancelled);
+    try std.testing.expect(!ts.gestures.?.tracking());
+
+    // Nothing further is reported for the rest of the grab.
+    seat.touchDown(3, 100, 100);
+    seat.touchDown(4, 100, 140);
+    seat.touchMotion(3, 400, 400);
+    seat.touchUp(3);
+    seat.touchUp(4);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), swipe_ev.begins);
+    try std.testing.expectEqual(@as(usize, 1), swipe_ev.ends);
+}
+
+test "a single touch point holds: the hold comes from fingers too" {
+    const allocator = std.testing.allocator;
+    var ts = testServer(allocator) catch return;
+    defer ts.deinit();
+
+    _ = try ts.touchSurface();
+    const hold = try ts.wl_gestures.?.getHoldGesture(ts.wl_pointer.?);
+    var ev: HoldEvents = .{};
+    hold.setListener(*HoldEvents, HoldEvents.listener, &ev);
+    try ts.pump();
+
+    const seat = ts.seat.?;
+    seat.touchDown(1, 100, 100);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ev.begins);
+
+    // Wait past the hold delay: the timer fires on the server's loop and
+    // reports ONE finger — the live point count, not pressed buttons.
+    try ts.pumpWith(2 * @as(c_int, @intCast(hold_threshold_ms)));
+    try std.testing.expectEqual(@as(usize, 1), ev.begins);
+    try std.testing.expectEqual(@as(u32, 1), ev.fingers);
+
+    // The lift ends it normally.
+    seat.touchUp(1);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.ends);
+    try std.testing.expectEqual(@as(i32, 0), ev.cancelled);
+    try std.testing.expect(!ts.gestures.?.tracking());
 }

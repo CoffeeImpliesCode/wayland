@@ -5,8 +5,9 @@
 //!
 //! Split of responsibilities:
 //!   - this file owns WHAT a buffer is (Attributes), WHETHER a set of
-//!     planes is legal (validate) and HOW one becomes a Buffer
-//!     (GbmDevice). It knows nothing about the wire protocol.
+//!     planes is legal (validate), HOW one becomes a Buffer
+//!     (GbmDevice) and how its pixels are reached from the CPU
+//!     (beginWrite/endWrite). It knows nothing about the wire protocol.
 //!   - shell/linux_dmabuf.zig owns the zwp_linux_dmabuf_v1 objects and
 //!     decides which Device (if any) the global may be advertised with.
 //!   - backend/drm.zig owns the GBM device itself: it resolves the DRM
@@ -39,6 +40,17 @@
 //! `Attributes` owns closing them: `Attributes.closePlanes` is called on
 //! every exit path, and `Device.import` takes the struct by value with
 //! that contract spelled out in its error set documentation.
+//! # CPU access to an imported bo
+//! A bo is GPU memory, so the Buffer impl carries no CPU pointer (see
+//! `dmabuf_impl` below). One consumer needs the pixels anyway: a
+//! screencopy frame is produced in system memory and the client may
+//! have asked for it to land in a dmabuf, so the copy has to be able
+//! to WRITE the destination. `beginWrite` / `endWrite` are that path
+//! (gbm_bo_map, Mesa 21.1+), and they are deliberately NOT the
+//! impl's begin/end_data_ptr_access pair: those say "this is a plain
+//! CPU-mappable surface" to every consumer (the GL renderer picks its
+//! texture upload path off them, buffer.zig:43-48), and a bo is
+//! mapped for one copy at a time, not for its whole life.
 //!
 //! Imports: buffers/buffer.zig (the Buffer abstraction this exposes) and
 //! the translated "gbm_c" namespace.
@@ -519,6 +531,80 @@ fn wrapGbmBuffer(
 }
 
 // ---------------------------------------------------------------------------
+// CPU access to an imported bo
+// ---------------------------------------------------------------------------
+
+/// A writable CPU mapping of an imported bo's pixels, from
+/// `beginWrite`, valid until the matching `endWrite`.
+pub const CpuWrite = struct {
+    /// First byte of the first row. Writable for as long as the
+    /// mapping is held.
+    ptr: [*]u8,
+    /// Row pitch of the MAPPING in bytes. This is not the stride the
+    /// client claimed in `add`: a bo GBM cannot map in place is staged
+    /// in a buffer of the driver's choosing, so a copy that stepped
+    /// rows by the claimed stride would shear every row after the
+    /// first.
+    stride: usize,
+    /// GBM's per-mapping token; `endWrite` hands it back.
+    map_data: ?*anyopaque,
+};
+
+/// Map the whole of `buf`'s pixels for CPU writing, or null when the
+/// driver will not map it. The caller answers with its own failure (a
+/// screencopy frame, in this compositor's case) rather than writing
+/// through nothing.
+///
+/// Precondition: `buf` is a Buffer this module imported (the bo comes
+/// from the impl's own data, so a Buffer from another factory is not
+/// a thing this may be handed).
+///
+/// # Constraints this relies on
+/// - The bo must be mappable in place, which the import path asks
+///   for: `import_usage` includes GBM_BO_USE_LINEAR, so every bo this
+///   module produced was created for a linear mapping. A destination
+///   imported with a tiling modifier is NOT rejected here — GBM
+///   stages it — but the copy then costs a driver round trip instead
+///   of a memcpy, which is the client's choice to make.
+/// - The caller must already know the format: rows are
+///   `width * bytes_per_pixel`, and nothing here checks that the
+///   mapping is tall enough for them. The screencopy destination path
+///   does (the `map.stride < row_len` guard there).
+///
+/// Mesa's gbm_bo_map may satisfy a bo it cannot map in place with a
+/// staging buffer (gbm.h, "gbm_bo_map"); the write-back then happens
+/// inside gbm_bo_unmap, which is why `endWrite` must run after the
+/// writes.
+pub fn beginWrite(buf: *Buffer) ?CpuWrite {
+    const bo = dmabufData(buf).bo;
+    var stride: u32 = 0;
+    var map_data: ?*anyopaque = null;
+    const ptr = c.gbm_bo_map(
+        bo,
+        0,
+        0,
+        c.gbm_bo_get_width(bo),
+        c.gbm_bo_get_height(bo),
+        @intCast(c.GBM_BO_TRANSFER_WRITE),
+        &stride,
+        &map_data,
+    ) orelse return null;
+    return .{
+        .ptr = @ptrCast(ptr),
+        .stride = @intCast(stride),
+        .map_data = map_data,
+    };
+}
+
+/// Hand a mapping back. Every successful `beginWrite` needs exactly
+/// one of these, AFTER the writes: for a staged mapping gbm_bo_unmap
+/// is what copies the pixels into the bo, so an early return loses
+/// them.
+pub fn endWrite(buf: *Buffer, map: CpuWrite) void {
+    c.gbm_bo_unmap(dmabufData(buf).bo, map.map_data);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -855,4 +941,41 @@ test "a real GBM device imports a real dmabuf (skipped without a DRM node)" {
     // A dmabuf has no CPU pointer, so the impl must not pretend otherwise.
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(&d.attrs)), buf.impl.get_dmabuf.?(buf));
     try testing.expect(buf.impl.begin_data_ptr_access == null);
+
+    // The CPU write path, end to end on a real bo: map it, write a
+    // distinct pattern into every pixel, unmap, then map again and
+    // read it all back. This is the round trip the screencopy dmabuf
+    // destination depends on, and the only part of it a driver can
+    // break — a bo it will not map, or a staged mapping that never
+    // comes back. A driver that refuses is a skip, like the import
+    // above, not a failure: the copy path turns a null mapping into a
+    // `failed` event, which is the contract, not an error.
+    const write = beginWrite(buf) orelse return error.SkipZigTest;
+    var y: usize = 0;
+    while (y < 64) : (y += 1) {
+        var x: usize = 0;
+        while (x < 64) : (x += 1) {
+            const at = y * write.stride + x * 4;
+            write.ptr[at] = @truncate(x);
+            write.ptr[at + 1] = @truncate(y);
+            write.ptr[at + 2] = 0x5a;
+            write.ptr[at + 3] = 0xa5;
+        }
+    }
+    endWrite(buf, write);
+
+    const read = beginWrite(buf) orelse return error.SkipZigTest;
+    defer endWrite(buf, read);
+    try testing.expect(read.stride >= 64 * 4);
+    y = 0;
+    while (y < 64) : (y += 1) {
+        var x: usize = 0;
+        while (x < 64) : (x += 1) {
+            const at = y * read.stride + x * 4;
+            try testing.expectEqual(@as(u8, @truncate(x)), read.ptr[at]);
+            try testing.expectEqual(@as(u8, @truncate(y)), read.ptr[at + 1]);
+            try testing.expectEqual(@as(u8, 0x5a), read.ptr[at + 2]);
+            try testing.expectEqual(@as(u8, 0xa5), read.ptr[at + 3]);
+        }
+    }
 }

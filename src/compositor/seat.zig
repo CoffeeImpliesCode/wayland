@@ -1,8 +1,7 @@
-//! wl_seat: keyboard + pointer input (M3).
+//! wl_seat: keyboard + pointer + touch input (M3).
 //!
-//! The Seat owns one wl_seat global (keyboard + pointer capabilities; no
-//! touch) and the input state the compositor drives it with:
-//!
+//! The Seat owns one wl_seat global (keyboard, pointer and touch
+//! capabilities) and the input state the compositor drives it with:
 //!   - Keyboard: xkbcommon keymap (sent over a memfd), keyboard focus
 //!     (enter/leave), key events with xkb keycodes, modifier tracking.
 //!     The WIRE keycode is the evdev scancode (xkb keycode minus 8):
@@ -14,11 +13,25 @@
 //!     stores the client cursor surface (the compositor renders it).
 //!     Pointer events are batched: each input batch (between two
 //!     pointerFrame() calls) closes with one wl_pointer.frame (F7).
+//!   - Touch: an ordered set of currently-down points with surface-local
+//!     positions, ONE focus surface per gesture (the surface the first
+//! point landed on), and the down/motion/up/frame/cancel events
+//!     (wayland.xml:2754-2898). Touch batches like the pointer: one
+//!     wl_touch.frame closes each input batch (touchFrame).
 //!
 //! The input *source* is external (backend-driven): the server polls the
 //! raylib backend each frame and feeds seat.keyEvent/pointerMotion/
 //! pointerButton/pointerAxis. Headless/test servers can synthesize input
 //! through the same API.
+//!
+//! Input hotplug: the backend announces every device through
+//! Backend.events.new_input and reports a disappearance through
+//! Backend.events.input_removed; the server forwards both to
+//! inputDeviceAdded / inputDeviceRemoved, and the seat withdraws the
+//! wl_seat capability bit the LAST device of that kind was providing
+//! (an unplugged touchscreen closes its gesture with the bit, and a
+//! client asking for the withdrawn interface afterwards gets the
+//! protocol's missing_capability error rather than a dead object).
 //!
 //! Click-to-focus: a pointer button press moves keyboard focus to the
 //! pointer focus surface — unless a grab suppresses click-to-focus
@@ -28,24 +41,44 @@
 //! signals so the compositor can bind keys (the server quits on
 //! Mod4+Escape).
 //!
+//! Composator gates (the compositor's policy seams; all three default to
+//! "off" and change nothing until the server installs them):
+//! - `setPick(fn, ctx)`: the hit test itself — output coordinates to
+//!   PickResult. Every pointer and touch position is translated through
+//!   it (pickAt), so making this lock-aware is what keeps pointer input
+//!   off user surfaces while a session is locked.
+//! - `setKeyboardFocusGate(fn, ctx)`: may this picked surface take
+//!   keyboard focus on a click.
+//! - `setTouchGate(fn, ctx)`: may this surface receive a touch POINT
+//!   right now. Consulted on touchDown AND touchMotion, and on the
+//!   get_touch hand-off that replays a live gesture to a fresh
+//!   resource — a gate that only refused new downs would leave a finger
+//!   that went down before the session locked dragging the user's
+//!   surface for the whole locked interval, which is what
+//!   ext_session_lock_v1:77-85 forbids. Up and cancel are not gated:
+//!   they finalize a gesture the client was already told about, and
+//!   swallowing them strands client state (see touchUp).
+//!
 //! Event delivery follows wlroots: keyboard and pointer events (enter,
 //! leave, key, modifiers, motion, button, axis) reach only the focused
 //! client's resources, never the whole seat's resource list. libwayland
 //! itself rejects events carrying another client's surface, so a fan-out
 //! would kill the unfocused clients.
 //!
-//! Imports: utils/*, core/wire.zig, core/display.zig, buffers (via the
-//! surface), compositor/surface.zig + xkb.zig (sibling modules).
+//! Imports: utils/*, core/wire.zig, core/display.zig, backend/backend.zig
+//! (the announced InputDevice identity), buffers (via the surface),
+//! compositor/surface.zig + xkb.zig (sibling modules).
 //!
 //! Configuration: `Seat.init` takes an `Options` struct for the optional
 //! bits — keyboard layout (forwarded to Xkb) and which capabilities to
-//! announce and serve (keyboard/pointer). Defaults preserve the current
-//! behavior: layout "us", keyboard + pointer on.
+//! announce and serve (keyboard/pointer/touch). Defaults preserve the
+//! current behavior: layout "us", keyboard + pointer + touch on.
 
 const std = @import("std");
 const log = @import("../utils/log.zig");
 const wire = @import("../core/wire.zig");
 const display_mod = @import("../core/display.zig");
+const backend_mod = @import("../backend/backend.zig");
 const compositor_mod = @import("compositor.zig");
 const surface_mod = @import("surface.zig");
 const role_mod = @import("role.zig");
@@ -67,6 +100,54 @@ pub const seat_version: u32 = 10;
 
 pub const capabilities_keyboard: u32 = 1;
 pub const capabilities_pointer: u32 = 2;
+
+/// wl_seat touch capability (wayland.xml capability enum: pointer=1,
+/// keyboard=2, touch=4, :2020-2034). The bit is advertised whenever
+/// Options.touch is on and dropped again by setCapabilities — including
+/// the hotplug path, when the LAST touch device goes away
+/// (inputDeviceRemoved).
+pub const capabilities_touch: u32 = 4;
+
+/// An input device announced by the backend: the identity both
+/// Backend.events.new_input and Backend.events.input_removed carry. The
+/// seat matches the two on this pair (kind + name), because the device
+/// handle stays inside the backend.
+pub const InputDevice = backend_mod.Backend.InputDevice;
+
+/// The wl_seat capability bit an announced device of this kind provides:
+/// the wayland.xml capability enum (pointer=1, keyboard=2, touch=4,
+/// :2020-2034), i.e. the same three constants the seat advertises.
+fn capabilityFor(device: *const InputDevice) u32 {
+    return switch (device.kind) {
+        .keyboard => capabilities_keyboard,
+        .pointer => capabilities_pointer,
+        .touch => capabilities_touch,
+    };
+}
+
+/// One announced input device, as the seat accounts for it. `count` is the
+/// number of live ANNOUNCEMENTS carrying this identity, not a flag: the
+/// announcement carries no handle, so two announcements of one identity
+/// are two live devices as far as the seat can tell, and only the last
+/// removal clears the entry. That is the rule wlroots states out loud —
+/// "if the capabilities haven't changed (i.e a redundant mouse was
+/// removed), we don't actually have to do anything",
+/// wlr_seat_set_capabilities, wlr_seat.c:392-396 — with the mask derived
+/// from the live device list the way tinywl derives it
+/// (!wl_list_empty(&server->keyboards) gates the keyboard bit,
+/// tinywl.c:311-315).
+const InputDeviceEntry = struct {
+    /// The announced identity, with `name` re-pointed at `owned_name`.
+    device: InputDevice,
+    /// The seat's own copy of the announced name. The pointer the signal
+    /// carried dies with the emit — libinput announces a stack local
+    /// (libinput.zig:893-894) — so the seat keeps a copy of the identity
+    /// and never the borrow.
+    owned_name: [:0]u8,
+    /// Live announcements of this identity (always >= 1 while the entry
+    /// exists).
+    count: u32 = 1,
+};
 
 /// Reset the v120 accumulators when the scroll direction flips (or on
 /// the first event of a new sequence): wlroots should_reset_value120_accumulators,
@@ -148,7 +229,7 @@ const Value120 = struct {
 
 /// Per-client seat state: the serial ringset for serial validation (F2)
 /// plus the v120 scroll accumulator (F4). Created on first use, pruned
-/// when the client's last keyboard/pointer resource dies.
+/// when the client's last keyboard/pointer/touch resource dies.
 const SeatClient = struct {
     client: *wire.Client,
     serials: SerialRing = .{},
@@ -156,6 +237,13 @@ const SeatClient = struct {
     /// A pointer event was delivered to this client without a closing
     /// wl_pointer.frame yet (F7 batching); pointerFrame() flushes it.
     frame_pending: bool = false,
+    /// A touch event was delivered to this client without a closing
+    /// wl_touch.frame yet. Tracked SEPARATELY from frame_pending: the
+    /// two frame events belong to different objects and each client may
+    /// hold an open batch of either independently (the same split
+    /// wlroots keeps in seat_client, wlr_seat.h:29-46). touchFrame()
+    /// flushes it; the two flags must never close each other's batch.
+    touch_frame_pending: bool = false,
 };
 
 /// wl_pointer.set_cursor role (wlroots pointer_cursor_surface_role,
@@ -292,6 +380,14 @@ pub const Options = struct {
     /// capability bit is not announced and get_pointer yields a dead
     /// object (no events).
     pointer: bool = true,
+    /// Advertise and serve the wl_touch capability. On: the capability
+    /// bit is announced, get_touch yields a live wl_touch (down/motion/
+    /// up/frame/cancel), and touchDown/touchMotion/touchUp/touchCancel
+    /// drive it. Off: the bit is not announced and get_touch posts
+    /// wl_seat missing_capability, because the protocol makes the
+    /// request a violation on a seat that never had the capability
+    /// (wayland.xml:2094-2098).
+    touch: bool = true,
     /// Server-side key repeat: delay before the first repeat (ms) and
     /// rate in keys/second (wlroots defaults: 600/25, tinywl.c:157).
     /// The seat runs a repeat timer (onRepeatTick) and advertises these
@@ -299,6 +395,18 @@ pub const Options = struct {
     repeat_delay_ms: u32 = 600,
     repeat_rate: u32 = 25,
 };
+
+/// One currently-down touch point. Positions are surface-local in the
+/// surface under the point; a point whose focus surface differs has no
+/// meaningful local position, so it is excluded from activeTouchPoints.
+pub const TouchPoint = struct { id: c_int, x: f64, y: f64 };
+
+/// Contacts one touchscreen reports at once (wlroots
+/// WLR_TOUCH_MAX_POINTS, include/wlr/types/wlr_seat.h:41). A down past
+/// this is dropped, not queued: an 11th contact on a device that
+/// reports one is a phantom, and the protocol lets the client assume
+/// an id it was never told about does not exist.
+const max_touch_points: usize = 10;
 
 pub const Seat = struct {
     allocator: std.mem.Allocator,
@@ -312,11 +420,11 @@ pub const Seat = struct {
     /// Bound wl_seat resources (one per client bind; S3). Capability and
     /// name changes re-broadcast to every resource in this list.
     seats: std.ArrayList(*server.wl.Seat) = .empty,
-    /// The seat's CURRENT capability mask (bitmask of
-    /// capabilities_keyboard / capabilities_pointer): what bindSeat
-    /// announces and what setCapabilities re-broadcasts on change.
-    /// Initialized from Options; updated by setCapabilities. Touch is
-    /// never in the mask (DEFER).
+    /// The wl_seat CURRENT capability mask (bitmask of
+    /// capabilities_keyboard / capabilities_pointer /
+    /// capabilities_touch): what bindSeat announces and what
+    /// setCapabilities re-broadcasts on change. Initialized from
+    /// Options; updated by setCapabilities.
     capabilities: u32 = 0,
     /// The wl_seat name (owned when set via setName, else the "default"
     /// literal). Re-broadcast to v2+ wl_seat resources on change.
@@ -467,6 +575,33 @@ pub const Seat = struct {
     cursor_hotspot_x: i32 = 0,
     cursor_hotspot_y: i32 = 0,
 
+    // Touch --------------------------------------------------------------
+    /// Per-client wl_touch resources (created on get_touch).
+    touches: std.ArrayList(*server.wl.Touch) = .empty,
+    /// The surface that receives the current gesture. ONE surface per
+    /// gesture: a touchscreen is a single physical surface, and the
+    /// protocol's touch model is per-client and per-surface — every
+    /// point in the sequence is delivered to the same surface, so
+    /// touchDown never switches focus while points are down.
+    touch_focus: ?*Surface = null,
+    /// Same re-armed surface-destroy listener as pointer_focus_listener
+    /// (wlroots wlr_seat_pointer.c:210-225, applied to the touch focus:
+    /// wlr_seat_touch re-arms the same way when its focus surface dies).
+    touch_focus_listener: wire.Listener(*Surface),
+    /// The currently-down touch points, in the order they went down
+    /// (TouchPoint). Read through activeTouchPoints.
+    touch_points: std.ArrayList(TouchPoint) = .empty,
+
+    // Input devices (hotplug) ---------------------------------------------
+    /// The input devices the backend announced, one entry per announced
+    /// identity (see InputDeviceEntry). This is what makes "the last
+    /// device of this kind" computable on removal: the seat's keyboard,
+    /// pointer and touch resources come from the clients' wl_seat.get_*
+    /// requests, so without the device table a removal could not tell a
+    /// dead device from a live one. Fed by inputDeviceAdded /
+    /// inputDeviceRemoved, which the server's backend listeners call.
+    input_devices: std.ArrayList(InputDeviceEntry) = .empty,
+
     /// Hit-test callback: map output coords to the surface under the
     /// pointer (surface-local coords). Null when nothing is hit.
     pick_fn: ?*const fn (ctx: *anyopaque, x: i32, y: i32) ?PickResult = null,
@@ -478,6 +613,41 @@ pub const Seat = struct {
     /// keyboard_interactivity=none unfocused.
     focus_gate_fn: ?*const fn (ctx: *anyopaque, surface: *Surface) bool = null,
     focus_gate_ctx: ?*anyopaque = null,
+    /// Optional compositor gate for TOUCH — the third of the seat's
+    /// three compositor gates, and the touch analogue of the two above.
+    /// Return false for "this surface may not receive touch right now";
+    /// the touch path consults it before every point it delivers
+    /// (touchDown and touchMotion).
+    ///
+    /// It exists because the session lock is an INPUT privilege
+    /// boundary, not a rendering one (ext_session_lock_v1:77-85: once
+    /// `locked` is sent the compositor "must stop rendering and
+    /// providing input to normal clients", the only surfaces that may
+    /// keep input are the lock surfaces and privileged extras), and
+    /// wl_touch is a third input stream next to wl_pointer and
+    /// wl_keyboard (XML:78). The other two already have a seam: pointer
+    /// through the lock-aware pick (main.zig:3806-3811) and keyboard
+    /// through focus_gate_fn. Touch had none, so a finger on a locked
+    /// screen reached the surface underneath it.
+    ///
+    /// It is a SURFACE predicate, deliberately NOT another pick:
+    /// pick_fn already answers "what is under this point" and the
+    /// server makes that lock-aware, so the gate carries only the
+    /// policy a hit test cannot express — chiefly the mid-gesture
+    /// case. A point that legitimately went down BEFORE the session
+    /// locked is still sitting on a surface, and the XML stops input
+    /// for the whole locked interval, not only for points that start
+    /// after it (see touchMotion).
+    ///
+    /// No gate registered (null): every surface may receive touch, the
+    /// behaviour this seat has had since wl_touch landed. There is no
+    /// uninstall API, and the teardown story is deliberately the same
+    /// as pick_fn's and focus_gate_fn's: the server installs one gate
+    /// once and the callback reads LIVE state (session_lock.isLocked()
+    /// / isLockSurface()), so dropping the lock object restores touch
+    /// by itself.
+    touch_gate_fn: ?*const fn (ctx: *anyopaque, surface: *Surface) bool = null,
+    touch_gate_ctx: ?*anyopaque = null,
 
     /// The active pointer grab (wlroots wlr_seat_pointer.c:19-53): while
     /// installed, pointer motion/buttons/axis route through the grab's
@@ -516,6 +686,14 @@ pub const Seat = struct {
         /// already updated). The cursor compositor hooks this to know
         /// when the client cursor image changed.
         cursor_surface: wire.Signal(*Seat),
+        /// A touch point went down, moved, lifted, or the gesture was
+        /// cancelled. The seat state (touchFocus, activeTouchPoints) is
+        /// already updated; read it in the handler. This is the touch
+        /// counterpart of pointer_move: a touch gesture repaints the
+        /// screen (hover state, a client's touch UI) with no pointer
+        /// motion to piggyback on, so the compositor marks its frame
+        /// dirty from here exactly as it does for a pointer motion.
+        touch: wire.Signal(*Seat),
         /// The seat is being destroyed (emitted at the top of deinit,
         /// while the seat memory is still valid). Subscribers that hold
         /// a seat pointer — the xdg popup grab (which must stop calling
@@ -551,7 +729,8 @@ pub const Seat = struct {
             .display = display,
             .options = options,
             .capabilities = (if (options.keyboard) capabilities_keyboard else 0) |
-                (if (options.pointer) capabilities_pointer else 0),
+                (if (options.pointer) capabilities_pointer else 0) |
+                (if (options.touch) capabilities_touch else 0),
             .seats = .empty,
             .key_repeat_rate = @intCast(options.repeat_rate),
             .key_repeat_delay = @intCast(options.repeat_delay_ms),
@@ -559,6 +738,8 @@ pub const Seat = struct {
             .keyboards = .empty,
             .pressed = .empty,
             .pointers = .empty,
+            .touches = .empty,
+            .touch_points = .empty,
             .client_state = .empty,
             // SAFETY: initialized via .init() immediately after construction, before any emit.
             .events = undefined,
@@ -566,6 +747,7 @@ pub const Seat = struct {
             // before any focus can arm them.
             .keyboard_focus_listener = wire.Listener(*Surface).init(onKeyboardFocusDestroy),
             .pointer_focus_listener = wire.Listener(*Surface).init(onPointerFocusDestroy),
+            .touch_focus_listener = wire.Listener(*Surface).init(onTouchFocusDestroy),
         };
         errdefer self.pressed.deinit(allocator);
         errdefer self.client_state.deinit(allocator);
@@ -573,15 +755,18 @@ pub const Seat = struct {
         self.keyboard_focus_listener.link.next = null;
         self.pointer_focus_listener.link.prev = null;
         self.pointer_focus_listener.link.next = null;
+        self.touch_focus_listener.link.prev = null;
+        self.touch_focus_listener.link.next = null;
         self.events.key.init();
         self.events.button.init();
         self.events.pointer_move.init();
         self.events.keyboard_focus.init();
         self.events.axis.init();
         self.events.cursor_surface.init();
+        self.events.touch.init();
         self.events.destroy.init();
         self.global = try display.addGlobal(server.wl.Seat, *Seat, bindSeat, seat_version, self);
-        log.debug("seat created (keyboard + pointer)", io, log_cfg, "seat", .{});
+        log.debug("seat created (keyboard + pointer + touch)", io, log_cfg, "seat", .{});
         return self;
     }
 
@@ -618,6 +803,12 @@ pub const Seat = struct {
                 }
             }
         }
+        // Touch: terminate any live gesture the way the pointer clears
+        // its focus above — one wl_touch.up per still-down point, then
+        // the leave, so a client that is still connected never waits on
+        // points that will never lift (wlroots clears the touch focus
+        // on the way out, wlr_seat.c:181-196).
+        self.touchCloseSequence();
         self.keyboard_focus = null;
         self.pointer_focus = null;
         // Detach the focus-destroy listeners: surfaces may outlive the
@@ -626,6 +817,7 @@ pub const Seat = struct {
         // the freed seat.
         if (self.keyboard_focus_listener.link.prev != null) self.keyboard_focus_listener.link.remove();
         if (self.pointer_focus_listener.link.prev != null) self.pointer_focus_listener.link.remove();
+        if (self.touch_focus_listener.link.prev != null) self.touch_focus_listener.link.remove();
         // Deliver the leaves, then destroy the seat's keyboard/pointer
         // resources: their destroy handlers (keyboardDestroy /
         // pointerDestroy) run against THIS seat's lists, so the
@@ -635,6 +827,7 @@ pub const Seat = struct {
         self.display.flushClients();
         while (self.keyboards.items.len > 0) self.keyboards.items[0].destroy();
         while (self.pointers.items.len > 0) self.pointers.items[0].destroy();
+        while (self.touches.items.len > 0) self.touches.items[0].destroy();
         // The wl_seat resources die here too: each destroy fires the
         // per-resource destroy listener (onSeatResDestroy), which prunes
         // the list, so the loop drains — the resources must not fire
@@ -650,6 +843,11 @@ pub const Seat = struct {
         if (self.seat_name_owned) allocator.free(self.seat_name);
         self.keyboards.deinit(allocator);
         self.pointers.deinit(allocator);
+        self.touches.deinit(allocator);
+        self.touch_points.deinit(allocator);
+        // The announced devices: one seat-owned name copy per entry.
+        for (self.input_devices.items) |entry| allocator.free(entry.owned_name);
+        self.input_devices.deinit(allocator);
         self.client_state.deinit(allocator);
         self.pressed.deinit(allocator);
         self.xkb.deinit();
@@ -686,6 +884,36 @@ pub const Seat = struct {
         return gate(self.focus_gate_ctx.?, surface);
     }
 
+    /// Register the touch gate (see touch_gate_fn): `gate_fn` decides
+    /// whether `surface` may receive a touch point right now. Same
+    /// optional-callback shape as setKeyboardFocusGate, same default
+    /// when nothing is installed, same teardown story (the callback
+    /// reads live state; there is no uninstall). No gate registered:
+    /// every surface may.
+    pub fn setTouchGate(
+        self: *Seat,
+        gate_fn: *const fn (ctx: *anyopaque, surface: *Surface) bool,
+        ctx: *anyopaque,
+    ) void {
+        self.touch_gate_fn = gate_fn;
+        self.touch_gate_ctx = ctx;
+    }
+
+    /// Whether the compositor's touch gate lets `surface` receive a
+    /// point now (see touch_gate_fn). No gate registered: allowed —
+    /// a seat that never installed one behaves exactly as it did
+    /// before the gate existed.
+    ///
+    /// Public, unlike focusAllowed, because the get_touch hand-off
+    /// asks it from the request dispatch: the replay of a live gesture
+    /// to a new wl_touch puts a wl_touch.down on the wire, so a
+    /// gesture that began before the session locked must not start
+    /// feeding a fresh resource while the gate refuses the surface.
+    pub fn touchAllowed(self: *Seat, surface: *Surface) bool {
+        const gate = self.touch_gate_fn orelse return true;
+        return gate(self.touch_gate_ctx.?, surface);
+    }
+
     /// Next seat serial: wraps the display counter and records the value,
     /// so serial-bearing client requests (set_cursor, set_selection,
     /// start_drag) can be validated against the seat's last serial.
@@ -718,8 +946,8 @@ pub const Seat = struct {
         return &self.client_state.items[self.client_state.items.len - 1];
     }
 
-    /// True when the client still owns a live keyboard or pointer
-    /// resource (i.e. the client connection is alive).
+    /// True when the client still owns a live keyboard, pointer or
+    /// touch resource (i.e. the client connection is alive).
     fn clientAlive(self: *Seat, wl_client: *wire.Client) bool {
         for (self.keyboards.items) |kbd| {
             if (kbd.getClient() == wl_client) return true;
@@ -727,11 +955,14 @@ pub const Seat = struct {
         for (self.pointers.items) |ptr| {
             if (ptr.getClient() == wl_client) return true;
         }
+        for (self.touches.items) |touch| {
+            if (touch.getClient() == wl_client) return true;
+        }
         return false;
     }
 
-    /// Drop the per-client state once the client's last keyboard/pointer
-    /// resource dies (called from the resource destroy handlers).
+    /// Drop the per-client state once the client's last keyboard/pointer/
+    /// touch resource dies (called from the resource destroy handlers).
     fn pruneSeatClient(self: *Seat, wl_client: *wire.Client) void {
         if (self.clientAlive(wl_client)) return;
         for (self.client_state.items, 0..) |sc, i| {
@@ -797,6 +1028,12 @@ pub const Seat = struct {
     pub fn startPointerGrab(self: *Seat, grab: *const PointerGrab) void {
         if (self.pointer_grab) |old| old.cancel(self, old);
         self.pointer_grab = grab;
+        // Touch shares the grab gate (see touchDown): the client must not
+        // see a touch sequence continue into the compositor's gesture,
+        // so a live gesture is closed here for the same reason the held
+        // buttons are released below (wlroots resets the touch points on
+        // grab start exactly as it resets the buttons).
+        self.touchCloseSequence();
         if (self.held_button_count == 0) return;
         // The synthetic release goes to the client that RECEIVED the
         // press (held_clients), not to whoever holds pointer focus
@@ -926,9 +1163,15 @@ pub const Seat = struct {
         if (self.seatClient(wl_client)) |sc| sc.frame_pending = true;
     }
 
+    /// A touch event was delivered to `client` without a closing
+    /// wl_touch.frame: the batch closes at the next touchFrame().
+    fn markTouchFramePending(self: *Seat, wl_client: *wire.Client) void {
+        if (self.seatClient(wl_client)) |sc| sc.touch_frame_pending = true;
+    }
+
     /// Close the current input batch: flush the deferred wl_pointer.frame
-    /// events to every client that received pointer events since the last
-    /// call, and reset the axis-source dedup (wlroots
+    /// AND wl_touch.frame events to every client that received input
+    /// since the last call, and reset the axis-source dedup (wlroots
     /// wlr_seat_pointer_send_frame, wlr_seat_pointer.c:394-402 — one
     /// frame per input batch, not per event). The server calls this once
     /// per event-loop iteration (main.zig renderFrame); backends feed
@@ -944,6 +1187,7 @@ pub const Seat = struct {
                 if (ptr.getVersion() >= 5) ptr.sendFrame();
             }
         }
+        self.touchFrame();
     }
 
     /// Pointer button press/release (linux input button code). A press
@@ -1481,18 +1725,157 @@ pub const Seat = struct {
         if (self.keyboard_focus != null) self.sendKeyboardModifiers();
     }
 
+    /// The index of the entry holding the announced identity `device`,
+    /// null when the seat never announced it. The match is on (kind,
+    /// name) — the whole identity the new_input / input_removed pair
+    /// carries, since the device handle stays inside the backend.
+    fn inputDeviceIndex(self: *Seat, device: *const InputDevice) ?usize {
+        for (self.input_devices.items, 0..) |entry, i| {
+            if (entry.device.kind != device.kind) continue;
+            if (!std.mem.eql(u8, entry.owned_name, device.name)) continue;
+            return i;
+        }
+        return null;
+    }
+
+    /// An input device became available (Backend.events.new_input → the
+    /// server's backend listener forwards the announcement here).
+    ///
+    /// The announcement is RECORDED, never applied to the capability mask.
+    /// The mask is compositor policy — Options decides which interfaces
+    /// this seat serves and setCapabilities is how the compositor changes
+    /// that at runtime — and a device showing up must not resurrect an
+    /// interface a server deliberately turned off (Options.touch = false
+    /// means this seat never serves touch, whatever hardware is plugged
+    /// in). What recording buys is the other half of the hotplug story:
+    /// inputDeviceRemoved can now tell "the last device of this kind" from
+    /// "one of several".
+    ///
+    /// A repeated announcement of an identity the seat already holds
+    /// bumps that entry's count instead of adding a second entry: the
+    /// removals then match one-for-one, so a device announced twice is
+    /// withdrawn on its last removal and never leaves a phantom device
+    /// pinning a capability bit forever.
+    pub fn inputDeviceAdded(self: *Seat, device: *const InputDevice) void {
+        if (self.inputDeviceIndex(device)) |idx| {
+            const entry = &self.input_devices.items[idx];
+            entry.count += 1;
+            log.debug("input device {s} ({s}) announced again", self.io, self.log_cfg, "seat", .{
+                device.name, @tagName(device.kind),
+            });
+            return;
+        }
+        const owned_name = self.allocator.dupeZ(u8, device.name) catch |err| {
+            log.warn("input device {s}: accounting allocation failed: {s}", self.io, self.log_cfg, "seat", .{
+                device.name, @errorName(err),
+            });
+            return;
+        };
+        self.input_devices.append(self.allocator, .{
+            .device = .{ .kind = device.kind, .name = owned_name },
+            .owned_name = owned_name,
+        }) catch |err| {
+            // The name copy is ours until the append succeeds; a failure
+            // must not leave it behind (the `catch` returns normally, so
+            // an errdefer would never fire).
+            self.allocator.free(owned_name);
+            log.warn("input device {s}: accounting allocation failed: {s}", self.io, self.log_cfg, "seat", .{
+                device.name, @errorName(err),
+            });
+            return;
+        };
+        log.debug("input device {s} ({s}) added", self.io, self.log_cfg, "seat", .{
+            device.name, @tagName(device.kind),
+        });
+    }
+
+    /// An announced input device went away (Backend.events
+    /// .input_removed → the server's backend listener forwards the
+    /// removal here). When the LAST device providing a capability is gone,
+    /// that capability bit is withdrawn through setCapabilities, so every
+    /// bound wl_seat resource is re-announced and the interface's client
+    /// resources are inerted.
+    ///
+    /// The touch case is the load-bearing one: a touchscreen unplugged
+    /// with fingers down must not leave the seat advertising touch — the
+    /// gesture is closed with an up per point plus the leave BEFORE the
+    /// wl_touch resources are inerted, because a client must never be
+    /// left waiting on points that will never lift. wlroots simply
+    /// destroys the touch resources with the capability
+    /// (wlr_seat_set_capabilities, wlr_seat.c:440-445); we close the
+    /// gesture first. A client that asks for the withdrawn interface
+    /// anyway gets the protocol's missing_capability error, not a
+    /// silently dead object (wayland.xml:2094-2098).
+    ///
+    /// A removal for an identity the seat does not hold is ignored: it
+    /// must not withdraw a bit that another live device still justifies,
+    /// and it must not free an entry the seat does not own. That is also
+    /// what makes the hotplug path safe against a client tearing down at
+    /// the same moment — the withdrawal only reads the seat's own device
+    /// table and the capability mask, never client state whose lifetime
+    /// the device removal does not control.
+    pub fn inputDeviceRemoved(self: *Seat, device: *const InputDevice) void {
+        const idx = self.inputDeviceIndex(device) orelse {
+            log.debug("input device {s} ({s}) removed: not announced to this seat", self.io, self.log_cfg, "seat", .{
+                device.name, @tagName(device.kind),
+            });
+            return;
+        };
+        // One announcement per removal (see inputDeviceAdded): a repeat
+        // announcement keeps the entry until its own removal arrives.
+        if (self.input_devices.items[idx].count > 1) {
+            self.input_devices.items[idx].count -= 1;
+            log.debug("input device {s} ({s}) removed ({d} left)", self.io, self.log_cfg, "seat", .{
+                device.name, @tagName(device.kind), self.input_devices.items[idx].count,
+            });
+            return;
+        }
+        const gone = self.input_devices.orderedRemove(idx);
+        // The last device of this kind: withdraw the bit it was the last
+        // provider of. setCapabilities is the single transition path — it
+        // re-announces the mask and inerts the resources — so the hotplug
+        // route and the compositor's own setCapabilities call cannot drift
+        // apart.
+        const cap = capabilityFor(&gone.device);
+        const withdraw = self.capabilities & cap != 0 and self.inputDeviceCount(&gone.device) == 0;
+        if (withdraw) {
+            log.info("last {s} device removed ({s}); withdrawing its wl_seat capability", self.io, self.log_cfg, "seat", .{
+                @tagName(gone.device.kind), gone.owned_name,
+            });
+        }
+        // The name copy dies here: everything that read it (the log above)
+        // is done, and nothing below may look at it again.
+        self.allocator.free(gone.owned_name);
+        if (withdraw) self.setCapabilities(self.capabilities & ~cap);
+    }
+
+    /// How many devices this seat currently holds for the kind of
+    /// `device` — the answer to "is this the last one?" on removal.
+    fn inputDeviceCount(self: *Seat, device: *const InputDevice) usize {
+        var n: usize = 0;
+        for (self.input_devices.items) |entry| {
+            if (entry.device.kind == device.kind) n += entry.count;
+        }
+        return n;
+    }
+
     /// Runtime capability update (S3, wlr_seat_set_capabilities,
     /// wlr_seat.c:390-451): store the new mask, re-send wl_seat.capabilities
-    /// to every bound wl_seat resource, then inert the keyboard/pointer
-    /// resources whose capability was removed (they leave the seat's
-    /// lists via the existing keyboardDestroy/pointerDestroy bookkeeping,
-    /// so no further events reach them; the client resources stay alive
-    /// until the client releases them). Focus state is deliberately left
-    /// untouched — the focused surface is compositor policy and an inert
-    /// keyboard/pointer simply stops delivering.
+    /// to every bound wl_seat resource, then inert the keyboard/pointer/
+    /// touch resources whose capability was removed (they leave the seat's
+    /// lists via the existing keyboardDestroy/pointerDestroy/touchDestroy
+    /// bookkeeping, so no further events reach them; the client resources
+    /// stay alive until the client releases them). Focus state is
+    /// deliberately left untouched — the focused surface is compositor
+    /// policy and an inert keyboard/pointer simply stops delivering.
     ///
-    /// Touch is NOT part of the mask (DEFER): this seat never advertises
-    /// touch, so this API can never enable it.
+    /// The touch bit (capabilities_touch) is a first-class member of the
+    /// mask: adding it announces touch to every bound wl_seat and makes
+    /// get_touch hand out a live wl_touch; dropping it closes any live
+    /// gesture (an up per point + the leave) BEFORE the resources are
+    /// inerted, because a client must never be left waiting for points
+    /// on an object the seat stopped serving (wlroots drops the touch
+    /// state with the capability, wlr_seat.c:390-451).
     pub fn setCapabilities(self: *Seat, caps: u32) void {
         // No-op on an unchanged mask: the dormant API cannot fire
         // mid-test by accident.
@@ -1502,6 +1885,7 @@ pub const Seat = struct {
             res.sendCapabilities(.{
                 .keyboard = caps & capabilities_keyboard != 0,
                 .pointer = caps & capabilities_pointer != 0,
+                .touch = caps & capabilities_touch != 0,
             });
         }
         if (caps & capabilities_keyboard == 0) {
@@ -1509,6 +1893,10 @@ pub const Seat = struct {
         }
         if (caps & capabilities_pointer == 0) {
             while (self.pointers.items.len > 0) pointerDestroy(self.pointers.items[0], self);
+        }
+        if (caps & capabilities_touch == 0) {
+            self.touchCloseSequence();
+            while (self.touches.items.len > 0) touchDestroy(self.touches.items[0], self);
         }
     }
 
@@ -1539,6 +1927,12 @@ pub const Seat = struct {
     /// focus pointers can never dangle. Idempotent.
     pub fn surfaceDestroyed(self: *Seat, surface: *Surface) void {
         if (self.pointer_focus == surface) self.pointerLeave();
+        // The touch focus dies with its surface: close the gesture the
+        // same way the grab path does (an up per still-down point, then
+        // the leave). Cancelling instead would leave the client holding
+        // point ids it can never resolve, and no leave at all would
+        // strand the pointer enter touchEnter sent.
+        if (self.touch_focus == surface) self.touchCloseSequence();
         if (self.keyboard_focus == surface) {
             self.repeating = null; // the repeating key's target died
             if (self.keyboard_focus_listener.link.prev != null) self.keyboard_focus_listener.link.remove();
@@ -1636,6 +2030,424 @@ pub const Seat = struct {
         self.surfaceDestroyed(surface);
     }
 
+    // -- Touch ------------------------------------------------------------
+    //
+    // Wire model. wl_touch has NO enter and NO leave event: its event
+    // list is down, up, motion, frame, cancel, shape, orientation
+    // (wayland.xml:2754-2898), and the enter is carried by the down,
+    // which names the surface it landed on. A touch focus transition
+    // is nevertheless a real transition the client must be able to
+    // observe, so this seat surfaces it as wl_pointer.enter /
+    // wl_pointer.leave on the touched surface's own client's pointer
+    // resources — the only enter/leave a Wayland client of this seat
+    // can see for a touch gesture, and the pair that keeps a client
+    // that tracks "am I entered" from being stranded. Every path that
+    // drops touch focus (last up, cancel, focus-surface destroy, grab
+    // start, capability removal, seat teardown) goes through
+    // touchLeave, so the enter always has its matching leave.
+    //
+    // The pointer's own focus is NOT moved by touch: touch and pointer
+    // focus are independent states, as they are in wlroots
+    // (wlr_seat_touch owns its own focus, wlr_seat_touch.c:63-96, and
+    // nothing in the touch path writes wlr_seat->pointer_state.focus).
+
+    /// The pick path takes integer output coordinates while a touch
+    /// backend reports doubles; round half-away-from-zero and saturate
+    /// so a NaN or an out-of-range report cannot trap the conversion.
+    fn pickCoord(v: f64) i32 {
+        if (std.math.isNan(v)) return 0;
+        const max_d: f64 = @floatFromInt(std.math.maxInt(i32));
+        const min_d: f64 = @floatFromInt(std.math.minInt(i32));
+        if (v >= max_d) return std.math.maxInt(i32);
+        if (v <= min_d) return std.math.minInt(i32);
+        // NaN fails every comparison, so only it reaches here: a NaN
+        // position cannot be picked and must not trap the conversion.
+        if (!(v >= min_d)) return 0;
+        return @intFromFloat(@round(v));
+    }
+
+    /// The pick at output position (x, y), or null when the compositor
+    /// registered no hit test or nothing is under the point.
+    fn pickAt(self: *Seat, x: f64, y: f64) ?PickResult {
+        const f = self.pick_fn orelse return null;
+        return f(self.pick_ctx.?, pickCoord(x), pickCoord(y));
+    }
+
+    /// The index of the live point `id`, or null when no such point is
+    /// down. An id is only meaningful between its down and its up
+    /// (wayland.xml:2774-2778), so this is also the "unknown id" gate
+    /// for motion/up.
+    fn touchIndex(self: *Seat, id: c_int) ?usize {
+        for (self.touch_points.items, 0..) |p, i| {
+            if (p.id == id) return i;
+        }
+        return null;
+    }
+
+    /// The surface that receives the current gesture, or null between
+    /// gestures. The surface the FIRST point landed on; it stays put
+    /// until that gesture ends (see the touch wire model above), and
+    /// it is NOT the pointer focus — touchDown never moves it (wlroots
+    /// keeps the two independent, wlr_seat_touch.c:63-96).
+    pub fn touchFocus(self: *Seat) ?*Surface {
+        return self.touch_focus;
+    }
+
+    /// The touch points currently down, in the order they went down.
+    ///
+    /// Wire contract: x/y are the SURFACE-LOCAL positions carried by
+    /// the wl_touch.down / wl_touch.motion the client received — the
+    /// compositor's pick translated the output position through the
+    /// focus surface, exactly as it does for wl_pointer.motion. A point
+    /// whose focus surface differs from touchFocus has no meaningful
+    /// local position and is excluded; in this seat that cannot happen
+    /// (one surface per gesture), so with a focus the result is every
+    /// live point and with none it is empty.
+    ///
+    /// The slice aliases the seat's own storage: it stays valid until
+    /// the next touchDown/touchMotion/touchUp/touchCancel call, which
+    /// may reallocate or shift the buffer.
+    pub fn activeTouchPoints(self: *Seat) []const TouchPoint {
+        if (self.touch_focus == null) return &[_]TouchPoint{};
+        return self.touch_points.items;
+    }
+
+    /// A finger went down at OUTPUT position (x, y) under the
+    /// compositor-assigned id.
+    ///
+    /// Wire contract: the position is translated by the compositor's
+    /// pick path into the focus surface, and the point joins the
+    /// gesture there — wl_touch.down(serial, time, surface, id, x, y)
+    /// goes to that surface's client's wl_touch resources, where the
+    /// serial is minted for the RECEIVING client and recorded in its
+    /// serial ring, so the client can validate it like any other seat
+    /// serial. The first point of a gesture also enters the surface
+    /// (see the touch wire model). A down whose pick misses, or that
+    /// resolves to a different surface while a gesture is already
+    /// running, is dropped: the id never goes down and the client is
+    /// never told about it.
+    ///
+    /// Grab policy: while a PointerGrab is installed, no touch reaches
+    /// the client at all. That is the same gate the pointer already
+    /// applies — "the grab gates CLIENT delivery" (PointerGrab,
+    /// above) — because this seat has ONE grab concept and a gesture
+    /// the compositor owns must not be readable by the client
+    /// underneath it. It covers both installed grab kinds: the
+    /// compositor's swallow grab (camera drag / interactive move, whose
+    /// premise is "the client sees nothing at all") and a drag-and-
+    /// drop grab, which installs its own PointerGrab in data_device.
+    /// Divergence from wlroots, stated plainly: wlroots keeps touch
+    /// grabs separate from pointer grabs (wlr_seat_touch_start_grab,
+    /// wlr_seat_touch.c:436-447), so a drag does not silence a
+    /// touchscreen there. This seat has no second grab layer yet, so
+    /// the pointer's policy is the one it follows.
+    ///
+    /// Touch gate: a down whose picked surface the compositor's touch
+    /// gate refuses is dropped the same way a missed pick is (see
+    /// touch_gate_fn). The gate is asked BEFORE the gesture opens,
+    /// because the session lock that installs it may lock the session
+    /// while a client is already mid-gesture, and a refusal must not
+    /// leave a half-registered point behind: no enter, no focus, no id
+    /// in activeTouchPoints, and the client never learns the point
+    /// exists. A second finger onto a gesture that is already running
+    /// is gated too — the surface is fixed for the gesture, so the
+    /// gate answers for that same surface.
+    ///
+    /// Click-to-focus: deliberately NOT applied. A touch-down never
+    /// moves keyboard focus — in wlroots only a pointer button press
+    /// does (wlr_seat_pointer.c:seat_pointer_button → set_focus), the
+    /// touch path has no focus write at all, and KWin's
+    /// Seat::processTouchDown likewise never calls setFocusedSurface
+    /// (seat.cpp:912-1039). Touch and pointer focus are independent
+    /// states there, and a finger resting on a window must not steal
+    /// the keyboard from the window the user is typing into.
+    pub fn touchDown(self: *Seat, id: c_int, x: f64, y: f64) void {
+        if (self.pointer_grab != null) return;
+        if (self.touchIndex(id) != null) return;
+        if (self.touch_points.items.len >= max_touch_points) return;
+        const p = self.pickAt(x, y) orelse return;
+        // The compositor's touch gate, asked about the PICKED surface
+        // before anything else happens. A refused point must leave no
+        // trace at all — no enter, no touch focus, no registered id,
+        // no touch signal — exactly like the two refusals above it. The
+        // pointer path has no half-applied pick either: a pick it will
+        // not act on just returns (pointerMotion, the branch that leaves
+        // when nothing is hit and nothing is focused).
+        if (!self.touchAllowed(p.surface)) return;
+        if (self.touch_focus) |focus| {
+            // Mid-gesture the surface is fixed (one surface per
+            // gesture): a second finger belongs to the same surface,
+            // and one that lands elsewhere is not delivered.
+            if (p.surface != focus) return;
+        } else {
+            self.touchEnter(p.surface, p.sx, p.sy);
+        }
+        self.touch_points.append(self.allocator, .{
+            .id = id,
+            .x = @floatFromInt(p.sx),
+            .y = @floatFromInt(p.sy),
+        }) catch {
+            // OOM: the client must not be told about a point the seat
+            // cannot track, and a focus was just entered — close the
+            // gesture rather than leaving a half-open one.
+            self.touchCloseSequence();
+            return;
+        };
+        const wl_client = p.surface.resource.getClient();
+        const serial = serialFor(self, wl_client);
+        const time = nowMs(self);
+        var delivered = false;
+        for (self.touches.items) |touch| {
+            if (touch.getClient() != wl_client) continue;
+            touch.sendDown(serial, time, p.surface.resource, @intCast(id), Fixed.fromDouble(@floatFromInt(p.sx)), Fixed.fromDouble(@floatFromInt(p.sy)));
+            delivered = true;
+        }
+        if (delivered) self.markTouchFramePending(wl_client);
+        self.events.touch.emit(self);
+        log.debug("touch down id={d} at {d},{d} surface@{d}", self.io, self.log_cfg, "seat", .{
+            id, p.sx, p.sy, p.surface.resource.getId(),
+        });
+    }
+
+    /// The point `id` moved to OUTPUT position (x, y).
+    ///
+    /// Wire contract: the pick translates the position into the focus
+    /// surface and wl_touch.motion(time, id, x, y) goes to that
+    /// surface's client's wl_touch resources. Motion carries NO serial
+    /// (wayland.xml:2792-2800) and no frame of its own — the batch it
+    /// belongs to closes at the next touchFrame().
+    ///
+    /// A motion for an id that is not down, and a motion whose pick
+    /// does not resolve to the focus surface, are both dropped: this
+    /// seat translates positions ONLY through the pick path (the same
+    /// path wl_pointer uses), and without a hit there is no surface to
+    /// be local to. The point keeps its last delivered position. An
+    /// unknown id is silently ignored rather than a protocol error
+    /// (wlroots ignores an unmatched touch id the same way).
+    ///
+    /// Touch gate: consulted here too, per motion, and NOT only on the
+    /// down that opened the gesture. A point that legitimately went
+    /// down before the session locked is still down when it locks, and
+    /// the session-lock contract stops input for the whole locked
+    /// interval (ext_session_lock_v1:77-85), so a gesture must not
+    /// survive the latch by virtue of having started before it. A
+    /// refused motion is dropped exactly like the ones above: the point
+    /// keeps its last delivered position, no wl_touch.motion goes out,
+    /// and the touch signal does not fire — the surface has not moved.
+    ///
+    /// Grab policy and click-to-focus: as documented on touchDown.
+    pub fn touchMotion(self: *Seat, id: c_int, x: f64, y: f64) void {
+        if (self.pointer_grab != null) return;
+        const idx = self.touchIndex(id) orelse return;
+        const focus = self.touch_focus orelse return;
+        const p = self.pickAt(x, y) orelse return;
+        if (p.surface != focus) return;
+        // Same gate as the down, asked about the surface the motion
+        // resolved to. This is the one place it does work the
+        // lock-aware pick alone cannot: a session that locks mid
+        // gesture, with the finger still resting on a user surface.
+        if (!self.touchAllowed(p.surface)) return;
+        const wl_client = focus.resource.getClient();
+        const time = nowMs(self);
+        var delivered = false;
+        for (self.touches.items) |touch| {
+            if (touch.getClient() != wl_client) continue;
+            touch.sendMotion(time, @intCast(id), Fixed.fromDouble(@floatFromInt(p.sx)), Fixed.fromDouble(@floatFromInt(p.sy)));
+            delivered = true;
+        }
+        if (!delivered) return;
+        self.touch_points.items[idx].x = @floatFromInt(p.sx);
+        self.touch_points.items[idx].y = @floatFromInt(p.sy);
+        self.markTouchFramePending(wl_client);
+        self.events.touch.emit(self);
+    }
+
+    /// The point `id` lifted.
+    ///
+    /// Wire contract: wl_touch.up(serial, time, id) to the focus
+    /// surface's client's wl_touch resources, with a serial minted for
+    /// the receiving client exactly like the down's (the protocol makes
+    /// up serial-bearing too, wayland.xml:2781-2790). The id is then
+    /// released — the protocol allows reuse, and this seat lets the
+    /// backend pick the next id freely (touchDown rejects an id that is
+    /// still down). When it was the LAST point of the surface the
+    /// LEAVE follows the up (touchLeave), never before: a leave in
+    /// between would tell the client the surface is gone while it
+    /// still has an unresolved point on it.
+    ///
+    /// Touch gate: deliberately NOT consulted. The gate answers "may
+    /// this surface receive INPUT right now", and the up is the one
+    /// touch event that is not input — it reports that input already
+    /// delivered is over. Swallowing it is what strands a client: a
+    /// point that went down while the session was unlocked, whose up
+    /// falls inside the locked interval, would stay down in the
+    /// client's own state forever, with a grab, a selection or a
+    /// pressed button it can never release. sway makes the same
+    /// choice when it locks — its session-lock handler ends the gesture
+    /// so "blocked clients receive a leave event and can release their
+    /// grabs" (sway session_lock.c:session_lock_notify_locked), and
+    /// this seat already has that path: touchCloseSequence sends an up
+    /// per live point and then the leave, and a server that wants the
+    /// stream closed at the latch can take it through the grab or
+    /// capability route. The gate's contract stops at down and motion,
+    /// where no client state would be left half-open.
+    ///
+    /// Grab policy and click-to-focus: as documented on touchDown.
+    pub fn touchUp(self: *Seat, id: c_int) void {
+        if (self.pointer_grab != null) return;
+        const idx = self.touchIndex(id) orelse return;
+        const focus = self.touch_focus orelse return;
+        const wl_client = focus.resource.getClient();
+        const serial = serialFor(self, wl_client);
+        const time = nowMs(self);
+        var delivered = false;
+        for (self.touches.items) |touch| {
+            if (touch.getClient() != wl_client) continue;
+            touch.sendUp(serial, time, @intCast(id));
+            delivered = true;
+        }
+        _ = self.touch_points.orderedRemove(idx);
+        if (delivered) self.markTouchFramePending(wl_client);
+        // Leave after the last up — the wire order is part of the
+        // contract above.
+        if (self.touch_points.items.len == 0) self.touchLeave();
+        self.events.touch.emit(self);
+        log.debug("touch up id={d}", self.io, self.log_cfg, "seat", .{id});
+    }
+
+    /// Close the current input batch for touch: one wl_touch.frame per
+    /// client that received at least one touch event since the last
+    /// call, and no more.
+    ///
+    /// Wire contract: the frame marks the end of the events that
+    /// logically belong together; a client accumulates within it and
+    /// assumes nothing outside it changed (wayland.xml:2802-2812). Two
+    /// points that went down in the SAME batch therefore share ONE
+    /// frame, and the compositor sends no second frame for that batch
+    /// no matter how many points it carried — the batch, not the
+    /// event, is the unit. pointerFrame calls this too, so the server's
+    /// single per-iteration batch close flushes both interfaces.
+    pub fn touchFrame(self: *Seat) void {
+        for (self.client_state.items) |*sc| {
+            if (!sc.touch_frame_pending) continue;
+            sc.touch_frame_pending = false;
+            for (self.touches.items) |touch| {
+                if (touch.getClient() != sc.client) continue;
+                touch.sendFrame();
+            }
+        }
+    }
+
+    /// Cancel the gesture: the touch stream is a global gesture the
+    /// client must not act on (wayland.xml:2814-2825).
+    ///
+    /// Wire contract: wl_touch.cancel() to the focus surface's client's
+    /// wl_touch resources. It applies to EVERY point currently down on
+    /// that surface, so every id is released at once and the client is
+    /// responsible for finalizing them (the protocol's own words).
+    /// NO frame follows the cancel — "No frame event is required after
+    /// the cancel event" — so the pending flag is dropped rather than
+    /// flushed. The leave still follows, because touchEnter sent an
+    /// enter and a client that tracks enter state must not be stranded
+    /// inside it.
+    ///
+    /// Touch gate: not consulted here either, for the same reason as on
+    /// touchUp — a cancel only ever FINALIZES a gesture the client was
+    /// already told about, and the leave that follows it releases the
+    /// client's grab. It cannot carry user input, so gating it would
+    /// strand exactly the state the leave exists to clear.
+    ///
+    /// Grab policy and click-to-focus: as documented on touchDown.
+    pub fn touchCancel(self: *Seat) void {
+        const focus = self.touch_focus orelse return;
+        const wl_client = focus.resource.getClient();
+        for (self.touches.items) |touch| {
+            if (touch.getClient() != wl_client) continue;
+            touch.sendCancel();
+        }
+        self.touch_points.clearRetainingCapacity();
+        if (self.seatClient(wl_client)) |sc| sc.touch_frame_pending = false;
+        self.touchLeave();
+        self.events.touch.emit(self);
+        log.debug("touch cancel", self.io, self.log_cfg, "seat", .{});
+    }
+
+    /// End a live gesture the seat is taking away from the client: one
+    /// wl_touch.up per still-down point, then the leave. Shared by the
+    /// grab start, the capability removal, the focus surface's death
+    /// and the seat teardown — every path where the client would
+    /// otherwise wait forever on points that will never lift.
+    fn touchCloseSequence(self: *Seat) void {
+        const focus = self.touch_focus orelse return;
+        const wl_client = focus.resource.getClient();
+        const time = nowMs(self);
+        var delivered = false;
+        for (self.touch_points.items) |p| {
+            const serial = serialFor(self, wl_client);
+            for (self.touches.items) |touch| {
+                if (touch.getClient() != wl_client) continue;
+                touch.sendUp(serial, time, @intCast(p.id));
+                delivered = true;
+            }
+        }
+        self.touch_points.clearRetainingCapacity();
+        if (delivered) self.markTouchFramePending(wl_client);
+        self.touchLeave();
+        self.events.touch.emit(self);
+    }
+
+    /// Enter `surface` for touch: arm the destroy listener and surface
+    /// the focus transition (see the touch wire model above). Sent to
+    /// the surface's OWN client's pointer resources only — libwayland
+    /// rejects an event carrying another client's surface.
+    fn touchEnter(self: *Seat, surface: *Surface, sx: i32, sy: i32) void {
+        if (self.touch_focus_listener.link.prev != null) self.touch_focus_listener.link.remove();
+        self.touch_focus = surface;
+        surface.events.destroy.add(&self.touch_focus_listener);
+        const wl_client = surface.resource.getClient();
+        const serial = serialFor(self, wl_client);
+        var delivered = false;
+        for (self.pointers.items) |ptr| {
+            if (ptr.getClient() != wl_client) continue;
+            ptr.sendEnter(
+                serial,
+                surface.resource,
+                Fixed.fromDouble(@floatFromInt(sx)),
+                Fixed.fromDouble(@floatFromInt(sy)),
+            );
+            delivered = true;
+        }
+        if (delivered) self.markFramePending(wl_client);
+        log.debug("touch enter surface@{d}", self.io, self.log_cfg, "seat", .{surface.resource.getId()});
+    }
+
+    /// Leave the touch focus surface. Idempotent (no focus, no leave),
+    /// and it does NOT touch the pointer focus or the client cursor:
+    /// those belong to the pointer's own enter/leave, and a touch
+    /// gesture must not clear a cursor the pointer is still using.
+    fn touchLeave(self: *Seat) void {
+        const surface = self.touch_focus orelse return;
+        if (self.touch_focus_listener.link.prev != null) self.touch_focus_listener.link.remove();
+        self.touch_focus = null;
+        const wl_client = surface.resource.getClient();
+        const serial = serialFor(self, wl_client);
+        var delivered = false;
+        for (self.pointers.items) |ptr| {
+            if (ptr.getClient() != wl_client) continue;
+            ptr.sendLeave(serial, surface.resource);
+            delivered = true;
+        }
+        if (delivered) self.markFramePending(wl_client);
+        log.debug("touch leave surface@{d}", self.io, self.log_cfg, "seat", .{surface.resource.getId()});
+    }
+
+    /// The touch focus surface died (its destroy signal): clear the
+    /// focus with a closed gesture before the Surface frees.
+    fn onTouchFocusDestroy(listener: *wire.Listener(*Surface), surface: *Surface) void {
+        const self: *Seat = @fieldParentPtr("touch_focus_listener", listener);
+        self.surfaceDestroyed(surface);
+    }
+
     /// The seat's monotonic-ms clock: CLOCK_MONOTONIC via std.Io.Clock
     /// (.awake), the same source main.zig's repeat-timer arming uses
     /// (S7). The wire `time` fields are u32 and the truncation wraps
@@ -1713,6 +2525,7 @@ fn bindSeat(wl_client: *wire.Client, seat: *Seat, version: u32, id: u32) void {
     resource.sendCapabilities(.{
         .keyboard = seat.capabilities & capabilities_keyboard != 0,
         .pointer = seat.capabilities & capabilities_pointer != 0,
+        .touch = seat.capabilities & capabilities_touch != 0,
     });
     if (resource.getVersion() >= 2) resource.sendName(seat.seat_name);
 }
@@ -1727,8 +2540,8 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
             kbd.setHandler(*Seat, keyboardRequest, keyboardDestroy, seat);
             // Capability disabled: keep the object dead (no keymap, no
             // events, no list entry) — deliberate smithay-style policy
-            // for capabilities the seat may regain; get_touch (which can
-            // never exist here) posts missing_capability instead (S3).
+            // for capabilities the seat may regain; get_touch posts
+            // missing_capability instead (wayland.xml:2094-2098).
             if (!seat.options.keyboard) return;
             seat.keyboards.append(seat.allocator, kbd) catch {
                 resource.getClient().postNoMemory();
@@ -1773,8 +2586,8 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
             ptr.setHandler(*Seat, pointerRequest, pointerDestroy, seat);
             // Capability disabled: keep the object dead (no events, no
             // list entry) — deliberate smithay-style policy for
-            // capabilities the seat may regain; get_touch (which can
-            // never exist here) posts missing_capability instead (S3).
+            // capabilities the seat may regain; get_touch posts
+            // missing_capability instead (wayland.xml:2094-2098).
             if (!seat.options.pointer) return;
             seat.pointers.append(seat.allocator, ptr) catch {
                 resource.getClient().postNoMemory();
@@ -1795,16 +2608,78 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
                 }
             }
         },
-        .get_touch => {
-            // Touch has never existed on this seat: kill the probing
-            // client with the protocol error instead of handing out a
-            // never-emitting object (wlroots posts
-            // WL_SEAT_ERROR_MISSING_CAPABILITY when the capability never
-            // existed, wlr_seat.c:53-66). Deliberately inconsistent with
-            // the disabled get_keyboard/get_pointer dead-object policy
-            // above — those cover capabilities the seat can regain, while
-            // touch is DEFER and can never exist here.
-            resource.postError(.missing_capability, "wl_seat.get_touch called when no touch capability has existed");
+        .get_touch => |r| {
+            // Version gate: wl_seat.get_touch and the touch capability
+            // bit are both since_version 1 (wayland.xml:2089-2101 and
+            // :2020-2034), so every wl_seat version this seat serves
+            // may ask for touch. The two assertions make that a
+            // property of the code, not a comment: raising seat_version
+            // can never make the bit un-advertisable, and lowering it
+            // below 1 cannot compile.
+            comptime {
+                if (seat_version < server.wl.Seat.Request.get_touch_since_version or
+                    seat_version < server.wl.Seat.Capability.touch_since_version)
+                {
+                    @compileError("wl_seat version below get_touch: the touch capability bit would be un-advertisable");
+                }
+            }
+            // The protocol: get_touch on a seat that NEVER had the touch
+            // capability is a violation → missing_capability
+            // (wayland.xml:2094-2098; wlroots wlr_seat.c:53-66). Once
+            // the seat HAS had it, the request keeps taking effect even
+            // if the bit was dropped afterwards (the same sentence:
+            // "or has had the touch capability in the past") — that is
+            // the setCapabilities path, which inerts the resources
+            // rather than killing their clients.
+            if (seat.capabilities & capabilities_touch == 0) {
+                resource.postError(.missing_capability, "wl_seat.get_touch called on a seat without the touch capability");
+                return;
+            }
+            const touch = server.wl.Touch.create(resource.getClient(), resource.getVersion(), r.id) catch {
+                resource.getClient().postNoMemory();
+                return;
+            };
+            touch.setHandler(*Seat, touchRequest, touchDestroy, seat);
+            seat.touches.append(seat.allocator, touch) catch {
+                resource.getClient().postNoMemory();
+                return;
+            };
+            // Late hand-off: a wl_touch created while THIS client
+            // already has points down is replayed those points in down
+            // order, otherwise the next up would reference an id the
+            // client never saw and its gesture state would never
+            // resolve. The replay is one batch: it marks the frame
+            // pending instead of posting its own frame, so the burst
+            // still closes with exactly one wl_touch.frame (the rule
+            // wlroots applies to its enter burst).
+            // The replay puts real wl_touch.down events on the wire,
+            // so the touch gate answers for it exactly as it does for
+            // touchDown: a gesture that began before the session
+            // locked must not start feeding a FRESH resource while the
+            // gate refuses the surface (ext_session_lock_v1:77-85 —
+            // input stops for the whole locked interval, whichever
+            // interface it would travel on). Nothing is dropped from
+            // the seat: the points stay live and the wl_touch that has
+            // been following the gesture still gets their up, so the
+            // gesture closes exactly once.
+            if (seat.touch_focus) |focus| {
+                const wl_client = focus.resource.getClient();
+                if (touch.getClient() == wl_client) {
+                    if (!seat.touchAllowed(focus)) return;
+                    const time = seat.nowMs();
+                    for (seat.touch_points.items) |p| {
+                        touch.sendDown(
+                            seat.serialFor(wl_client),
+                            time,
+                            focus.resource,
+                            @intCast(p.id),
+                            Fixed.fromDouble(p.x),
+                            Fixed.fromDouble(p.y),
+                        );
+                    }
+                    seat.markTouchFramePending(wl_client);
+                }
+            }
         },
         .release => resource.destroy(),
     }
@@ -1829,9 +2704,22 @@ fn pointerDestroy(resource: *server.wl.Pointer, seat: *Seat) void {
     seat.pruneSeatClient(resource.getClient());
 }
 
-/// wl_touch request handling. UNREACHABLE today: get_touch posts
-/// missing_capability and never creates the resource (touch is DEFER).
-/// Kept so the release path exists the moment touch lands.
+/// wl_touch resource died: same bookkeeping as keyboardDestroy.
+fn touchDestroy(resource: *server.wl.Touch, seat: *Seat) void {
+    const idx = std.mem.indexOfScalar(*server.wl.Touch, seat.touches.items, resource) orelse 0;
+    if (idx < seat.touches.items.len and seat.touches.items[idx] == resource) {
+        _ = seat.touches.orderedRemove(idx);
+    }
+    seat.pruneSeatClient(resource.getClient());
+}
+
+/// wl_touch request handling. `release` is the interface's only request
+/// (wayland.xml:2754-2898): down/motion/up/frame/cancel are compositor
+/// to CLIENT events driven by touchDown/touchMotion/touchUp/touchFrame/
+/// touchCancel, so the client has nothing else to say here. The release
+/// still has to end the resource — touchDestroy prunes it from the
+/// seat's list, which is what keeps every later event off a dead
+/// object.
 fn touchRequest(resource: *server.wl.Touch, request: server.wl.Touch.Request, seat: *Seat) void {
     _ = seat;
     switch (request) {
@@ -1990,6 +2878,37 @@ const KeyboardEvents = struct {
     }
 };
 
+/// Client-side events the touch tests need to put in ORDER across two
+/// different objects: the wl_pointer.leave that carries a touch focus
+/// transition and the wl_touch.up that closes the sequence. Each
+/// listener's own counters cannot order them, so both listeners append
+/// to one shared log when a test installs it.
+const EventOrder = enum { pointer_enter, pointer_leave, touch_down, touch_motion, touch_up, touch_frame, touch_cancel };
+
+const OrderLog = struct {
+    // SAFETY: only events[0..len] is read, and the listeners append
+    // within len < events.len before every read.
+    events: [32]EventOrder = undefined,
+    len: usize = 0,
+
+    fn push(self: *OrderLog, e: EventOrder) void {
+        if (self.len >= self.events.len) return;
+        self.events[self.len] = e;
+        self.len += 1;
+    }
+
+    /// True when `e` appears before `after` (an empty log or a missing
+    /// event reads false).
+    fn before(self: *const OrderLog, e: EventOrder, after: EventOrder) bool {
+        var seen_e = false;
+        for (self.events[0..self.len]) |x| {
+            if (x == after) return seen_e;
+            if (x == e) seen_e = true;
+        }
+        return false;
+    }
+};
+
 /// Event counts for one client-side wl_pointer.
 const PointerEvents = struct {
     entered: bool = false,
@@ -2004,18 +2923,30 @@ const PointerEvents = struct {
     axis_value120: usize = 0,
     axis_relative_direction: usize = 0,
     frame: usize = 0,
+    /// Enter COUNT (the boolean above only says "at least one"): the
+    /// touch tests need to tell a second touch-focus enter from the
+    /// first.
+    enters: usize = 0,
+    /// Shared cross-object order log (see OrderLog); null in the tests
+    /// that do not need it.
+    order: ?*OrderLog = null,
 
     fn listener(pointer: *client.wl.Pointer, event: client.wl.Pointer.Event, data: *PointerEvents) void {
         _ = pointer;
         switch (event) {
             .enter => |e| {
                 data.entered = true;
+                data.enters += 1;
                 if (e.surface) |s| data.enter_surface_id = s.getId();
+                if (data.order) |ord| ord.push(.pointer_enter);
             },
-            .leave => data.left += 1,
             .motion => data.motion += 1,
             .button => data.button += 1,
             .axis => data.axis += 1,
+            .leave => {
+                data.left += 1;
+                if (data.order) |ord| ord.push(.pointer_leave);
+            },
             .axis_stop => data.axis_stop += 1,
             .axis_discrete => data.axis_discrete += 1,
             .axis_source => data.axis_source += 1,
@@ -2023,6 +2954,75 @@ const PointerEvents = struct {
             .axis_relative_direction => data.axis_relative_direction += 1,
             .frame => data.frame += 1,
             .warp => {},
+        }
+    }
+};
+
+/// Event log for one client-side wl_touch: the down/motion/up/frame/
+/// cancel stream plus the serials and surface-local coordinates the
+/// protocol puts on the wire (wayland.xml:2766-2825).
+const TouchEvents = struct {
+    down: usize = 0,
+    up: usize = 0,
+    motion: usize = 0,
+    frame: usize = 0,
+    cancel: usize = 0,
+    /// The most recent down's point id and surface-local position, and
+    /// the wl_surface id it named.
+    last_id: i32 = 0,
+    last_x: f64 = 0,
+    last_y: f64 = 0,
+    down_surface_id: u32 = 0,
+    /// Serials of the downs/ups in arrival order — the acceptance check
+    // SAFETY: only down_serials[0..down_serial_count] and
+    // up_serials[0..up_serial_count] are read; the listener writes
+    // exactly one entry per down/up before any read happens.
+    down_serials: [16]u32 = undefined,
+    down_serial_count: usize = 0,
+    up_serials: [16]u32 = undefined,
+    up_serial_count: usize = 0,
+    order: ?*OrderLog = null,
+
+    fn listener(touch: *client.wl.Touch, event: client.wl.Touch.Event, data: *TouchEvents) void {
+        _ = touch;
+        switch (event) {
+            .down => |e| {
+                data.down += 1;
+                data.last_id = e.id;
+                data.last_x = Fixed.toDouble(e.x);
+                data.last_y = Fixed.toDouble(e.y);
+                if (e.surface) |s| data.down_surface_id = s.getId();
+                if (data.down_serial_count < data.down_serials.len) {
+                    data.down_serials[data.down_serial_count] = e.serial;
+                    data.down_serial_count += 1;
+                }
+                if (data.order) |ord| ord.push(.touch_down);
+            },
+            .up => |e| {
+                data.up += 1;
+                data.last_id = e.id;
+                if (data.up_serial_count < data.up_serials.len) {
+                    data.up_serials[data.up_serial_count] = e.serial;
+                    data.up_serial_count += 1;
+                }
+                if (data.order) |ord| ord.push(.touch_up);
+            },
+            .motion => |e| {
+                data.motion += 1;
+                data.last_id = e.id;
+                data.last_x = Fixed.toDouble(e.x);
+                data.last_y = Fixed.toDouble(e.y);
+                if (data.order) |ord| ord.push(.touch_motion);
+            },
+            .frame => {
+                data.frame += 1;
+                if (data.order) |ord| ord.push(.touch_frame);
+            },
+            .cancel => {
+                data.cancel += 1;
+                if (data.order) |ord| ord.push(.touch_cancel);
+            },
+            .shape, .orientation => {},
         }
     }
 };
@@ -2060,26 +3060,45 @@ const SeatEvents = struct {
 /// One connected in-memory client: server-side wire client + client-side
 /// compositor/seat proxies, surface, keyboard and pointer.
 const TestClient = struct {
-    server: *wire.Client,
+    /// The server-side wire client. NULL once the server has destroyed
+    /// it: libwayland does that from inside its own request dispatch on
+    /// a protocol error (wl_client_connection_data,
+    /// wayland-server.c:498-500), and wl_client_destroy frees every
+    /// resource that client owned (wayland-server.c:1025) — so from
+    /// that instant the handle is dangling. `dispatchClient` clears it
+    /// where the failure is reported; every other read goes through
+    /// `.?`, which is the assertion that the client is still alive.
+    server: ?*wire.Client,
     display: *client.wl.Display,
     compositor: *client.wl.Compositor,
     seat: *client.wl.Seat,
     surface: *client.wl.Surface,
     keyboard: *client.wl.Keyboard,
     pointer: *client.wl.Pointer,
+    /// Created by enableTouch (null until a touch test asks for it: a
+    /// seat built without the touch capability kills the client on
+    /// get_touch, and no other test should probe touch).
+    touch: ?*client.wl.Touch = null,
     kbd_events: KeyboardEvents = .{},
     ptr_events: PointerEvents = .{},
+    touch_events: TouchEvents = .{},
     seat_events: SeatEvents = .{},
 };
 
-/// The seat's hit-test context: which surface the pick returns.
+/// The seat's hit-test context: which surface the pick returns, and
+/// where that surface sits in output coordinates (the pick subtracts
+/// it, so a surface positioned away from the origin yields
+/// surface-local coordinates that differ from the reported position —
+/// what the touch path must translate through).
 const TestPickState = struct {
     surface: ?*Surface = null,
+    origin_x: i32 = 0,
+    origin_y: i32 = 0,
 };
 
 fn testPick(ctx: *anyopaque, x: i32, y: i32) ?Seat.PickResult {
     const st: *TestPickState = @ptrCast(@alignCast(ctx));
-    if (st.surface) |s| return .{ .surface = s, .sx = x, .sy = y };
+    if (st.surface) |s| return .{ .surface = s, .sx = x - st.origin_x, .sy = y - st.origin_y };
     return null;
 }
 
@@ -2127,6 +3146,12 @@ const TestServer = struct {
     /// Heap-allocated (the `io` pointer must outlive the stack frame; the
     /// display, compositor and seat all store it).
     fn init(allocator: std.mem.Allocator) !*TestServer {
+        return initOptions(allocator, .{});
+    }
+
+    /// Same, with explicit seat Options — the touch tests need a seat
+    /// that never had the touch capability, which only Options can say.
+    fn initOptions(allocator: std.mem.Allocator, options: Options) !*TestServer {
         const ts = try allocator.create(TestServer);
         ts.* = .{
             .allocator = allocator,
@@ -2137,7 +3162,7 @@ const TestServer = struct {
         errdefer ts.deinit();
         ts.display = try display_mod.CompositorDisplay.init(allocator, &ts.io, &ts.log_cfg);
         ts.compositor = try compositor_mod.Compositor.init(allocator, &ts.io, &ts.log_cfg, ts.display.?);
-        ts.seat = try Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, .{});
+        ts.seat = try Seat.init(allocator, &ts.io, &ts.log_cfg, ts.display.?, options);
         ts.seat.?.setPick(testPick, &ts.pick_state);
         try connectClient(ts, &ts.a);
         try connectClient(ts, &ts.b);
@@ -2145,14 +3170,19 @@ const TestServer = struct {
     }
 
     fn deinit(ts: *TestServer) void {
-        // Clients tear down first (LIFO), then the modules.
+        // Clients tear down first (LIFO), then the modules. The client
+        // half of each socketpair goes with its display; the SERVER
+        // half only goes with a client the server still owns — one
+        // destroyed mid-test is already freed and its handle is null
+        // (see TestClient.server), so a second wl_client_destroy here
+        // would be a use-after-free.
         if (ts.clients >= 2) {
             ts.b.display.disconnect();
-            ts.b.server.destroy();
+            if (ts.b.server) |c| c.destroy();
         }
         if (ts.clients >= 1) {
             ts.a.display.disconnect();
-            ts.a.server.destroy();
+            if (ts.a.server) |c| c.destroy();
         }
         if (ts.seat) |s| s.deinit();
         if (ts.compositor) |c| c.deinit();
@@ -2183,8 +3213,8 @@ const TestServer = struct {
         try test_pump.dispatchOnce(null, ts.display.?, 0);
         if (ts.seat) |s| s.pointerFrame();
         test_pump.flushServers(ts.display.?);
-        if (ts.clients >= 1) try dispatchDisplay(ts.a.display);
-        if (ts.clients >= 2) try dispatchDisplay(ts.b.display);
+        if (ts.clients >= 1) try dispatchClient(&ts.a);
+        if (ts.clients >= 2) try dispatchClient(&ts.b);
     }
 };
 
@@ -2201,6 +3231,24 @@ fn dispatchDisplay(c_display: *client.wl.Display) !void {
     };
     if (try posix.poll(&fds, 0) > 0) {
         if (c_display.dispatch() != .SUCCESS) return error.ClientDispatchFailed;
+    }
+}
+
+/// dispatchDisplay for a client the harness already owns. A failed
+/// dispatch means the server destroyed that client from inside its own
+/// request dispatch (wl_client_connection_data, wayland-server.c:498-
+/// 500), which freed it and every resource it owned
+/// (wl_client_destroy, wayland-server.c:1025) — so the handle into it
+/// goes here, the one place that knows, and deinit leaves it alone.
+fn dispatchClient(tc: *TestClient) !void {
+    var fds = [_]posix.pollfd{
+        .{ .fd = tc.display.getFd(), .events = posix.POLL.IN, .revents = 0 },
+    };
+    if (try posix.poll(&fds, 0) > 0) {
+        if (tc.display.dispatch() != .SUCCESS) {
+            tc.server = null;
+            return error.ClientDispatchFailed;
+        }
     }
 }
 
@@ -2247,6 +3295,19 @@ fn connectClient(ts: *TestServer, tc: *TestClient) !void {
     ts.clients += 1;
 }
 
+/// Give `tc` a live wl_touch with an event listener, the way a
+/// touch-aware client would. Only the touch tests call it: connectClient
+/// deliberately does NOT probe touch, because a seat built with
+/// Options.touch = false answers get_touch with a protocol error that
+/// kills the connection.
+fn enableTouch(ts: *TestServer, tc: *TestClient) !*client.wl.Touch {
+    const touch = try tc.seat.getTouch();
+    touch.setListener(*TouchEvents, TouchEvents.listener, &tc.touch_events);
+    tc.touch = touch;
+    try ts.pump();
+    return touch;
+}
+
 /// The server-side Surface created by `server_client` (each test client
 /// creates exactly one surface).
 fn surfaceForClient(ts: *TestServer, server_client: *wire.Client) *Surface {
@@ -2268,7 +3329,7 @@ test "keyboard and pointer events reach only the focused client" {
 
     const a = &ts.a;
     const b = &ts.b;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
     try std.testing.expectEqual(@as(usize, 2), ts.seat.?.keyboards.items.len);
     try std.testing.expectEqual(@as(usize, 2), ts.seat.?.pointers.items.len);
 
@@ -2359,8 +3420,8 @@ test "click-to-focus gate: a denied surface keeps the current focus (L-D7)" {
     defer ts.deinit();
 
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, ts.a.server);
-    const surface_b = surfaceForClient(ts, ts.b.server);
+    const surface_a = surfaceForClient(ts, ts.a.server.?);
+    const surface_b = surfaceForClient(ts, ts.b.server.?);
 
     // No gate registered: a click over A's surface moves keyboard focus
     // to it (the seat's built-in click-to-focus).
@@ -2400,7 +3461,7 @@ test "server-side key repeat: press, delay, repeat, release stops" {
     try std.testing.expectEqual(@as(u64, 1), ts.seat.?.repeatIntervalMs());
 
     const a = &ts.a;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
     ts.pick_state.surface = surface_a;
     ts.seat.?.pointerMotion(10, 10);
     try ts.pump();
@@ -2443,7 +3504,7 @@ test "v10 clients get repeat_info rate 0 and repeated-state repeats (S1)" {
 
     const a = &ts.a;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // The harness binds wl_seat at v10: repeat_info advertises rate 0
     // (the compositor owns repeats, S1) with the real delay. A v10
@@ -2491,7 +3552,7 @@ test "pre-v10 clients get repeat_info rate 25 and pressed-state repeats (S1)" {
 
     const a = &ts.a;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // Bind a second wl_keyboard for client A at wl_seat version 9 (the
     // v7-bind pattern): a pre-v10 resource keeps the real repeat rate
@@ -2541,7 +3602,7 @@ test "implicit pointer grab gates axis and button release (S2)" {
 
     const a = &ts.a;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // Focus A; the press is delivered normally (the camera drag starts
     // on the press, the grab only on the threshold-crossing motion).
@@ -2587,7 +3648,7 @@ test "press mints a grab_serial on the 0->1 transition, release closes it (S-F5)
     defer ts.deinit();
 
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, ts.a.server);
+    const surface_a = surfaceForClient(ts, ts.a.server.?);
 
     // Focus A so the press is delivered (with a serial).
     ts.pick_state.surface = surface_a;
@@ -2622,7 +3683,7 @@ test "two held buttons invalidate the grab serial (S-F5)" {
     defer ts.deinit();
 
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, ts.a.server);
+    const surface_a = surfaceForClient(ts, ts.a.server.?);
 
     ts.pick_state.surface = surface_a;
     seat.pointerMotion(10, 10);
@@ -2662,7 +3723,7 @@ test "a re-press mints a fresh grab serial (S-F5)" {
     defer ts.deinit();
 
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, ts.a.server);
+    const surface_a = surfaceForClient(ts, ts.a.server.?);
 
     ts.pick_state.surface = surface_a;
     seat.pointerMotion(10, 10);
@@ -2699,8 +3760,8 @@ test "click-to-focus arms the grab serial against the focused surface (S-F5)" {
     defer ts.deinit();
 
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, ts.a.server);
-    const surface_b = surfaceForClient(ts, ts.b.server);
+    const surface_a = surfaceForClient(ts, ts.a.server.?);
+    const surface_b = surfaceForClient(ts, ts.b.server.?);
 
     // Pointer over A (enter sets the pointer focus); keyboard focus
     // still elsewhere.
@@ -2764,7 +3825,7 @@ test "pointer grab lifecycle: start routes, end cancels and restores delivery (F
 
     const a = &ts.a;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // Focus A and press (delivered normally pre-grab).
     ts.pick_state.surface = surface_a;
@@ -2816,8 +3877,8 @@ test "a swallow grab suppresses click-to-focus: the press leaves the focus alone
     const a = &ts.a;
     const b = &ts.b;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
-    const surface_b = surfaceForClient(ts, b.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    const surface_b = surfaceForClient(ts, b.server.?);
 
     // A plain click focuses what is under the pointer.
     ts.pick_state.surface = surface_a;
@@ -2871,8 +3932,8 @@ test "a drag-and-drop grab keeps click-to-focus (P1-7)" {
     defer ts.deinit();
 
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, ts.a.server);
-    const surface_b = surfaceForClient(ts, ts.b.server);
+    const surface_a = surfaceForClient(ts, ts.a.server.?);
+    const surface_b = surfaceForClient(ts, ts.b.server.?);
 
     // Focus A, then install a grab shaped like the drag-and-drop grab
     // data_device.zig installs (its own data plus dragGrab* handlers)
@@ -2925,8 +3986,8 @@ test "grab start releases the held buttons to the client that got the press (P1-
     const a = &ts.a;
     const b = &ts.b;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
-    const surface_b = surfaceForClient(ts, b.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    const surface_b = surfaceForClient(ts, b.server.?);
 
     // A takes the press and believes BTN_LEFT is down.
     ts.pick_state.surface = surface_a;
@@ -3000,7 +4061,7 @@ test "keyboard grab routes key events and modifiers, cancel on end (F2)" {
 
     const a = &ts.a;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // Focus A normally.
     ts.pick_state.surface = surface_a;
@@ -3049,7 +4110,7 @@ test "repeat tick before the deadline is a no-op, after it emits exactly once (S
 
     const a = &ts.a;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     ts.pick_state.surface = surface_a;
     seat.pointerMotion(10, 10);
@@ -3093,7 +4154,7 @@ test "keyboard enter is followed by a modifiers event" {
 
     const a = &ts.a;
     const b = &ts.b;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // Initial bind: no focus yet, so no enter and no modifiers.
     try std.testing.expect(!a.kbd_events.entered);
@@ -3151,8 +4212,8 @@ test "keyboard enter carries evdev scancodes, not xkb keycodes (F1)" {
 
     const a = &ts.a;
     const b = &ts.b;
-    const surface_a = surfaceForClient(ts, a.server);
-    const surface_b = surfaceForClient(ts, b.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    const surface_b = surfaceForClient(ts, b.server.?);
 
     // Hold 'a' (xkb keycode 38) with focus on A, then switch focus to B:
     // B's enter carries the pressed key as the evdev SCANCODE 30 (the
@@ -3178,28 +4239,28 @@ test "serial validation is per client with a recent-serial ring (F2)" {
     const a = &ts.a;
     const b = &ts.b;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // No serial was ever handed to either client: 0 is rejected (wlroots
     // validates over the per-client ring, wlr_seat.c:500-524).
-    try std.testing.expect(!seat.validateEventSerial(a.server, 0));
-    try std.testing.expect(!seat.validateEventSerial(b.server, 0));
+    try std.testing.expect(!seat.validateEventSerial(a.server.?, 0));
+    try std.testing.expect(!seat.validateEventSerial(b.server.?, 0));
 
     // A pointer enter mints a serial for A only.
     ts.pick_state.surface = surface_a;
     seat.pointerMotion(10, 10);
     try ts.pump();
     const serial_a = seat.pointer_enter_serial;
-    try std.testing.expect(seat.validateEventSerial(a.server, serial_a));
+    try std.testing.expect(seat.validateEventSerial(a.server.?, serial_a));
     // B was never handed A's serial: rejected for B (false-reject fix:
     // an event to A must not invalidate A's serials, and must not
     // validate for B).
-    try std.testing.expect(!seat.validateEventSerial(b.server, serial_a));
+    try std.testing.expect(!seat.validateEventSerial(b.server.?, serial_a));
 
     // A serial the seat never handed out is rejected for everyone.
     const bogus = seat.display.nextSerial();
-    try std.testing.expect(!seat.validateEventSerial(a.server, bogus));
-    try std.testing.expect(!seat.validateEventSerial(b.server, bogus));
+    try std.testing.expect(!seat.validateEventSerial(a.server.?, bogus));
+    try std.testing.expect(!seat.validateEventSerial(b.server.?, bogus));
 
     // A keyboard event serial for A also validates for A (any serial the
     // seat recently handed this client, not just the last one).
@@ -3207,8 +4268,8 @@ test "serial validation is per client with a recent-serial ring (F2)" {
     seat.keyEvent(38, true);
     try ts.pump();
     const last_serial = seat.last_serial;
-    try std.testing.expect(seat.validateEventSerial(a.server, serial_a));
-    try std.testing.expect(seat.validateEventSerial(a.server, last_serial));
+    try std.testing.expect(seat.validateEventSerial(a.server.?, serial_a));
+    try std.testing.expect(seat.validateEventSerial(a.server.?, last_serial));
 }
 
 test "v8+ clients get axis_value120, v7 clients get accumulated discrete (F4)" {
@@ -3221,7 +4282,7 @@ test "v8+ clients get axis_value120, v7 clients get accumulated discrete (F4)" {
 
     const a = &ts.a;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // Bind a SECOND wl_pointer for client A at seat version 7 (a fresh
     // registry round): its resources are v7, so it gets axis_discrete
@@ -3260,7 +4321,7 @@ test "axis events batch into one frame with a single axis_source (F7)" {
 
     const a = &ts.a;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     ts.pick_state.surface = surface_a;
     seat.pointerMotion(10, 10);
@@ -3294,7 +4355,7 @@ test "set_cursor requires focus, a valid serial and the cursor role (F9)" {
     const a = &ts.a;
     const b = &ts.b;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // The cursor_surface signal fires exactly when set_cursor is
     // accepted (the cursor compositor hooks it to re-import the image).
@@ -3387,7 +4448,7 @@ test "keymap change re-broadcasts to all clients (F10)" {
     // A runtime layout switch re-broadcasts the keymap to EVERY client
     // (wlroots handle_keyboard_keymap, wlr_seat_keyboard.c:87-99) and
     // re-sends the modifiers to the focused client with the group.
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
     seat.setKeyboardFocus(surface_a);
     try ts.pump();
     const modifiers_before = a.kbd_events.modifiers;
@@ -3417,7 +4478,7 @@ test "seat teardown sends leave to the focused client (F11)" {
     defer ts.deinit();
 
     const a = &ts.a;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
     ts.pick_state.surface = surface_a;
     ts.seat.?.pointerMotion(10, 10);
     ts.seat.?.setKeyboardFocus(surface_a);
@@ -3444,7 +4505,7 @@ test "focused-surface destroy sends leave before clearing (F12)" {
 
     const a = &ts.a;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
     ts.pick_state.surface = surface_a;
     seat.pointerMotion(10, 10);
     seat.setKeyboardFocus(surface_a);
@@ -3462,7 +4523,28 @@ test "focused-surface destroy sends leave before clearing (F12)" {
     try std.testing.expect(seat.keyboard_focus == null);
 }
 
-test "wl_seat.get_touch on a touch-less seat kills the client (S3)" {
+test "wl_seat.get_touch on a seat that never had touch kills the client (S3)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.initOptions(allocator, .{ .touch = false }) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    // Options.touch = false means the seat NEVER had the touch
+    // capability, so the protocol makes get_touch a violation and the
+    // client dies with wl_seat missing_capability (0)
+    // (wayland.xml:2094-2098; wlroots wlr_seat.c:53-66). The bit must
+    // not have been advertised either.
+    const a = &ts.a;
+    try std.testing.expect(!a.seat_events.last_capability.touch);
+    try std.testing.expectEqual(@as(u32, 0), ts.seat.?.capabilities & capabilities_touch);
+    const touch = try a.seat.getTouch();
+    _ = touch;
+    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+}
+
+test "wl_touch delivers down/motion/up with surface-local coords, enter and leave" {
     const allocator = std.testing.allocator;
     const ts = TestServer.init(allocator) catch |err| {
         std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
@@ -3470,13 +4552,654 @@ test "wl_seat.get_touch on a touch-less seat kills the client (S3)" {
     };
     defer ts.deinit();
 
-    // The seat advertises keyboard + pointer only: a client probing
-    // touch dies with wl_seat missing_capability (0) instead of holding
-    // a live object that never emits (wlroots wlr_seat.c:53-66).
     const a = &ts.a;
-    const touch = try a.seat.getTouch();
-    _ = touch;
-    try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    // The touch capability IS advertised now.
+    try std.testing.expect(a.seat_events.last_capability.touch);
+    try std.testing.expectEqual(@as(usize, 1), seat.touches.items.len);
+
+    // A real wire client sees the enter that opens the gesture.
+    var order: OrderLog = .{};
+    a.ptr_events.order = &order;
+    a.touch_events.order = &order;
+
+    // The surface sits away from the origin: the pick subtracts it, so
+    // a report at output (110, 60) is surface-local (10, 10). Getting
+    // this wrong hands the client raw output coordinates.
+    ts.pick_state.surface = surface_a;
+    ts.pick_state.origin_x = 100;
+    ts.pick_state.origin_y = 50;
+
+    seat.touchDown(1, 110, 60);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down);
+    try std.testing.expectEqual(@as(i32, 1), a.touch_events.last_id);
+    try std.testing.expectEqual(a.surface.getId(), a.touch_events.down_surface_id);
+    try std.testing.expectEqual(@as(f64, 10), a.touch_events.last_x);
+    try std.testing.expectEqual(@as(f64, 10), a.touch_events.last_y);
+    // The gesture opened with exactly one enter, and the down came
+    // after it.
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.enters);
+    try std.testing.expect(order.before(.pointer_enter, .touch_down));
+    // Compositor-side state matches the wire.
+    try std.testing.expect(seat.touchFocus() == surface_a);
+    const pts = seat.activeTouchPoints();
+    try std.testing.expectEqual(@as(usize, 1), pts.len);
+    try std.testing.expectEqual(@as(c_int, 1), pts[0].id);
+    try std.testing.expectEqual(@as(f64, 10), pts[0].x);
+    try std.testing.expectEqual(@as(f64, 10), pts[0].y);
+
+    seat.touchMotion(1, 111, 62);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.motion);
+    try std.testing.expectEqual(@as(f64, 11), a.touch_events.last_x);
+    try std.testing.expectEqual(@as(f64, 12), a.touch_events.last_y);
+    try std.testing.expectEqual(@as(f64, 12), seat.activeTouchPoints()[0].y);
+
+    // The last up ends the gesture: up, then leave — never the reverse,
+    // and exactly one of each.
+    seat.touchUp(1);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+    try std.testing.expect(order.before(.touch_up, .pointer_leave));
+    try std.testing.expect(seat.touchFocus() == null);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+
+    // A down for an id that never went down, and a motion/up for a
+    // released id, reach nobody (the id is dead after its up,
+    // wayland.xml:2774-2778).
+    seat.touchMotion(1, 120, 80);
+    seat.touchUp(1);
+    seat.touchUp(99);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.motion);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.enters);
+
+    // A down whose pick misses every surface is dropped, not delivered.
+    ts.pick_state.surface = null;
+    seat.touchDown(5, 200, 200);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
+}
+
+test "wl_touch frame batching: one frame per batch, not one per point" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+
+    // Two fingers in ONE input batch: two downs, ONE frame. The batch,
+    // not the event, is the unit (wayland.xml:2802-2812).
+    seat.touchDown(1, 10, 10);
+    seat.touchDown(2, 20, 20);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.frame);
+    // Both points are live, in down order.
+    const pts = seat.activeTouchPoints();
+    try std.testing.expectEqual(@as(usize, 2), pts.len);
+    try std.testing.expectEqual(@as(c_int, 1), pts[0].id);
+    try std.testing.expectEqual(@as(c_int, 2), pts[1].id);
+    // One enter for the whole gesture, not one per finger.
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.enters);
+
+    // Closing another empty batch must NOT send a second frame: the
+    // compositor owes a frame only for a batch that carried events.
+    try ts.pump();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.frame);
+
+    // The next batch closes with exactly one more.
+    seat.touchMotion(2, 21, 21);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.motion);
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.frame);
+
+    // Lifting both points is one batch too: two ups, one frame, and the
+    // leave rides along after the last up.
+    seat.touchUp(1);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 3), a.touch_events.frame);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+}
+
+test "wl_touch down/up serials validate in the receiving client's ring" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+
+    seat.touchDown(7, 10, 10);
+    try ts.pump();
+    seat.touchUp(7);
+    try ts.pump();
+
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down_serial_count);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.up_serial_count);
+    const down_serial = a.touch_events.down_serials[0];
+    const up_serial = a.touch_events.up_serials[0];
+    try std.testing.expect(down_serial != 0);
+    try std.testing.expect(up_serial != 0);
+    try std.testing.expect(down_serial != up_serial);
+
+    // Both serials were minted through the same per-client ring the
+    // pointer uses (wlroots wlr_seat_client_next_serial,
+    // wlr_seat.c:473-497), so a client can validate the serial it was
+    // handed on the down AND on the up.
+    try std.testing.expect(seat.validateEventSerial(a.server.?, down_serial));
+    try std.testing.expect(seat.validateEventSerial(a.server.?, up_serial));
+    // Serial recording is PER CLIENT: the other client saw neither
+    // event and must not be able to validate either serial (F2).
+    try std.testing.expect(!seat.validateEventSerial(ts.b.server.?, down_serial));
+    try std.testing.expect(!seat.validateEventSerial(ts.b.server.?, up_serial));
+    // A serial the seat never minted validates nowhere.
+    try std.testing.expect(!seat.validateEventSerial(a.server.?, seat.display.nextSerial()));
+}
+
+test "a compositor grab closes the touch sequence and swallows later touch (S2)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+
+    // A live gesture, delivered normally.
+    seat.touchDown(1, 10, 10);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 1), seat.activeTouchPoints().len);
+
+    // Installing ANY pointer grab closes it: the client's gesture state
+    // must not extend into the compositor's gesture — the same rule
+    // that makes startPointerGrab synthesize the held buttons'
+    // releases (S2, wlr_seat_pointer.c:435-437).
+    seat.startPointerGrab(&swallow_pointer_grab);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
+
+    // During the grab NOTHING reaches the client: no enter, no down, no
+    // motion, no up. (This covers the DnD drag grab too — data_device
+    // installs its own PointerGrab, so the same gate closes touch for
+    // the whole drag.)
+    ts.pick_state.origin_x = 100;
+    ts.pick_state.origin_y = 50;
+    seat.touchDown(2, 110, 60);
+    seat.touchMotion(2, 111, 61);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 0), a.touch_events.motion);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.enters);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
+
+    // ... and touch works again once the grab ends.
+    seat.endPointerGrab();
+    seat.touchDown(3, 110, 60);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.enters);
+    seat.touchUp(3);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.left);
+}
+
+test "a touch-down never moves keyboard focus (wlroots parity)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const seat = ts.seat.?;
+    const surface_a = surfaceForClient(ts, a.server.?);
+    const surface_b = surfaceForClient(ts, b.server.?);
+
+    // A takes keyboard focus the documented way: a click (click-to-
+    // focus, the ONLY path in this seat that moves keyboard focus).
+    ts.pick_state.surface = surface_a;
+    seat.pointerMotion(10, 10);
+    try ts.pump();
+    seat.pointerButton(btn_left, true);
+    try ts.pump();
+    seat.pointerButton(btn_left, false);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+
+    // A finger on B's surface enters B for TOUCH and stops there. In
+    // wlroots only a pointer button press moves keyboard focus
+    // (wlr_seat_pointer.c:seat_pointer_button); the touch path has no
+    // focus write at all and touch/pointer focus are independent states
+    // (wlr_seat_touch.c:63-96). KWin matches: Seat::processTouchDown
+    // (seat.cpp:912-1039) never calls setFocusedSurface.
+    _ = try enableTouch(ts, b);
+    ts.pick_state.surface = surface_b;
+    seat.touchDown(1, 20, 20);
+    try ts.pump();
+    try std.testing.expect(seat.touchFocus() == surface_b);
+    try std.testing.expectEqual(@as(usize, 1), b.touch_events.down);
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+    try std.testing.expect(!b.kbd_events.entered);
+    try std.testing.expectEqual(@as(usize, 0), b.touch_events.up);
+    seat.touchUp(1);
+    try ts.pump();
+    try std.testing.expect(seat.keyboard_focus == surface_a);
+    try std.testing.expectEqual(@as(usize, 1), b.touch_events.up);
+}
+
+test "wl_touch.cancel ends every live point and closes the focus" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+
+    seat.touchDown(1, 10, 10);
+    seat.touchDown(2, 20, 20);
+    seat.touchMotion(2, 21, 21);
+    try std.testing.expectEqual(@as(usize, 2), seat.activeTouchPoints().len);
+
+    // Cancel INSIDE the still-open batch: "No frame event is required
+    // after the cancel event" (wayland.xml:2820-2825), so the batch's
+    // pending wl_touch.frame is dropped, not sent. The leave still
+    // follows, because touchEnter sent an enter.
+    seat.touchCancel();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.motion);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.cancel);
+    try std.testing.expectEqual(@as(usize, 0), a.touch_events.frame);
+
+    // A cancel with nothing down reaches nobody.
+    seat.touchCancel();
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.cancel);
+
+    // A new gesture still works on the same surface.
+    seat.touchDown(3, 10, 10);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 3), a.touch_events.down);
+    try std.testing.expect(seat.touchFocus() == surface_a);
+    seat.touchUp(3);
+    try ts.pump();
+}
+
+test "the touch focus surface dying closes the touch sequence (F12)" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+
+    seat.touchDown(1, 10, 10);
+    seat.touchDown(2, 20, 20);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+
+    // The surface dies mid-gesture: the client gets an up per point and
+    // the matching leave, never points it can never resolve.
+    seat.surfaceDestroyed(surface_a);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
+}
+
+test "setCapabilities drops the touch bit: the gesture closes and the resource inerts" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+    seat.touchDown(1, 10, 10);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down);
+
+    // Dropping the bit re-announces the mask, closes the live gesture
+    // (up per point + leave) and inerts the wl_touch resource.
+    const full_caps = seat.capabilities;
+    seat.setCapabilities(full_caps & ~capabilities_touch);
+    try ts.pump();
+    try std.testing.expect(!a.seat_events.last_capability.touch);
+    try std.testing.expect(a.seat_events.last_capability.keyboard);
+    try std.testing.expect(a.seat_events.last_capability.pointer);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
+    try std.testing.expectEqual(@as(usize, 0), seat.touches.items.len);
+
+    // Re-enabling announces the bit again and get_touch works.
+    seat.setCapabilities(full_caps);
+    try ts.pump();
+    try std.testing.expect(a.seat_events.last_capability.touch);
+    const touch2 = try a.seat.getTouch();
+    var touch2_events: TouchEvents = .{};
+    touch2.setListener(*TouchEvents, TouchEvents.listener, &touch2_events);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), seat.touches.items.len);
+}
+
+test "a wl_touch created mid-gesture is handed the live points" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+    ts.pick_state.origin_x = 100;
+    ts.pick_state.origin_y = 50;
+
+    seat.touchDown(4, 110, 60);
+    seat.touchDown(5, 120, 70);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+
+    // A second wl_touch for the same client replays the points already
+    // down: without it the next up would name an id this client never
+    // saw.
+    const touch2 = try a.seat.getTouch();
+    var touch2_events: TouchEvents = .{};
+    touch2.setListener(*TouchEvents, TouchEvents.listener, &touch2_events);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), touch2_events.down);
+    // The replay is in DOWN order, so the last id seen is the last point.
+    try std.testing.expectEqual(@as(i32, 5), touch2_events.last_id);
+    try std.testing.expectEqual(@as(usize, 1), touch2_events.frame);
+
+    seat.touchUp(4);
+    seat.touchUp(5);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), touch2_events.up);
+}
+
+test "touch gate: a refused surface never sees a down" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+    ts.pick_state.origin_x = 100;
+    ts.pick_state.origin_y = 50;
+
+    // No gate installed: the pick alone decides and the point goes
+    // down. This is the baseline the gate must not shift.
+    seat.touchDown(1, 110, 60);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down);
+    try std.testing.expect(seat.touchFocus() == surface_a);
+    seat.touchUp(1);
+    try ts.pump();
+    try std.testing.expect(seat.touchFocus() == null);
+
+    // The gate now refuses that surface — what a session lock does the
+    // instant it latches. The finger lands on the same pixels and
+    // nothing about it reaches the client: no down, no registered id,
+    // no focus, and no enter, so the refused point cannot half-open a
+    // gesture the client would have to close.
+    var gate_state: TestGateState = .{ .denied = surface_a };
+    seat.setTouchGate(testGate, &gate_state);
+    seat.touchDown(2, 110, 60);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.enters);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+
+    // Un-denying is the unlock: the very next finger lands.
+    gate_state.denied = null;
+    seat.touchDown(3, 110, 60);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 1), seat.activeTouchPoints().len);
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.enters);
+
+    // Mid-gesture the gate answers for the surface the gesture is
+    // already on, so a second finger is refused too — and the finger
+    // that is already down keeps the gesture exactly as it was.
+    gate_state.denied = surface_a;
+    seat.touchDown(4, 120, 70);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 1), seat.activeTouchPoints().len);
+    try std.testing.expectEqual(@as(c_int, 3), seat.activeTouchPoints()[0].id);
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.enters);
+
+    seat.touchUp(3);
+    try ts.pump();
+    // Cumulative, like the down counters above: the first gesture's
+    // touchUp(1) already delivered one up, so the two DELIVERED downs
+    // have now produced exactly two ups — neither refused finger added
+    // one, which is the point of the mid-gesture refusal above.
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.up);
+    try std.testing.expect(seat.touchFocus() == null);
+}
+
+test "touch gate: a point down before the lock stops moving" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+    ts.pick_state.origin_x = 100;
+    ts.pick_state.origin_y = 50;
+
+    // Unlocked: the gesture runs.
+    seat.touchDown(1, 110, 60);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.down);
+
+    // The session locks with the finger still resting on the user
+    // surface. The gesture is legitimate, the delivery is not: motion
+    // must stop for the whole locked interval, not only for points
+    // that begin after it (ext_session_lock_v1:77-85).
+    var gate_state: TestGateState = .{ .denied = surface_a };
+    seat.setTouchGate(testGate, &gate_state);
+    seat.touchMotion(1, 120, 70);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), a.touch_events.motion);
+    // Dropped exactly like a motion whose pick missed: the point keeps
+    // the last position the client was actually told about.
+    const gated = seat.activeTouchPoints();
+    try std.testing.expectEqual(@as(usize, 1), gated.len);
+    try std.testing.expectEqual(@as(f64, 10), gated[0].x);
+    try std.testing.expectEqual(@as(f64, 10), gated[0].y);
+
+    // Unlock: the finger moves and the client hears where it is now.
+    gate_state.denied = null;
+    seat.touchMotion(1, 120, 70);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.motion);
+    try std.testing.expectEqual(@as(f64, 20), a.touch_events.last_x);
+    try std.testing.expectEqual(@as(f64, 20), a.touch_events.last_y);
+    try std.testing.expectEqual(@as(f64, 20), seat.activeTouchPoints()[0].x);
+    try std.testing.expectEqual(@as(f64, 20), seat.activeTouchPoints()[0].y);
+
+    // The UP is not gated (see touchUp): a client that was told a point
+    // went down must be told it lifted, or its own gesture state —
+    // grab, selection, held control — stays stuck forever. Re-lock and
+    // the gesture still closes cleanly.
+    gate_state.denied = surface_a;
+    seat.touchUp(1);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+}
+
+test "no touch gate installed: every picked point is delivered through the gesture" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+    ts.pick_state.origin_x = 100;
+    ts.pick_state.origin_y = 50;
+
+    // Nothing installed a gate, so nothing may be filtered: both fingers
+    // go down and are tracked, the motion is delivered, and the batch
+    // closes once. A gate that silently refused everything would fail
+    // every count below.
+    seat.touchDown(1, 110, 60);
+    seat.touchDown(2, 120, 70);
+    seat.touchMotion(2, 121, 71);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.motion);
+    try std.testing.expectEqual(@as(usize, 1), a.touch_events.frame);
+    const pts = seat.activeTouchPoints();
+    try std.testing.expectEqual(@as(usize, 2), pts.len);
+    try std.testing.expectEqual(@as(c_int, 1), pts[0].id);
+    try std.testing.expectEqual(@as(c_int, 2), pts[1].id);
+    try std.testing.expectEqual(@as(f64, 21), pts[1].x);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.enters);
+
+    seat.touchUp(1);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+}
+
+test "touch gate: a late wl_touch is not handed a gesture the gate refuses" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+    ts.pick_state.origin_x = 100;
+    ts.pick_state.origin_y = 50;
+
+    // Two fingers down while the session is open, on the wl_touch A
+    // already holds.
+    seat.touchDown(1, 110, 60);
+    seat.touchDown(2, 120, 70);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+
+    // The session locks, and A asks for a second wl_touch. The replay
+    // is a wl_touch.down on the wire, so the gate answers for it like
+    // it does for touchDown: the new resource receives nothing at all,
+    // not even an empty frame.
+    var gate_state: TestGateState = .{ .denied = surface_a };
+    seat.setTouchGate(testGate, &gate_state);
+    const touch2 = try a.seat.getTouch();
+    var touch2_events: TouchEvents = .{};
+    touch2.setListener(*TouchEvents, TouchEvents.listener, &touch2_events);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), touch2_events.down);
+    try std.testing.expectEqual(@as(usize, 0), touch2_events.frame);
+
+    // The seat lost nothing: both points are still live, and the lift
+    // closes the gesture on both resources exactly once.
+    try std.testing.expectEqual(@as(usize, 2), seat.activeTouchPoints().len);
+    seat.touchUp(1);
+    seat.touchUp(2);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 2), touch2_events.up);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
 }
 
 test "setCapabilities re-broadcasts and inerts removed-capability resources (S3)" {
@@ -3490,7 +5213,7 @@ test "setCapabilities re-broadcasts and inerts removed-capability resources (S3)
     const a = &ts.a;
     const b = &ts.b;
     const seat = ts.seat.?;
-    const surface_a = surfaceForClient(ts, a.server);
+    const surface_a = surfaceForClient(ts, a.server.?);
 
     // The initial bind announced keyboard + pointer (one capabilities
     // event each).
@@ -3559,4 +5282,230 @@ test "setName re-broadcasts to v2+ seat resources only (S3)" {
     try std.testing.expectEqual(@as(usize, 2), b.seat_events.names);
     try std.testing.expectEqualStrings("my-seat", a.seat_events.last_name[0..a.seat_events.last_name_len]);
     try std.testing.expectEqual(@as(usize, 0), seat1_events.names);
+}
+
+test "a capability is withdrawn only on the LAST removal of that kind" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const b = &ts.b;
+    const seat = ts.seat.?;
+    const kbd_a: InputDevice = .{ .kind = .keyboard, .name = "Virtual Keyboard" };
+    const kbd_b: InputDevice = .{ .kind = .keyboard, .name = "Laptop Keyboard" };
+    const mouse: InputDevice = .{ .kind = .pointer, .name = "Virtual Mouse" };
+    const screen: InputDevice = .{ .kind = .touch, .name = "Virtual Touchscreen" };
+    seat.inputDeviceAdded(&kbd_a);
+    seat.inputDeviceAdded(&kbd_b);
+    seat.inputDeviceAdded(&mouse);
+    seat.inputDeviceAdded(&screen);
+    try std.testing.expectEqual(@as(usize, 4), seat.input_devices.items.len);
+    // The announcement alone changes nothing on the wire: the mask stays
+    // the one Options produced (1 capabilities event = the bind).
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.seat_events.capabilities);
+    try std.testing.expect(a.seat_events.last_capability.keyboard);
+
+    // The first keyboard out: the second one still provides the bit, so
+    // NOTHING reaches the wire and the keyboard resources keep serving.
+    seat.inputDeviceRemoved(&kbd_a);
+    try ts.pump();
+    try std.testing.expect(seat.capabilities & capabilities_keyboard != 0);
+    try std.testing.expectEqual(@as(usize, 1), a.seat_events.capabilities);
+    try std.testing.expectEqual(@as(usize, 1), b.seat_events.capabilities);
+    try std.testing.expectEqual(@as(usize, 2), seat.keyboards.items.len);
+
+    // The LAST one: wl_seat.capabilities is re-announced to every bound
+    // resource and the keyboard resources are inerted.
+    seat.inputDeviceRemoved(&kbd_b);
+    try ts.pump();
+    try std.testing.expect(seat.capabilities & capabilities_keyboard == 0);
+    try std.testing.expectEqual(@as(usize, 2), a.seat_events.capabilities);
+    try std.testing.expectEqual(@as(usize, 2), b.seat_events.capabilities);
+    try std.testing.expect(!a.seat_events.last_capability.keyboard);
+    try std.testing.expect(a.seat_events.last_capability.pointer);
+    try std.testing.expect(a.seat_events.last_capability.touch);
+    try std.testing.expectEqual(@as(usize, 0), seat.keyboards.items.len);
+
+    // The pointer and the touchscreen follow the same rule.
+    seat.inputDeviceRemoved(&mouse);
+    try ts.pump();
+    try std.testing.expect(!a.seat_events.last_capability.pointer);
+    try std.testing.expect(a.seat_events.last_capability.touch);
+    try std.testing.expectEqual(@as(usize, 0), seat.pointers.items.len);
+    try std.testing.expectEqual(@as(usize, 3), a.seat_events.capabilities);
+
+    seat.inputDeviceRemoved(&screen);
+    try ts.pump();
+    try std.testing.expect(!a.seat_events.last_capability.touch);
+    try std.testing.expectEqual(@as(u32, 0), seat.capabilities);
+    try std.testing.expectEqual(@as(usize, 0), seat.input_devices.items.len);
+    try std.testing.expectEqual(@as(usize, 4), a.seat_events.capabilities);
+
+    // A removal the seat never saw (another backend, or a device already
+    // pruned) withdraws nothing and frees nothing: the accounting must
+    // not drift when the two hotplug paths race.
+    seat.inputDeviceRemoved(&kbd_a);
+    seat.inputDeviceRemoved(&screen);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), seat.input_devices.items.len);
+    try std.testing.expectEqual(@as(u32, 0), seat.capabilities);
+    try std.testing.expectEqual(@as(usize, 4), a.seat_events.capabilities);
+}
+
+test "a device announced twice is withdrawn on its LAST removal" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    const kbd: InputDevice = .{ .kind = .keyboard, .name = "Virtual Keyboard" };
+    const screen: InputDevice = .{ .kind = .touch, .name = "Virtual Touchscreen" };
+    seat.inputDeviceAdded(&kbd);
+    seat.inputDeviceAdded(&kbd);
+    seat.inputDeviceAdded(&screen);
+    // One entry, counted twice: a repeated announcement must neither
+    // double the entry (the first removal would drain it and drop the bit
+    // while a keyboard is still attached) nor be swallowed (the removal
+    // would clear it and leave the second announcement unaccounted).
+    try std.testing.expectEqual(@as(usize, 2), seat.input_devices.items.len);
+    try std.testing.expectEqual(@as(u32, 2), seat.input_devices.items[0].count);
+
+    seat.inputDeviceRemoved(&kbd);
+    try ts.pump();
+    try std.testing.expect(seat.capabilities & capabilities_keyboard != 0);
+    try std.testing.expectEqual(@as(usize, 1), a.seat_events.capabilities);
+    try std.testing.expectEqual(@as(usize, 2), seat.keyboards.items.len);
+
+    seat.inputDeviceRemoved(&kbd);
+    try ts.pump();
+    try std.testing.expect(seat.capabilities & capabilities_keyboard == 0);
+    try std.testing.expectEqual(@as(usize, 2), a.seat_events.capabilities);
+    try std.testing.expect(!a.seat_events.last_capability.keyboard);
+    try std.testing.expectEqual(@as(usize, 0), seat.keyboards.items.len);
+    // The touchscreen never took part in the keyboard's accounting.
+    try std.testing.expectEqual(@as(usize, 1), seat.input_devices.items.len);
+    try std.testing.expect(seat.capabilities & capabilities_touch != 0);
+}
+
+test "removing the last touch device closes the gesture and inerts wl_touch" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    _ = try enableTouch(ts, a);
+    const surface_a = surfaceForClient(ts, a.server.?);
+    ts.pick_state.surface = surface_a;
+    const screen: InputDevice = .{ .kind = .touch, .name = "Virtual Touchscreen" };
+    seat.inputDeviceAdded(&screen);
+
+    // A touchscreen unplugged with fingers down: the client holds the
+    // points and the seat still advertises touch.
+    seat.touchDown(1, 10, 10);
+    seat.touchDown(2, 20, 20);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+    try std.testing.expect(seat.capabilities & capabilities_touch != 0);
+    try std.testing.expectEqual(@as(usize, 1), seat.touches.items.len);
+
+    // The removal goes through the real hotplug path, which drops the bit
+    // through setCapabilities: the live gesture is closed (an up per point
+    // plus the leave) BEFORE the wl_touch resource is inerted.
+    seat.inputDeviceRemoved(&screen);
+    try ts.pump();
+    try std.testing.expect(!a.seat_events.last_capability.touch);
+    try std.testing.expect(a.seat_events.last_capability.keyboard);
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.up);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.left);
+    try std.testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try std.testing.expect(seat.touchFocus() == null);
+    try std.testing.expectEqual(@as(usize, 0), seat.touches.items.len);
+
+    // The inerted wl_touch receives nothing more: no interface, no
+    // delivery, even though the compositor still has a surface under the
+    // pointer.
+    seat.touchDown(3, 30, 30);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.down);
+    try std.testing.expectEqual(@as(usize, 2), a.touch_events.up);
+}
+
+test "a device removed while a client tears down keeps the accounting" {
+    const allocator = std.testing.allocator;
+    const ts = TestServer.init(allocator) catch |err| {
+        std.debug.print("seat test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+
+    const a = &ts.a;
+    const seat = ts.seat.?;
+    const kbd: InputDevice = .{ .kind = .keyboard, .name = "Virtual Keyboard" };
+    const screen: InputDevice = .{ .kind = .touch, .name = "Virtual Touchscreen" };
+    seat.inputDeviceAdded(&kbd);
+    seat.inputDeviceAdded(&screen);
+    try std.testing.expectEqual(@as(usize, 2), seat.keyboards.items.len);
+    try std.testing.expectEqual(@as(usize, 2), seat.pointers.items.len);
+
+    // Client B disconnects while the devices are being unplugged: its
+    // resources die, the destroy handlers prune the seat's lists and its
+    // per-client state. The client pointer is only compared, never
+    // dereferenced (see held_clients).
+    const dead_client = ts.b.server.?;
+    ts.b.display.disconnect();
+    ts.b.server.?.destroy();
+    // The handle dies with the client (see TestClient.server): deinit
+    // must not destroy it a second time.
+    ts.b.server = null;
+    ts.clients -= 1;
+    try std.testing.expectEqual(@as(usize, 1), seat.keyboards.items.len);
+    try std.testing.expectEqual(@as(usize, 1), seat.pointers.items.len);
+    for (seat.client_state.items) |sc| {
+        try std.testing.expect(sc.client != dead_client);
+    }
+
+    // The removals that arrive around the teardown still withdraw exactly
+    // the bits the devices justified: no bit is dropped early, none is
+    // kept alive, and the dead client's state is not resurrected.
+    seat.inputDeviceRemoved(&kbd);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.seat_events.capabilities);
+    try std.testing.expect(!a.seat_events.last_capability.keyboard);
+    try std.testing.expect(a.seat_events.last_capability.touch);
+    // A's wl_keyboard is inerted with the bit; the pointer bit and A's
+    // wl_pointer survive (no pointer device was announced).
+    try std.testing.expectEqual(@as(usize, 0), seat.keyboards.items.len);
+    try std.testing.expectEqual(@as(usize, 1), seat.pointers.items.len);
+
+    seat.inputDeviceRemoved(&screen);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 3), a.seat_events.capabilities);
+    try std.testing.expect(!a.seat_events.last_capability.touch);
+    // Pointer was never withdrawn: no pointer device was announced, so
+    // the seat keeps serving it (Options decides the mask, hotplug only
+    // narrows it).
+    try std.testing.expectEqual(capabilities_pointer, seat.capabilities);
+    try std.testing.expectEqual(@as(usize, 0), seat.input_devices.items.len);
+    try std.testing.expectEqual(@as(usize, 0), seat.keyboards.items.len);
+    for (seat.client_state.items) |sc| {
+        try std.testing.expect(sc.client != dead_client);
+    }
+
+    // The surviving client is untouched by its neighbour's teardown.
+    try ts.pump();
+    try std.testing.expect(a.seat_events.last_capability.pointer);
+    try std.testing.expectEqual(@as(usize, 1), seat.pointers.items.len);
 }

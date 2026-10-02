@@ -15,13 +15,33 @@
 //! of that registry: get_tablet_seat announces the hardware registered so
 //! far, in registration order, and later registrations are pushed to every
 //! live seat (wlroots 0.20.2 get_or_create_tablet_seat + add_tablet_client,
-//! types/tablet_v2/wlr_tablet_v2.c:66-200). This server has no tablet
-//! hardware today, so the registry starts empty — the only protocol-visible
-//! consequence is a zwp_tablet_seat_v2 that stays silent, which is a state
-//! every real client must already handle. Everything else (the full bursts,
-//! the pad tree, every `removed` path) is implemented and driven by the
-//! tests through the same public registration API a tablet input backend
-//! would use.
+//! types/tablet_v2/wlr_tablet_v2.c:66-200). The hardware comes from the
+//! libinput backend: an evdev node with LIBINPUT_DEVICE_CAP_TABLET_TOOL is
+//! registered as a zwp_tablet_v2, each tool it reports as a
+//! zwp_tablet_tool_v2, and a node with LIBINPUT_DEVICE_CAP_TABLET_PAD as a
+//! zwp_tablet_pad_v2 (src/backend/libinput.zig). With no tablet attached the
+//! registry is empty and the only protocol-visible consequence is a
+//! zwp_tablet_seat_v2 that stays silent, which is a state every real client
+//! must already handle.
+//!
+//! Two levels of entry point, because the protocol is per client while an
+//! input backend only knows hardware: proximity_in names one
+//! zwp_tablet_tool_v2, one zwp_tablet_v2, one wl_surface and one serial
+//! (XML:380-395), so the resource-level functions (toolProximityIn,
+//! toolProximityOut, padEnter, padLeave) take a client's objects — which
+//! this module owns and does not export. The *Hw functions fan one hardware
+//! event out to every client object that hardware was announced to, pairing
+//! the tool's and the tablet's object on the SAME seat; that is what
+//! src/backend/libinput.zig calls, and what its tests drive.
+//!
+//! NOT sent here: the tool's axis and button events
+//! (zwp_tablet_tool_v2.down/up/motion/pressure/distance/tilt/rotation/
+//! slider/wheel/button/frame, XML:414-563), zwp_tablet_pad_v2.button
+//! (XML:1185) and the ring/strip/dial axis events (XML:737-780, 851-895,
+//! 1264-1290). The vendored protocol declares them and wlroots sends them,
+//! but this module's surface is the announcement tree plus proximity and
+//! pad focus, so a libinput axis/tip/button/pad-ring event has no home here
+//! yet and the backend drops it.
 //!
 //! Burst ordering (tablet-v2.xml is the authority):
 //! - zwp_tablet_v2 (XML:588-682): name?, id?, path*, bustype?(v2), done.
@@ -552,9 +572,10 @@ pub const Tablet = struct {
     // -- hardware registration ------------------------------------------------
 
     /// Register a physical tablet and announce it to every live seat
-    /// (tablet_added + the full capability burst). This server has no
-    /// tablet input backend, so nothing calls this today; the tests drive
-    /// it through the same public API such a backend would.
+    /// (tablet_added + the full capability burst). The descriptor's
+    /// strings are copied, so the caller keeps ownership of `desc`.
+    /// The libinput backend calls this once per evdev node with
+    /// LIBINPUT_DEVICE_CAP_TABLET_TOOL.
     pub fn addTablet(self: *Tablet, desc: TabletDesc) !*TabletHw {
         const allocator = self.allocator;
         const hw = try allocator.create(TabletHw);
@@ -721,6 +742,44 @@ pub const Tablet = struct {
         log.debug("tablet tool@{d} proximity_out", self.io, self.log_cfg, log_tag, .{tool_res.getId()});
     }
 
+    // -- hardware-level proximity ------------------------------------------
+
+    /// The zwp_tablet_v2 object `hw` was announced to on `seat`, or null.
+    /// A client that owns one of `tool`'s objects owns one of `hw`'s on
+    /// the same seat too (announceTo appends to both lists), so this
+    /// pairs objects of one client and never crosses clients.
+    fn tabletClientOn(hw: *TabletHw, seat: *SeatClient) ?*TabletClient {
+        for (hw.clients.items) |tc| {
+            if (tc.seat == seat) return tc;
+        }
+        return null;
+    }
+
+    /// toolProximityIn for one hardware tool, on every client it was
+    /// announced to: what an input backend calls when its pen comes into
+    /// proximity (wlroots does the same fan-out in
+    /// wlr_tablet_v2_tool_notify_proximity_in, types/tablet_v2/
+    /// wlr_tablet_v2_tool.c).
+    pub fn toolProximityInHw(
+        self: *Tablet,
+        tool: *ToolHw,
+        tablet: *TabletHw,
+        surface: *surface_mod.Surface,
+    ) void {
+        for (tool.clients.items) |tc| {
+            const partner = tabletClientOn(tablet, tc.seat) orelse continue;
+            _ = self.toolProximityIn(tc.res, partner.res, surface);
+        }
+    }
+
+    /// toolProximityOut for one hardware tool, on every client it was
+    /// announced to. A tool that never went in sends nothing: the
+    /// per-client proximity serial is what gates it, exactly as for one
+    /// client at a time (XML:397-412).
+    pub fn toolProximityOutHw(self: *Tablet, tool: *ToolHw) void {
+        for (tool.clients.items) |tc| self.toolProximityOut(tc.res);
+    }
+
     /// The proximity_in serial this client currently holds for `tool_res`,
     /// or null when the tool is out of proximity or is not one of ours.
     /// This is the registry entry shell/cursor_shape.zig consumes: a
@@ -799,6 +858,31 @@ pub const Tablet = struct {
             pad_res.getId(),
             serial,
         });
+    }
+
+    // -- hardware-level pad focus ------------------------------------------
+
+    /// padEnter for one hardware pad, on every client it was announced
+    /// to. `time` is the mode_switch time argument in milliseconds, the
+    /// same value padEnter takes per client.
+    pub fn padEnterHw(
+        self: *Tablet,
+        pad: *PadHw,
+        tablet: *TabletHw,
+        surface: *surface_mod.Surface,
+        time: u32,
+    ) void {
+        for (pad.clients.items) |pc| {
+            const partner = tabletClientOn(tablet, pc.seat) orelse continue;
+            self.padEnter(pc.res, partner.res, surface, time);
+        }
+    }
+
+    /// padLeave for one hardware pad, on every client it was announced
+    /// to. `surface` is the surface the pad is focused on, which the
+    /// event names (XML:1203-1210).
+    pub fn padLeaveHw(self: *Tablet, pad: *PadHw, surface: *surface_mod.Surface) void {
+        for (pad.clients.items) |pc| self.padLeave(pc.res, surface);
     }
 
     fn findPad(self: *Tablet, pad_res: *server.zwp.TabletPadV2) ?*PadClient {
@@ -1367,10 +1451,16 @@ const posix = std.posix;
 const compositor_mod = @import("../compositor/compositor.zig");
 const seat_mod = @import("../compositor/seat.zig");
 
+/// The harness below (EventLog, Capture, Peer, TestServer) is exported
+/// because src/backend/libinput.zig drives a REAL zwp_tablet_manager_v2
+/// through it: the backend's tablet translation is proven against a real
+/// client reading a real socketpair, not against a stub, and duplicating
+/// this harness in the backend would be a second copy of the same rig.
+///
 /// Ordered record of the events the test client received, as one flat
 /// string: `"tablet_added name id path bustype done "`. Comparing the whole
 /// string is what pins the XML's burst order.
-const EventLog = struct {
+pub const EventLog = struct {
     buf: [512]u8 = undefined,
     len: usize = 0,
 
@@ -1395,7 +1485,7 @@ const EventLog = struct {
 /// newest object of each kind so a test can send requests back. A new_id
 /// that arrives in an event gets its listener attached inside the parent
 /// listener, before libwayland dispatches the events that follow it.
-const Capture = struct {
+pub const Capture = struct {
     log: *EventLog,
     tool: ?*client.zwp.TabletToolV2 = null,
     /// Every announced zwp_tablet_tool_v2 in announcement order. `tool`
@@ -1537,7 +1627,7 @@ const RegistryCapture = struct {
     }
 };
 
-const TestServer = struct {
+pub const TestServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     log_cfg: log.Config,
@@ -1559,7 +1649,7 @@ const TestServer = struct {
     /// `capture` holds a pointer into this struct, so it must be stable
     /// too. `manager_version` is the zwp_tablet_manager_v2 version the
     /// test client binds.
-    fn init(allocator: std.mem.Allocator, manager_version: u32) !*TestServer {
+    pub fn init(allocator: std.mem.Allocator, manager_version: u32) !*TestServer {
         const ts = try allocator.create(TestServer);
         errdefer allocator.destroy(ts);
         ts.* = .{
@@ -1638,7 +1728,7 @@ const TestServer = struct {
         return peer;
     }
 
-    fn deinit(ts: *TestServer) void {
+    pub fn deinit(ts: *TestServer) void {
         // Tear the client down first: its resource destroy handlers must
         // run while the tablet module lives.
         if (ts.c_display) |d| d.disconnect();
@@ -1656,7 +1746,7 @@ const TestServer = struct {
     /// The shared `test_pump.roundtrip` (client flush -> server dispatch ->
     /// server flush) plus a client dispatch, which runs only when the server
     /// actually wrote to the socket. Never blocks.
-    fn pump(ts: *TestServer) !void {
+    pub fn pump(ts: *TestServer) !void {
         try test_pump.roundtrip(ts.c_display.?, ts.display.?, 0);
         var fds = [_]posix.pollfd{
             .{ .fd = ts.c_display.?.getFd(), .events = posix.POLL.IN, .revents = 0 },
@@ -1672,7 +1762,7 @@ const TestServer = struct {
     }
 
     /// get_tablet_seat for the client's own wl_seat, wired to the log.
-    fn getTabletSeat(ts: *TestServer) !*client.zwp.TabletSeatV2 {
+    pub fn getTabletSeat(ts: *TestServer) !*client.zwp.TabletSeatV2 {
         const seat = try ts.tablet_manager.?.getTabletSeat(ts.wl_seat.?);
         seat.setListener(*Capture, Capture.seat, &ts.capture);
         try ts.pump();
@@ -1680,7 +1770,7 @@ const TestServer = struct {
     }
 
     /// A client wl_surface plus the compositor Surface behind it.
-    fn makeSurface(ts: *TestServer) !struct { proxy: *client.wl.Surface, surface: *surface_mod.Surface } {
+    pub fn makeSurface(ts: *TestServer) !struct { proxy: *client.wl.Surface, surface: *surface_mod.Surface } {
         const proxy = try ts.wl_compositor.?.createSurface();
         // The wl_surface resource only exists server-side once the request
         // has been flushed and dispatched.
@@ -1689,7 +1779,7 @@ const TestServer = struct {
     }
 
     /// The server-side Surface created for `proxy`.
-    fn surfaceFor(ts: *TestServer, proxy: *client.wl.Surface) *surface_mod.Surface {
+    pub fn surfaceFor(ts: *TestServer, proxy: *client.wl.Surface) *surface_mod.Surface {
         for (ts.compositor.?.surfaces.items) |s| {
             if (s.resource.getId() == proxy.getId()) return s;
         }
@@ -1706,7 +1796,7 @@ const TestServer = struct {
 /// connection — three seats on one client would all die with the first
 /// failure, and the test could no longer tell whether the announce loop
 /// went on to the seats behind the dead one.
-const Peer = struct {
+pub const Peer = struct {
     ts: *TestServer,
     client: *wire.Client,
     c_display: *client.wl.Display,

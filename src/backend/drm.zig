@@ -26,6 +26,14 @@
 //! runs wayland-server with WAYLAND_BACKEND=drm, greps "drm:" info lines
 //! as the pass signal).
 //!
+//! M6 (logind session, VT switch, udev hotplug) adds two more fds to that
+//! registration. `drm.fromBackend(base).extraFds()` returns them; the
+//! server adds one `zio.ev.PipePoll` per non -1 entry, calling
+//! `drm.dispatchSession(data)` and `drm.dispatchHotplug(base, data)` when
+//! the matching fd is readable. Nothing else about the loop changes, and a
+//! -1 entry (no logind, no libudev - the VM case) is simply skipped: the
+//! backend already ran without them.
+//!
 //! The scanout size is the connector's preferred mode: the dumb buffer
 //! and the atomic modeset are created at that size at start(), and the
 //! output test hook rejects modes/buffers of any other size. The server
@@ -58,6 +66,7 @@ const pixman = @import("../renderer/pixman.zig");
 const c = @import("drm_c");
 const dmabuf = @import("../buffers/dmabuf.zig");
 const gbm_c = @import("gbm_c");
+const session_mod = @import("session.zig");
 
 /// DRM_FORMAT_XRGB8888 ('XR24' fourcc, 0x34325258): memory bytes
 /// B,G,R,X (little-endian u32; the alpha byte is ignored on scanout).
@@ -119,19 +128,58 @@ const PlanePropIds = struct {
     fb_damage_clips: u32 = 0,
 };
 
-/// One dumb scanout buffer: the CREATE_DUMB handle, its mmap, and the
-/// framebuffer id from ADDFB2. The backend keeps two of these (A/B) and
-/// page-flips between them, so the compositor never writes into the
-/// buffer currently being scanned out.
-const DumbBuffer = struct {
-    /// Dumb buffer (struct drm_mode_create_dumb output).
-    handle: u32 = 0,
-    pitch: u32 = 0,
-    size: usize = 0,
-    /// mmap of the dumb buffer; pitch may exceed width*4 (padding).
-    map: []align(std.heap.page_size_min) u8 = &.{},
-    /// Framebuffer id from DRM_IOCTL_MODE_ADDFB2.
+/// One scanout framebuffer: an A/B swapchain side. Two flavours exist and
+/// the only difference is where the pixels come from:
+///
+///  - **dumb**: CREATE_DUMB + MAP_DUMB, mapped by the kernel. This is the
+///    VM path and the fallback everywhere else: no GBM, no render node, no
+///    modifier, and it works on every KMS driver that supports dumb
+///    buffers.
+///  - **plane**: a real GEM buffer object allocated by the GBM device this
+///    backend already opened (buffers/dmabuf.zig GbmDevice - the SAME
+///    device the dmabuf global uses, never a second allocator), exported
+///    to DRM with the modifier GBM reports through
+///    drmModeAddFB2WithModifiers. The primary plane then scans out a
+///    genuine framebuffer object with a negotiated layout instead of a
+///    dumb one - the "planes + modifiers" half of GBM support (wlroots
+///    allocator/drm_dumb.c vs render/allocator/gbm.c + drmModeAddFB2
+///    with the bo's modifier, backend/drm/atomic.c plane commit).
+///
+/// Both flavours present identically: the modeset and the page flip only
+/// ever name `fb_id`, and copyRows writes through `map`/`pitch`.
+const ScanoutBuffer = struct {
+    /// Framebuffer id from DRM_IOCTL_MODE_ADDFB2 / drmModeAddFB2WithModifiers.
     fb_id: u32 = 0,
+    /// Bytes per row. Both a dumb pitch and a GBM stride exceed width*4 on
+    /// real drivers, which is why copyRows walks rows.
+    pitch: u32 = 0,
+    /// CPU-mapped pixels. An mmap for a dumb buffer, gbm_bo_map's pointer
+    /// for a plane one. A plain `[]u8` because the two mappers have
+    /// different alignment contracts and only byte copies touch them.
+    map: []u8 = &.{},
+    /// Dumb-buffer handle (DRM_IOCTL_MODE_CREATE_DUMB); 0 on the plane
+    /// path.
+    handle: u32 = 0,
+    /// GEM handle named by ADDFB2; nonzero only on the plane path.
+    gem_handle: u32 = 0,
+    /// DRM_FORMAT_MOD_* handed to drmModeAddFB2WithModifiers (the plane
+    /// path); 0 (DRM_FORMAT_MOD_LINEAR) on the dumb path, which has no
+    /// modifier to speak of.
+    modifier: u64 = 0,
+    /// The GBM buffer object behind this framebuffer; null on the dumb
+    /// path.
+    bo: ?*gbm_c.struct_gbm_bo = null,
+    /// gbm_bo_map's pointer, released with gbm_bo_unmap. Null until mapped.
+    bo_map: ?*anyopaque = null,
+};
+
+/// How the two swapchain buffers were allocated. Read for logs and for
+/// teardown; the present path is identical either way.
+const ScanoutPath = enum {
+    /// CREATE_DUMB (DRM_IOCTL_MODE_CREATE_DUMB/MAP_DUMB).
+    dumb,
+    /// A GBM buffer object with a modifier, on a real primary plane.
+    plane,
 };
 
 /// Per-output DRM state: the scanout buffers and the KMS object ids bound
@@ -147,7 +195,14 @@ const DrmOutput = struct {
     crtc_mode_id: u32 = 0,
     crtc_active: u32 = 0,
     mode: output_mod.Mode,
-    /// Two dumb scanout buffers used as a flip-flop swapchain: every
+    /// The connector this output drives. Kept so a udev "remove" or
+    /// "change" can find it again without re-enumerating the whole device
+    /// (backend/session/direct.c wlr_output->connector is the same
+    /// back-pointer wlroots keeps).
+    connector_id: u32 = 0,
+    /// Which buffer allocation won the start() decision, and for logs.
+    scanout: ScanoutPath = .dumb,
+    /// Two scanout buffers used as a flip-flop swapchain: every
     /// per-frame commit copies into the buffer that is NOT currently
     /// displayed and page-flips to ITS framebuffer id, so FB_ID changes
     /// on every flip. This is mandatory on virtio-gpu: the plane update
@@ -161,7 +216,7 @@ const DrmOutput = struct {
     /// (wlr_drm_plane swapchain, backend/drm/atomic.c). It also closes
     /// the single-buffer tearing gap (notes/116 gap 2): the previous
     /// flip's buffer stays on screen while the next frame is written.
-    buffers: [2]DumbBuffer = .{ .{}, .{} },
+    buffers: [2]ScanoutBuffer = .{ .{}, .{} },
     /// Index into `buffers` of the buffer the modeset bound / last
     /// flipped to. The next commit copies into buffers[1 - flip_index]
     /// and flips to it, then flips the index — FB_ID alternates
@@ -191,13 +246,26 @@ const DrmBackendData = struct {
     /// interface when the driver lacks ATOMIC; smithay the same,
     /// device/mod.rs:252-256). Read by commit() to pick the flip path.
     atomic: bool = true,
-    drm_output: ?*DrmOutput = null,
+    /// Every output this backend drives. One entry per connected connector
+    /// that has a mode, a free CRTC and a scannable plane; a second output
+    /// appears here when a cable is plugged (see addOutput / dropOutputs).
+    /// Owned: destroy() frees each entry after Output.destroy() has run.
+    outputs: std.ArrayListUnmanaged(*DrmOutput) = .empty,
+    /// The logind session (backend/session.zig), or null when this machine
+    /// has none or logind would not host us. Null is the normal VM case
+    /// and is NOT an error: the backend then runs exactly as it did before.
+    session: ?*session_mod.Session = null,
+    /// The udev monitor that turns connector changes into addOutput /
+    /// dropOutputs, or null when libudev or its netlink socket is missing.
+    hotplug: ?*session_mod.Hotplug = null,
     /// The GBM device this backend can import client dmabufs into, or null
     /// when the node offers no GBM (no render node, no gbm_create_device)
     /// or no supported (format, modifier) pair. The buffer allocator
     /// (buffers/dmabuf.zig) and the zwp_linux_dmabuf_v1 global
     /// (shell/linux_dmabuf.zig) are both gated on this field: a global
     /// without a device behind it is a promise the client can falsify.
+    /// The plane scanout path (createPlaneBuffers) uses it too, so a
+    /// modifier-capable allocation never needs a second GBM device.
     gbm: ?*dmabuf.GbmDevice = null,
 };
 
@@ -291,31 +359,44 @@ fn start(base: *backend_mod.Backend) error{BackendFailed}!void {
     };
 }
 
-/// Bring the device up. Eleven ordered phases, each a named step that can
-/// fail on its own (the definitions sit below `destroy`):
+/// Bring the device up. Ordered phases, each a named step that can fail on
+/// its own (the definitions sit below `destroy`):
 ///
 ///   1. `openDevice`            openat the card node (O_RDWR|O_CLOEXEC).
 ///   2. `selectKmsInterface`    DRM_CLIENT_CAP_ATOMIC, or fall back to legacy.
-///   3. `becomeMaster`          DRM_IOCTL_SET_MASTER.
-///   4. `enumerateTarget`       connected connector + preferred mode + CRTC.
-///   5. `resolvePlane`          the CRTC's PRIMARY plane + its property ids.
-///   6. `allocOutput`           the DrmOutput that will own the resources.
-///   7. `scanKmsProps`          connector CRTC_ID, CRTC MODE_ID/ACTIVE ids.
-///   8. `createScanoutBuffers`  the A/B dumb-buffer swapchain.
-///   9. `createModeBlob`        the mode blob MODE_ID points at.
-///  10. `modeset`               bind connector->CRTC->plane->fb.
-///  11. `announceOutput`        publish the output, kick the first frame.
+///   3. `openSession`           logind session: CreateSession, Type=wayland,
+///                               TTY, TakeDevice, PrepareForSleep watch,
+///                               and the VT switch (VT_ACTIVATE + VT_ACK).
+///   4. `becomeMaster`          DRM_IOCTL_SET_MASTER.
+///   5. `openGbm`               the GBM device both the dmabuf global and the
+///                               plane scanout path allocate from.
+///   6. `addOutput`             one output per connected connector that has a
+///                               mode, a free CRTC and a scannable plane
+///                               (enumerateTarget -> resolvePlane ->
+///                               allocOutput -> scanKmsProps ->
+///                               createScanoutBuffers -> createModeBlob ->
+///                               modeset -> announceOutput).
+///   7. `openHotplug`           the udev monitor that drives 6 again (and
+///                               tears outputs down) when a cable moves.
 ///
-/// The order is load-bearing at four seams: the ATOMIC client cap must be
+/// The order is load-bearing at five seams. The ATOMIC client cap must be
 /// requested before any KMS ioctl (wlroots drm.c drm_open issues
-/// drmSetClientCap as part of the open); DRM master must be held before
-/// the modeset commits, because the kernel rejects a non-master client's
-/// mode/plane updates (drm_mode_atomic_ioctl, drm_mode_crtc_set_property);
-/// the primary plane must be resolved before a framebuffer can be
-/// attached to anything, since the atomic commit names the plane object;
-/// and both framebuffers must exist before the modeset points the plane at
-/// one of them. Phases 5, 7 and 9 are atomic-only — the legacy interface
-/// has no planes and no property blobs, so they are skipped there.
+/// drmSetClientCap as part of the open). The session must exist BEFORE DRM
+/// master is taken and before the VT moves: `Manager.TakeDevice` is what
+/// stops logind from handing the master to the console session the moment
+/// we look away (org.freedesktop.login1(5) Manager.TakeDevice), and the VT
+/// switch is only ours once Session.TTY names it (without that, logind
+/// activates whatever getty owns the VT we activated). DRM master must be
+/// held before the modeset commits, because the kernel rejects a
+/// non-master client's mode/plane updates (drm_mode_atomic_ioctl,
+/// drm_mode_crtc_set_property). The primary plane must be resolved before a
+/// framebuffer can be attached to anything, since the atomic commit names
+/// the plane object. And both framebuffers must exist before the modeset
+/// points the plane at one of them. The VT ack is waited for on the DRM fd
+/// before the first flip is queued, which is the only window in which a raw
+/// read there cannot eat a flip event. Phases inside `addOutput` for the
+/// properties and blobs (scanKmsProps, createModeBlob) are atomic-only —
+/// the legacy interface has neither.
 ///
 /// One `errdefer drmTeardown` covers every failure: teardown is
 /// null-safe, idempotent and ordered by reverse acquisition, so a phase
@@ -324,51 +405,58 @@ fn start(base: *backend_mod.Backend) error{BackendFailed}!void {
 fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!void {
     const self: *DrmBackendData = @ptrCast(@alignCast(base.data));
 
-    // --- phases 1-3: the device itself. A failed open publishes no fd, so
+    // --- phases 1-2: the device itself. A failed open publishes no fd, so
     // teardown only starts mattering once the open succeeded.
     try openDevice(self);
     errdefer drmTeardown(self);
     selectKmsInterface(self);
+
+    // --- phase 3: the seat, before anyone can take the master away. Every
+    // failure here is non-fatal and logged by openSession itself: the VM
+    // has no logind at all, and a machine that refuses the session still
+    // runs - it just does not hold the seat (see session.zig's failure
+    // policy).
+    openSession(self);
+
+    // --- phase 4: master. After the session, so logind knows the device is
+    // ours before we ask for it.
     becomeMaster(self);
 
-    // --- phase 3b: the GBM device. Not fatal: a node without GBM (or with
-    // no format GBM accepts) still scans out, it just cannot offer
-    // zwp_linux_dmabuf_v1. It sits here, right after the node is open and
-    // before the modeset, because it re-resolves the node from the fd and
-    // that is the last moment the KMS fd is unambiguously ours.
+    // --- phase 5: the GBM device. Not fatal: a node without GBM (or with
+    // no format GBM accepts) still scans out - on the dumb path - it just
+    // cannot offer zwp_linux_dmabuf_v1 nor scan out a modifier-capable
+    // framebuffer. It sits here, right after the node is open and before
+    // the modeset, because it re-resolves the node from the fd and that is
+    // the last moment the KMS fd is unambiguously ours.
     try openGbm(self);
 
-    // --- phases 4-5: what to drive. `var` (not const): the legacy
-    // drmModeSetCrtc path passes &found.connector_id / &found.mode to C,
-    // which wants mutable [*c] pointers.
-    var found = try enumerateTarget(self);
-    const plane = try resolvePlane(self, found);
+    // --- phase 6: one output per usable connector. The loop ends when the
+    // enumeration has nothing left; the only error it can raise is a device
+    // with no usable connector at all, which is a backend failure.
+    while (try addOutput(base, self)) {}
 
-    // --- phase 6: the output that owns the device resources from here on.
-    const drm_out = try allocOutput(self, found, plane);
-
-    // --- phases 7-9: the ids, buffers and blob the modeset will commit.
-    try scanKmsProps(self, found, drm_out);
-    try createScanoutBuffers(self, found, drm_out);
-    try createModeBlob(self, found, drm_out);
-
-    // --- phase 10: make it visible.
-    try modeset(self, &found, plane, drm_out);
-
-    // --- phase 11: hand it to the compositor.
-    try announceOutput(base, self, drm_out);
+    // --- phase 7: hotplug last, so the events that arrive during startup
+    // are judged against an already-complete output list.
+    openHotplug(self);
 }
 
+/// Tear the whole backend down, in reverse acquisition order: the udev
+/// monitor first (it must stop producing callbacks into state we are about
+/// to free), then the session (which puts the console back on its own VT
+/// and hands the device to logind), then the outputs and finally the card
+/// fd. The VT restore deliberately happens while we still hold DRM master
+/// and before the session ends, so the console is never left on a VT that
+/// no live session owns.
 fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
     const self: *DrmBackendData = @ptrCast(@alignCast(data));
-    // Tear down the output first (emits destroy signals) so no frame
-    // callback can touch the DRM state after the fd closes; then release
-    // the device resources (which live in drm_out) before freeing it.
-    if (self.drm_output) |drm_out| {
+    // Outputs first: Output.destroy() emits the destroy signal, so no
+    // compositor callback can touch the DRM state after the fd closes.
+    for (self.outputs.items) |drm_out| {
         if (drm_out.out) |out| out.destroy();
     }
     drmTeardown(self);
-    if (self.drm_output) |drm_out| allocator.destroy(drm_out);
+    for (self.outputs.items) |drm_out| allocator.destroy(drm_out);
+    self.outputs.deinit(allocator);
     allocator.destroy(self);
 }
 
@@ -430,15 +518,243 @@ fn selectKmsInterface(self: *DrmBackendData) void {
     }
 }
 
-/// Phase 3: become DRM master (required for modeset). The first opener is
+/// Phase 4: become DRM master (required for modeset). The first opener is
 /// master automatically, so failure is non-fatal here (headless VM).
+///
+/// Callable more than once, which is what resume needs: after a suspend the
+/// master is gone (the session either released the device or the kernel
+/// handed the card to whoever opened it next), so `becomeMaster` runs again
+/// from handlePrepareForSleep. Idempotent while the master is held.
 fn becomeMaster(self: *DrmBackendData) void {
-    const fd = self.fd.?;
+    const fd = self.fd orelse return;
+    if (self.is_master) return;
     if (c.drmIoctl(fd, c.DRM_IOCTL_SET_MASTER, null) == 0) {
         self.is_master = true;
+        log_mod.info("drm: DRM master acquired", self.io, self.log_cfg, "drm", .{});
     } else {
         log_mod.warn("drm: DRM_IOCTL_SET_MASTER failed (not master?)", self.io, self.log_cfg, "drm", .{});
     }
+}
+
+/// Phase 3: the logind session - the seat, the device claim and the VT
+/// switch, in the order session.zig needs (see that file's open()).
+///
+/// NON-fatal by construction: every error it can return is a reason this
+/// machine cannot host a session, not a reason to fail the backend. The VM
+/// has no logind at all and runs exactly as before; a machine whose seat
+/// refuses us runs, reports, and leaves the console alone. What is NOT
+/// negotiable is that this runs BEFORE becomeMaster: once logind knows the
+/// session holds the device it will not hand the master to the console
+/// session, which is the entire point.
+fn openSession(self: *DrmBackendData) void {
+    const fd = self.fd orelse return;
+    self.session = session_mod.Session.open(self.allocator, self.io, self.log_cfg, .{
+        // The VT ack arrives on the DRM fd: the DRM core queues a
+        // `struct vt_event` to every open card when the console switches.
+        .vt_ack_fd = fd,
+        .drm_minor = cardMinor(self.device_path),
+        .on_sleep = onSessionSleep,
+        .ctx = self,
+    }) catch |err| {
+        log_mod.info(
+            "drm: no logind session ({s}); the card is driven without one",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{@errorName(err)},
+        );
+        return;
+    };
+}
+
+/// The session module's suspend callback. The session has already released
+/// or re-taken the device by the time this runs (session.zig dispatch does
+/// its own half first); this is the backend's half - see the sleep plan.
+fn onSessionSleep(ctx: ?*anyopaque, sleeping: bool) void {
+    const self: *DrmBackendData = @ptrCast(@alignCast(ctx.?));
+    handlePrepareForSleep(self, sleeping);
+}
+
+/// PrepareForSleep, resolved through the session module's plan so the two
+/// halves cannot disagree: on the way down the device goes back to logind
+/// and DRM master is dropped; on the way up the device is taken back, the
+/// VT is re-activated, DRM master is re-acquired and the flip pipeline is
+/// re-armed (a flip that was in flight when the machine slept never
+/// completes, so `flip_pending` must be cleared or the output would refuse
+/// every commit until the next event).
+fn handlePrepareForSleep(self: *DrmBackendData, sleeping: bool) void {
+    const have_logind = self.session != null;
+    const phase = if (self.session) |s| s.sleepPhase() else .running;
+    const plan = session_mod.planSleep(phase, sleeping, have_logind);
+    if (plan.work.drop_master and self.is_master) {
+        const fd = self.fd orelse return;
+        if (c.drmIoctl(fd, c.DRM_IOCTL_DROP_MASTER, null) == 0) {
+            self.is_master = false;
+            log_mod.info("drm: suspend: DRM master dropped", self.io, self.log_cfg, "drm", .{});
+        } else {
+            log_mod.warn("drm: suspend: DRM_IOCTL_DROP_MASTER failed", self.io, self.log_cfg, "drm", .{});
+        }
+    }
+    if (plan.work.reacquire) {
+        becomeMaster(self);
+        for (self.outputs.items) |drm_out| {
+            // The flip that was in flight across the suspend will never
+            // complete, so its completion event will never arrive.
+            drm_out.flip_pending = false;
+        }
+        log_mod.info("drm: resume: DRM master and flip pacing re-armed", self.io, self.log_cfg, "drm", .{});
+    }
+}
+
+/// Phase 7: the udev monitor that turns connector changes into output
+/// add/remove. NON-fatal: without libudev (or without its netlink socket)
+/// the compositor simply does not react to a cable being plugged, and says
+/// so once.
+fn openHotplug(self: *DrmBackendData) void {
+    self.hotplug = session_mod.Hotplug.open(self.allocator) catch |err| {
+        log_mod.info(
+            "drm: connector hotplug disabled ({s}); outputs are fixed for this run",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    log_mod.info(
+        "drm: watching the drm subsystem for connector changes (fd {d})",
+        self.io,
+        self.log_cfg,
+        "drm",
+        .{self.hotplug.?.pollFd()},
+    );
+}
+
+/// The extra fds the server's event loop must poll for M6 to be live: the
+/// logind bus (PrepareForSleep) and the udev monitor (connector changes).
+/// Both are -1 when the feature is not available, and the server skips
+/// them - `dispatchSession` and `dispatchHotplug` are then no-ops.
+///
+/// The server wires these next to the DRM fd it already registers for
+/// `dispatch` (src/server/main.zig: `zio.ev.PipePoll.init(drm_fd, .read)`
+/// / onDrmReady): one PipePoll per non -1 fd, each calling the matching
+/// dispatch on readability. Nothing else about the loop changes.
+pub const ExtraFds = struct {
+    /// Poll for readability, then call `dispatchSession`.
+    session: std.posix.fd_t = -1,
+    /// Poll mask for `session` (POLLIN, plus POLLOUT when the bus must
+    /// flush).
+    session_events: i16 = 0,
+    /// Poll for readability, then call `dispatchHotplug`.
+    hotplug: std.posix.fd_t = -1,
+    /// Poll mask for `hotplug`.
+    hotplug_events: i16 = 0,
+    /// The logind connection's own timeout, if it has one.
+    session_timeout_us: ?u64 = null,
+};
+
+pub fn extraFds(self: *DrmBackendData) ExtraFds {
+    var fds: ExtraFds = .{};
+    if (self.session) |s| {
+        fds.session = s.pollFd();
+        fds.session_events = s.pollEvents();
+        fds.session_timeout_us = s.pollTimeoutUs();
+    }
+    if (self.hotplug) |hp| {
+        fds.hotplug = hp.pollFd();
+        fds.hotplug_events = hp.pollEvents();
+    }
+    return fds;
+}
+
+/// Drain the logind bus. Called when `extraFds().session` is readable; runs
+/// one suspend/resume step if logind asked for one. Non-fatal throughout
+/// (session.zig's failure policy).
+pub fn dispatchSession(self: *DrmBackendData) void {
+    const s = self.session orelse return;
+    s.dispatch();
+}
+
+/// Drain the udev monitor and reconcile the output list with the hardware.
+/// Called when `extraFds().hotplug` is readable.
+///
+/// One reconciliation per batch of events, and it is the same one whatever
+/// the event was:
+///
+///   1. destroy the outputs whose connector is no longer connected
+///      (`removeDisconnectedOutputs`) - this is the unplug path, and it is
+///      what tells clients their wl_output is gone (wlroots calls
+///      destroy_drm_connector on DRM_REMOVE, backend/drm/backend.c);
+///   2. bring up an output for any connector that is connected and not yet
+///      driven, through the very same `addOutput` path start() used - this
+///      is the plug path (wlroots calls init_drm_connector on DRM_ADD and
+///      DRM_CHANGE).
+///
+/// Reconciling on EVERY event rather than branching on the action is
+/// deliberate: a connector arriving is an "add" on some drivers and a
+/// "change" on others (a cable going into a connector the kernel already
+/// knows flips its status file, drm_connector.c connector_detect ->
+/// drm_sysfs_connector_status), and DRM does not promise which. Asking KMS
+/// for the truth instead of trusting the event's verb is what makes a plug
+/// work on all of them.
+///
+/// A failure while adding is logged and the remaining events are still
+/// drained: one connector that cannot be driven is not a reason to take the
+/// backend down.
+pub fn dispatchHotplug(base: *backend_mod.Backend, self: *DrmBackendData) void {
+    const hp = self.hotplug orelse return;
+    var seen: usize = 0;
+    while (hp.next()) |event| {
+        seen += 1;
+        // Only the drm subsystem reaches this monitor (the filter is set in
+        // session.zig's Hotplug.open); anything else is logged and skipped
+        // so a surprise cannot drive a modeset.
+        log_mod.debug(
+            "drm: udev {s} {s}",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{ @tagName(event.action), event.sysname },
+        );
+        if (!event.isConnector() and event.action != .remove) {
+            log_mod.debug(
+                "drm: udev event on {s} is not a connector; reconciling anyway",
+                self.io,
+                self.log_cfg,
+                "drm",
+                .{event.sysname},
+            );
+        }
+    }
+    if (seen == 0) return;
+    removeDisconnectedOutputs(self);
+    _ = addOutput(base, self) catch |err| {
+        // "Nothing new" is the normal outcome of a change event on a
+        // connector we already drive, so this is only worth a debug line.
+        log_mod.debug(
+            "drm: hotplug: no new output ({s})",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{@errorName(err)},
+        );
+    };
+}
+
+/// The DRM primary minor a card node names: "card0" -> 0. libdrm builds
+/// node names the same way (xf86drmMode.h DRM_DEV_NAME is "%s/%s%d" over
+/// DRM_PRIMARY_MINOR_NAME = "card"), and logind's TakeDevice wants that
+/// number.
+///
+/// A path that is not a card node (a render node, an empty path) answers 0,
+/// which is what logind will refuse - deliberately. Guessing a minor from a
+/// name we do not understand would claim a device we do not hold.
+fn cardMinor(path: []const u8) u32 {
+    const base = std.fs.path.basename(path);
+    if (!std.mem.startsWith(u8, base, "card")) return 0;
+    const digits = base["card".len..];
+    if (digits.len == 0 or digits.len > 2) return 0;
+    return std.fmt.parseUnsigned(u32, digits, 10) catch 0;
 }
 
 /// Phase 3b: bring up the GBM device this backend can import client
@@ -531,15 +847,17 @@ fn queryGbmFormats(self: *DrmBackendData, dev: *dmabuf.GbmDevice) error{OutOfMem
     return list.items;
 }
 
-/// Phase 4: find a connected connector with a mode, its encoder and a
-/// CRTC (wlroots drm.c init_drm_resources + drm_connector_alloc_crtc).
-fn enumerateTarget(self: *DrmBackendData) error{BackendFailed}!FoundConnector {
-    const found = findConnectorMode(self) orelse {
-        log_mod.err("drm: no connected connector with a mode on {s}", self.io, self.log_cfg, "drm", .{
-            self.device_path,
-        });
-        return error.BackendFailed;
-    };
+/// Find the next connector this backend does not drive yet: connected, with
+/// a mode, and with a CRTC no live output holds (wlroots drm.c
+/// init_drm_resources + drm_connector_alloc_crtc).
+///
+/// Connectors already bound to a live output are skipped inside the scan
+/// (see connectorBound), so one call per connector brings every output up
+/// and a hotplug "add" finds only the connector that is actually new. Null
+/// when nothing is left, which is the normal end of the loop rather than a
+/// failure.
+fn enumerateTarget(self: *DrmBackendData) ?FoundConnector {
+    const found = findConnectorMode(self) orelse return null;
     log_mod.info(
         "drm: {s} connector={d} mode={d}x{d}",
         self.io,
@@ -548,6 +866,83 @@ fn enumerateTarget(self: *DrmBackendData) error{BackendFailed}!FoundConnector {
         .{ basename(self.device_path), found.connector_id, found.mode.hdisplay, found.mode.vdisplay },
     );
     return found;
+}
+
+/// Bring up one output. Returns true when it did, false when there was no
+/// connector left to bring one up for.
+///
+/// Every phase inside is the same one the first start() used, in the same
+/// order (see startInner): resolve the plane, allocate the output that will
+/// own the device resources, resolve the property ids, allocate the A/B
+/// swapchain, create the mode blob, modeset, announce. Calling it again
+/// after a udev event is how a plugged cable becomes an output, and it
+/// reuses that enumeration rather than growing a second one.
+///
+/// The bool is what lets start() say `while (try addOutput(...)) {}`: the
+/// enumeration skips connectors that already drive an output, so the call
+/// that finds none ends the loop. It is also an error only while NO output
+/// is up - a device with nothing connected cannot announce an output, and
+/// that is a backend failure; afterwards, "nothing new" is the normal
+/// answer to a hotplug event.
+fn addOutput(base: *backend_mod.Backend, self: *DrmBackendData) error{ BackendFailed, OutOfMemory }!bool {
+    const found = enumerateTarget(self) orelse {
+        // Nothing left. With no live output that is a real failure - the
+        // device has nothing to show - and drmTeardown takes the backend
+        // down; with outputs already up it is the normal "nothing new"
+        // answer after a hotplug event.
+        if (self.outputs.items.len == 0) {
+            log_mod.err("drm: no connected connector with a mode on {s}", self.io, self.log_cfg, "drm", .{
+                self.device_path,
+            });
+            return error.BackendFailed;
+        }
+        return false;
+    };
+    const plane = try resolvePlane(self, found);
+    const drm_out = try allocOutput(self, found, plane);
+    try scanKmsProps(self, found, drm_out);
+    try createScanoutBuffers(self, found, drm_out);
+    try createModeBlob(self, found, drm_out);
+    // `found` by pointer: the legacy drmModeSetCrtc path passes
+    // &found.connector_id / &found.mode to C, which wants mutable [*c].
+    var mutable = found;
+    try modeset(self, &mutable, plane, drm_out);
+    try announceOutput(base, self, drm_out);
+    return true;
+}
+/// Is this connector already driving one of our outputs? A linear scan over
+/// a handful of entries - cheaper than materialising an id list, and it
+/// cannot go stale between the check and the use, which is the failure mode
+/// a cached list would have. wlroots skips bound connectors the same way
+/// (backend/drm/drm.c realloc_crtcs skips the connectors already allocated).
+fn connectorBound(self: *DrmBackendData, connector_id: u32) bool {
+    for (self.outputs.items) |drm_out| {
+        if (drm_out.connector_id == connector_id) return true;
+    }
+    return false;
+}
+
+/// Phase 6: allocate the DrmOutput that owns every device resource the
+/// later phases create (wlroots attaches the mode, buffers and blobs to
+/// the output it enables). Ownership moves to the backend list before
+/// returning, so a failure further down still reaches these through
+/// drmTeardown; destroy() frees the structs themselves.
+fn allocOutput(self: *DrmBackendData, found: FoundConnector, plane: PlaneSelection) error{OutOfMemory}!*DrmOutput {
+    const drm_out = try self.allocator.create(DrmOutput);
+    drm_out.* = .{
+        .backend = self,
+        .crtc_id = found.crtc_id,
+        .plane_id = plane.id,
+        .props = plane.props,
+        .connector_id = found.connector_id,
+        .mode = modeToOutput(found.mode),
+        .refresh_ns = modeRefreshNs(found.mode),
+    };
+    // Append before the resources exist: drmTeardown walks the list, so a
+    // phase that dies after this point releases what did get created.
+    errdefer self.allocator.destroy(drm_out);
+    try self.outputs.append(self.allocator, drm_out);
+    return drm_out;
 }
 
 /// Phase 5: the primary plane for the CRTC, with all commit property ids
@@ -563,25 +958,6 @@ fn resolvePlane(self: *DrmBackendData, found: FoundConnector) error{BackendFaile
         return error.BackendFailed;
     };
     return .{ .id = id, .props = props };
-}
-
-/// Phase 6: allocate the DrmOutput that owns every device resource the
-/// later phases create (wlroots attaches the mode, buffers and blobs to
-/// the output it enables). Ownership moves to the backend before
-/// returning, so a failure further down still reaches these through
-/// drmTeardown; the caller's backend.destroy() frees the struct itself.
-fn allocOutput(self: *DrmBackendData, found: FoundConnector, plane: PlaneSelection) error{OutOfMemory}!*DrmOutput {
-    const drm_out = try self.allocator.create(DrmOutput);
-    drm_out.* = .{
-        .backend = self,
-        .crtc_id = found.crtc_id,
-        .plane_id = plane.id,
-        .props = plane.props,
-        .mode = modeToOutput(found.mode),
-        .refresh_ns = modeRefreshNs(found.mode),
-    };
-    self.drm_output = drm_out;
-    return drm_out;
 }
 
 /// Phase 7: connector + crtc property ids (wlroots properties.c tables).
@@ -615,14 +991,58 @@ fn scanKmsProps(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutpu
     drm_out.crtc_active = crtc_props[1];
 }
 
-/// Phase 8: dumb scanout buffers: create, map, addfb2 — TWO of them, an
-/// A/B swapchain (see the DrmOutput.buffers doc: every flip must change
-/// FB_ID because virtio-gpu's plane update is damage-gated).
-/// (smithay src/backend/drm/dumb.rs framebuffer_from_dumb_buffer:
-/// create dumb -> add_framebuffer; wlroots uses the same ioctls.)
-/// A partial failure is fine: drmTeardown is idempotent and frees
-/// whatever the loop already created.
+/// Phase 8: the A/B swapchain - TWO framebuffers, because every flip must
+/// change FB_ID (see the DrmOutput.buffers doc: virtio-gpu's plane update is
+/// damage-gated).
+///
+/// Which allocation backs them is one decision, taken once per output by
+/// `chooseScanout` and then executed by whichever path it picked:
+///
+///  - **plane** (`createPlaneBuffers`): real GEM buffer objects from the
+///    GBM device this backend already owns, added with the modifier GBM
+///    reported. The primary plane then scans out a genuine framebuffer on a
+///    real plane - the planes+modifiers half of GBM support.
+///  - **dumb** (`createDumbBuffers`, the original path): CREATE_DUMB +
+///    MAP_DUMB + ADDFB2. Still the fallback, and still what the VM uses
+///    today; it needs no GBM device, no render node and no modifier.
+///
+/// The plane path is attempted FIRST and any failure in it falls back to
+/// dumb rather than failing the backend: a driver whose bo cannot be
+/// mmap'd for CPU access, or that has no GBM device at all, must still
+/// scan out. A partial failure is fine either way - drmTeardown is
+/// idempotent and releases whatever was created.
 fn createScanoutBuffers(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
+    if (chooseScanout(self, drm_out.plane_id).use_plane) {
+        createPlaneBuffers(self, found, drm_out) catch |err| {
+            log_mod.warn(
+                "drm: plane scanout buffers failed ({s}); falling back to dumb buffers",
+                self.io,
+                self.log_cfg,
+                "drm",
+                .{@errorName(err)},
+            );
+            releaseBuffers(self, drm_out);
+            drm_out.scanout = .dumb;
+            return createDumbBuffers(self, found, drm_out);
+        };
+        drm_out.scanout = .plane;
+        log_mod.info(
+            "drm: {d} GBM framebuffers (modifier 0x{x}) on plane {d}",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{ drm_out.buffers.len, drm_out.buffers[0].modifier, drm_out.plane_id },
+        );
+        return;
+    }
+    drm_out.scanout = .dumb;
+    try createDumbBuffers(self, found, drm_out);
+}
+
+/// The dumb path, unchanged: CREATE_DUMB -> MAP_DUMB -> mmap -> ADDFB2,
+/// twice (smithay src/backend/drm/dumb.rs framebuffer_from_dumb_buffer;
+/// wlroots uses the same ioctls through allocator/drm_dumb.c).
+fn createDumbBuffers(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
     const fd = self.fd.?;
     const width: u32 = found.mode.hdisplay;
     const height: u32 = found.mode.vdisplay;
@@ -640,7 +1060,7 @@ fn createScanoutBuffers(self: *DrmBackendData, found: FoundConnector, drm_out: *
         }
         buf.handle = create_dumb.handle;
         buf.pitch = create_dumb.pitch;
-        buf.size = @intCast(create_dumb.size);
+        const size: usize = @intCast(create_dumb.size);
 
         var map_dumb: c.struct_drm_mode_map_dumb = .{ .handle = create_dumb.handle };
         if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0) {
@@ -649,7 +1069,7 @@ fn createScanoutBuffers(self: *DrmBackendData, found: FoundConnector, drm_out: *
         }
         buf.map = std.posix.mmap(
             null,
-            buf.size,
+            size,
             .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             fd,
@@ -673,6 +1093,140 @@ fn createScanoutBuffers(self: *DrmBackendData, found: FoundConnector, drm_out: *
         }
         buf.fb_id = fb2.fb_id;
     }
+}
+
+/// The plane path: two GBM buffer objects, mapped for the CPU and added to
+/// DRM with the modifier GBM gave them.
+///
+/// Steps, and why each one:
+///  1. `gbm_bo_create(SCANOUT | LINEAR)` - SCANOUT because this is what the
+///     KMS plane will display, LINEAR because the compositor writes it from
+///     the CPU (the pixman framebuffer is host memory and copyRows has no
+///     GPU renderer to upload through). wlroots asks for the same pair when
+///     it needs a linear scanout buffer (render/allocator/gbm.c:
+///     GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR). RENDERING is a second
+///     attempt: several drivers refuse to map a scanout-only bo.
+///  2. `gbm_bo_map(READ | WRITE)` - the CPU view copyRows writes through.
+///     A bo that cannot be mapped is the single most likely reason this
+///     path has to fall back to dumb buffers.
+///  3. `drmModeAddFB2WithModifiers` with `gbm_bo_get_modifier(bo)` - the
+///     modifier-aware framebuffer add (xf86drmMode.h). Passing the modifier
+///     the driver actually chose is what lets a tiled or compressed plane
+///     take these buffers; the plain ADDFB2 struct has no field for it. The
+///     GEM handle comes from `gbm_bo_get_handle_for_plane(bo, 0)`: DRM
+///     handles are per-DEVICE, not per-fd, so a handle from the GBM render
+///     node is valid on this KMS fd for the same card - which is why the GBM
+///     device is opened on this device's own node (openGbm/gbmNodePath) and
+///     never on another.
+fn createPlaneBuffers(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
+    const gbm = self.gbm orelse return error.BackendFailed;
+    const width: u32 = found.mode.hdisplay;
+    const height: u32 = found.mode.vdisplay;
+
+    // SCANOUT alone first, then with RENDERING: a bo the driver will not
+    // scan out but will render to is still a fine framebuffer for us.
+    const usages = [_]u32{
+        gbm_c.GBM_BO_USE_SCANOUT | gbm_c.GBM_BO_USE_LINEAR,
+        gbm_c.GBM_BO_USE_SCANOUT | gbm_c.GBM_BO_USE_LINEAR | gbm_c.GBM_BO_USE_RENDERING,
+    };
+    var first: ?ScanoutBuffer = null;
+    var usage_index: usize = 0;
+    while (usage_index < usages.len) : (usage_index += 1) {
+        first = allocPlaneBuffer(self, gbm.device, width, height, usages[usage_index]) catch |err| switch (err) {
+            error.BackendFailed => continue,
+        };
+        break;
+    }
+    // Nothing allocated at all: let the caller fall back to dumb buffers.
+    var buffer = first orelse return error.BackendFailed;
+    errdefer releaseBuffer(self, &buffer);
+
+    const second = allocPlaneBuffer(self, gbm.device, width, height, usages[usages.len - 1]) catch
+        return error.BackendFailed;
+    drm_out.buffers[0] = buffer;
+    drm_out.buffers[1] = second;
+}
+
+/// One GEM buffer object mapped for the CPU and added to DRM as a
+/// framebuffer with its modifier. Null-safe on every failure: a bo that was
+/// created is unmapped and destroyed before returning, and a bo that was
+/// added and then abandoned is RmFB'd in `releaseBuffer`.
+fn allocPlaneBuffer(
+    self: *DrmBackendData,
+    device: *gbm_c.struct_gbm_device,
+    width: u32,
+    height: u32,
+    usage: u32,
+) error{BackendFailed}!ScanoutBuffer {
+    const fd = self.fd.?;
+    const bo = gbm_c.gbm_bo_create(device, width, height, drm_format_xrgb8888, usage) orelse
+        return error.BackendFailed;
+    var stride_out: u32 = 0;
+    var map_ptr: ?*anyopaque = null;
+    if (gbm_c.gbm_bo_map(bo, 0, 0, width, height, gbm_c.GBM_BO_TRANSFER_READ_WRITE, &stride_out, &map_ptr) == null or map_ptr == null) {
+        gbm_c.gbm_bo_destroy(bo);
+        return error.BackendFailed;
+    }
+    const stride = gbm_c.gbm_bo_get_stride(bo);
+    if (stride == 0) {
+        gbm_c.gbm_bo_unmap(bo, map_ptr);
+        gbm_c.gbm_bo_destroy(bo);
+        return error.BackendFailed;
+    }
+    const handle = gbm_c.gbm_bo_get_handle_for_plane(bo, 0);
+    const modifier = gbm_c.gbm_bo_get_modifier(bo);
+    const handles = [1]u32{handle.u32};
+    const pitches = [1]u32{stride};
+    const offsets = [1]u32{gbm_c.gbm_bo_get_offset(bo, 0)};
+    const modifiers = [1]u64{modifier};
+    var fb_id: u32 = 0;
+    if (c.drmModeAddFB2WithModifiers(fd, width, height, drm_format_xrgb8888, &handles, &pitches, &offsets, &modifiers, &fb_id, 0) != 0) {
+        gbm_c.gbm_bo_unmap(bo, map_ptr);
+        gbm_c.gbm_bo_destroy(bo);
+        return error.BackendFailed;
+    }
+    const pixels: [*]u8 = @ptrCast(map_ptr.?);
+    return .{
+        .fb_id = fb_id,
+        .pitch = stride,
+        // One row per scanline, each `stride` bytes; copyRows reads at most
+        // width*4 out of each and never past the last row's end.
+        .map = pixels[0 .. @as(usize, stride) * height],
+        .gem_handle = handle.u32,
+        .modifier = modifier,
+        .bo = bo,
+        .bo_map = map_ptr,
+    };
+}
+
+/// The scanout decision, as pure data so it can be tested without a card.
+///
+/// `use_plane` is true only when every precondition holds: a GBM device
+/// exists, the caller owns a real PRIMARY plane (plane_id != 0, i.e. the
+/// atomic interface - the legacy path has no planes and flips through the
+/// CRTC), and GBM advertises at least one (format, modifier) pair with a
+/// plane behind it. Anything else is the dumb path, which is what the VM
+/// runs today and what must keep working.
+const ScanoutChoice = struct {
+    use_plane: bool,
+    /// Which precondition failed, for the log line at the decision point.
+    reason: Reason,
+
+    const Reason = enum { plane, no_gbm, no_plane, gbm_has_no_format };
+
+    /// The decision itself, from the three facts that drive it. Kept free of
+    /// the backend so it can be tested on any machine.
+    fn decide(has_gbm: bool, has_formats: bool, plane_id: u32) ScanoutChoice {
+        if (!has_gbm) return .{ .use_plane = false, .reason = .no_gbm };
+        if (plane_id == 0) return .{ .use_plane = false, .reason = .no_plane };
+        if (!has_formats) return .{ .use_plane = false, .reason = .gbm_has_no_format };
+        return .{ .use_plane = true, .reason = .plane };
+    }
+};
+
+fn chooseScanout(self: *DrmBackendData, plane_id: u32) ScanoutChoice {
+    const gbm = self.gbm orelse return ScanoutChoice.decide(false, false, plane_id);
+    return ScanoutChoice.decide(true, gbm.formats.len != 0, plane_id);
 }
 
 /// Phase 9: the mode blob (wlroots atomic.c create_mode_blob). Atomic-only:
@@ -1080,6 +1634,11 @@ fn findConnectorMode(self: *DrmBackendData) ?FoundConnector {
         const conn = c.drmModeGetConnector(fd, connector_id) orelse continue;
         defer c.drmModeFreeConnector(conn);
         if (conn.*.connection != c.DRM_MODE_CONNECTED or conn.*.count_modes <= 0) continue;
+        // A connector one of our outputs already drives is skipped here, so
+        // the caller's one-output-per-connector loop terminates and a
+        // hotplug "change" on an existing connector does not add a second
+        // output for it.
+        if (connectorBound(self, connector_id)) continue;
 
         var chosen: c_int = 0;
         var m: c_int = 0;
@@ -1360,34 +1919,38 @@ fn teardownGbm(self: *DrmBackendData) void {
     dev.deinit();
 }
 
-/// Release DRM device resources in reverse acquisition order: RmFB,
-/// destroy dumb, munmap, drop master, close (task teardown order).
-/// Null-safe and idempotent so partial start() failures clean up.
+/// Release every DRM device resource, in reverse acquisition order.
+///
+/// Null-safe and idempotent, so a start() that died half-way (or a
+/// teardown that runs twice) releases exactly what exists:
+///
+///   1. the udev monitor, so nothing produces a callback into state that is
+///      about to be freed;
+///   2. the logind session, which restores the console VT, hands the device
+///      back to logind and ends the session - while we still hold DRM
+///      master and the fd, so the handover happens on a card we still own;
+///   3. per output: the mode blob, then each swapchain buffer (RmFB, then
+///      the mapping, then the allocation);
+///   4. the GBM device - after every bo, because a bo destruction touches
+///      the device;
+///   5. DRM master, then the fd.
+///
+/// The order of 2 and 5 is the answer to "can this leave the console on the
+/// wrong VT or hold DRM master after shutdown": it cannot. The VT is put
+/// back before the fd closes and before the master is dropped, so the
+/// console is never switched while we are half-dead; and the master is
+/// dropped unconditionally, whether or not the session existed.
 fn drmTeardown(self: *DrmBackendData) void {
-    const fd = self.fd orelse return;
-    if (self.drm_output) |drm_out| {
-        if (drm_out.mode_blob != 0) {
-            _ = c.drmModeDestroyPropertyBlob(fd, drm_out.mode_blob);
-            drm_out.mode_blob = 0;
-        }
-        // Reverse acquisition order per buffer: RmFB, munmap, destroy
-        // dumb. Both swapchain buffers are released.
-        for (&drm_out.buffers) |*buf| {
-            if (buf.fb_id != 0) {
-                _ = c.drmModeRmFB(fd, buf.fb_id);
-                buf.fb_id = 0;
-            }
-            if (buf.map.len != 0) {
-                std.posix.munmap(buf.map);
-                buf.map = &.{};
-            }
-            if (buf.handle != 0) {
-                var destroy_dumb: c.struct_drm_mode_destroy_dumb = .{ .handle = buf.handle };
-                _ = c.drmIoctl(fd, c.DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
-                buf.handle = 0;
-            }
-        }
+    if (self.hotplug) |hp| {
+        self.hotplug = null;
+        hp.close();
     }
+    if (self.session) |s| {
+        self.session = null;
+        s.close();
+    }
+    const fd = self.fd orelse return;
+    for (self.outputs.items) |drm_out| releaseOutputResources(self, drm_out);
     teardownGbm(self);
     if (self.is_master) {
         _ = c.drmIoctl(fd, c.DRM_IOCTL_DROP_MASTER, null);
@@ -1395,6 +1958,108 @@ fn drmTeardown(self: *DrmBackendData) void {
     }
     _ = std.os.linux.close(fd);
     self.fd = null;
+}
+
+/// One output's KMS resources: the mode blob and both swapchain buffers, in
+/// reverse acquisition order. Idempotent - every id is zeroed as it is
+/// released - and safe on an output that never finished starting.
+fn releaseOutputResources(self: *DrmBackendData, drm_out: *DrmOutput) void {
+    const fd = self.fd orelse return;
+    if (drm_out.mode_blob != 0) {
+        _ = c.drmModeDestroyPropertyBlob(fd, drm_out.mode_blob);
+        drm_out.mode_blob = 0;
+    }
+    releaseBuffers(self, drm_out);
+}
+
+/// Both swapchain buffers of one output.
+fn releaseBuffers(self: *DrmBackendData, drm_out: *DrmOutput) void {
+    for (&drm_out.buffers) |*buf| releaseBuffer(self, buf);
+}
+
+/// One swapchain buffer, whatever flavour it is: RmFB the framebuffer, then
+/// drop the CPU mapping, then the allocation.
+///
+/// Order matters twice over. The framebuffer goes first because it is what
+/// the kernel holds a reference through (drivers/gpu/drm/drm_framebuffer.c
+/// drm_mode_rmfb takes the last fb reference). The mapping goes before the
+/// allocation because the mapping IS a reference to it - unmapping after
+/// gbm_bo_destroy would touch freed memory, and skipping it for a dumb
+/// buffer leaves a live mapping onto a destroyed handle.
+fn releaseBuffer(self: *DrmBackendData, buf: *ScanoutBuffer) void {
+    const fd = self.fd orelse return;
+    if (buf.fb_id != 0) {
+        _ = c.drmModeRmFB(fd, buf.fb_id);
+        buf.fb_id = 0;
+    }
+    if (buf.bo_map) |m| {
+        buf.bo_map = null;
+        buf.map = &.{};
+        if (buf.bo) |bo| gbm_c.gbm_bo_unmap(bo, m);
+    }
+    if (buf.map.len != 0) {
+        std.posix.munmap(@alignCast(buf.map));
+        buf.map = &.{};
+    }
+    if (buf.bo) |bo| {
+        buf.bo = null;
+        gbm_c.gbm_bo_destroy(bo);
+    }
+    buf.gem_handle = 0;
+    buf.modifier = 0;
+    if (buf.handle != 0) {
+        var destroy_dumb: c.struct_drm_mode_destroy_dumb = .{ .handle = buf.handle };
+        _ = c.drmIoctl(fd, c.DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
+        buf.handle = 0;
+    }
+}
+
+/// Destroy every output whose connector is no longer connected - the
+/// unplug path.
+///
+/// Matching is by asking KMS, not by comparing udev names: for each live
+/// output the connector is re-read and destroyed when it is gone,
+/// DISCONNECTED, or has no modes left. That is exactly the state a yanked
+/// cable produces (drivers/gpu/drm/drm_connector.c connector_detect writes
+/// the new status; a connector object that disappeared makes
+/// drmModeGetConnector fail), and it needs no name bookkeeping that could
+/// drift from the kernel's.
+///
+/// The Output wrapper is destroyed first - that emits the signal the
+/// compositor uses to retire the wl_output - then the KMS resources, then
+/// the struct. The list entry is removed last, because orderedRemove shifts
+/// the tail down and the index has to stay valid for the loop.
+fn removeDisconnectedOutputs(self: *DrmBackendData) void {
+    const fd = self.fd orelse return;
+    var i: usize = 0;
+    while (i < self.outputs.items.len) {
+        const drm_out = self.outputs.items[i];
+        if (connectorStillUsable(fd, drm_out.connector_id)) {
+            i += 1;
+            continue;
+        }
+        log_mod.info(
+            "drm: connector {d} is disconnected; destroying its output",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{drm_out.connector_id},
+        );
+        if (drm_out.out) |out| out.destroy();
+        releaseOutputResources(self, drm_out);
+        self.allocator.destroy(drm_out);
+        _ = self.outputs.orderedRemove(i);
+    }
+}
+
+/// Is this connector still something we can drive? Present, connected, and
+/// advertising at least one mode - the same three conditions
+/// findConnectorMode applies, so what survives here is exactly what an
+/// addOutput would accept.
+fn connectorStillUsable(fd: std.posix.fd_t, connector_id: u32) bool {
+    const conn = c.drmModeGetConnector(fd, connector_id) orelse return false;
+    defer c.drmModeFreeConnector(conn);
+    return conn.*.connection == c.DRM_MODE_CONNECTED and conn.*.count_modes > 0;
 }
 
 /// wp_presentation_feedback.presented flags for a DRM page flip
@@ -1499,6 +2164,45 @@ test "mode to output conversion" {
     mode.htotal = 0;
     mode.vtotal = 0;
     try testing.expectEqual(@as(i32, 16), modeToOutput(mode).refresh_msec);
+}
+
+test "scanout path: a plane framebuffer only when every precondition holds" {
+    // Everything present: the real-plane GBM path.
+    const plane = ScanoutChoice.decide(true, true, 42);
+    try testing.expect(plane.use_plane);
+    try testing.expectEqual(ScanoutChoice.Reason.plane, plane.reason);
+
+    // No GBM device at all - the VM case, and the reason the dumb path
+    // still exists. It must stay REACHABLE, not merely present in the
+    // source: this is the configuration the backend runs in today.
+    const no_gbm = ScanoutChoice.decide(false, false, 42);
+    try testing.expect(!no_gbm.use_plane);
+    try testing.expectEqual(ScanoutChoice.Reason.no_gbm, no_gbm.reason);
+
+    // The legacy KMS interface has no planes (plane_id 0): flips go through
+    // the CRTC, so there is nothing to allocate a plane framebuffer for.
+    const no_plane = ScanoutChoice.decide(true, true, 0);
+    try testing.expect(!no_plane.use_plane);
+    try testing.expectEqual(ScanoutChoice.Reason.no_plane, no_plane.reason);
+
+    // A GBM device with no (format, modifier) pair behind a plane cannot
+    // allocate anything; the advertised pair set is what says so.
+    const no_formats = ScanoutChoice.decide(true, false, 42);
+    try testing.expect(!no_formats.use_plane);
+    try testing.expectEqual(ScanoutChoice.Reason.gbm_has_no_format, no_formats.reason);
+}
+
+test "card node path yields the DRM minor logind wants" {
+    // TakeDevice names the device by its primary minor, and libdrm builds
+    // node names as "card<minor>" (xf86drmMode.h DRM_DEV_NAME).
+    try testing.expectEqual(@as(u32, 0), cardMinor("/dev/dri/card0"));
+    try testing.expectEqual(@as(u32, 12), cardMinor("/dev/dri/card12"));
+    try testing.expectEqual(@as(u32, 1), cardMinor("card1"));
+    // A render node is not a KMS device; claiming a device for it would be
+    // claiming the wrong one, so the minor falls back to 0 rather than
+    // inventing a number.
+    try testing.expectEqual(@as(u32, 0), cardMinor("/dev/dri/renderD128"));
+    try testing.expectEqual(@as(u32, 0), cardMinor(""));
 }
 
 test "encoder fallback picks the first CRTC in the possible_crtcs union" {

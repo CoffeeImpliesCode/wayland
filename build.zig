@@ -343,6 +343,12 @@ pub fn build(b: *Build) void {
     // them explicitly (same pattern as the raylib link above).
     server_exe.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
     server_exe.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
+    // libudev: the libinput backend's hotplug monitor calls
+    // udev_monitor_* directly (libinput.zig). Same non-propagation trap as
+    // egl/glesv2 above — lib links it, the exe does not inherit it, and the
+    // undefined symbol only shows up when the exe is LINKED. `zig build
+    // check` compiles but never links, so only `zig build` catches this.
+    server_exe.root_module.linkSystemLibrary("libudev", .{ .use_pkg_config = .force });
     b.installArtifact(server_exe);
     // libgbm, for the same reason as exe above.
     linkGbm(b, server_exe.root_module, gbm);
@@ -438,6 +444,8 @@ pub fn build(b: *Build) void {
     // is not automatic — link egl/glesv2 explicitly (raylib pattern).
     exe_test_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
     exe_test_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
+    // libudev, for the same non-propagation reason as on server_exe.
+    exe_test_module.linkSystemLibrary("libudev", .{ .use_pkg_config = .force });
     // libgbm, for the same reason as exe above.
     linkGbm(b, exe_test_module, gbm);
     const exe_tests = b.addTest(.{ .root_module = exe_test_module });

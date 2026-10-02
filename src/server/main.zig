@@ -430,10 +430,26 @@ const ServerState = struct {
     input_backend: ?*wayland.backend.Backend = null,
     /// The DRM backend's poll fd watcher state (page-flip events).
     drm_poll_fd: c_int = -1,
+    /// The optional fds the loop was actually asked to watch, each -1
+    /// when the feature behind it is absent. They exist because an
+    /// absent feature must arm NOTHING (armFdPoll's rule): a poller on a
+    /// -1 fd completes instantly and forever, which is a busy-spin. So
+    /// the armed set is the record the tests read and the state keeps.
+    /// The udev hotplug monitor beside the libinput device fd.
+    input_hotplug_poll_fd: c_int = -1,
+    /// The logind bus (M6 PrepareForSleep), DRM backend only.
+    drm_session_poll_fd: c_int = -1,
+    /// The DRM connector hotplug (udev) monitor, DRM backend only.
+    drm_hotplug_poll_fd: c_int = -1,
     /// The DRM backend (when WAYLAND_BACKEND=drm).
     drm_backend: ?*wayland.backend.Backend = null,
     // SAFETY: initialized in main() before the backend starts.
     new_input_listener: wire.Listener(*wayland.backend.Backend.InputDevice),
+    /// Backend.events.input_removed: a device the new_input signal
+    /// announced is gone. Subscribed beside new_input_listener in
+    /// subscribe(); the handler forwards it to the seat so the wl_seat
+    /// capability the LAST device of that kind provided is withdrawn.
+    input_removed_listener: wire.Listener(*wayland.backend.Backend.InputDevice),
     /// wl_output protocol global for the backend output.
     wl_output: ?*wayland.wl_output.WlOutput = null,
     screencopy: ?*wayland.screencopy.Screencopy = null,
@@ -832,6 +848,13 @@ const LoopTimers = struct {
     input_poll: zio.ev.PipePoll,
     /// The DRM card fd (page-flip events), for the DRM backend.
     drm_poll: zio.ev.PipePoll,
+    /// The libinput udev hotplug monitor (device add/remove), when
+    /// WAYLAND_LIBINPUT=1 AND the monitor exists.
+    input_hotplug_poll: zio.ev.PipePoll,
+    /// The logind bus (M6 PrepareForSleep), DRM backend only.
+    drm_session_poll: zio.ev.PipePoll,
+    /// The DRM connector udev monitor, DRM backend only.
+    drm_hotplug_poll: zio.ev.PipePoll,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -874,7 +897,7 @@ pub fn main(init: std.process.Init) !void {
     const output = try buildOutput(&start, &core);
     defer output.deinit(core.compositor);
 
-    const input_backend = try buildInputBackend(&start, core.seat);
+    const input_backend = try buildInputBackend(&start, core.seat, seat_mods.tablet);
     defer if (input_backend) |ib| ib.destroy();
 
     const framebuffer = try pixman.Framebuffer.create(allocator, output_width, output_height);
@@ -900,6 +923,13 @@ pub fn main(init: std.process.Init) !void {
     defer unlinkSessionLockListeners(&state);
     try initScreencopy(&start, &state, &core);
     defer if (state.screencopy) |sc| sc.deinit();
+    // The dmabuf half of zwlr_screencopy_v1 (screencopy.zig's wiring
+    // snippet). Registered AFTER the screencopy deinit above and
+    // therefore running BEFORE it, and long before OutputModules.deinit
+    // destroys linux_dmabuf: a `copy` that arrived in between would
+    // dereference a freed module through `destination.ctx`.
+    wireScreencopyDmabuf(&state, &output);
+    defer clearScreencopyDmabuf(&state);
     try applyEnvironment(&start, &state, &output);
 
     // --- zio event loop ---------------------------------------------------
@@ -963,6 +993,74 @@ fn initScreencopy(start: *Startup, state: *ServerState, core: *const CoreModules
         requestFrame,
         state,
     );
+}
+
+/// `dmabuf_mod.beginWrite` in the ctx/fn pair a screencopy destination
+/// takes. The mapping lives in the Buffer's own impl data (the gbm bo the
+/// import path created), so the context is not consulted — it is carried
+/// only because DmabufDestination reaches all three of its members the
+/// same way, and the resolver beside them does need it.
+fn beginDmabufWrite(ctx: *anyopaque, buf: *wayland.buffers.Buffer) ?wayland.dmabuf.CpuWrite {
+    _ = ctx;
+    return wayland.dmabuf.beginWrite(buf);
+}
+
+/// `dmabuf_mod.endWrite` in the same pair. It runs AFTER the writes: for
+/// a bo GBM could not map in place, `gbm_bo_unmap` is what copies the
+/// staging buffer into the bo, so an early call loses the pixels.
+fn endDmabufWrite(ctx: *anyopaque, buf: *wayland.buffers.Buffer, map: wayland.dmabuf.CpuWrite) void {
+    _ = ctx;
+    wayland.dmabuf.endWrite(buf, map);
+}
+
+/// Hand zwlr_screencopy_v1 the compositor's dmabuf import path, exactly
+/// as screencopy.zig's wiring snippet spells it: the LinuxDmabuf module
+/// owns the buffers and resolves the client's wl_buffer, and the CPU
+/// write mapping comes from buffers/dmabuf.zig.
+fn wireScreencopyDmabuf(state: *ServerState, output: *const OutputModules) void {
+    const sc = state.screencopy orelse return;
+    wireScreencopyDmabufInto(sc, output.linux_dmabuf, state.io, state.log_cfg);
+}
+
+/// The wiring itself, over the two modules it names. Split from
+/// `wireScreencopyDmabuf` so the test harness can install the very same
+/// destination on its own Screencopy, and so the teardown half has one
+/// shape to mirror.
+fn wireScreencopyDmabufInto(
+    sc: *wayland.screencopy.Screencopy,
+    linux: *wayland.linux_dmabuf.LinuxDmabuf,
+    io: *std.Io,
+    log_cfg: *const log.Config,
+) void {
+    // Only wired when the module actually has a device. A LinuxDmabuf
+    // built with a null GBM device registers no global and resolves
+    // every resource to null, so leaving the destination unset keeps
+    // every backend without a GBM device byte-for-byte the shm-only
+    // compositor it is today.
+    if (!linux.advertised()) {
+        log.info(
+            "screencopy: no dmabuf import device; captures stay shm-only",
+            io,
+            log_cfg,
+            "screencopy",
+            .{},
+        );
+        return;
+    }
+    sc.setDmabufDestination(.{
+        .ctx = linux,
+        .resolve = resolveDmabufBuffer,
+        .begin_write = beginDmabufWrite,
+        .end_write = endDmabufWrite,
+    });
+}
+
+/// The other half of the wiring: drop the destination so a `copy` that
+/// arrives after the LinuxDmabuf module is gone cannot reach it. main()
+/// runs this before the screencopy module is deinited, and both run
+/// before OutputModules.deinit destroys linux_dmabuf.
+fn clearScreencopyDmabuf(state: *ServerState) void {
+    if (state.screencopy) |sc| sc.clearDmabufDestination();
 }
 
 /// Phase 1: the display, wl_shm, the compositor, the shell, the seat and
@@ -1411,13 +1509,24 @@ fn buildBackend(start: *Startup, display: *wayland.core.display.CompositorDispla
 /// A second Backend whose only role is announcing devices + the poll fd
 /// the zio loop watches; events flow into the seat via its dispatch.
 /// Null when WAYLAND_LIBINPUT is unset or not "1".
-fn buildInputBackend(start: *Startup, seat: *wayland.seat.Seat) !?*wayland.backend.Backend {
+///
+/// `tablet` is the zwp_tablet_manager_v2 module, handed over here so the
+/// backend announces real tablet hardware instead of only logging a
+/// device it cannot classify. It must outlive the backend: the module is
+/// built by buildSeatModules and torn down after `input_backend.destroy()`
+/// (defers unwind in reverse), and the backend's own teardown only frees
+/// its device registry.
+fn buildInputBackend(
+    start: *Startup,
+    seat: *wayland.seat.Seat,
+    tablet: *wayland.tablet.Tablet,
+) !?*wayland.backend.Backend {
     const value = start.env.get("WAYLAND_LIBINPUT") orelse return null;
     if (!std.mem.eql(u8, value, "1")) {
         log.warn("WAYLAND_LIBINPUT '{s}' ignored (expected \"1\")", start.io, start.log_cfg, "server", .{value});
         return null;
     }
-    return try libinput_mod.LibinputBackend.create(
+    const backend = try libinput_mod.LibinputBackend.create(
         start.allocator,
         start.io,
         start.log_cfg,
@@ -1426,6 +1535,11 @@ fn buildInputBackend(start: *Startup, seat: *wayland.seat.Seat) !?*wayland.backe
         output_width,
         output_height,
     );
+    // BEFORE start(): the initial udev drain inside start() is what
+    // registers a tablet that was already plugged in, so attaching after
+    // it would make the first tablet invisible (libinput.zig attachTablet).
+    libinput_mod.LibinputBackend.attachTablet(backend, tablet);
+    return backend;
 }
 
 /// The renderer WAYLAND_RENDERER selects, with the log line that says so.
@@ -1495,6 +1609,7 @@ fn initServerState(
         .layer_popups = .empty,
         .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
         .new_input_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onNewInput),
+        .input_removed_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onInputRemoved),
         .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
         .content_dirty_listener = wire.Listener(*wayland.scene.Scene).init(onSceneContentDirty),
         .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
@@ -1529,6 +1644,10 @@ fn subscribe(state: *ServerState) void {
     state.backend.events.new_output.add(&state.new_output_listener);
     if (state.input_backend) |ib| {
         ib.events.new_input.add(&state.new_input_listener);
+        // Hotplug removal, the mirror of new_input: the seat must learn a
+        // device it counted is gone, or it keeps advertising a wl_seat
+        // capability no live hardware provides anymore.
+        ib.events.input_removed.add(&state.input_removed_listener);
     }
     state.shell.events.new_toplevel.add(&state.new_toplevel_listener);
     state.shell.events.new_popup.add(&state.new_popup_listener);
@@ -1571,6 +1690,16 @@ fn subscribe(state: *ServerState) void {
     // move-based routing in applyLayerKeyboardFocus enforces the same
     // for hover.
     state.seat.setKeyboardFocusGate(keyboardFocusAllowed, state);
+    // ext_session_lock_manager_v1, wiring item 2, for TOUCH: the
+    // lock-aware pick above already drops every pointer event that is
+    // not a lock surface, but the seat translates touch positions
+    // through the same pick only to decide the focus surface. The gate
+    // is what refuses a point (down AND motion) on a surface a locked
+    // session must not drive, which is what stops a finger that went
+    // down before the latch from dragging user content for the whole
+    // locked interval. Same live-state callback shape as the two above,
+    // so dropping the lock module restores touch by itself.
+    state.seat.setTouchGate(touchAllowed, state);
     // zwlr_foreign_toplevel_manager_v1's `activate` is the THIRD route a
     // client has to keyboard focus (a click, xdg_activation, this one), so
     // it goes through the SAME composite gate with the SAME context: the
@@ -1650,10 +1779,14 @@ fn armEventLoop(
         .repeat = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(600) }),
         .raylib_poll = zio.ev.Timer.init(.{ .duration = zio.Duration.fromMilliseconds(16) }),
         .display_poll = zio.ev.PipePoll.init(state.display.loopFd(), .read),
-        // SAFETY: the two optional pollers are written by the branches
-        // below and read only under the same condition.
+        // SAFETY: the optional pollers are written by armBackendPollers,
+        // which registers each one with the loop in the same breath, so
+        // the loop only ever reads one that was initialized.
         .input_poll = undefined,
         .drm_poll = undefined,
+        .input_hotplug_poll = undefined,
+        .drm_session_poll = undefined,
+        .drm_hotplug_poll = undefined,
     };
 
     // Watchdog: registered BEFORE backend.start() so the first DRM frame's
@@ -1703,8 +1836,10 @@ fn armEventLoop(
 }
 
 /// Register the fd pollers: the display (client requests + wire timers),
-/// the libinput device fd and the DRM card fd. Called after the backends
-/// start, so the first frame a backend fires already has its poller.
+/// the libinput device fd, its udev hotplug monitor, and the DRM card
+/// fd with its logind bus and connector monitor. Called after the
+/// backends start, so the first frame a backend fires already has its
+/// poller.
 fn armBackendPollers(
     state: *ServerState,
     output: *const OutputModules,
@@ -1722,23 +1857,69 @@ fn armBackendPollers(
 
     // libinput: watch the udev/evdev fd; dispatch drains events into the seat.
     if (input_backend) |ib| {
-        const input_fd = libinput_mod.LibinputBackend.fromBackend(ib).pollFd();
-        timers.input_poll = zio.ev.PipePoll.init(input_fd, .read);
+        const libinput = libinput_mod.LibinputBackend.fromBackend(ib);
+        timers.input_poll = zio.ev.PipePoll.init(libinput.pollFd(), .read);
         timers.input_poll.c.userdata = state;
         timers.input_poll.c.callback = onInputReady;
         timers.input_poll.c.flags.rearm = true;
         loop.add(&timers.input_poll.c);
+        // The udev monitor beside it, so a device that appears or
+        // disappears while the server runs is noticed and not only the
+        // ones present at startup. It is a separate netlink socket from
+        // the libinput context's, so it needs its own poller.
+        if (armFdPoll(loop, &timers.input_hotplug_poll, libinput.hotplugPollFd(), state, onInputHotplugReady)) {
+            state.input_hotplug_poll_fd = timers.input_hotplug_poll.handle;
+        }
     }
     // DRM: watch the card fd for page-flip events (the frame pacing).
     if (output.is_drm) {
-        const drm_fd = drm_mod.pollFd(drm_mod.DrmBackend.fromBackend(output.backend));
+        const data = drm_mod.DrmBackend.fromBackend(output.backend);
+        const drm_fd = drm_mod.pollFd(data);
         state.drm_poll_fd = drm_fd;
         timers.drm_poll = zio.ev.PipePoll.init(drm_fd, .read);
         timers.drm_poll.c.userdata = state;
         timers.drm_poll.c.callback = onDrmReady;
         timers.drm_poll.c.flags.rearm = true;
         loop.add(&timers.drm_poll.c);
+        // M6: the logind bus (PrepareForSleep) and the connector hotplug
+        // monitor are two more fds the DRM backend contributes, armed
+        // beside the card fd exactly as the libinput monitor is beside the
+        // device fd.
+        const extra = drm_mod.extraFds(data);
+        if (armFdPoll(loop, &timers.drm_session_poll, extra.session, state, onDrmSessionReady)) {
+            state.drm_session_poll_fd = timers.drm_session_poll.handle;
+        }
+        if (armFdPoll(loop, &timers.drm_hotplug_poll, extra.hotplug, state, onDrmHotplugReady)) {
+            state.drm_hotplug_poll_fd = timers.drm_hotplug_poll.handle;
+        }
     }
+}
+
+/// Register one fd poller with the loop, or do NOTHING when there is no
+/// fd to watch. Returns whether a poller was registered.
+///
+/// A -1 fd is the "this feature is not available" answer every one of
+/// these subsystems gives (no udevd, no logind, no session). Registering
+/// a poller for it would be the busy-spin the server must not have: a
+/// poller on no descriptor completes immediately and forever, so the loop
+/// would wake in a tight circle doing no work. Skipping is safe because
+/// each dispatch function is itself a no-op without its fd.
+fn armFdPoll(
+    loop: *zio.ev.Loop,
+    poll: *zio.ev.PipePoll,
+    fd: std.posix.fd_t,
+    state: *ServerState,
+    callback: *const fn (*zio.ev.Loop, *zio.ev.Completion) void,
+) bool {
+    if (fd < 0) return false;
+    poll.* = zio.ev.PipePoll.init(fd, .read);
+    poll.c.userdata = state;
+    poll.c.callback = callback;
+    // Rearm: the callback drains the descriptor and the watch stays, so
+    // the next wake dispatches again without re-registering.
+    poll.c.flags.rearm = true;
+    loop.add(&poll.c);
+    return true;
 }
 
 /// Poll until the loop stops (the watchdog, WAYLAND_RUN_FRAMES, a poll
@@ -1779,6 +1960,12 @@ fn freeRenderTargets(state: *ServerState) void {
 // ---------------------------------------------------------------------------
 
 /// A backend announced an input device (libinput udev enumeration).
+///
+/// The announcement is RECORDED on the seat: the seat's device table is
+/// what lets a later `input_removed` tell "the last device of this kind"
+/// from "one of several", and only then may the corresponding wl_seat
+/// capability be withdrawn. The seat decides the mask; this handler
+/// only forwards the identity (compositor/seat.zig inputDeviceAdded).
 fn onNewInput(
     listener: *wire.Listener(*wayland.backend.Backend.InputDevice),
     device: *wayland.backend.Backend.InputDevice,
@@ -1787,6 +1974,30 @@ fn onNewInput(
     log.info("libinput: device {s} ({s})", self.io, self.log_cfg, "libinput", .{
         device.name, @tagName(device.kind),
     });
+    self.seat.inputDeviceAdded(device);
+}
+
+/// A device the seat counted is gone (udev "remove", libinput's
+/// DEVICE_REMOVED, or the udev monitor).
+///
+/// The wire consequence is the seat's: when this was the LAST device
+/// providing a capability, the seat withdraws that wl_seat capability
+/// bit through setCapabilities, which re-announces the mask to every
+/// bound wl_seat and inerts that interface's resources — so a client
+/// asking for an interface no attached hardware can drive gets the
+/// protocol's missing_capability error rather than a dead object
+/// (wayland.xml:2094-2098). The touch case closes the live gesture with
+/// an up per point plus the leave BEFORE the wl_touch resources go
+/// inert, so no client is left waiting on points that will never lift.
+fn onInputRemoved(
+    listener: *wire.Listener(*wayland.backend.Backend.InputDevice),
+    device: *wayland.backend.Backend.InputDevice,
+) void {
+    const self: *ServerState = @fieldParentPtr("input_removed_listener", listener);
+    log.info("libinput: device {s} ({s}) removed", self.io, self.log_cfg, "libinput", .{
+        device.name, @tagName(device.kind),
+    });
+    self.seat.inputDeviceRemoved(device);
 }
 
 fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.output.Output) void {
@@ -2545,6 +2756,22 @@ fn onInputReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     }
 }
 
+/// The udev monitor armed beside the libinput device fd became readable:
+/// an input device appeared or disappeared. `dispatchHotplug` drains the
+/// whole queue (every queued notification, not one per wake), so a burst
+/// of udev events is fully consumed before the loop sleeps again.
+fn onInputHotplugReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
+    _ = loop;
+    const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
+    if (self.input_backend) |ib| {
+        libinput_mod.LibinputBackend.fromBackend(ib).dispatchHotplug();
+        // A removed touchscreen owes its client a wl_touch.cancel, and an
+        // added one may announce a new capability: both are marshalled
+        // here, so flush for the same reason onInputReady does.
+        self.display.flushClients();
+    }
+}
+
 fn onDrmReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     _ = loop;
     const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
@@ -2554,6 +2781,29 @@ fn onDrmReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
             // Fatal device error: stop the loop (tests must not hang).
             if (err == error.BackendFailed) self.loop.?.stop();
         };
+    }
+}
+
+/// The logind bus became readable (M6). Draining it runs one
+/// suspend/resume step if logind asked for one, entirely non-fatal: a bus
+/// error drops the connection and logs, and the compositor keeps running
+/// on the card it already has (session.zig's failure policy).
+fn onDrmSessionReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
+    _ = loop;
+    const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
+    if (self.drm_backend) |db| {
+        drm_mod.dispatchSession(drm_mod.DrmBackend.fromBackend(db));
+    }
+}
+
+/// The DRM connector udev monitor became readable: reconcile the output
+/// list with the hardware. Non-fatal throughout — one connector that
+/// cannot be driven is logged and the rest still are.
+fn onDrmHotplugReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
+    _ = loop;
+    const self: *ServerState = @ptrCast(@alignCast(completion.userdata.?));
+    if (self.drm_backend) |db| {
+        drm_mod.dispatchHotplug(db, drm_mod.DrmBackend.fromBackend(db));
     }
 }
 
@@ -3925,6 +4175,34 @@ fn keyboardFocusAllowed(ctx: *anyopaque, surface: *Surface) bool {
     return layerKeyboardFocusAllowed(ctx, surface);
 }
 
+/// The seat's touch gate: may `surface` receive a touch point right now.
+///
+/// ext_session_lock_manager_v1:77-85 is an INPUT privilege boundary, and
+/// the lock-aware pick (pickSurface) only closes the POINTER half of it:
+/// it stops a position from resolving to user content, which is what a
+/// new touch-down needs, but it says nothing about a finger already down
+/// when the session locked. Refusing the point here is what stops that
+/// gesture from dragging user content for the whole locked interval —
+/// the seat drops it exactly as it drops a missed pick (no down, no
+/// enter, no focus change, nothing in activeTouchPoints), so the client
+/// is never told about a point it may not act on.
+///
+/// Only lock surfaces pass, and `acceptsInput` is the assertion that the
+/// surface really belongs to the lock client. Up and cancel are NOT
+/// gated: they finalize a gesture the client was already told about, and
+/// swallowing them would strand its state.
+///
+/// Read from LIVE lock state, so unlinking the lock listeners (or the
+/// lock ending) restores touch by itself — the same teardown story as
+/// setPick and setKeyboardFocusGate.
+fn touchAllowed(ctx: *anyopaque, surface: *Surface) bool {
+    const self: *ServerState = @ptrCast(@alignCast(ctx));
+    const sl = self.session_lock orelse return true;
+    if (!sl.isLocked()) return true;
+    if (!sl.isLockSurface(surface)) return false;
+    return sl.acceptsInput(surface.resource.getClient());
+}
+
 // ---------------------------------------------------------------------------
 // ext_session_lock_manager_v1 + wp_cursor_shape_manager_v1 wiring
 //
@@ -5238,6 +5516,7 @@ const PolicyServer = struct {
             .layer_popups = .empty,
             .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
             .new_input_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onNewInput),
+            .input_removed_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onInputRemoved),
             .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
             .content_dirty_listener = wire.Listener(*wayland.scene.Scene).init(onSceneContentDirty),
             .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
@@ -5280,6 +5559,11 @@ const PolicyServer = struct {
         ts.seat.?.setPick(PolicyServer.pick, ts);
         // main()'s gate: the session lock first, then L-D7's layer policy.
         ts.seat.?.setKeyboardFocusGate(keyboardFocusAllowed, state);
+        // main()'s touch gate (ext_session_lock_manager_v1 wiring item 2
+        // for touch): the same live-state callback, so a locked session
+        // refuses a point on user content here exactly as it does in the
+        // running server.
+        ts.seat.?.setTouchGate(touchAllowed, state);
         // main()'s other two policy seams: the foreign-toplevel activate
         // gate (the third route to keyboard focus) and the popup grab's
         // screen->world conversion.
@@ -6735,6 +7019,255 @@ test "a locked session denies input to every client but the lock one and blanks 
     try testing.expect(sl.acceptsInput(other_client));
 }
 
+test "a locked session delivers no touch to user content" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const seat = ts.seat.?;
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const user_surface = ts.serverSurface(t.wl_surface);
+    ts.pick_surface = user_surface;
+
+    var events: ClientSeatEvents = .{};
+    const wl_touch = try ts.wl_seat.?.getTouch();
+    wl_touch.setListener(*ClientSeatEvents, ClientSeatEvents.touchListener, &events);
+    try ts.pump();
+
+    // Unlocked: the gesture is delivered, exactly as before the gate.
+    seat.touchDown(1, 100, 100);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.downs);
+    try testing.expectEqual(@as(usize, 1), seat.activeTouchPoints().len);
+    seat.touchUp(1);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.ups);
+
+    // The lock client takes the session.
+    var lock_events: LockClientEvents = .{};
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    const lock_surface = try ts.lockSession(&lock_events, &lock_surface_events);
+    try testing.expect(ts.session_lock.?.isLocked());
+
+    // A finger on user content while locked: no down, no point registered,
+    // no touch focus — exactly what a missed pick does.
+    seat.touchDown(2, 100, 100);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.downs);
+    try testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try testing.expectEqual(@as(?*Surface, null), seat.touchFocus());
+
+    // The lock client's own surface still takes touch: the boundary
+    // suppresses every client but the lock one, it does not suppress all.
+    ts.pick_surface = lock_surface;
+    seat.touchDown(3, 100, 100);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 2), events.downs);
+    try testing.expectEqual(@as(usize, 1), seat.activeTouchPoints().len);
+    try testing.expectEqual(@as(?*Surface, lock_surface), seat.touchFocus());
+
+    // The gesture ends normally: up is NOT gated (swallowing it would
+    // strand the client's point ids).
+    seat.touchUp(3);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 2), events.ups);
+    try testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+}
+
+test "a touch point that was down when the session locked stops moving on user content" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const seat = ts.seat.?;
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    const user_surface = ts.serverSurface(t.wl_surface);
+    ts.pick_surface = user_surface;
+
+    var events: ClientSeatEvents = .{};
+    const wl_touch = try ts.wl_seat.?.getTouch();
+    wl_touch.setListener(*ClientSeatEvents, ClientSeatEvents.touchListener, &events);
+    try ts.pump();
+
+    // A finger goes down on the user toplevel while the session is open.
+    seat.touchDown(7, 100, 100);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.downs);
+    try testing.expectEqual(@as(usize, 1), seat.activeTouchPoints().len);
+    try testing.expectEqual(@as(?*Surface, user_surface), seat.touchFocus());
+
+    // The session locks mid-gesture. This is the case the lock-aware PICK
+    // alone does not cover, because the point is already down and there is
+    // no new hit test to refuse. The pick is deliberately swapped for a
+    // lock-UNAWARE one so the GATE is the only thing that can stop the
+    // motion: with the production lock-aware pick installed, the motion is
+    // dropped upstream of the gate and this test would prove nothing.
+    var lock_events: LockClientEvents = .{};
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    const lock_surface = try ts.lockSession(&lock_events, &lock_surface_events);
+    try testing.expect(ts.session_lock.?.isLocked());
+    seat.setPick(pickIgnoringLock, ts);
+
+    // The gate's own answer, both ways: user content is refused, the lock
+    // surface is not (ext_session_lock_v1:77-85 — input stops for every
+    // client but the lock one).
+    try testing.expect(!touchAllowed(ts.state.?, user_surface));
+    try testing.expect(touchAllowed(ts.state.?, lock_surface));
+
+    // With the pick handing the seat the surface anyway, the motion is
+    // still refused: no wl_touch.motion, and the seat's own point state
+    // does not move — a refused point is as if it never arrived.
+    seat.touchMotion(7, 400, 400);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 0), events.motions);
+    try testing.expectEqual(@as(f64, 100), seat.activeTouchPoints()[0].x);
+    try testing.expectEqual(@as(f64, 100), seat.activeTouchPoints()[0].y);
+
+    // The up still goes out: the client saw the down, so its point must
+    // resolve rather than hang forever. Up is deliberately NOT gated.
+    seat.touchUp(7);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.ups);
+    try testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+}
+
+/// A hit test that does NOT consult the session lock, for the one test
+/// that must show the touch gate refusing a point on its own: with the
+/// production lock-aware pick installed a motion is already dropped by the
+/// pick, and the gate would never be reached. Installed over `Seat.setPick`
+/// for the body of that test only.
+fn pickIgnoringLock(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
+    const ts: *PolicyServer = @ptrCast(@alignCast(ctx));
+    const s = ts.pick_surface orelse return null;
+    return .{ .surface = s, .sx = x, .sy = y };
+}
+
+// ---------------------------------------------------------------------------
+// Input hotplug: Backend.events.input_removed
+// ---------------------------------------------------------------------------
+
+test "the last input device of a kind going away withdraws its wl_seat capability" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const seat = ts.seat.?;
+    // The production subscription main() makes: the same two listeners on
+    // one Backend. The harness has one Backend for both roles, so it plays
+    // the libinput backend's part here (WAYLAND_LIBINPUT=1).
+    ts.backend.?.events.new_input.add(&ts.state.?.new_input_listener);
+    ts.backend.?.events.input_removed.add(&ts.state.?.input_removed_listener);
+
+    const touch_capability = wayland.seat.capabilities_touch;
+    const pointer_capability = wayland.seat.capabilities_pointer;
+    try testing.expect(seat.capabilities & touch_capability != 0);
+    try testing.expect(seat.capabilities & pointer_capability != 0);
+
+    // Two touchscreens: the first removal must NOT withdraw the bit,
+    // because another device of the kind still provides it.
+    var first: wayland.backend.Backend.InputDevice = .{ .kind = .touch, .name = "Touchscreen A" };
+    var second: wayland.backend.Backend.InputDevice = .{ .kind = .touch, .name = "Touchscreen B" };
+    ts.backend.?.emitNewInput(&first);
+    ts.backend.?.emitNewInput(&second);
+    try testing.expect(seat.capabilities & touch_capability != 0);
+
+    ts.backend.?.emitInputRemoved(&first);
+    try testing.expect(seat.capabilities & touch_capability != 0);
+
+    // A removal for an identity the seat never announced is ignored: it
+    // must not withdraw a bit another live device still justifies.
+    var stranger: wayland.backend.Backend.InputDevice = .{ .kind = .touch, .name = "Never Announced" };
+    ts.backend.?.emitInputRemoved(&stranger);
+    try testing.expect(seat.capabilities & touch_capability != 0);
+
+    // The LAST touchscreen: the touch bit is withdrawn, and only it — the
+    // pointer bit belongs to a different kind and stays.
+    ts.backend.?.emitInputRemoved(&second);
+    try testing.expect(seat.capabilities & touch_capability == 0);
+    try testing.expect(seat.capabilities & pointer_capability != 0);
+
+    // A client that asks for the withdrawn interface now gets the
+    // protocol's missing_capability error rather than a dead object
+    // (wayland.xml:2094-2098) — the seat serves no wl_touch at all.
+    try testing.expectEqual(@as(usize, 0), seat.touches.items.len);
+}
+
+test "an unplugged touchscreen with a point down closes the gesture before inverting wl_touch" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const seat = ts.seat.?;
+    ts.backend.?.events.new_input.add(&ts.state.?.new_input_listener);
+    ts.backend.?.events.input_removed.add(&ts.state.?.input_removed_listener);
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    ts.pick_surface = ts.serverSurface(t.wl_surface);
+
+    var touch: wayland.backend.Backend.InputDevice = .{ .kind = .touch, .name = "Touchscreen" };
+    ts.backend.?.emitNewInput(&touch);
+
+    // A client with live wl_touch and wl_pointer resources, so the gesture
+    // the withdrawal has to finalize is delivered to something whose wire
+    // state must stay consistent: the points go out on wl_touch, and the
+    // enter/leave pair on this client's wl_pointer (wl_touch has no
+    // enter/leave of its own — seat.zig's touch wire model).
+    var events: ClientSeatEvents = .{};
+    const wl_pointer = try ts.wl_seat.?.getPointer();
+    wl_pointer.setListener(*ClientSeatEvents, ClientSeatEvents.pointerListener, &events);
+    const wl_touch = try ts.wl_seat.?.getTouch();
+    wl_touch.setListener(*ClientSeatEvents, ClientSeatEvents.touchListener, &events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), seat.touches.items.len);
+    try testing.expectEqual(@as(usize, 1), seat.pointers.items.len);
+
+    seat.touchDown(1, 100, 100);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.downs);
+    try testing.expectEqual(@as(usize, 1), seat.activeTouchPoints().len);
+
+    // The device is unplugged with the finger still down. The gesture must
+    // be finalized (an up per point plus the leave) BEFORE the wl_touch
+    // resources are inerted, or the client waits forever on a point that
+    // will never lift.
+    ts.backend.?.emitInputRemoved(&touch);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.ups);
+    try testing.expectEqual(@as(usize, 1), events.leaves);
+    try testing.expectEqual(@as(usize, 0), seat.activeTouchPoints().len);
+    try testing.expectEqual(@as(usize, 0), seat.touches.items.len);
+    try testing.expect(seat.capabilities & wayland.seat.capabilities_touch == 0);
+}
+
+/// The client's wl_touch event record: what a locked session must not
+/// produce, and what a withdrawn capability must finalize.
+const ClientSeatEvents = struct {
+    downs: usize = 0,
+    motions: usize = 0,
+    ups: usize = 0,
+    cancels: usize = 0,
+    frames: usize = 0,
+    /// The pointer enter/leave pair the seat emits on the TOUCHED surface's
+    /// own client's pointer resources (wl_touch has no enter/leave of its
+    /// own; seat.zig's touch wire model).
+    leaves: usize = 0,
+
+    fn touchListener(_: *client.wl.Touch, event: client.wl.Touch.Event, self: *ClientSeatEvents) void {
+        switch (event) {
+            .down => self.downs += 1,
+            .motion => self.motions += 1,
+            .up => self.ups += 1,
+            .cancel => self.cancels += 1,
+            .frame => self.frames += 1,
+            .shape, .orientation => {},
+        }
+    }
+
+    fn pointerListener(_: *client.wl.Pointer, event: client.wl.Pointer.Event, self: *ClientSeatEvents) void {
+        switch (event) {
+            .leave => self.leaves += 1,
+            .enter, .motion, .button, .axis, .frame, .axis_source, .axis_stop, .axis_discrete, .axis_value120, .axis_relative_direction, .warp => {},
+        }
+    }
+};
+
 // ---------------------------------------------------------------------------
 // zwp_linux_dmabuf_v1 -> wl_surface.attach
 // ---------------------------------------------------------------------------
@@ -7066,6 +7599,287 @@ test "with the resolver cleared a dmabuf buffer is no longer attached (F56)" {
     // Client side: the protocol error took the connection down.
     try testing.expect(!ts.toClient());
 }
+
+/// Enable the harness's output the way main()'s onNewOutput does: an
+/// enable-only commit. A capture of a DISABLED output fails the frame
+/// (wlroots :508-511), so every screencopy test needs it up first.
+fn enableHarnessOutput(ts: *PolicyServer) !void {
+    var init_state = wayland.output.Output.State.init(ts.allocator);
+    defer init_state.deinit();
+    init_state.committed = wayland.output.Output.State.committed_enabled |
+        wayland.output.Output.State.committed_mode;
+    init_state.enabled = true;
+    init_state.mode = ts.output.?.mode;
+    try ts.output.?.commitState(&init_state);
+}
+
+// ---------------------------------------------------------------------------
+// zwlr_screencopy_v1 -> zwp_linux_dmabuf_v1 destination
+// ---------------------------------------------------------------------------
+//
+// main()'s screencopy dmabuf wiring is two statements: wireScreencopyDmabuf
+// once linux_dmabuf exists, then clearScreencopyDmabuf before the module
+// dies. Both are visible to a client only through the frames it captures:
+// with a destination installed a v3 frame advertises the `linux_dmabuf`
+// buffer type and accepts a dmabuf wl_buffer, without one the same copy is
+// the invalid_buffer protocol error it has always been.
+
+test "without a dmabuf destination a screencopy frame advertises only shm" {
+    // The default harness builds zwp_linux_dmabuf_v1 with NO device (the
+    // documented null-device state every non-DRM backend is in), so this is
+    // exactly what main() wires on a headless / raylib / nested run.
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    try enableHarnessOutput(ts);
+
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const entry = capture.find("zwlr_screencopy_manager_v1") orelse return error.GlobalMissing;
+    const manager = try registry.bind(entry.name, client.zwlr.ScreencopyManagerV1, 3);
+    try ts.pump();
+
+    var events: ClientScreencopyFrameEvents = .{};
+    const frame = try manager.captureOutput(0, ts.wl_output_client.?);
+    frame.setListener(*ClientScreencopyFrameEvents, ClientScreencopyFrameEvents.listener, &events);
+    try ts.pump();
+
+    try testing.expectEqual(@as(usize, 1), events.buffers);
+    try testing.expectEqual(@as(usize, 1), events.buffer_done);
+    try testing.expectEqual(@as(usize, 0), events.failed);
+    // No dmabuf type: the client was never told one exists, so a dmabuf
+    // buffer it sends stays the invalid_buffer protocol error it has
+    // always been — today's behaviour, unchanged.
+    try testing.expectEqual(@as(usize, 0), events.linux_dmabuf);
+}
+
+test "a screencopy dmabuf destination is wired only when the module has a device" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+
+    // The harness's LinuxDmabuf has no device, so the production wiring
+    // must leave the module shm-only rather than advertise a buffer type
+    // no client on this backend can produce.
+    try testing.expect(!ts.linux_dmabuf.?.advertised());
+    wireScreencopyDmabufInto(ts.screencopy.?, ts.linux_dmabuf.?, &ts.io, &ts.log_cfg);
+    try testing.expect(ts.screencopy.?.dmabuf == null);
+
+    // The frame a client gets is unchanged: one shm buffer type, no
+    // dmabuf, no failure.
+    try enableHarnessOutput(ts);
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const entry = capture.find("zwlr_screencopy_manager_v1") orelse return error.GlobalMissing;
+    const manager = try registry.bind(entry.name, client.zwlr.ScreencopyManagerV1, 3);
+    try ts.pump();
+    var events: ClientScreencopyFrameEvents = .{};
+    const frame = try manager.captureOutput(0, ts.wl_output_client.?);
+    frame.setListener(*ClientScreencopyFrameEvents, ClientScreencopyFrameEvents.listener, &events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), events.buffers);
+    try testing.expectEqual(@as(usize, 0), events.linux_dmabuf);
+    try testing.expectEqual(@as(usize, 0), events.failed);
+}
+
+test "clearing the screencopy dmabuf destination removes the advertised buffer type" {
+    // The teardown half: main() drops the destination before
+    // linux_dmabuf.deinit, so a `copy` arriving afterwards cannot
+    // dereference the freed module through `destination.ctx`. What that
+    // looks like from a client is the shm-only frame again.
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const sc = ts.screencopy.?;
+    try enableHarnessOutput(ts);
+
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const entry = capture.find("zwlr_screencopy_manager_v1") orelse return error.GlobalMissing;
+    const manager = try registry.bind(entry.name, client.zwlr.ScreencopyManagerV1, 3);
+    try ts.pump();
+
+    // The harness cannot allocate a real gbm bo (bo creation belongs to
+    // the dmabuf module and needs a real GBM device), so the destination
+    // is installed over the harness's inert module by hand. It is the SAME
+    // struct production installs — same ctx, same resolver, same write
+    // mapping — so the advertisement below is the one a wired server
+    // makes, and the clear that follows is the production statement.
+    sc.setDmabufDestination(.{
+        .ctx = ts.linux_dmabuf.?,
+        .resolve = resolveDmabufBuffer,
+        .begin_write = beginDmabufWrite,
+        .end_write = endDmabufWrite,
+    });
+
+    var with_destination: ClientScreencopyFrameEvents = .{};
+    const frame = try manager.captureOutput(0, ts.wl_output_client.?);
+    frame.setListener(*ClientScreencopyFrameEvents, ClientScreencopyFrameEvents.listener, &with_destination);
+    try ts.pump();
+    // A v3 client with a destination wired is told about BOTH buffer
+    // types: the shm one and the dmabuf one, with the fourcc the frame's
+    // own format maps to (wlr-screencopy-unstable-v1.xml:211-220).
+    try testing.expectEqual(@as(usize, 1), with_destination.buffers);
+    try testing.expectEqual(@as(usize, 1), with_destination.linux_dmabuf);
+    try testing.expectEqual(wayland.dmabuf.drm_format_argb8888, with_destination.linux_dmabuf_format);
+    try testing.expectEqual(@as(usize, 1), with_destination.buffer_done);
+    try testing.expectEqual(@as(usize, 0), with_destination.failed);
+
+    clearScreencopyDmabufInto(sc);
+    try testing.expect(sc.dmabuf == null);
+
+    var after_clear: ClientScreencopyFrameEvents = .{};
+    const frame2 = try manager.captureOutput(0, ts.wl_output_client.?);
+    frame2.setListener(*ClientScreencopyFrameEvents, ClientScreencopyFrameEvents.listener, &after_clear);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), after_clear.buffers);
+    try testing.expectEqual(@as(usize, 0), after_clear.linux_dmabuf);
+    try testing.expectEqual(@as(usize, 0), after_clear.failed);
+}
+
+// ---------------------------------------------------------------------------
+// M6: logind session + connector hotplug pollers
+// ---------------------------------------------------------------------------
+
+test "with no logind session the server arms no session poller and still runs" {
+    // The VM case: a DRM backend that never started has no session, no
+    // connector monitor and no card fd, so `extraFds` is all -1. The server
+    // must arm no poller for any of them — a PipePoll on -1 would report
+    // readable forever and spin the loop — and must keep serving the
+    // display, which is what "still starts" means here.
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const state = ts.state.?;
+
+    const drm = try drm_mod.DrmBackend.create(testing.allocator, &ts.io, &ts.log_cfg, "/nonexistent/card");
+    defer drm.destroy();
+    const data = drm_mod.DrmBackend.fromBackend(drm);
+    const extra = drm_mod.extraFds(data);
+    try testing.expectEqual(@as(std.posix.fd_t, -1), extra.session);
+    try testing.expectEqual(@as(std.posix.fd_t, -1), extra.hotplug);
+    // The dispatch functions are the no-ops that make the missing fds
+    // harmless: calling them on a session-less backend must not fault.
+    drm_mod.dispatchSession(data);
+    drm_mod.dispatchHotplug(drm, data);
+
+    // A real event loop, driven the way main() drives it. The three M6
+    // pollers are armed through the same helper main() uses, with the
+    // session-less backend's -1 fds: nothing is registered, so the loop
+    // has no descriptor to spin on.
+    var loop: zio.ev.Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+    const previous_loop = state.loop;
+    state.loop = &loop;
+    defer state.loop = previous_loop;
+
+    // The display poller, armed the way armEventLoop does it, so the loop
+    // has the ONE descriptor it should have on a session-less machine.
+    var timers: LoopTimers = undefined;
+    timers.display_poll = zio.ev.PipePoll.init(state.display.loopFd(), .read);
+    timers.display_poll.c.userdata = state;
+    timers.display_poll.c.callback = onDisplayReady;
+    timers.display_poll.c.flags.rearm = true;
+    loop.add(&timers.display_poll.c);
+
+    // The three new pollers go through the same helper main() uses, fed the
+    // -1 each subsystem answers with when the feature is missing (this
+    // backend's own session/hotplug pair, and the libinput monitor's -1 for
+    // an environment with no udevd). None is registered, so the loop has no
+    // descriptor to spin on.
+    var hotplug_poll: zio.ev.PipePoll = undefined;
+    var session_poll: zio.ev.PipePoll = undefined;
+    var connector_poll: zio.ev.PipePoll = undefined;
+    try testing.expect(!armFdPoll(&loop, &hotplug_poll, -1, state, onInputHotplugReady));
+    try testing.expect(!armFdPoll(&loop, &session_poll, extra.session, state, onDrmSessionReady));
+    try testing.expect(!armFdPoll(&loop, &connector_poll, extra.hotplug, state, onDrmHotplugReady));
+    // With nothing armed the poller slots stay at the "no fd" default the
+    // state records, and the loop has nothing spurious to wake on.
+    try testing.expectEqual(@as(c_int, -1), state.drm_session_poll_fd);
+    try testing.expectEqual(@as(c_int, -1), state.drm_hotplug_poll_fd);
+    try testing.expectEqual(@as(c_int, -1), state.input_hotplug_poll_fd);
+
+    // A client request queued before the loop runs: the display poller is
+    // the one that must fire, proving the loop is live and not wedged on a
+    // missing descriptor.
+    const wl_surface = try ts.wl_compositor.?.createSurface();
+    try testing.expect(wl_surface.getId() != 0);
+    if (ts.c_display.?.flush() != .SUCCESS) return error.FlushFailed;
+    var iterations: usize = 0;
+    while (iterations < 8) : (iterations += 1) {
+        try loop.poll(.zero);
+        if (ts.compositor.?.surfaces.items.len > 0) break;
+    }
+    // The compositor saw the client's create_surface: the display fd was
+    // dispatched, and the absent session fds cost nothing.
+    try testing.expectEqual(@as(usize, 1), ts.compositor.?.surfaces.items.len);
+}
+
+test "an output comes up on a machine with no logind session at all" {
+    // The other half of "still starts": the output the server drives is
+    // unaffected by the absence of a session, which is the VM this
+    // compositor runs in today. The enable commit is main()'s own, from
+    // onNewOutput.
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    try enableHarnessOutput(ts);
+
+    const out = ts.output.?;
+    try testing.expect(out.enabled);
+    try testing.expectEqual(@as(i32, 800), out.mode.width);
+    try testing.expectEqual(@as(i32, 600), out.mode.height);
+
+    // The frame signal fires on an enabled output (wlroots
+    // wlr_output_send_frame, output.c:833-837): the output is really up,
+    // not merely flagged enabled.
+    var recorder: FrameRecorder = .{};
+    defer if (recorder.listener.link.prev != null) recorder.listener.link.remove();
+    out.events.frame.add(&recorder.listener);
+    out.sendFrame();
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+}
+
+/// One `Output.events.frame` listener, for the test that watches a frame
+/// signal without standing up a whole backend.
+const FrameRecorder = struct {
+    listener: wire.Listener(*wayland.output.Output) = wire.Listener(*wayland.output.Output).init(onFrame),
+    count: usize = 0,
+
+    fn onFrame(listener: *wire.Listener(*wayland.output.Output), _: *wayland.output.Output) void {
+        const self: *FrameRecorder = @fieldParentPtr("listener", listener);
+        self.count += 1;
+    }
+};
+
+/// The clear half over the module alone, so a test can drop the
+/// destination without a whole ServerState behind it.
+fn clearScreencopyDmabufInto(sc: *wayland.screencopy.Screencopy) void {
+    sc.clearDmabufDestination();
+}
+
+/// What a client saw on its zwlr_screencopy_frame_v1: which buffer types
+/// the frame advertised, and how it ended.
+const ClientScreencopyFrameEvents = struct {
+    buffers: usize = 0,
+    linux_dmabuf: usize = 0,
+    buffer_done: usize = 0,
+    ready: usize = 0,
+    failed: usize = 0,
+    linux_dmabuf_format: u32 = 0,
+
+    fn listener(_: *client.zwlr.ScreencopyFrameV1, event: client.zwlr.ScreencopyFrameV1.Event, self: *ClientScreencopyFrameEvents) void {
+        switch (event) {
+            .buffer => self.buffers += 1,
+            .linux_dmabuf => |d| {
+                self.linux_dmabuf += 1;
+                self.linux_dmabuf_format = d.format;
+            },
+            .buffer_done => self.buffer_done += 1,
+            .ready => self.ready += 1,
+            .failed => self.failed += 1,
+            // flags and damage are the metadata a v4+ client gets
+            // alongside the copy; nothing here reads them.
+            .flags, .damage => {},
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Renderer selection (WAYLAND_RENDERER)

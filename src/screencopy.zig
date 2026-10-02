@@ -1,30 +1,73 @@
 //! zwlr_screencopy_manager_v1 (v3): output capture for clients.
 //!
-//! Shm-only compositor: on frame creation the manager sends the `buffer`
-//! event (format/width/height/stride) + `buffer_done`; the client sends
-//! `copy(buffer)` (or `copy_with_damage(buffer)`) with a matching
-//! wl_shm buffer. The copy itself is DEFERRED to the next output commit
-//! (wlroots wlr_screencopy_v1.c:434-435: the copy samples a presented
-//! frame, never a mid-render or stale one); the ready event then carries
-//! the commit timestamp. `copy_with_damage` sends the accumulated
-//! per-client output damage boxes (wlroots screencopy_damage_accumulate,
-//! :47-61) instead of a full rect.
+//! On frame creation the manager sends one event per buffer type it can
+//! copy into, then `buffer_done`: `buffer` (the wl_shm format, width,
+//! height and tight stride) always, and `linux_dmabuf` (the DRM fourcc,
+//! width, height) from v3 on when the compositor has a dmabuf import
+//! path wired in (wlr-screencopy-unstable-v1.xml:211-220). The client
+//! sends `copy(buffer)` (or `copy_with_damage(buffer)`) with a
+//! wl_buffer of one of those types. The copy itself is DEFERRED to the
+//! next output commit (wlroots wlr_screencopy_v1.c:434-435: the copy
+//! samples a presented frame, never a mid-render or stale one); the
+//! ready event then carries the commit timestamp. `copy_with_damage`
+//! sends the accumulated per-client output damage boxes (wlroots
+//! screencopy_damage_accumulate, :47-61) instead of a full rect.
 //!
 //! overlay_cursor: the compositor's framebuffer always has the cursor
 //! composited into it, so overlay_cursor=1 is naturally satisfied; for
 //! overlay_cursor=0 the copy source is the cursor-less base framebuffer
 //! (a get_framebuffer callback flag — wlroots locks software cursors for
 //! the opposite reason, :443-446).
+//! # The two destinations
+//! The shm destination is written through libwayland's own mapping
+//! (wire.shm.Buffer plus the impl's begin/end_data_ptr_access). A
+//! dmabuf destination is GPU memory, so it is written through the CPU
+//! write mapping in buffers/dmabuf.zig (`beginWrite`, gbm_bo_map) —
+//! a memcpy for a linear bo the driver maps in place, and a staged
+//! round trip for anything else. Both run the same row loop over a
+//! (pointer, stride) pair, so the two destinations receive identical
+//! bytes.
 //!
-//! The framebuffer is supplied by the compositor through a callback (the
-//! server's output framebuffers); the wl_output argument is validated
-//! through another callback (the server's wl_output module), and a
-//! request_frame callback wakes the renderer so the deferred copy gets
-//! its commit (wlroots wlr_output_update_needs_frame, :440). Captures of
-//! a disabled output fail at capture AND at copy (wlroots :508-511,
-//! :364-367).
+//! A dmabuf wl_buffer is only *accepted* when the frame advertised the
+//! type: a wl_buffer nobody owns is the invalid_buffer protocol error
+//! it always was, and a v1/v2 client was never told the type exists,
+//! so a dmabuf buffer it sends gets that same error (the event is
+//! since 3 — the advertisement and the acceptance are one gate,
+//! `FrameState.dmabuf_format`).
+//!
+//! A destination this compositor DID import but cannot copy into —
+//! wrong size, a format the frame did not advertise, a stride too
+//! small for the frame, a bo the driver will not map — FAILS THE
+//! FRAME instead. The protocol's answer to a copy that could not be
+//! made is the `failed` event (wlr-screencopy-unstable-v1.xml:122-123,
+//! "If the frame is successfully copied ... Otherwise, a failed event
+//! is sent"), and the failures this path can hit are not the client's
+//! bug the way a padded wl_shm stride is: half of them are properties
+//! of the driver's mapping rather than of anything the client sent.
+//! The wl_shm rejections are untouched and still post invalid_buffer.
+//!
+//! # Wiring the dmabuf destination
+//! `Screencopy.init` takes no dmabuf argument, so the server hands
+//! the path over afterwards with `setDmabufDestination`:
+//!
+//!     sc.setDmabufDestination(.{
+//!         .ctx = linux_dmabuf,
+//!         .resolve = resolveDmabufBuffer,
+//!         .begin_write = dmabuf_mod.beginWrite,
+//!         .end_write = dmabuf_mod.endWrite,
+//!     });
+//!
+//! where `resolveDmabufBuffer` is `LinuxDmabuf.fromResource` rewrapped
+//! with the ctx/fn pair (main.zig already has that adapter for the
+//! compositor's own DmabufResolver). Until it is called this module is
+//! shm-only, which is every backend without a GBM device.
+//!
+//! Teardown is the other half: call `clearDmabufDestination` before
+//! `linux_dmabuf.deinit()`, or a `copy` that arrives afterwards would
+//! dereference a freed module.
 //!
 //! Imports: utils/*, core/wire.zig, core/display.zig, buffers/shm.zig,
+//! buffers/dmabuf.zig (the fourccs and the CPU write mapping),
 //! renderer/pixman.zig, output/output.zig (sibling modules).
 
 const std = @import("std");
@@ -33,6 +76,7 @@ const wire = @import("./core/wire.zig");
 const display_mod = @import("./core/display.zig");
 const shm_mod = @import("./buffers/shm.zig");
 const buffer_mod = @import("./buffers/buffer.zig");
+const dmabuf_mod = @import("./buffers/dmabuf.zig");
 const pixman = @import("./renderer/pixman.zig");
 const geom = @import("./utils/geom.zig");
 const damage_mod = @import("./utils/damage.zig");
@@ -47,6 +91,27 @@ const CommitEvent = Output.CommitEvent;
 
 /// zwlr_screencopy_manager_v1 protocol version this library implements.
 pub const screencopy_version: u32 = 3;
+
+/// The compositor's dmabuf import path, as a screencopy destination
+/// needs it: resolve a client wl_buffer to the Buffer the compositor
+/// owns for it, then take CPU write access to that Buffer's pixels.
+/// Function pointers rather than a `?*linux_dmabuf.LinuxDmabuf`
+/// field, the same reason `compositor.DmabufResolver` is a pointer
+/// pair: shell/linux_dmabuf.zig imports modules that import this one,
+/// and a field would close the cycle.
+pub const DmabufDestination = struct {
+    /// The module that owns the buffers (`ctx` is that module).
+    ctx: *anyopaque,
+    /// The Buffer for a client wl_buffer this path created; null when
+    /// the resource is not one of them.
+    resolve: *const fn (ctx: *anyopaque, resource: *wire.Resource) ?*buffer_mod.Buffer,
+    /// Map a resolved buffer's pixels for writing. Null when the
+    /// driver will not map it, which fails the frame.
+    begin_write: *const fn (ctx: *anyopaque, buf: *buffer_mod.Buffer) ?dmabuf_mod.CpuWrite,
+    /// Give a mapping back, AFTER the writes: for a bo GBM staged,
+    /// this is where the pixels reach the bo.
+    end_write: *const fn (ctx: *anyopaque, buf: *buffer_mod.Buffer, map: dmabuf_mod.CpuWrite) void,
+};
 
 pub const Screencopy = struct {
     allocator: std.mem.Allocator,
@@ -72,6 +137,29 @@ pub const Screencopy = struct {
     /// is marked ready). The server reads this to time synth input
     /// against real client captures instead of frame counts.
     captures_served: u32 = 0,
+
+    /// The dmabuf copy destination, or null when the compositor has no
+    /// import path (no GBM device) or the server has not wired one.
+    /// A null here means a dmabuf wl_buffer is a buffer nobody owns,
+    /// which is the invalid_buffer protocol error it always was.
+    dmabuf: ?DmabufDestination = null,
+
+    /// Hand the compositor's dmabuf import path to this module. Called
+    /// after `init` (which takes no dmabuf argument) and before the
+    /// first frame is captured, because a frame decides from this
+    /// whether it advertises the dmabuf buffer type at all.
+    pub fn setDmabufDestination(self: *Screencopy, destination: DmabufDestination) void {
+        self.dmabuf = destination;
+        log.info("screencopy: dmabuf copy destinations enabled", self.io, self.log_cfg, "screencopy", .{});
+    }
+
+    /// Drop the dmabuf destination. The server calls this BEFORE the
+    /// module that owns the buffers is destroyed: request handlers
+    /// dereference `destination.ctx`, and a client can still send a
+    /// `copy` after an unrelated module was torn down.
+    pub fn clearDmabufDestination(self: *Screencopy) void {
+        self.dmabuf = null;
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -108,7 +196,7 @@ pub const Screencopy = struct {
             screencopy_version,
             self,
         );
-        log.debug("screencopy manager registered (shm only)", io, log_cfg, "screencopy", .{});
+        log.debug("screencopy manager registered", io, log_cfg, "screencopy", .{});
         return self;
     }
 
@@ -165,10 +253,21 @@ const FrameState = struct {
     /// copy_with_damage requested: the ready event carries accumulated
     /// per-client damage boxes.
     with_damage: bool = false,
-    /// The client's validated shm buffer; null until `copy` is
+    /// The client's validated copy destination; null until `copy` is
     /// requested. Doubles as the already-used guard; cleared once the
     /// frame is served or failed.
     buffer: ?*buffer_mod.Buffer = null,
+    /// True when `buffer` is a dmabuf import rather than a wl_shm
+    /// buffer, i.e. the copy reaches its pixels through the import
+    /// path's CPU write mapping instead of libwayland's.
+    destination_dmabuf: bool = false,
+    /// The DRM fourcc a dmabuf destination must have, or null when
+    /// this frame did NOT advertise the dmabuf buffer type (no import
+    /// path, or a client too old to be told about one). The
+    /// advertisement and the acceptance are the same gate: a
+    /// wl_buffer this compositor owns but the client was never told it
+    /// may send is a buffer this frame does not accept.
+    dmabuf_format: ?u32 = null,
     /// True once ready/failed was sent: the frame no longer reacts to
     /// output commits or copy requests. The RESOURCE stays alive — the
     /// client owns its lifetime and destroys it after ready/failed
@@ -326,6 +425,18 @@ fn capture(
         return;
     };
 
+    // The dmabuf buffer type, advertised only when this compositor can
+    // actually copy into one AND the client is new enough to be told
+    // (the event is since 3, wlr-screencopy-unstable-v1.xml:211). A
+    // frame that does not advertise it also does not accept one: a
+    // client cannot have allocated a destination in a format it was
+    // never given, so refusing that buffer tells it the truth.
+    const dmabuf_format: ?u32 = if (sc.dmabuf != null and
+        manager.getVersion() >= server.zwlr.ScreencopyFrameV1.linux_dmabuf_since_version)
+        dmabufFormatFor(src_fb.format)
+    else
+        null;
+
     // The frame inherits the manager resource's version (opcode-gated
     // events below must not leak to older clients).
     const frame = server.zwlr.ScreencopyFrameV1.create(cli, manager.getVersion(), frame_id) catch {
@@ -350,6 +461,7 @@ fn capture(
         .overlay_cursor = overlay_cursor != 0,
         .shm_format = @intCast(@intFromEnum(fmt)),
         .shm_stride = shm_stride,
+        .dmabuf_format = dmabuf_format,
         .commit_listener = wire.Listener(*CommitEvent).init(onFrameOutputCommit),
         .output_destroy_listener = wire.Listener(*Output).init(onFrameOutputDestroy),
     };
@@ -361,6 +473,12 @@ fn capture(
     client_state.ref += 1;
 
     frame.sendBuffer(fmt, @intCast(rw), @intCast(rh), @intCast(shm_stride));
+    if (dmabuf_format) |fourcc| {
+        // Before buffer_done and after the shm event: the XML sends one
+        // event per supported buffer type and then closes the list
+        // (:87-91, :222-228).
+        frame.sendLinuxDmabuf(fourcc, @intCast(rw), @intCast(rh));
+    }
     if (frame.getVersion() >= 3) frame.sendBufferDone();
 }
 
@@ -402,35 +520,29 @@ fn copyRequest(
     }
     state.with_damage = with_damage;
 
-    // The client's wl_buffer must be a shm buffer of the advertised
-    // size, format and exact stride (wlroots :381-421; the stride
-    // rejection is :418-421 — a padded client buffer must not be
-    // silently mis-copied row by row).
-    const buf = state.screencopy.shm.fromResource(state.screencopy.allocator, @ptrCast(buffer)) catch {
-        frame.postError(.invalid_buffer, "buffer is not a wl_shm buffer");
-        return;
+    const buf = switch (resolveDestination(state, buffer)) {
+        .none => {
+            // A buffer no factory of ours produced: the same
+            // invalid_buffer the shm-only compositor always posted.
+            frame.postError(.invalid_buffer, "buffer is not a wl_shm or a dmabuf buffer");
+            return;
+        },
+        .shm => |shm_buf| resolved: {
+            if (!validateShm(frame, state, shm_buf)) return;
+            break :resolved shm_buf;
+        },
+        .dmabuf => |dmabuf_buf| resolved: {
+            if (!validateDmabuf(state, dmabuf_buf)) {
+                // A dmabuf destination this compositor cannot copy
+                // into fails the frame instead of erroring the client
+                // (module header, "The two destinations").
+                frameFailed(state);
+                return;
+            }
+            state.destination_dmabuf = true;
+            break :resolved dmabuf_buf;
+        },
     };
-    if (buf.width != state.width or buf.height != state.height) {
-        frame.postError(.invalid_buffer, "buffer size does not match the frame");
-        return;
-    }
-    const get_shm = buf.impl.get_shm orelse {
-        frame.postError(.invalid_buffer, "buffer has no shm data");
-        return;
-    };
-    const shm = get_shm(buf) orelse {
-        frame.postError(.invalid_buffer, "buffer has no shm data");
-        return;
-    };
-    if (wire.shm.Buffer.getFormat(shm) != state.shm_format) {
-        frame.postError(.invalid_buffer, "buffer format does not match the frame");
-        return;
-    }
-    const stride = wire.shm.Buffer.getStride(shm);
-    if (stride <= 0 or stride != state.shm_stride) {
-        frame.postError(.invalid_buffer, "buffer stride does not match the frame");
-        return;
-    }
     // Hold the buffer until the copy happens (the client may not reuse
     // it before wl_buffer.release, which fires on the unlock).
     buf.lock() catch {
@@ -452,6 +564,97 @@ fn copyRequest(
     state.output.events.commit.add(&state.commit_listener);
     state.output.events.destroy.add(&state.output_destroy_listener);
     state.screencopy.request_frame(state.screencopy.request_ctx);
+}
+
+/// The client's copy destination, resolved from the wl_buffer it sent.
+/// `none` is a buffer this compositor does not own.
+const Destination = union(enum) {
+    shm: *buffer_mod.Buffer,
+    dmabuf: *buffer_mod.Buffer,
+    none,
+};
+
+/// Which Buffer receives the copy. A wl_buffer comes from exactly one
+/// factory, so the two registries never overlap: the import is asked
+/// first because it is the rarer answer, and a null from it falls
+/// through to the shm registry every wl_shm client needs.
+fn resolveDestination(state: *FrameState, buffer: *server.wl.Buffer) Destination {
+    // Only when this frame advertised the type — see
+    // FrameState.dmabuf_format.
+    if (state.dmabuf_format != null) {
+        if (state.screencopy.dmabuf) |destination| {
+            if (destination.resolve(destination.ctx, @ptrCast(buffer))) |buf| {
+                return .{ .dmabuf = buf };
+            }
+        }
+    }
+    const buf = state.screencopy.shm.fromResource(state.screencopy.allocator, @ptrCast(buffer)) catch {
+        return .none;
+    };
+    return .{ .shm = buf };
+}
+
+/// The wl_shm destination must be of the advertised size, format and
+/// exact stride (wlroots :381-421; the stride rejection is :418-421 —
+/// a padded client buffer must not be silently mis-copied row by row).
+/// A rejection posts invalid_buffer and kills the client, as wlroots
+/// does: every check here is a claim the client itself made and cannot
+/// have got wrong by accident.
+fn validateShm(
+    frame: *server.zwlr.ScreencopyFrameV1,
+    state: *FrameState,
+    buf: *buffer_mod.Buffer,
+) bool {
+    if (buf.width != state.width or buf.height != state.height) {
+        frame.postError(.invalid_buffer, "buffer size does not match the frame");
+        return false;
+    }
+    const get_shm = buf.impl.get_shm orelse {
+        frame.postError(.invalid_buffer, "buffer has no shm data");
+        return false;
+    };
+    const shm = get_shm(buf) orelse {
+        frame.postError(.invalid_buffer, "buffer has no shm data");
+        return false;
+    };
+    if (wire.shm.Buffer.getFormat(shm) != state.shm_format) {
+        frame.postError(.invalid_buffer, "buffer format does not match the frame");
+        return false;
+    }
+    const stride = wire.shm.Buffer.getStride(shm);
+    if (stride <= 0 or stride != state.shm_stride) {
+        frame.postError(.invalid_buffer, "buffer stride does not match the frame");
+        return false;
+    }
+    return true;
+}
+
+/// The dmabuf destination, checked against what this frame
+/// advertised. False FAILS THE FRAME; it never kills the client.
+///
+/// The modifier is deliberately not checked: a client may import a
+/// tiled destination (the linux_dmabuf global advertises whatever the
+/// device takes) and GBM stages it, which costs a driver round trip
+/// and not correctness. The stride that matters is the one the copy
+/// walks with, and that is checked in copyPixelsDmabuf, against the
+/// mapping the driver actually gave back.
+fn validateDmabuf(state: *FrameState, buf: *buffer_mod.Buffer) bool {
+    if (buf.width != state.width or buf.height != state.height) return false;
+    const get_dmabuf = buf.impl.get_dmabuf orelse return false;
+    const attrs: *dmabuf_mod.Attributes = @ptrCast(@alignCast(get_dmabuf(buf) orelse return false));
+    // The fourcc from the `linux_dmabuf` event: the client allocated
+    // this buffer to receive exactly those bytes, in that layout.
+    if (attrs.format != state.dmabuf_format.?) return false;
+    // The fourccs this advertises are single-plane
+    // (gbm_device_get_format_modifier_plane_count is 1 for both), so a
+    // second plane does not describe the image the copy is about to
+    // write, whatever the client claimed.
+    if (attrs.n_planes != 1) return false;
+    // A row must have room for the frame's width in 4-byte pixels. A
+    // smaller claimed stride makes the row loop walk into the next
+    // row's pixels, and past the end of the object on the last one.
+    if (attrs.planes[0].stride < rowLen(state)) return false;
+    return true;
 }
 
 /// The deferred copy: runs inside the output's commit signal, after the
@@ -552,12 +755,24 @@ fn finishFrame(state: *FrameState) void {
         if (b.n_locks > 0) b.unlock();
     }
     state.buffer = null;
+    // Cleared with the buffer it describes: a frame that is finished
+    // is never copied into again, and a stale flag must not outlive
+    // the Buffer it was decided from.
+    state.destination_dmabuf = false;
     state.finished = true;
 }
 
-/// Row-wise copy of the region into the client's shm buffer. Both sides
-/// are the advertised format (ARGB8888 family).
+/// Copy the region into whichever destination the client sent.
 fn copyPixels(state: *FrameState, src: *pixman.Framebuffer) bool {
+    return if (state.destination_dmabuf)
+        copyPixelsDmabuf(state, src)
+    else
+        copyPixelsShm(state, src);
+}
+
+/// Row-wise copy of the region into the client's wl_shm buffer, through
+/// libwayland's own mapping.
+fn copyPixelsShm(state: *FrameState, src: *pixman.Framebuffer) bool {
     const buf = state.buffer orelse return false;
     const get_shm = buf.impl.get_shm orelse return false;
     const shm = get_shm(buf) orelse return false;
@@ -567,18 +782,55 @@ fn copyPixels(state: *FrameState, src: *pixman.Framebuffer) bool {
     defer end(buf);
     const dst = dst_ptr orelse return false;
     // The stride was validated to equal the advertised tight stride.
-    const dst_stride: usize = @intCast(wire.shm.Buffer.getStride(shm));
+    copyRegion(state, src, dst, @intCast(wire.shm.Buffer.getStride(shm)));
+    return true;
+}
+
+/// Row-wise copy into the client's dmabuf, through the import path's
+/// CPU write mapping (gbm_bo_map; buffers/dmabuf.zig beginWrite).
+/// False fails the frame, and only for the two things this mapping can
+/// tell us that validation could not: the driver refused to map the
+/// bo, or it handed back a pitch too narrow for a row. The second
+/// check is why the copy waits for the mapping — the client's claimed
+/// stride is not the pitch GBM mapped.
+fn copyPixelsDmabuf(state: *FrameState, src: *pixman.Framebuffer) bool {
+    const buf = state.buffer orelse return false;
+    const destination = state.screencopy.dmabuf orelse return false;
+    const map = destination.begin_write(destination.ctx, buf) orelse return false;
+    // A staged mapping is written back here, so this must run AFTER the
+    // copy (and must run at all: skipping it loses the pixels).
+    defer destination.end_write(destination.ctx, buf, map);
+    if (map.stride < rowLen(state)) return false;
+    copyRegion(state, src, map.ptr, map.stride);
+    return true;
+}
+
+/// Bytes in one row of the capture region. Every format this frame
+/// advertises is 4 bytes per pixel, so a row is the frame width times
+/// four. The product is done in usize: the frame is already on the
+/// wire with that width, and an i32 overflow here would trap a copy
+/// the protocol accepted.
+fn rowLen(state: *const FrameState) usize {
+    return @as(usize, @intCast(state.width)) * 4;
+}
+
+/// The row loop both destinations share: rows are `stride` bytes apart
+/// on each side and every format involved is the same ARGB8888 layout
+/// (wl_shm's ARGB8888 and DRM_FORMAT_ARGB8888 are both a native 32-bit
+/// 0xAARRGGBB, drm_fourcc.h fourcc_code('A','R','2','4')), so a row is
+/// a memcpy with no conversion. That shared loop is what makes the two
+/// destinations receive identical bytes.
+fn copyRegion(state: *const FrameState, src: *pixman.Framebuffer, dst: [*]u8, stride: usize) void {
+    const row_len = rowLen(state);
     const src_stride: usize = @intCast(src.stride);
     const src_offset: usize = @as(usize, @intCast(state.y)) * src_stride +
         @as(usize, @intCast(state.x)) * 4;
-    const row_len: usize = @intCast(state.width * 4);
     var row: usize = 0;
     while (row < @as(usize, @intCast(state.height))) : (row += 1) {
         const src_row = src.data[src_offset + row * src_stride ..][0..row_len];
-        const dst_row = dst[row * dst_stride ..][0..row_len];
+        const dst_row = dst[row * stride ..][0..row_len];
         @memcpy(dst_row, src_row);
     }
-    return true;
 }
 
 /// Send the accumulated damage boxes and clear the accumulator (wlroots
@@ -726,6 +978,22 @@ fn scaleCoord(v: i32, scale: f32) i32 {
     return std.math.lossyCast(i32, @as(f64, v) * @as(f64, scale));
 }
 
+/// The DRM fourcc a `linux_dmabuf` destination for a framebuffer of
+/// this read format must use, or null when no dmabuf destination can
+/// carry those bytes. The two formats a frame can advertise are the
+/// same 32-bit 0xAARRGGBB value in both spellings — wl_shm's
+/// ARGB8888 (wayland.xml) and pixman's a8r8g8b8 are one native-endian
+/// word — so the copy stays a row memcpy and the two destinations
+/// agree byte for byte. A read format with no 4-byte dmabuf twin
+/// (there is none today) would have to fail the frame instead of
+/// converting, and this is where that decision is made.
+fn dmabufFormatFor(shm_format: u32) ?u32 {
+    return switch (shm_format) {
+        pixman.format_argb8888 => dmabuf_mod.drm_format_argb8888,
+        else => null,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -735,6 +1003,10 @@ const posix = std.posix;
 const backend_mod = @import("./backend/backend.zig");
 const wl_output_mod = @import("./output/wl_output.zig");
 const test_pump = @import("./utils/test_pump.zig");
+
+/// libwayland-client >= 1.18: the code and object of the last protocol
+/// error, so a client-killing test can pin WHICH object answered.
+extern fn wl_display_get_protocol_error(display: *client.wl.Display, interface: ?*anyopaque, id: ?*u32) c_int;
 
 const FakeBackendImpl = struct {
     fn start(_: *backend_mod.Backend) error{BackendFailed}!void {}
@@ -800,6 +1072,14 @@ const FrameEvents = struct {
     failed_count: usize = 0,
     damage_count: usize = 0,
     buffer_done_count: usize = 0,
+    /// dmabuf buffer types advertised. Zero unless the compositor has
+    /// an import path AND the frame's client is new enough to be told
+    /// (the event is since 3) — the same gate the copy request uses.
+    linux_dmabuf_count: usize = 0,
+    /// The fourcc, width and height of the last `linux_dmabuf` event.
+    linux_dmabuf_format: u32 = 0,
+    linux_dmabuf_width: u32 = 0,
+    linux_dmabuf_height: u32 = 0,
     damage_x: u32 = 0,
     damage_y: u32 = 0,
     damage_width: u32 = 0,
@@ -824,11 +1104,124 @@ const FrameEvents = struct {
                 data.damage_height = d.height;
             },
             .buffer_done => data.buffer_done_count += 1,
-            // The compositor is shm-only: linux_dmabuf is never sent.
-            .linux_dmabuf => data.buffer_done_count += 1,
+            // Since 3, and only when this compositor can copy into a
+            // dmabuf: counted apart from buffer_done so a test can
+            // assert the buffer type was (or was not) offered.
+            .linux_dmabuf => |d| {
+                data.linux_dmabuf_count += 1;
+                data.linux_dmabuf_format = d.format;
+                data.linux_dmabuf_width = d.width;
+                data.linux_dmabuf_height = d.height;
+            },
         }
     }
 };
+
+/// A CPU-backed stand-in for an imported dmabuf: the Buffer the copy
+/// path resolves for a client wl_buffer, plus the write access the copy
+/// takes on it. Its impl is deliberately the same shape as a real
+/// import — a `get_dmabuf` and nothing else, no shm handle and no
+/// begin/end_data_ptr_access (buffers/dmabuf.zig, dmabuf_impl) — so
+/// code that reached for a wl_shm pointer or a CPU data pointer fails
+/// here exactly as it would on hardware.
+///
+/// The write path is staged, the way a bo GBM cannot map in place: the
+/// copy writes `staging` and `endWrite` moves the bytes into `pixels`.
+/// A copy that skipped endWrite therefore loses its pixels, which is
+/// the bug the staging exists to catch.
+const FakeDmabuf = struct {
+    allocator: std.mem.Allocator,
+    /// What the compositor knows about the "import": the geometry and
+    /// the layout the copy path validates the destination against.
+    attrs: dmabuf_mod.Attributes,
+    /// The destination image. Only endWrite writes it.
+    pixels: []u8,
+    stride: usize,
+    /// The image a mapping hands out.
+    staging: []u8,
+    /// Mappings currently open. A served frame leaves this at zero.
+    open: usize = 0,
+    /// Mappings ever handed out. Zero means the copy never reached the
+    /// destination: a rejected buffer is refused before this point and
+    /// must never be mapped.
+    maps: usize = 0,
+    // SAFETY: assigned from Buffer.init at construction, before the
+    // Buffer is reachable from anywhere.
+    buf: *buffer_mod.Buffer,
+};
+
+fn fakeDmabufGetDmabuf(buf: *buffer_mod.Buffer) ?*anyopaque {
+    const fake: *FakeDmabuf = @ptrCast(@alignCast(buf.data));
+    return @ptrCast(&fake.attrs);
+}
+
+fn fakeDmabufDestroy(allocator: std.mem.Allocator, data: *anyopaque) void {
+    _ = allocator;
+    const fake: *FakeDmabuf = @ptrCast(@alignCast(data));
+    fake.allocator.free(fake.pixels);
+    fake.allocator.free(fake.staging);
+    fake.allocator.destroy(fake);
+}
+
+const fake_dmabuf_impl: buffer_mod.Impl = .{
+    .get_dmabuf = fakeDmabufGetDmabuf,
+    .get_shm = null,
+    .begin_data_ptr_access = null,
+    .end_data_ptr_access = null,
+    .destroy = fakeDmabufDestroy,
+};
+
+/// `LinuxDmabuf.fromResource` in the ctx/fn pair a screencopy
+/// destination takes, over the harness's own one-entry table.
+fn fakeDmabufResolve(ctx: *anyopaque, resource: *wire.Resource) ?*buffer_mod.Buffer {
+    const ts: *TestServer = @ptrCast(@alignCast(ctx));
+    if (ts.fake_dmabuf_resource != resource) return null;
+    const fake = ts.fake_dmabuf orelse return null;
+    return fake.buf;
+}
+
+fn fakeDmabufBeginWrite(ctx: *anyopaque, buf: *buffer_mod.Buffer) ?dmabuf_mod.CpuWrite {
+    _ = ctx;
+    const fake: *FakeDmabuf = @ptrCast(@alignCast(buf.data));
+    @memcpy(fake.staging, fake.pixels);
+    fake.open += 1;
+    fake.maps += 1;
+    // The token is the double itself: endWrite re-derives it from the
+    // Buffer, and CpuWrite only has to carry it unchanged.
+    const token: ?*anyopaque = @ptrCast(fake);
+    return .{ .ptr = fake.staging.ptr, .stride = fake.stride, .map_data = token };
+}
+
+fn fakeDmabufEndWrite(ctx: *anyopaque, buf: *buffer_mod.Buffer, map: dmabuf_mod.CpuWrite) void {
+    _ = ctx;
+    const fake: *FakeDmabuf = @ptrCast(@alignCast(buf.data));
+    // A real write-back takes what the caller wrote through the
+    // mapping, not the image the mapping started from.
+    @memcpy(fake.pixels, map.ptr[0..fake.pixels.len]);
+    fake.open -= 1;
+}
+
+/// The capture source's pattern: opaque, and a distinct value for
+/// every (x, y) of the 64x64 test frame.
+fn patternPixel(x: u32, y: u32) u32 {
+    return 0xFF00_0000 | (y << 16) | (x << 8);
+}
+
+/// Fill the capture source with `patternPixel`, so a copy that copied
+/// nothing, the wrong region, or the wrong row cannot pass a
+/// comparison against it.
+fn fillCapturePattern(fb: *pixman.Framebuffer) void {
+    const stride: usize = @intCast(fb.stride);
+    var y: usize = 0;
+    while (y < @as(usize, @intCast(fb.height))) : (y += 1) {
+        var x: usize = 0;
+        while (x < @as(usize, @intCast(fb.width))) : (x += 1) {
+            const at = y * stride + x * 4;
+            const pixel = patternPixel(@intCast(x), @intCast(y));
+            std.mem.writeInt(u32, fb.data[at..][0..4], pixel, .little);
+        }
+    }
+}
 
 /// A compositor + shm + output + screencopy manager + in-memory client, for
 /// wire roundtrips of the capture flow at a chosen manager version.
@@ -858,6 +1251,16 @@ const TestServer = struct {
     /// retained so the buffer stays valid until the frame is ready.
     shm_pool: ?*client.wl.ShmPool = null,
     buffer: ?*client.wl.Buffer = null,
+    /// The object behind the shm pool, retained (not closed after the
+    /// pool request) so a test can read the copied pixels back through
+    /// its own mapping. libwayland holds a dup, so the pool stays valid
+    /// either way; only the test's readability needs this one.
+    shm_fd: std.posix.fd_t = -1,
+    /// The CPU-backed dmabuf import the copy path resolves, and the
+    /// server-side resource the client's copy request names. Both null
+    /// until createDmabufBuffer runs.
+    fake_dmabuf: ?*FakeDmabuf = null,
+    fake_dmabuf_resource: ?*wire.Resource = null,
     /// Requests to wake the renderer (no-op in tests).
     frame_requests: usize = 0,
     /// Dummy listener data for the wl_output proxy.
@@ -998,6 +1401,14 @@ const TestServer = struct {
     fn ignoreOutputEvents(_: *client.wl.Output, _: client.wl.Output.Event, _: *u8) void {}
 
     fn deinit(ts: *TestServer) void {
+        // The fabricated dmabuf import first: its server-side resource
+        // belongs to the client that is about to go, and the wrapper is
+        // ours.
+        ts.destroyFakeDmabuf();
+        if (ts.shm_fd >= 0) {
+            _ = std.os.linux.close(ts.shm_fd);
+            ts.shm_fd = -1;
+        }
         // Tear the client down first: its resource destroy handlers (the
         // frame's frameDestroy) must run while the screencopy module lives.
         if (ts.c_display) |d| d.disconnect();
@@ -1028,20 +1439,153 @@ const TestServer = struct {
         const width: i32 = 64;
         const height: i32 = 64;
         const fd = try std.posix.memfd_create("screencopy-test-buffer", std.os.linux.MFD.CLOEXEC);
-        defer _ = std.os.linux.close(fd);
+        errdefer _ = std.os.linux.close(fd);
         const pool_size = @as(usize, @intCast(stride)) * @as(usize, @intCast(height));
         const rc = std.os.linux.ftruncate(fd, @intCast(pool_size));
         if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
         ts.shm_pool = try ts.wl_shm.?.createPool(fd, @intCast(pool_size));
         ts.buffer = try ts.shm_pool.?.createBuffer(0, width, height, stride, .argb8888);
+        // The object is retained instead of closed: libwayland holds a
+        // dup for the pool, so the destination stays valid either way,
+        // but only this descriptor lets a test read the pixels back.
+        ts.retainShmFd(fd);
         return ts.buffer.?;
+    }
+
+    /// The shm destination's pixels, read through the pool object's own
+    /// descriptor: the very bytes wl_shm handed the compositor.
+    fn readShmPixels(ts: *TestServer, stride: usize, height: usize) ![]u8 {
+        if (ts.shm_fd < 0) return error.NoShmBuffer;
+        const map = std.posix.mmap(
+            null,
+            stride * height,
+            .{ .READ = true, .WRITE = false },
+            .{ .TYPE = .SHARED },
+            ts.shm_fd,
+            0,
+        ) catch return error.ShmMapFailed;
+        defer std.posix.munmap(map);
+        return ts.allocator.dupe(u8, map);
+    }
+
+    fn retainShmFd(ts: *TestServer, fd: std.posix.fd_t) void {
+        // The tests that create two shm buffers (copy_with_damage) must
+        // not leak the first object.
+        if (ts.shm_fd >= 0) _ = std.os.linux.close(ts.shm_fd);
+        ts.shm_fd = fd;
+    }
+
+    /// Hand the compositor's dmabuf import path to the screencopy
+    /// module, in the shape src/server/main.zig will: the resolver is
+    /// the harness's one-entry table, the write access is the staged
+    /// double's. After this the module advertises the dmabuf buffer
+    /// type to v3 clients.
+    fn enableDmabufDestination(ts: *TestServer) void {
+        ts.sc.?.setDmabufDestination(.{
+            .ctx = ts,
+            .resolve = fakeDmabufResolve,
+            .begin_write = fakeDmabufBeginWrite,
+            .end_write = fakeDmabufEndWrite,
+        });
+    }
+
+    /// A wl_buffer the harness owns as a dmabuf import: a client proxy
+    /// for an object id no wl_shm pool made, the server-side resource
+    /// of that exact id, and the CPU-backed import the resolver hands
+    /// back for it.
+    ///
+    /// The zwp_linux_dmabuf_v1 factory needs a live GBM device, which a
+    /// test may not have, so the object is fabricated on both sides at
+    /// one id — the same trick buffers/shm.zig's resource test uses.
+    /// Any previous double is released first, which is only safe
+    /// because a frame that rejected its buffer holds no reference to
+    /// it.
+    fn createDmabufBuffer(ts: *TestServer, width: i32, height: i32, format: u32) !*client.wl.Buffer {
+        ts.destroyFakeDmabuf();
+        const stride: usize = @as(usize, @intCast(width)) * 4;
+        const size = stride * @as(usize, @intCast(height));
+        const fake = try ts.allocator.create(FakeDmabuf);
+        errdefer ts.allocator.destroy(fake);
+        const pixels = try ts.allocator.alloc(u8, size);
+        errdefer ts.allocator.free(pixels);
+        const staging = try ts.allocator.alloc(u8, size);
+        errdefer ts.allocator.free(staging);
+        @memset(pixels, 0);
+        @memset(staging, 0);
+        fake.* = .{
+            .allocator = ts.allocator,
+            .attrs = .{
+                .width = width,
+                .height = height,
+                .format = format,
+                .modifier = dmabuf_mod.drm_format_mod_linear,
+                .n_planes = 1,
+            },
+            .pixels = pixels,
+            .stride = stride,
+            .staging = staging,
+            // SAFETY: assigned from Buffer.init below, before the
+            // Buffer is reachable from anywhere.
+            .buf = undefined,
+        };
+        // No fd: the import is CPU-backed, and closePlanes on a set
+        // whose fds are all -1 is a no-op (buffers/dmabuf.zig).
+        fake.attrs.planes[0] = .{ .fd = -1, .offset = 0, .stride = @intCast(stride) };
+        const buf = try buffer_mod.Buffer.init(ts.allocator, &fake_dmabuf_impl, fake, width, height);
+        fake.buf = buf;
+        ts.fake_dmabuf = fake;
+
+        // Client side: a fresh object id for the copy request to carry.
+        const proxy = try client.wl.Proxy.create(@ptrCast(ts.c_display.?), client.wl.Buffer.interface);
+        // Server side: the resource of that exact id, which the copy
+        // request resolves to and the resolver answers for.
+        ts.fake_dmabuf_resource = wire.Resource.create(
+            ts.client.?,
+            wire.wl.Buffer,
+            1,
+            proxy.getId(),
+        ) catch return error.ResourceCreateFailed;
+        return @ptrCast(proxy);
+    }
+
+    /// Release the fabricated import: the server-side resource first
+    /// (it belongs to the client), then the wrapper.
+    ///
+    /// The resource is the CLIENT's object, not the harness's: it was
+    /// created with `wl_resource_create` on `ts.client` and lives in
+    /// that client's object map. It only reaches this function while
+    /// the client still owns it — `forgetClient` drops the handle
+    /// otherwise — so `resource.destroy()` never touches a client the
+    /// server has already destroyed.
+    fn destroyFakeDmabuf(ts: *TestServer) void {
+        if (ts.fake_dmabuf_resource) |resource| {
+            resource.destroy();
+            ts.fake_dmabuf_resource = null;
+        }
+        if (ts.fake_dmabuf) |fake| {
+            buffer_mod.Buffer.destroy(fake.buf);
+            ts.fake_dmabuf = null;
+        }
+    }
+
+    /// The server destroyed this client: a protocol error kills it
+    /// inside the server's own request dispatch
+    /// (wl_client_connection_data, wayland-server.c:498-500), and
+    /// `wl_client_destroy` frees every resource the client owned
+    /// (wayland-server.c:1025) — the fabricated dmabuf buffer's
+    /// server-side resource among them. Both handles go at once: the
+    /// client is dangling, and destroying that resource again would be
+    /// a use-after-free, so nothing may hold it past this point.
+    fn forgetClient(ts: *TestServer) void {
+        ts.client = null;
+        ts.fake_dmabuf_resource = null;
     }
 
     /// One shared roundtrip (utils/test_pump.zig) plus this harness's own
     /// client-side poll and dispatch, so the server's replies reach the
     /// test's listeners before the assertions run. A dispatch failure
-    /// nulls the client: the server already destroyed it, so deinit must
-    /// not destroy it again.
+    /// means the server already destroyed the client: `forgetClient`
+    /// drops it, so deinit must not destroy it again.
     fn pump(ts: *TestServer) !void {
         try test_pump.roundtrip(ts.c_display, ts.display.?, 0);
         var fds = [_]posix.pollfd{
@@ -1049,9 +1593,7 @@ const TestServer = struct {
         };
         if (try posix.poll(&fds, 0) > 0) {
             if (ts.c_display.?.dispatch() != .SUCCESS) {
-                // Protocol error or disconnect: the server has already
-                // destroyed its client (dangling) — forget it for deinit.
-                ts.client = null;
+                ts.forgetClient();
                 return error.ClientDispatchFailed;
             }
         }
@@ -1298,4 +1840,161 @@ test "padded client stride is rejected as invalid_buffer" {
     const padded = try ts.createBufferWithStride(64 * 4 + 4);
     frame.copy(padded);
     try testing.expectError(error.ClientDispatchFailed, ts.pump());
+}
+
+test "a dmabuf copy destination receives the same pixels as an shm one" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    ts.enableDmabufDestination();
+    // A pattern the copy cannot fake: every pixel differs from its
+    // neighbours and from zero, so an unwritten destination, the wrong
+    // region or a copy that never happened all fail the comparison.
+    fillCapturePattern(ts.fb.?);
+
+    // The shm reference: the same source and the same region, through
+    // the path that already worked. The dmabuf destination is wired
+    // in, so this also proves the two registries do not shadow each
+    // other.
+    const shm_frame = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var shm_events: FrameEvents = .{};
+    shm_frame.setListener(*FrameEvents, FrameEvents.listener, &shm_events);
+    try ts.pump();
+    // v3 with an import path: both buffer types are on the table, and
+    // the dmabuf one names the source's fourcc and the frame's size.
+    try testing.expectEqual(@as(usize, 1), shm_events.buffer_count);
+    try testing.expectEqual(@as(usize, 1), shm_events.linux_dmabuf_count);
+    try testing.expectEqual(dmabuf_mod.drm_format_argb8888, shm_events.linux_dmabuf_format);
+    try testing.expectEqual(@as(u32, 64), shm_events.linux_dmabuf_width);
+    try testing.expectEqual(@as(u32, 64), shm_events.linux_dmabuf_height);
+    try testing.expectEqual(@as(usize, 1), shm_events.buffer_done_count);
+
+    const shm_buffer = try ts.createBuffer();
+    shm_frame.copy(shm_buffer);
+    try ts.pump();
+    try commitOutput(ts);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), shm_events.ready_count);
+    try testing.expectEqual(@as(usize, 0), shm_events.failed_count);
+    const shm_pixels = try ts.readShmPixels(64 * 4, 64);
+    defer allocator.free(shm_pixels);
+
+    // The dmabuf destination: a client wl_buffer the import path owns,
+    // in the advertised size and format.
+    const dmabuf_buffer = try ts.createDmabufBuffer(64, 64, dmabuf_mod.drm_format_argb8888);
+    const dmabuf_frame = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var dmabuf_events: FrameEvents = .{};
+    dmabuf_frame.setListener(*FrameEvents, FrameEvents.listener, &dmabuf_events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), dmabuf_events.linux_dmabuf_count);
+    dmabuf_frame.copy(dmabuf_buffer);
+    try ts.pump();
+    // Still deferred: a destination is not a served copy.
+    try testing.expectEqual(@as(usize, 0), dmabuf_events.ready_count);
+    try commitOutput(ts);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), dmabuf_events.ready_count);
+    try testing.expectEqual(@as(usize, 0), dmabuf_events.failed_count);
+    // Both copies counted: the shm reference and the dmabuf one.
+    try testing.expectEqual(@as(u32, 2), ts.sc.?.captures_served);
+
+    const fake = ts.fake_dmabuf.?;
+    // The destination was mapped once and the mapping handed back: a
+    // copy that skipped endWrite would leave pixels behind.
+    try testing.expectEqual(@as(usize, 1), fake.maps);
+    try testing.expectEqual(@as(usize, 0), fake.open);
+
+    // Byte for byte against the shm copy of the same capture.
+    try testing.expectEqualSlices(u8, shm_pixels, fake.pixels);
+    // And not two empty images that merely match each other.
+    try testing.expectEqual(patternPixel(0, 0), std.mem.readInt(u32, fake.pixels[0..4], .little));
+    try testing.expectEqual(patternPixel(63, 63), std.mem.readInt(u32, fake.pixels[fake.pixels.len - 4 ..][0..4], .little));
+}
+
+test "a wrong-size or wrong-format dmabuf destination fails the frame" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.init(allocator);
+    defer ts.deinit();
+    ts.enableDmabufDestination();
+    fillCapturePattern(ts.fb.?);
+
+    // A 32x32 destination for a 64x64 frame: a real import of the
+    // wrong geometry, which the copy cannot be made into.
+    const small = try ts.createDmabufBuffer(32, 32, dmabuf_mod.drm_format_argb8888);
+    const small_frame = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var small_events: FrameEvents = .{};
+    small_frame.setListener(*FrameEvents, FrameEvents.listener, &small_events);
+    try ts.pump();
+    small_frame.copy(small);
+    try ts.pump();
+
+    // failed, and at the copy request: no commit was needed, no
+    // deferred copy was armed, and the destination was never even
+    // mapped — let alone written.
+    try testing.expectEqual(@as(usize, 1), small_events.failed_count);
+    try testing.expectEqual(@as(usize, 0), small_events.ready_count);
+    try testing.expectEqual(@as(usize, 0), small_events.flags_count);
+    try testing.expectEqual(@as(usize, 0), ts.frame_requests);
+    const small_fake = ts.fake_dmabuf.?;
+    try testing.expectEqual(@as(usize, 0), small_fake.maps);
+    try testing.expectEqual(@as(usize, 0), small_fake.open);
+    for (small_fake.pixels) |byte| try testing.expectEqual(@as(u8, 0), byte);
+
+    // The connection survived. This is the difference from the shm
+    // path, which answers a wrong-size buffer with invalid_buffer and
+    // kills the client (the padded-stride test above): the roundtrip
+    // below cannot happen if this client is gone.
+    const after = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var after_events: FrameEvents = .{};
+    after.setListener(*FrameEvents, FrameEvents.listener, &after_events);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), after_events.buffer_count);
+    try testing.expectEqual(@as(usize, 0), after_events.failed_count);
+
+    // A destination in a fourcc the frame did not advertise fails the
+    // same way: the client allocated it for different bytes.
+    const wrong_format = try ts.createDmabufBuffer(64, 64, dmabuf_mod.drm_format_xrgb8888);
+    const format_frame = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var format_events: FrameEvents = .{};
+    format_frame.setListener(*FrameEvents, FrameEvents.listener, &format_events);
+    try ts.pump();
+    format_frame.copy(wrong_format);
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), format_events.failed_count);
+    try testing.expectEqual(@as(usize, 0), format_events.ready_count);
+    try testing.expectEqual(@as(usize, 0), ts.fake_dmabuf.?.maps);
+}
+
+test "a v1 frame is neither offered nor served a dmabuf destination" {
+    const allocator = testing.allocator;
+    var ts = try TestServer.initAtVersion(allocator, 1);
+    defer ts.deinit();
+    ts.enableDmabufDestination();
+
+    const frame = try ts.screencopy_mgr.?.captureOutput(0, ts.wl_output_client.?);
+    var events: FrameEvents = .{};
+    frame.setListener(*FrameEvents, FrameEvents.listener, &events);
+    try ts.pump();
+    // The shm buffer type is since 1 and is always sent; buffer_done
+    // and linux_dmabuf are since 3, so a v1 client is told neither.
+    try testing.expectEqual(@as(usize, 1), events.buffer_count);
+    try testing.expectEqual(@as(usize, 0), events.linux_dmabuf_count);
+    try testing.expectEqual(@as(usize, 0), events.buffer_done_count);
+
+    // A dmabuf buffer is then one this frame does not accept: the same
+    // invalid_buffer any buffer nobody owns gets, and the client is
+    // gone (the same shape as the padded-stride test). The error must
+    // name the FRAME (its object id, code 1) and not the buffer: the
+    // frame is what refuses it, and an error on the buffer would mean
+    // this compositor failing to resolve a buffer it owns.
+    const buffer = try ts.createDmabufBuffer(64, 64, dmabuf_mod.drm_format_argb8888);
+    frame.copy(buffer);
+    try testing.expectError(error.ClientDispatchFailed, ts.pump());
+    try testing.expectEqual(
+        @as(c_int, @intCast(@intFromEnum(server.zwlr.ScreencopyFrameV1.Error.invalid_buffer))),
+        wl_display_get_protocol_error(ts.c_display.?, null, null),
+    );
+    var error_id: u32 = 0;
+    _ = wl_display_get_protocol_error(ts.c_display.?, null, &error_id);
+    try testing.expectEqual(frame.getId(), error_id);
 }
