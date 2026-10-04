@@ -91,7 +91,7 @@ const display_mod = @import("../core/display.zig");
 const log_tag = "pointer_constraints";
 const Fixed = wire.wl.Fixed;
 const Rect = geom.Rect;
-const Point = geom.Point;
+const Point = geom.FPoint;
 
 /// zwp_pointer_constraints_v1.lifetime (XML:75-97).
 pub const Lifetime = server.zwp.PointerConstraintsV1.Lifetime;
@@ -107,10 +107,13 @@ pub const ConstraintKind = enum {
 /// Where the compositor must present the cursor.
 pub const CursorPosition = struct {
     surface: *surface_mod.Surface,
-    /// Surface-local x.
-    x: i32,
+    /// Surface-local x, at the precision the seat's hit test reported it
+    /// (f64: an active lock pins the point the pointer was at when the
+    /// constraint activated, and a camera-inverse pick puts that point
+    /// on a fraction of a pixel).
+    x: f64,
     /// Surface-local y.
-    y: i32,
+    y: f64,
     /// True when an active lock pins the cursor here: the position must not
     /// follow the seat any more.
     locked: bool,
@@ -137,9 +140,11 @@ pub const Constraint = struct {
     confined_res: ?*server.zwp.ConfinedPointerV1 = null,
     /// Whether `locked` / `confined` has been sent and not yet revoked.
     active: bool = false,
-    /// The surface-local point an active lock pins the cursor at.
-    lock_x: i32 = 0,
-    lock_y: i32 = 0,
+    /// The surface-local point an active lock pins the cursor at. The
+    /// seat's stored focus is f64, so this keeps the pin exactly where
+    /// the pointer was rather than rounding it onto the pixel grid.
+    lock_x: f64 = 0,
+    lock_y: f64 = 0,
     /// The client's set_cursor_position_hint in effect, if any. The hint is
     /// double-buffered too (XML:229-231), so it lands at the next commit.
     hint: ?CursorPositionHint = null,
@@ -186,10 +191,20 @@ pub const Constraint = struct {
     }
 
     /// True when (x, y) lies inside the effective region.
-    pub fn contains(self: *const Constraint, x: i32, y: i32) bool {
+    ///
+    /// The point is f64 and the region rectangles stay i32: a wl_region
+    /// is an integer protocol object (XML:107-115), so the rectangle
+    /// EDGES are the integer boundary, not the point. Widening the edges
+    /// to f64 compares the real position instead of one rounded to a
+    /// whole pixel, so a point just inside a region still activates the
+    /// constraint and one just outside does not.
+    pub fn contains(self: *const Constraint, x: f64, y: f64) bool {
         if (self.region_unbounded) return true;
         for (self.region.items) |r| {
-            if (r.containsPoint(.{ .x = x, .y = y })) return true;
+            if (x >= @as(f64, @floatFromInt(r.x)) and
+                y >= @as(f64, @floatFromInt(r.y)) and
+                x < @as(f64, @floatFromInt(geom.addSat(r.x, r.width))) and
+                y < @as(f64, @floatFromInt(geom.addSat(r.y, r.height)))) return true;
         }
         return false;
     }
@@ -199,19 +214,27 @@ pub const Constraint = struct {
     /// the nearest inside point (per rect, then the closest of those).
     /// Null when the region is empty or unbounded — there is nothing to
     /// clamp to.
-    pub fn clampTo(self: *const Constraint, x: i32, y: i32) ?Point {
+    ///
+    /// The rectangle edges are integer (see contains), so a clamped
+    /// point lands exactly on a boundary while an already-inside point
+    /// keeps the fraction it came in with.
+    pub fn clampTo(self: *const Constraint, x: f64, y: f64) ?Point {
         if (self.region_unbounded) return null;
         if (self.region.items.len == 0) return null;
         if (self.contains(x, y)) return .{ .x = x, .y = y };
         var best: ?Point = null;
-        var best_dist: u64 = std.math.maxInt(u64);
+        var best_dist: f64 = std.math.inf(f64);
         for (self.region.items) |r| {
             if (r.isEmpty()) continue; // a degenerate rect clamps to nothing
-            const cx = std.math.clamp(x, r.x, geom.addSat(r.x, r.width) - 1);
-            const cy = std.math.clamp(y, r.y, geom.addSat(r.y, r.height) - 1);
-            const ddx: u64 = @abs(@as(i64, cx) - @as(i64, x));
-            const ddy: u64 = @abs(@as(i64, cy) - @as(i64, y));
-            const dist = ddx *| ddx +| ddy *| ddy;
+            const lo_x: f64 = @floatFromInt(r.x);
+            const lo_y: f64 = @floatFromInt(r.y);
+            const hi_x: f64 = @floatFromInt(geom.addSat(r.x, r.width) - 1);
+            const hi_y: f64 = @floatFromInt(geom.addSat(r.y, r.height) - 1);
+            const cx = std.math.clamp(x, lo_x, hi_x);
+            const cy = std.math.clamp(y, lo_y, hi_y);
+            const ddx = cx - x;
+            const ddy = cy - y;
+            const dist = ddx * ddx + ddy * ddy;
             if (dist < best_dist) {
                 best_dist = dist;
                 best = .{ .x = cx, .y = cy };
@@ -361,8 +384,8 @@ pub const PointerConstraints = struct {
     pub fn cursorPosition(
         self: *PointerConstraints,
         surface: *surface_mod.Surface,
-        live_x: i32,
-        live_y: i32,
+        live_x: f64,
+        live_y: f64,
     ) CursorPosition {
         if (self.activeLock(surface)) |c| {
             return .{ .surface = surface, .x = c.lock_x, .y = c.lock_y, .locked = true };
@@ -375,8 +398,8 @@ pub const PointerConstraints = struct {
     pub fn confine(
         self: *PointerConstraints,
         surface: *surface_mod.Surface,
-        x: i32,
-        y: i32,
+        x: f64,
+        y: f64,
     ) ?Point {
         const c = self.activeConfine(surface) orelse return null;
         return c.clampTo(x, y);
@@ -901,14 +924,23 @@ const ConfineEvents = struct {
     }
 };
 
-/// The seat's hit-test stub.
+/// The seat's hit-test stub. `offset_x` / `offset_y` shift the reported
+/// surface-local position off the pixel grid the desktop coordinate
+/// arrived on — what a camera inverse does when the surface it resolves
+/// to is not aligned to the output pixel.
 const PickState = struct {
     surface: ?*surface_mod.Surface = null,
+    offset_x: f64 = 0,
+    offset_y: f64 = 0,
 };
 
 fn testPick(ctx: *anyopaque, x: i32, y: i32) ?seat_mod.Seat.PickResult {
     const st: *PickState = @ptrCast(@alignCast(ctx));
-    if (st.surface) |s| return .{ .surface = s, .sx = x, .sy = y };
+    if (st.surface) |s| return .{
+        .surface = s,
+        .sx = @as(f64, @floatFromInt(x)) + st.offset_x,
+        .sy = @as(f64, @floatFromInt(y)) + st.offset_y,
+    };
     return null;
 }
 
@@ -1172,13 +1204,13 @@ test "lock lifecycle: locked, cursor pinned, unlocked when focus is lost" {
     // pointer keeps moving.
     const pinned = ts.pc.?.cursorPosition(surface, 900, 900);
     try std.testing.expect(pinned.locked);
-    try std.testing.expectEqual(@as(i32, 120), pinned.x);
-    try std.testing.expectEqual(@as(i32, 80), pinned.y);
+    try std.testing.expectEqual(@as(f64, 120), pinned.x);
+    try std.testing.expectEqual(@as(f64, 80), pinned.y);
     ts.seat.?.pointerMotion(900, 900);
     try ts.pump();
     const still = ts.pc.?.cursorPosition(surface, 900, 900);
-    try std.testing.expectEqual(@as(i32, 120), still.x);
-    try std.testing.expectEqual(@as(i32, 80), still.y);
+    try std.testing.expectEqual(@as(f64, 120), still.x);
+    try std.testing.expectEqual(@as(f64, 80), still.y);
 
     // Losing pointer focus deactivates: a PERSISTENT constraint survives.
     try ts.unfocus();
@@ -1187,11 +1219,60 @@ test "lock lifecycle: locked, cursor pinned, unlocked when focus is lost" {
     try std.testing.expectEqual(@as(usize, 0), ts.pc.?.activeCount());
     const free = ts.pc.?.cursorPosition(surface, 900, 900);
     try std.testing.expect(!free.locked);
-    try std.testing.expectEqual(@as(i32, 900), free.x);
+    try std.testing.expectEqual(@as(f64, 900), free.x);
 
     // Re-focusing reactivates the same persistent object.
     try ts.focus(surface, 30, 40);
     try std.testing.expectEqual(@as(usize, 2), ev.locked);
+}
+
+test "a fractional surface-local point activates a constraint and pins the lock there" {
+    const allocator = std.testing.allocator;
+    const ts = try testServer(allocator, .{});
+    defer ts.deinit();
+
+    const surface = try ts.createSurface();
+    const region = try ts.a.wl_compositor.?.createRegion();
+    region.add(0, 0, 100, 100);
+    const locked = try ts.a.wl_constraints.?.lockPointer(
+        ts.a.surface.?,
+        ts.a.wl_pointer.?,
+        region,
+        .persistent,
+    );
+    var ev: LockEvents = .{};
+    locked.setListener(*LockEvents, LockEvents.listener, &ev);
+    try ts.pump();
+
+    // The hit test answers half a pixel past the desktop coordinate, so
+    // the position the XML's activation precondition is checked against
+    // is 100.5 — genuinely OUTSIDE a region that ends at 100. The
+    // rectangle edges are the integer boundary here (a wl_region is an
+    // integer protocol object); the position inside it is not, so it is
+    // compared as it stands rather than rounded to a whole pixel first.
+    ts.pick_state.surface = surface;
+    ts.pick_state.offset_x = 0.5;
+    ts.seat.?.pointerMotion(100, 50);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 0), ev.locked);
+
+    // One pixel earlier the local position is 99.5, inside the region:
+    // the lock activates, and it pins the cursor at EXACTLY 99.5
+    // rather than at a rounded 99 or 100.
+    ts.seat.?.pointerMotion(99, 50);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), ev.locked);
+    const pinned = ts.pc.?.cursorPosition(surface, 900, 900);
+    try std.testing.expect(pinned.locked);
+    try std.testing.expectEqual(@as(f64, 99.5), pinned.x);
+    try std.testing.expectEqual(@as(f64, 50), pinned.y);
+    // The region boundary itself, with the fraction on both sides of it:
+    // a lock may activate only where the pointer really is.
+    const c = ts.pc.?.constraints.items[0];
+    try std.testing.expect(c.contains(99.5, 50));
+    try std.testing.expect(c.contains(0, 0));
+    try std.testing.expect(!c.contains(100, 50));
+    try std.testing.expect(!c.contains(99.5, 100));
 }
 
 test "confine lifecycle with a region and exact geometry clamping" {
@@ -1228,11 +1309,11 @@ test "confine lifecycle with a region and exact geometry clamping" {
     // not 150: a clamp that landed outside the region would confine
     // nothing.
     const pc = ts.pc.?;
-    try std.testing.expectEqual(@as(i32, 10), pc.confine(surface, 10, 10).?.x);
-    try std.testing.expectEqual(@as(i32, 99), pc.confine(surface, 150, 50).?.x);
-    try std.testing.expectEqual(@as(i32, 50), pc.confine(surface, 150, 50).?.y);
-    try std.testing.expectEqual(@as(i32, 0), pc.confine(surface, -40, -40).?.x);
-    try std.testing.expectEqual(@as(i32, 0), pc.confine(surface, -40, -40).?.y);
+    try std.testing.expectEqual(@as(f64, 10), pc.confine(surface, 10, 10).?.x);
+    try std.testing.expectEqual(@as(f64, 99), pc.confine(surface, 150, 50).?.x);
+    try std.testing.expectEqual(@as(f64, 50), pc.confine(surface, 150, 50).?.y);
+    try std.testing.expectEqual(@as(f64, 0), pc.confine(surface, -40, -40).?.x);
+    try std.testing.expectEqual(@as(f64, 0), pc.confine(surface, -40, -40).?.y);
     // Losing focus deactivates, so confine() has nothing to clamp to.
     try ts.unfocus();
 }

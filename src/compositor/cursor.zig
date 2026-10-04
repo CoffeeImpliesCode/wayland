@@ -50,7 +50,6 @@ const client = @import("protocol").client;
 const Scene = scene_mod.Scene;
 const SceneNode = scene_mod.SceneNode;
 const Texture = texture_mod.Texture;
-const Rect = geom.Rect;
 const Allocator = std.mem.Allocator;
 
 /// Fallback cursor size (px): a cursor_size² arrow when no client
@@ -101,9 +100,13 @@ pub const Cursor = struct {
     /// Old+new footprints across one update: the compositor damages both
     /// (a partial upload must repaint the old and the new position) and
     /// restores both from the persisted base on a hover repaint.
+    ///
+    /// WORLD-space f64 rects (see footprints): the compositor projects
+    /// them through the view camera and narrows only what lands on the
+    /// output.
     pub const Footprints = struct {
-        old: [2]?Rect,
-        new: [2]?Rect,
+        old: [2]?geom.FRect,
+        new: [2]?geom.FRect,
     };
 
     pub fn create(
@@ -167,13 +170,13 @@ pub const Cursor = struct {
     /// re-append the nodes to the scene root (keep them on top), resolve
     /// + import the client cursor surface (or fall back to the rect),
     /// position at the pointer minus the hotspot. The returned
-    /// Footprints carry the OLD rects (captured before the move) and the
-    /// NEW rects; the compositor damages/restores both.
+    /// Footprints carry the OLD world rects (captured before the move)
+    /// and the NEW world rects; the compositor damages/restores both.
     pub fn update(self: *Cursor) Footprints {
         const old = self.footprints();
         const seat = self.seat;
-        const x = seat.pointer_x;
-        const y = seat.pointer_y;
+        const x: f64 = @floatFromInt(seat.pointer_x);
+        const y: f64 = @floatFromInt(seat.pointer_y);
 
         // Keep the cursor on top of every surface: re-append both nodes
         // to the scene root (appendChild reparents, moving them to draw
@@ -230,24 +233,39 @@ pub const Cursor = struct {
             const scale: i32 = if (self.client_scale > 1) self.client_scale else 1;
             node.kind.buffer.dst_width = @max(1, @divTrunc(tex.width, scale));
             node.kind.buffer.dst_height = @max(1, @divTrunc(tex.height, scale));
-            node.x = x - seat.cursor_hotspot_x;
-            node.y = y - seat.cursor_hotspot_y;
+            // The node sits in WORLD space, like every other node. The
+            // pointer is an output pixel and the hotspot a surface-local
+            // logical offset, so both widen here — the subtraction never
+            // runs in i32 where a large hotspot could wrap.
+            node.setPosition(
+                x - @as(f64, @floatFromInt(seat.cursor_hotspot_x)),
+                y - @as(f64, @floatFromInt(seat.cursor_hotspot_y)),
+            );
             node.enable(true);
             self.rect_node.enable(false);
         } else {
             self.texture_buffer = null;
-            self.rect_node.x = x;
-            self.rect_node.y = y;
+            self.rect_node.setPosition(x, y);
             self.rect_node.enable(true);
             self.buf_node.enable(false);
         }
         return .{ .old = old, .new = self.footprints() };
     }
 
-    /// The cursor nodes' absolute rects (fallback rect + client cursor
-    /// buffer), or null for a disabled node.
-    pub fn footprints(self: *Cursor) [2]?Rect {
-        var out: [2]?Rect = .{ null, null };
+    /// The cursor nodes' footprints in WORLD space (fallback rect +
+    /// client cursor buffer), or null for a disabled node.
+    ///
+    /// A footprint is the node's f64 absolute rect: the parent chain
+    /// plus the node offset, fraction and far origin included. This is
+    /// the only place the cursor's exact world placement is known, so it
+    /// is never narrowed here. Converting to output pixels lost that
+    /// placement: past the i32 range both ends saturated onto the
+    /// boundary, so every far position reported the same empty rect and
+    /// the subpixel part vanished before the camera ever saw it. The
+    /// compositor projects the world rect through the view camera in
+    /// f64 and narrows only the on-screen result.
+    pub fn footprints(self: *Cursor) [2]?geom.FRect {
+        var out: [2]?geom.FRect = .{ null, null };
         inline for (.{ self.rect_node, self.buf_node }, 0..) |node, i| {
             if (node.enabled) out[i] = node.absolutePosition();
         }
@@ -266,28 +284,30 @@ pub const Cursor = struct {
             .screen_w = @floatFromInt(fb.width),
             .screen_h = @floatFromInt(fb.height),
         };
+        // The world position comes from the NODE, not from a second copy
+        // of the pointer-minus-hotspot arithmetic: update() already placed
+        // it, and the scene pass and this canvas pass then draw the cursor
+        // at the same world point by construction.
         var cursor_items: [1]canvas_mod.CanvasItem = undefined;
         if (self.texture) |tex| {
-            const seat = self.seat;
-            // S6: the same logical size as the scene node (buffer pixels
-            // ÷ buffer scale, clamped to 1).
-            const scale: i32 = if (self.client_scale > 1) self.client_scale else 1;
+            const node = self.buf_node;
             cursor_items[0] = .{
                 .texture = tex,
-                .world_x = @floatFromInt(seat.pointer_x - seat.cursor_hotspot_x),
-                .world_y = @floatFromInt(seat.pointer_y - seat.cursor_hotspot_y),
-                .world_w = @floatFromInt(@max(1, @divTrunc(tex.width, scale))),
-                .world_h = @floatFromInt(@max(1, @divTrunc(tex.height, scale))),
+                .world_x = node.x,
+                .world_y = node.y,
+                .world_w = @floatFromInt(node.kind.buffer.dst_width),
+                .world_h = @floatFromInt(node.kind.buffer.dst_height),
                 .opacity = 1.0,
             };
         } else {
             const tex = self.ensureFallbackTexture() orelse return;
+            const node = self.rect_node;
             cursor_items[0] = .{
                 .texture = tex,
-                .world_x = @floatFromInt(self.seat.pointer_x),
-                .world_y = @floatFromInt(self.seat.pointer_y),
-                .world_w = @floatFromInt(cursor_size),
-                .world_h = @floatFromInt(cursor_size),
+                .world_x = node.x,
+                .world_y = node.y,
+                .world_w = @floatFromInt(node.kind.rect.width),
+                .world_h = @floatFromInt(node.kind.rect.height),
                 .opacity = 1.0,
             };
         }
@@ -501,7 +521,7 @@ test "update positions the fallback rect at the pointer and tracks footprints" {
     try testing.expect(fp.old[0] == null);
     try testing.expect(fp.old[1] == null);
     // New: the rect node at the pointer, the buffer node still off.
-    const expected: Rect = .{ .x = 100, .y = 50, .width = cursor_size, .height = cursor_size };
+    const expected: geom.FRect = .{ .x = 100, .y = 50, .width = @floatFromInt(cursor_size), .height = @floatFromInt(cursor_size) };
     try testing.expectEqual(expected, fp.new[0].?);
     try testing.expect(fp.new[1] == null);
     try testing.expect(cursor.rect_node.enabled);
@@ -512,10 +532,73 @@ test "update positions the fallback rect at the pointer and tracks footprints" {
     seat.pointerMotion(110, 60);
     const fp2 = cursor.update();
     try testing.expectEqual(fp.new[0].?, fp2.old[0].?);
-    const expected2: Rect = .{ .x = 110, .y = 60, .width = cursor_size, .height = cursor_size };
+    const expected2: geom.FRect = .{ .x = 110, .y = 60, .width = @floatFromInt(cursor_size), .height = @floatFromInt(cursor_size) };
     try testing.expectEqual(expected2, fp2.new[0].?);
     try testing.expect(fp2.old[1] == null);
     try testing.expect(fp2.new[1] == null);
+}
+
+test "footprints keep far subpixel world positions across a move" {
+    const allocator = testing.allocator;
+    const ts = TestCursorServer.init(allocator) catch |err| {
+        std.debug.print("cursor test init failed: {s} (xkeyboard-config missing?)\n", .{@errorName(err)});
+        return;
+    };
+    defer ts.deinit();
+    const cursor = ts.cursor.?;
+    const seat = ts.seat.?;
+    const scene = ts.scene.?;
+
+    // The scene root a terabyte from the origin, a quarter pixel and
+    // three quarters off it: the cursor nodes inherit that offset
+    // through their parent chain. A footprint that reached the damage
+    // ring as output pixels saturated onto the i32 boundary here — every
+    // far position became the same empty rect, and the subpixel part was
+    // gone before the camera ever saw it.
+    const far_x: f64 = 0x1p40 + 0.25;
+    const far_y: f64 = 0x1p40 + 0.75;
+    scene.root.setPosition(far_x, far_y);
+    const size: f64 = @floatFromInt(cursor_size);
+
+    // No client cursor surface: the fallback rect follows the pointer.
+    seat.pointerMotion(10, 20);
+    const fp = cursor.update();
+    try testing.expect(fp.old[0] == null);
+    try testing.expect(fp.new[1] == null);
+    const first = fp.new[0].?;
+    try testing.expectEqual(far_x + 10, first.x);
+    try testing.expectEqual(far_y + 20, first.y);
+    try testing.expectEqual(size, first.width);
+    try testing.expectEqual(size, first.height);
+    // The subpixel part survives the whole path.
+    try testing.expectEqual(@as(f64, 0.25), first.x - @floor(first.x));
+    try testing.expectEqual(@as(f64, 0.75), first.y - @floor(first.y));
+
+    // Move: old and new are DISTINCT far world rects — the property a
+    // saturating pixel conversion cannot express.
+    seat.pointerMotion(11, 21);
+    const fp2 = cursor.update();
+    const second = fp2.new[0].?;
+    try testing.expectEqual(far_x + 11, second.x);
+    try testing.expectEqual(far_y + 21, second.y);
+    try testing.expectEqual(first, fp2.old[0].?);
+    try testing.expect(first.x != second.x);
+    try testing.expect(first.y != second.y);
+
+    // The client-cursor slot carries its own world rect: the node
+    // enabled here stands in for an imported cursor surface, whose
+    // logical size differs from the fallback rect's.
+    cursor.buf_node.setPosition(11, 21);
+    cursor.buf_node.kind.buffer.dst_width = 24;
+    cursor.buf_node.kind.buffer.dst_height = 8;
+    cursor.buf_node.enable(true);
+    const client_fp = cursor.footprints();
+    try testing.expectEqual(
+        geom.FRect{ .x = far_x + 11, .y = far_y + 21, .width = 24, .height = 8 },
+        client_fp[1].?,
+    );
+    // The rect slot keeps the fallback's own world rect beside it.
+    try testing.expectEqual(second, client_fp[0].?);
 }
 
 test "draw renders the fallback arrow texture at the pointer" {
@@ -590,7 +673,7 @@ test "client cursor surface without an importable buffer falls back to the rect"
     try testing.expect(cursor.texture == null);
     try testing.expect(cursor.rect_node.enabled);
     try testing.expect(!cursor.buf_node.enabled);
-    const expected: Rect = .{ .x = 20, .y = 20, .width = cursor_size, .height = cursor_size };
+    const expected: geom.FRect = .{ .x = 20, .y = 20, .width = @floatFromInt(cursor_size), .height = @floatFromInt(cursor_size) };
     try testing.expectEqual(expected, fp.new[0].?);
     try testing.expect(fp.new[1] == null);
 
@@ -609,7 +692,7 @@ test "client cursor surface without an importable buffer falls back to the rect"
     const fp3 = cursor.update();
     try testing.expect(cursor.texture == null);
     try testing.expectEqual(
-        Rect{ .x = 30, .y = 30, .width = cursor_size, .height = cursor_size },
+        geom.FRect{ .x = 30, .y = 30, .width = @floatFromInt(cursor_size), .height = @floatFromInt(cursor_size) },
         fp3.new[0].?,
     );
 }
@@ -720,14 +803,14 @@ test "scale-2 client cursor surface renders at its logical size (S6)" {
     // (the hotspot is logical and the image is logical-sized, S6).
     try testing.expect(cursor.texture != null);
     try testing.expect(cursor.buf_node.enabled);
-    try testing.expectEqual(@as(i32, 30 - 5), cursor.buf_node.x);
-    try testing.expectEqual(@as(i32, 40 - 6), cursor.buf_node.y);
+    try testing.expectEqual(@as(f64, 25), cursor.buf_node.x);
+    try testing.expectEqual(@as(f64, 34), cursor.buf_node.y);
     try testing.expectEqual(@as(i32, 2), cursor.client_scale);
     // 32x32 buffer at scale 2 renders 16x16 (clamped to >= 1).
     try testing.expectEqual(@as(i32, 16), cursor.buf_node.kind.buffer.dst_width);
     try testing.expectEqual(@as(i32, 16), cursor.buf_node.kind.buffer.dst_height);
     // The update footprint covers the logical 16x16 rect.
-    const expected: Rect = .{ .x = 25, .y = 34, .width = 16, .height = 16 };
+    const expected: geom.FRect = .{ .x = 25, .y = 34, .width = 16, .height = 16 };
     try testing.expectEqual(expected, fp.new[1].?);
 
     // The draw path renders the same 16x16 footprint: opaque white over

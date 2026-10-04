@@ -180,17 +180,16 @@ pub fn build(b: *Build) void {
     // resolved by `gbmDirs` below instead of `pkg-config --cflags gbm`,
     // and linked as raw -I/-L exactly like the DRM shim's flags.
     const gbm = gbmDirs(b);
-    {
-        const gbm_c = b.addTranslateC(.{
-            .root_source_file = b.path("src/buffers/dmabuf_c.h"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        gbm_c.addSystemIncludePath(.{ .cwd_relative = gbm.include });
-        lib.addImport("gbm_c", gbm_c.createModule());
-        linkGbm(b, lib, gbm);
-    }
+    const gbm_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/buffers/dmabuf_c.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gbm_c.addSystemIncludePath(.{ .cwd_relative = gbm.include });
+    const gbm_c_mod = gbm_c.createModule();
+    lib.addImport("gbm_c", gbm_c_mod);
+    linkGbm(b, lib, gbm);
     // libinput backend (src/backend/libinput.zig): udev context, evdev
     // devices; the runtime lib is in the devenv/nix closure.
     lib.linkSystemLibrary("libinput", .{});
@@ -374,6 +373,8 @@ pub fn build(b: *Build) void {
             },
         }),
     });
+    client_exe.root_module.addImport("gbm_c", gbm_c_mod);
+    linkGbm(b, client_exe.root_module, gbm);
     b.installArtifact(client_exe);
 
     // Adversarial protocol roundtrip probe: deliberately triggers

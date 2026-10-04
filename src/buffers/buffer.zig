@@ -12,19 +12,28 @@
 //!   the last unlock (types/buffer/buffer.c:50-61), and drop() of an
 //!   already-unlocked buffer also fires it. Listeners (e.g. the shm module)
 //!   use it to tell the client the buffer may be reused.
-//! - The release signal fires AT MOST ONCE per buffer lifetime: a
-//!   `released` guard (see maybeRelease) suppresses the duplicate
-//!   wl_buffer.release that re-dropping a replaced buffer at the next
-//!   commit would otherwise send. A client may re-attach the same
-//!   wl_buffer resource across cycles (double buffering), but the protocol
-//!   release event is per buffer, not per cycle — wlroots sends it exactly
-//!   once per committed buffer.
-//! - `destroy()`: emits the `destroy` signal, releases impl-private
-//!   resources via `impl.destroy`, then frees the Buffer itself.
+//! - The release signal fires AT MOST ONCE per LOCK CYCLE: a `released`
+//!   guard (see maybeRelease) suppresses the duplicate wl_buffer.release
+//!   that re-dropping a replaced buffer at the next commit would
+//!   otherwise send. `lock()` re-arms it, because a client re-attaches the
+//!   same wl_buffer across cycles (double buffering) and needs a release
+//!   per use.
+//! - `destroy()`: notifies ONCE (the `destroy` signal) and hands the
+//!   impl backing to the consumer locks — `impl.destroy` and the
+//!   Buffer's own free run when `n_locks` reaches 0, never inside the
+//!   emitter. A renderer still holding the pixels therefore keeps them
+//!   valid past producer teardown.
+//! - `queueReleaseCallback()`: a wl_surface.get_release callback (v7)
+//!   rides the BUFFER, not the surface — the protocol promise is "when
+//!   the compositor is no longer using this buffer". It completes the
+//!   moment the last consumer lock drops, even when teardown was
+//!   already requested. Every queued callback owns a destroy listener on
+//!   its own wire resource, so a client that disconnects (or destroys
+//!   the callback early) drops its record without touching the Buffer.
 //!
-//! Callers must never destroy a Buffer from inside a signal handler: signal
-//! emission iterates live listeners, so freeing a listener's storage during
-//! emission is use-after-free. The owner destroys from regular control flow.
+//! Never free a Buffer or listener storage from inside a signal handler:
+//! emission iterates live listeners. `destroy` is the one call that does
+//! it, and it defers the free (`notifying_destroy`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -50,6 +59,33 @@ pub const Impl = struct {
     destroy: *const fn (allocator: std.mem.Allocator, data: *anyopaque) void,
 };
 
+/// One queued wl_surface.get_release callback (protocol v7). The record
+/// is intrusive on the Buffer that must complete it and owns the destroy
+/// listener on the callback's own wire resource: a client that destroys
+/// the callback (or disconnects) unlinks and frees the record here, so
+/// the Buffer never completes a dead resource.
+pub const ReleaseCallback = struct {
+    allocator: std.mem.Allocator,
+    buf: *Buffer,
+    /// The client's wl_callback; owned here until completion.
+    callback: *wire.wl.Callback,
+    /// Position on `Buffer.release_callbacks`.
+    link: wire.list.Link,
+    /// Fires when the client destroys the callback resource.
+    destroy: wire.Listener(*wire.Resource),
+
+    fn onClientDestroy(listener: *wire.Listener(*wire.Resource), _: *wire.Resource) void {
+        const rec: *ReleaseCallback = @fieldParentPtr("destroy", listener);
+        const allocator = rec.allocator;
+        // Unlink before freeing: the record's own destroy link is
+        // detached by wl_resource_destroy itself, and the Buffer list
+        // must not keep pointing at freed storage. No done: the client
+        // asked for this callback to be gone.
+        rec.link.remove();
+        allocator.destroy(rec);
+    }
+};
+
 pub const Buffer = struct {
     impl: *const Impl,
     /// Impl-private state (the fn-pointer functions receive it via self).
@@ -60,21 +96,31 @@ pub const Buffer = struct {
     /// The producer has dropped the buffer.
     dropped: bool = false,
     /// Number of consumers currently reading the buffer.
-    n_locks: u32 = 0, // public: the surface guards unlocks after early releases
-    /// The release signal has fired; it is emitted at most once per buffer
-    /// lifetime (see maybeRelease).
+    n_locks: u32 = 0,
+    /// The release signal has fired in this lock cycle.
     released: bool = false,
-    /// Whether a producer registry (e.g. ShmState) owns this wrapper and
-    /// frees it at deinit. False for untracked wrappers (the stateless
-    /// shm fromResource): the consumer that holds the last reference
-    /// destroys them via Buffer.destroy when done.
+    /// Producer teardown was requested; consumer locks retain the backing.
+    destroy_requested: bool = false,
+    /// Final unlock inside a destroy listener must not free the emitter.
+    notifying_destroy: bool = false,
+    /// Whether a producer registry (e.g. ShmState) keeps this wrapper
+    /// reachable for as long as its wire resource lives. True wrappers
+    /// must not be destroyed by a consumer dropping its reference: a
+    /// later attach of the same resource would hand the client back a
+    /// dead wrapper. False for untracked wrappers (the stateless shm
+    /// fromResource), whose only owner is the consumer.
     tracked: bool = true,
     events: struct {
-        /// Fires once when `dropped && n_locks == 0`.
+        /// Fires once per completed consumer-lock cycle while alive.
         release: wire.Signal(*Buffer),
         /// Fires from destroy() while the Buffer is still valid.
         destroy: wire.Signal(*Buffer),
     },
+    /// get_release callbacks this buffer owes the client. They live on
+    /// the Buffer, not on the Surface: the promise is "when the
+    /// compositor stops reading this buffer", and the surface that
+    /// requested them may already be gone.
+    release_callbacks: wire.list.Head(ReleaseCallback, .link),
 
     /// Allocate a Buffer with the given impl. The impl must provide
     /// `destroy`; `begin_data_ptr_access` and `end_data_ptr_access` must be
@@ -99,7 +145,9 @@ pub const Buffer = struct {
             .height = h,
             // SAFETY: events signals are initialized via .init() immediately below, before any emit.
             .events = undefined,
+            .release_callbacks = undefined,
         };
+        buf.release_callbacks.init();
         wire.Signal(*Buffer).init(&buf.events.release);
         wire.Signal(*Buffer).init(&buf.events.destroy);
         return buf;
@@ -130,36 +178,103 @@ pub const Buffer = struct {
     /// the leaf stuck, exhausting the pool ("all buffers are held by the
     /// server", weston clients/window.c shm_surface_prepare exit(1)).
     pub fn lock(buf: *Buffer) !void {
+        assert(!buf.destroy_requested);
         buf.n_locks += 1;
         buf.released = false;
     }
 
     /// A consumer is done reading. Unlocking an unlocked buffer is a
-    /// programmer error. Dropping the last lock fires the release signal
-    /// (once per lock cycle, re-armed by the next lock) even if the
-    /// buffer was never dropped (wlroots types/buffer/buffer.c:50-61):
-    /// the client learns it may reuse the buffer as soon as the
-    /// compositor is done reading it.
+    /// programmer error. Dropping the last lock completes every queued
+    /// get_release callback and fires the release signal (once per lock
+    /// cycle, re-armed by the next lock) even if the buffer was never
+    /// dropped (wlroots types/buffer/buffer.c:50-61): the client learns
+    /// it may reuse the buffer as soon as the compositor is done.
     pub fn unlock(buf: *Buffer) void {
         assert(buf.n_locks > 0);
         buf.n_locks -= 1;
+        if (buf.n_locks != 0) return;
         buf.maybeRelease();
+        if (buf.destroy_requested and !buf.notifying_destroy) buf.finishDestroy();
     }
 
+    /// The compositor stopped reading the buffer. Queued get_release
+    /// callbacks complete even when teardown was already requested: they
+    /// are a protocol promise about the CLIENT's reuse, not about
+    /// backing memory, and dropping them would hang the client forever.
     fn maybeRelease(buf: *Buffer) void {
+        assert(buf.n_locks == 0);
+        buf.completeReleaseCallbacks();
         // Once per lock cycle: the next lock() re-arms. The surface's
-        // re-drops of replaced buffers (drop only) never fire it.
-        if (!buf.released and buf.n_locks == 0) {
+        // re-drops of replaced buffers (drop only) never fire it. After
+        // teardown the wire resource is gone, so no release goes out.
+        if (!buf.released) {
             buf.released = true;
-            buf.events.release.emit(buf);
+            if (!buf.destroy_requested) buf.events.release.emit(buf);
         }
     }
 
-    /// Destroy the buffer: fires the destroy signal while the Buffer is
-    /// still valid, calls impl.destroy for impl-private resources, then
-    /// frees the Buffer. Must not be called from inside a signal handler.
+    /// Queue a wl_surface.get_release callback against this buffer. It
+    /// completes now when no consumer holds a lock, otherwise on the
+    /// final unlock. The callback resource itself is owned by the record
+    /// until then: the client destroying it (or disconnecting) unlinks
+    /// and frees the record without a done.
+    pub fn queueReleaseCallback(buf: *Buffer, callback: *wire.wl.Callback) error{OutOfMemory}!void {
+        if (buf.n_locks == 0) {
+            // Nobody is reading: the client may reuse the buffer now.
+            callback.destroySendDone(0);
+            return;
+        }
+        const rec = try buf.allocator.create(ReleaseCallback);
+        rec.* = .{
+            .allocator = buf.allocator,
+            .buf = buf,
+            .callback = callback,
+            .link = undefined,
+            .destroy = wire.Listener(*wire.Resource).init(ReleaseCallback.onClientDestroy),
+        };
+        rec.link.init();
+        buf.release_callbacks.append(rec);
+        const res: *wire.Resource = @ptrCast(callback);
+        res.addDestroyListener(&rec.destroy);
+    }
+
+    /// Send done on every queued get_release callback and free its
+    /// record. Called at the final unlock, never while the destroy
+    /// emitter is walking the Buffer.
+    fn completeReleaseCallbacks(buf: *Buffer) void {
+        var it = buf.release_callbacks.iterator(.forward);
+        while (it.next()) |rec| {
+            // Detach the callback's own destroy listener BEFORE destroying
+            // the resource: wl_resource_destroy would otherwise call back
+            // into the record we are about to free.
+            rec.destroy.link.remove();
+            rec.link.remove();
+            const callback = rec.callback;
+            buf.allocator.destroy(rec);
+            callback.destroySendDone(0);
+        }
+    }
+
+    /// Notify producer teardown once. The Buffer and impl backing survive
+    /// until the last consumer unlocks. Do not call from a release listener.
     pub fn destroy(buf: *Buffer) void {
+        if (buf.destroy_requested) return;
+        buf.destroy_requested = true;
+        buf.notifying_destroy = true;
         buf.events.destroy.emit(buf);
+        buf.notifying_destroy = false;
+        if (buf.n_locks == 0) {
+            // No queued callback can outlive a lock (queueReleaseCallback
+            // completes immediately at zero locks), but a destroy listener
+            // may have queued one during the emission; nothing may be
+            // owed to the client once the backing is gone.
+            buf.completeReleaseCallbacks();
+            buf.finishDestroy();
+        }
+    }
+
+    fn finishDestroy(buf: *Buffer) void {
+        assert(buf.destroy_requested and !buf.notifying_destroy and buf.n_locks == 0);
         buf.impl.destroy(buf.allocator, buf.data);
         buf.allocator.destroy(buf);
     }
@@ -286,6 +401,129 @@ test "destroy fires destroy signal before impl destroy" {
     buf.destroy();
     try std.testing.expectEqual(@as(u32, 1), observer.destroy_count);
     try std.testing.expect(data.destroyed);
+}
+
+test "destroy retains pixels while a renderer still owns a consumer lock" {
+    var data: TestBufferData = .{};
+    const buf = try Buffer.init(std.testing.allocator, &test_impl, &data, 4, 1);
+    try buf.lock();
+    buf.destroy();
+    try std.testing.expect(!data.destroyed);
+    const pixels = (try buf.impl.begin_data_ptr_access.?(buf)).?;
+    pixels[0] = 0xA7;
+    buf.impl.end_data_ptr_access.?(buf);
+    try std.testing.expectEqual(@as(u8, 0xA7), data.bytes[0]);
+    buf.unlock();
+    try std.testing.expect(data.destroyed);
+}
+
+/// A server + client pair with a raw peer fd, so a test can watch the
+/// bytes a wl_callback.done would put on the wire.
+const CallbackWire = struct {
+    server: *wire.Server,
+    client: ?*wire.Client,
+    peer_fd: std.posix.fd_t,
+    scratch: [128]u8 = undefined,
+
+    fn init() error{ ServerCreateFailed, SocketPairFailed, ClientCreateFailed }!CallbackWire {
+        const srv = try wire.Server.create();
+        errdefer srv.destroy();
+        var fds: [2]std.posix.fd_t = undefined;
+        const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds);
+        if (@as(isize, @bitCast(rc)) < 0) return error.SocketPairFailed;
+        const client = wire.Client.create(srv, fds[0]) orelse {
+            _ = std.os.linux.close(fds[0]);
+            _ = std.os.linux.close(fds[1]);
+            return error.ClientCreateFailed;
+        };
+        return .{ .server = srv, .client = client, .peer_fd = fds[1] };
+    }
+
+    fn deinit(self: *CallbackWire) void {
+        self.disconnect();
+        self.server.destroy();
+        _ = std.os.linux.close(self.peer_fd);
+        self.* = undefined;
+    }
+
+    fn disconnect(self: *CallbackWire) void {
+        if (self.client) |client| client.destroy();
+        self.client = null;
+    }
+
+    /// Flush the server, then the bytes the client would read — null when
+    /// nothing is queued.
+    fn recv(self: *CallbackWire) ?[]const u8 {
+        self.server.flushClients();
+        const n = std.os.linux.recvfrom(
+            self.peer_fd,
+            &self.scratch,
+            self.scratch.len,
+            std.os.linux.MSG.DONTWAIT,
+            null,
+            null,
+        );
+        const got: isize = @bitCast(n);
+        if (got < 12) return null;
+        return self.scratch[0..@intCast(got)];
+    }
+};
+
+test "a queued get_release callback completes on the final unlock, even after teardown" {
+    const allocator = std.testing.allocator;
+    var data: TestBufferData = .{};
+    var tw = try CallbackWire.init();
+    defer tw.deinit();
+
+    const buf = try Buffer.init(allocator, &test_impl, &data, 8, 8);
+    defer if (!data.destroyed) {
+        buf.destroy();
+        if (!data.destroyed) buf.unlock();
+    };
+    try buf.lock(); // the consumer is still reading the pixels
+    // A fresh client's display owns id 1; its next new_id is 2.
+    const callback = try wire.wl.Callback.create(tw.client.?, 1, 2);
+    try buf.queueReleaseCallback(callback);
+
+    // The producer tears down first: the promise to the client outlives
+    // the backing, and the backing outlives the consumer's lock.
+    buf.destroy();
+    try std.testing.expect(!data.destroyed);
+    try std.testing.expect(tw.recv() == null);
+
+    buf.unlock();
+    try std.testing.expect(data.destroyed);
+    const msg = tw.recv() orelse return error.NoCallbackDone;
+    const endian = @import("builtin").target.cpu.arch.endian();
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, msg[0..][0..4], endian));
+    try std.testing.expectEqual(@as(u32, 12 << 16), std.mem.readInt(u32, msg[4..][0..4], endian));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, msg[8..][0..4], endian));
+}
+
+test "a disconnected client drops its queued get_release callback" {
+    const allocator = std.testing.allocator;
+    var data: TestBufferData = .{};
+    var tw = try CallbackWire.init();
+    defer tw.deinit();
+
+    const buf = try Buffer.init(allocator, &test_impl, &data, 8, 8);
+    defer if (!data.destroyed) {
+        buf.destroy();
+        if (!data.destroyed) buf.unlock();
+    };
+    try buf.lock();
+    const callback = try wire.wl.Callback.create(tw.client.?, 1, 2);
+    try buf.queueReleaseCallback(callback);
+    try std.testing.expect(!buf.release_callbacks.empty());
+
+    // wl_callback has no destroy request: disconnecting the client
+    // destroys its resource and removes the promise before final unlock.
+    tw.disconnect();
+    try std.testing.expect(buf.release_callbacks.empty());
+    buf.unlock();
+    buf.destroy();
+    try std.testing.expect(data.destroyed);
+    try std.testing.expect(tw.recv() == null);
 }
 
 test "data ptr access roundtrip via impl" {

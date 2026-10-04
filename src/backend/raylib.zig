@@ -266,6 +266,11 @@ fn testState(_: *output.Output, state: *const output.Output.State) error{Invalid
         output.Output.State.committed_mode |
         output.Output.State.committed_buffer;
     if (state.committed & ~supported != 0) return error.InvalidState;
+    if (state.committed & output.Output.State.committed_buffer != 0) {
+        if (state.buffer) |buffer| {
+            if (buffer == .gpu) return error.InvalidState;
+        }
+    }
 }
 
 /// Upload the committed framebuffer into the window texture and draw it.
@@ -280,7 +285,10 @@ fn testState(_: *output.Output, state: *const output.Output.State) error{Invalid
 fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFailed}!void {
     const od: *RaylibOutputData = @ptrCast(@alignCast(out.data));
     if (state.buffer) |buf| {
-        const fb: *pixman.Framebuffer = @ptrCast(@alignCast(buf));
+        const fb = switch (buf) {
+            .cpu => |framebuffer| framebuffer,
+            .gpu => return error.CommitFailed,
+        };
         const perf_t0 = perfNs(out.io);
         const upload = uploadRegion(&state.damage, fb.width, fb.height);
         // The GL upload state (texture binding + unpack row length) is

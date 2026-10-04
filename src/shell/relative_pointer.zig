@@ -424,7 +424,7 @@ const PickState = struct {
 
 fn testPick(ctx: *anyopaque, x: i32, y: i32) ?seat_mod.Seat.PickResult {
     const st: *PickState = @ptrCast(@alignCast(ctx));
-    if (st.surface) |s| return .{ .surface = s, .sx = x, .sy = y };
+    if (st.surface) |s| return .{ .surface = s, .sx = @floatFromInt(x), .sy = @floatFromInt(y) };
     return null;
 }
 

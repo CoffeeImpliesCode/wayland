@@ -2403,6 +2403,35 @@ pub const LibinputBackend = struct {
     pub fn attachTablet(base: *backend.Backend, tablet: *tablet_mod.Tablet) void {
         LibinputBackend.fromBackend(base).tablet = tablet;
     }
+
+    /// The desktop extent absolute input devices are normalized onto.
+    ///
+    /// libinput reports a tablet or absolute pointer as a fraction of the
+    /// screen it was told about (`..._get_*_transformed(event, width,
+    /// height)`), and `scaleToOutput` maps that fraction onto these two
+    /// numbers. The compositor's screen is the DESKTOP, not one output:
+    /// with two outputs side by side an absolute device spans both, so
+    /// the numbers have to follow the layout as connectors come and go
+    /// (create's pair is only the initial desktop).
+    ///
+    /// Call it whenever the layout changes shape — an output added,
+    /// removed or resized. Views themselves never move: the layout
+    /// appends at the right end and a removal leaves its column unused,
+    /// so a surviving output keeps both its origin and its pixels.
+    pub fn setDesktopSize(base: *backend.Backend, width: u32, height: u32) void {
+        std.debug.assert(width > 0);
+        std.debug.assert(height > 0);
+        const self = LibinputBackend.fromBackend(base);
+        self.output_width = width;
+        self.output_height = height;
+        log_mod.info(
+            "libinput: absolute input now spans a {d}x{d} desktop",
+            self.io,
+            self.log_cfg,
+            "libinput",
+            .{ width, height },
+        );
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -3025,7 +3054,7 @@ const TabletFixture = struct {
     fn pickTestSurface(ctx: *anyopaque, _: i32, _: i32) ?seat_mod.Seat.PickResult {
         const self: *TabletFixture = @ptrCast(@alignCast(ctx));
         if (!self.hits) return null;
-        return .{ .surface = self.surface, .sx = 0, .sy = 0 };
+        return .{ .surface = self.surface, .sx = 0.0, .sy = 0.0 };
     }
 };
 

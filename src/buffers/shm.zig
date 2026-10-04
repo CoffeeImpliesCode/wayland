@@ -26,19 +26,20 @@
 //! - The release listener sends wl_buffer.release when the Buffer's release
 //!   signal fires (dropped && n_locks == 0): libwayland never sends release,
 //!   the compositor must.
-//! - A resource-destroy listener marks the wrapper dead (its backing is
-//!   freed by libwayland) and drops the Buffer. The wrapper is reclaimed by
-//!   ShmState.deinit; it must not be freed from inside the resource destroy
-//!   signal (that would free listener storage mid-emission).
+//! - A resource-destroy listener drops the Buffer and hands the wrapper
+//!   to `Buffer.destroy`. The wire resource owns the wrapper; the
+//!   wrapper's BACKING survives until the last consumer unlock
+//!   (buffers/buffer.zig), so nothing parks a dead wrapper anywhere.
 //!
 //! Wrapper lifetime contract:
 //! - Consumers (surfaces) lock() on attach, unlock() and drop() when done
 //!   presenting; drop is guarded by the caller (drop only if !buf.dropped),
 //!   because the module also drops on resource destruction.
-//! - Tracked wrappers (stateful path) are owned by ShmState and freed in
-//!   deinit. Untracked wrappers (stateless fromResource) are owned by the
-//!   surface, which destroys them via Buffer.destroy in its buffer-replace
-//!   and destroy paths (Buffer.tracked == false).
+//! - Tracked wrappers (stateful path) stay in ShmState.buffers for as long
+//!   as their wire resource lives, so re-attaching one resource reuses one
+//!   wrapper. Untracked wrappers (stateless fromResource) are created per
+//!   attach and destroyed by the surface, which holds the only reference
+//!   (Buffer.tracked == false).
 
 const std = @import("std");
 const wire = @import("../core/wire.zig");
@@ -60,18 +61,10 @@ pub const ShmState = struct {
     log_cfg: *const log.Config,
     display: *display_mod.CompositorDisplay,
     /// Tracked wrappers: client wl_buffer resource -> Buffer (dedupe).
+    /// An entry lives only as long as the wire resource: destruction
+    /// removes it and hands the wrapper to Buffer.destroy, which holds
+    /// the backing until the last consumer unlocks.
     buffers: std.AutoHashMap(*wire.Resource, *Buffer),
-    /// Wrappers whose client resource was destroyed: dropped from the map
-    /// (a recycled resource pointer must get a fresh wrapper) but still
-    /// referenced by surfaces until teardown, so ownership moves here and
-    /// deinit frees them.
-    dead_buffers: std.ArrayList(*Buffer) = .empty,
-    /// Fixed-size overflow for the graveyard when its append OOMs (F52):
-    /// wrappers with outstanding consumer locks cannot be freed inside the
-    /// resource-destroy signal, so they park here (no allocation) until
-    /// deinit frees them. A full stash leaks (bounded, OOM-only).
-    dead_stash: [8]?*Buffer = [_]?*Buffer{null} ** 8,
-    dead_stash_len: usize = 0,
 
     /// Enable the wl_shm protocol (internal libwayland global + formats)
     /// and allocate the shm state. Safe to call once per display.
@@ -94,21 +87,18 @@ pub const ShmState = struct {
         return state;
     }
 
-    /// Reclaim all tracked wrappers (their client resources may already be
-    /// gone; the wrappers themselves outlive them). Destroying a wrapper
-    /// removes it from the map, so re-iterate until empty. Dead wrappers
-    /// (resource destroyed, still surface-referenced) live in the
-    /// graveyard list and are freed here too, plus the F52 overflow stash.
+    /// Destroy the wl_buffers still owned. Each destroy runs
+    /// resourceDestroy, which takes the entry out of the map and hands
+    /// the wrapper to Buffer.destroy, so the iterator restarts from the
+    /// top every round. A wrapper a consumer still reads survives its
+    /// resource and frees itself at the final unlock.
     pub fn deinit(state: *ShmState) void {
-        for (state.dead_stash[0..state.dead_stash_len]) |buf| Buffer.destroy(buf.?);
-        state.dead_stash_len = 0;
-        for (state.dead_buffers.items) |buf| Buffer.destroy(buf);
-        state.dead_buffers.deinit(state.allocator);
+        // Destroy the wire object, never the wrapper.
         while (state.buffers.count() > 0) {
             var it = state.buffers.keyIterator();
-            const key = (it.next() orelse unreachable).*;
-            const buf = state.buffers.get(key).?;
-            Buffer.destroy(buf);
+            const resource = (it.next() orelse unreachable).*;
+            const wl_buffer: *wire.wl.Buffer = @ptrCast(resource);
+            wl_buffer.destroy();
         }
         const allocator = state.allocator;
         state.buffers.deinit();
@@ -117,8 +107,8 @@ pub const ShmState = struct {
 
     /// Wrap a client wl_buffer resource as a tracked Buffer. Repeated calls
     /// with the same resource return the same wrapper (one wrapper per
-    /// resource; release fires when all consumers are done). The wrapper is
-    /// owned by the state and freed in deinit.
+    /// resource; release fires when all consumers are done). The entry
+    /// lives as long as the wire resource.
     pub fn fromResource(
         state: *ShmState,
         allocator: std.mem.Allocator,
@@ -132,12 +122,12 @@ pub const ShmState = struct {
 };
 
 /// Wrap a client wl_buffer resource as an untracked Buffer. Unlike the
-/// stateful variant this creates a fresh wrapper per call; the surface
-/// (the only caller, via surface.zig handleAttach when no ShmState is
-/// wired) owns it and destroys it via Buffer.destroy when it stops using
-/// it (buffer-replace and surface-destroy paths). Prefer
-/// ShmState.fromResource in the compositor so repeated attaches of one
-/// resource share a wrapper.
+/// stateful variant this creates a fresh wrapper per call, so nothing
+/// dedupes re-attaches of one resource; the surface (the only caller,
+/// via surface.zig handleAttach when no ShmState is wired) holds the only
+/// reference and destroys it via Buffer.destroy when it stops using it
+/// (buffer-replace and surface-destroy paths). Prefer
+/// ShmState.fromResource in the compositor.
 pub fn fromResource(
     allocator: std.mem.Allocator,
     resource: *wire.Resource,
@@ -207,50 +197,30 @@ fn shmDestroy(allocator: std.mem.Allocator, data: *anyopaque) void {
 }
 
 /// The client destroyed the wl_buffer resource: libwayland frees the shm
-/// buffer backing, so mark the wrapper dead and drop it (the producer is
-/// done). The map entry is removed so a REUSED resource pointer (libwayland
-/// recycles freed resource memory) gets a fresh wrapper instead of this
-/// dead one — without this, the release event for the recycled buffer is
-/// silently dropped and the client's buffer stays busy forever
-/// (weston-simple-shm: "Both buffers busy at redraw()").
+/// buffer backing, so invalidate the wrapper and drop it (the producer is
+/// done). The map entry goes first so a REUSED resource pointer
+/// (libwayland recycles freed resource memory) gets a fresh wrapper
+/// instead of this dead one — without this, the release event for the
+/// recycled buffer is silently dropped and the client's buffer stays busy
+/// forever (weston-simple-shm: "Both buffers busy at redraw()").
+///
+/// The wrapper itself is handed to `Buffer.destroy`, which keeps the
+/// wrapper AND its impl data alive until the last consumer unlock: a
+/// renderer still sampling the pixels keeps them valid, and frees them
+/// itself. That is why this module needs no graveyard of its own.
 fn resourceDestroy(listener: *wire.Listener(*wire.Resource), resource: *wire.Resource) void {
     _ = resource;
     const d: *ShmBufferData = @fieldParentPtr("resource_destroy", listener);
-    if (d.state) |state| {
-        // The wrapper still outlives the resource (surfaces may hold it
-        // until teardown); move ownership to the graveyard so deinit
-        // frees it instead of leaking (the map no longer tracks it).
-        _ = state.buffers.remove(d.resource_key);
-    }
-    // Invalidate BEFORE the graveyard append: if the append OOMs the
-    // wrapper is unreachable (removed from the map, never appended), so it
-    // leaks at deinit — but it must not keep pointing at the freed client
-    // resource, or a later surface unlock/replace/destroy would
-    // use-after-free. The nulling also makes releaseNotify's guard work.
+    if (d.state) |state| _ = state.buffers.remove(d.resource_key);
+    // Invalidate BEFORE handing the wrapper over: the resource (and the
+    // shm backing libwayland frees with it) is gone, so a later release
+    // must stay silent and begin_data_ptr_access must fail rather than
+    // reach for freed memory. The nulling also makes releaseNotify's
+    // guard work.
     d.resource = null;
     d.shm = null;
     if (!d.buf.dropped) d.buf.drop();
-    if (d.state) |state| {
-        state.dead_buffers.append(state.allocator, d.buf) catch {
-            // F52: the graveyard could not take the wrapper. Free it now
-            // when no consumer holds a lock — safe inside the destroy
-            // signal: signal emission tolerates freeing the current
-            // listener, and the surface-side F42 listeners that run later
-            // in this emission only compare resource pointers, never
-            // dereference the wrapper. With outstanding locks the wrapper
-            // parks in the fixed-size stash for deinit.
-            if (d.buf.n_locks == 0) {
-                Buffer.destroy(d.buf);
-            } else {
-                if (state.dead_stash_len < state.dead_stash.len) {
-                    state.dead_stash[state.dead_stash_len] = d.buf;
-                    state.dead_stash_len += 1;
-                }
-                // Stash full: the wrapper leaks at deinit (bounded,
-                // OOM-only).
-            }
-        };
-    }
+    Buffer.destroy(d.buf);
 }
 
 /// The compositor is done with the buffer (dropped && n_locks == 0): tell
@@ -294,9 +264,11 @@ fn shmFromResource(
     );
     errdefer allocator.destroy(buf);
     d.buf = buf;
-    // Tracked wrappers (state != null) are owned by ShmState and freed in
-    // deinit; untracked wrappers are caller-owned, and the surface destroys
-    // them in its buffer-replace and destroy paths (Buffer.tracked).
+    // A tracked wrapper stays reachable through ShmState.buffers for as
+    // long as its wire resource lives, so the surface must NOT destroy it
+    // when it drops a reference: a later attach of the same resource
+    // would hand the client back a dead wrapper. An untracked wrapper has
+    // no other owner, so the surface destroys it.
     buf.tracked = state != null;
 
     d.resource_destroy = wire.Listener(*wire.Resource).init(resourceDestroy);
@@ -358,13 +330,42 @@ test "shm state init deinit" {
     try std.testing.expectEqual(@as(usize, 0), state.buffers.count());
 }
 
-test "graveyard append OOM frees unlocked wrappers and stashes locked ones" {
-    // F52: dead_buffers.append OOM used to leak the wrapper (it was
-    // removed from the map and never reclaimed). Now an unlocked wrapper
-    // is freed immediately (safe: signal emission tolerates freeing the
-    // current listener, and the surface-side F42 listeners that run later
-    // only compare resource pointers), and a locked one parks in the
-    // fixed-size stash for deinit.
+/// Build the ShmBufferData + Buffer pair `shmFromResource` produces, for
+/// a (never-real) client wl_buffer: the internal shm pipeline is
+/// unreachable in unit tests, so the destroy path is driven by hand.
+fn fabricateWrapper(
+    allocator: std.mem.Allocator,
+    state: *ShmState,
+    client: *wire.Client,
+    id: u32,
+    size: i32,
+) !struct { resource: *wire.Resource, buf: *Buffer } {
+    const resource = try wire.Resource.create(client, wire.wl.Buffer, 1, id);
+    const wl_buf_view: *wire.wl.Buffer = @ptrCast(resource);
+    const d = try allocator.create(ShmBufferData);
+    d.* = .{
+        .allocator = allocator,
+        .resource_key = resource,
+        .resource = wl_buf_view,
+        .shm = null,
+        .state = state,
+        .buf = undefined,
+        .resource_destroy = undefined,
+        .release = undefined,
+    };
+    const buf = try Buffer.init(allocator, &shm_impl, d, size, size);
+    d.buf = buf;
+    d.resource_destroy = wire.Listener(*wire.Resource).init(resourceDestroy);
+    d.release = wire.Listener(*Buffer).init(releaseNotify);
+    // Never added to a signal; shmDestroy removes it unconditionally, so
+    // put the link in the removable detached state.
+    d.release.link.init();
+    resource.addDestroyListener(&d.resource_destroy);
+    try state.buffers.put(resource, buf);
+    return .{ .resource = resource, .buf = buf };
+}
+
+test "a destroyed wl_buffer keeps its wrapper alive for the reader until the final unlock" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -373,9 +374,7 @@ test "graveyard append OOM frees unlocked wrappers and stashes locked ones" {
 
     const display = try display_mod.CompositorDisplay.init(allocator, &io, &cfg);
     defer display.deinit();
-
-    var failing = std.testing.FailingAllocator.init(allocator, .{});
-    const state = try ShmState.init(failing.allocator(), &io, &cfg, display);
+    const state = try ShmState.init(allocator, &io, &cfg, display);
     defer state.deinit();
 
     var fds: [2]std.c.fd_t = undefined;
@@ -389,68 +388,30 @@ test "graveyard append OOM frees unlocked wrappers and stashes locked ones" {
     }
     defer client.destroy();
 
-    // Fabricate a wrapper for a (never-real) client wl_buffer: the
-    // internal shm pipeline is unreachable in unit tests, so build the
-    // ShmBufferData + Buffer pair the resource-destroy path expects.
-    const resource = try wire.Resource.create(client, wire.wl.Buffer, 1, 2);
-    const wl_buf_view: *wire.wl.Buffer = @ptrCast(resource);
-    const d = try allocator.create(ShmBufferData);
-    d.* = .{
-        .allocator = allocator,
-        .resource_key = resource,
-        .resource = wl_buf_view,
-        .shm = null,
-        .state = state,
-        .buf = undefined,
-        .resource_destroy = undefined,
-        .release = undefined,
-    };
-    const buf = try Buffer.init(allocator, &shm_impl, d, 16, 16);
-    d.buf = buf;
-    d.resource_destroy = wire.Listener(*wire.Resource).init(resourceDestroy);
-    d.release = wire.Listener(*Buffer).init(releaseNotify);
-    // Never added to a signal; shmDestroy removes it unconditionally, so
-    // put the link in the removable detached state.
-    d.release.link.init();
-    resource.addDestroyListener(&d.resource_destroy);
-    try state.buffers.put(resource, buf);
-
-    // The client destroys the wl_buffer with the graveyard append failing:
-    // no consumer lock -> the wrapper is freed immediately, not leaked.
-    failing.fail_index = failing.alloc_index;
-    resource.destroy();
+    // A reader holds the buffer when the client destroys its wl_buffer.
+    const locked = try fabricateWrapper(allocator, state, client, 2, 16);
+    try locked.buf.lock();
+    locked.resource.destroy();
+    // The registry entry is gone (libwayland recycles resource memory,
+    // so a stale entry would hand the next client this dead wrapper),
+    // but the wrapper is still whole for the consumer holding it.
     try std.testing.expectEqual(@as(usize, 0), state.buffers.count());
-    try std.testing.expectEqual(@as(usize, 0), state.dead_buffers.items.len);
-    try std.testing.expectEqual(@as(usize, 0), state.dead_stash_len);
+    try std.testing.expect(locked.buf.destroy_requested);
+    try std.testing.expectEqual(@as(i32, 16), locked.buf.width);
+    try std.testing.expect(locked.buf.dropped);
+    // The backing handle died with the resource: reads report that
+    // instead of reaching into freed memory.
+    try std.testing.expectError(
+        error.Unsupported,
+        locked.buf.impl.begin_data_ptr_access.?(locked.buf),
+    );
+    // The final unlock frees the wrapper; nothing reclaims it afterwards
+    // (the testing allocator reports the leak this replaced).
+    locked.buf.unlock();
 
-    // Second wrapper with an outstanding consumer lock: cannot free it
-    // mid-emission, so the fixed-size stash takes it (freed by deinit).
-    const resource2 = try wire.Resource.create(client, wire.wl.Buffer, 1, 3);
-    const wl_buf_view2: *wire.wl.Buffer = @ptrCast(resource2);
-    const d2 = try allocator.create(ShmBufferData);
-    d2.* = .{
-        .allocator = allocator,
-        .resource_key = resource2,
-        .resource = wl_buf_view2,
-        .shm = null,
-        .state = state,
-        .buf = undefined,
-        .resource_destroy = undefined,
-        .release = undefined,
-    };
-    const buf2 = try Buffer.init(allocator, &shm_impl, d2, 8, 8);
-    d2.buf = buf2;
-    d2.resource_destroy = wire.Listener(*wire.Resource).init(resourceDestroy);
-    d2.release = wire.Listener(*Buffer).init(releaseNotify);
-    d2.release.link.init();
-    resource2.addDestroyListener(&d2.resource_destroy);
-    try state.buffers.put(resource2, buf2);
-    try buf2.lock(); // a consumer is reading
-
-    failing.fail_index = failing.alloc_index;
-    resource2.destroy();
+    // The same path without a reader: the wrapper is retired with the
+    // resource and must not be parked anywhere.
+    const idle = try fabricateWrapper(allocator, state, client, 3, 8);
+    idle.resource.destroy();
     try std.testing.expectEqual(@as(usize, 0), state.buffers.count());
-    try std.testing.expectEqual(@as(usize, 0), state.dead_buffers.items.len);
-    try std.testing.expectEqual(@as(usize, 1), state.dead_stash_len);
-    // state.deinit (defer) frees the stashed wrapper.
 }

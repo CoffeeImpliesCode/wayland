@@ -40,6 +40,15 @@
 //! `Attributes` owns closing them: `Attributes.closePlanes` is called on
 //! every exit path, and `Device.import` takes the struct by value with
 //! that contract spelled out in its error set documentation.
+//! An IMPORTED buffer keeps its OWN descriptors: `gbmImport` duplicates
+//! every plane fd into the wrapper (`wrapGbmBuffer`) and closes the ones
+//! it was handed, so what `get_dmabuf` hands back afterwards is a
+//! complete, exportable description - real fds, real strides, real plane
+//! count - rather than a set of spent descriptor numbers. That is what
+//! makes a client buffer usable as a scanout frame (EGLImage import,
+//! drmModeAddFB2) and what makes `screencopy`'s single-plane destination
+//! check (`attrs.n_planes != 1`) see the buffer it actually got. The
+//! duplicates are closed exactly once, in `dmabufDestroy`.
 //! # CPU access to an imported bo
 //! A bo is GPU memory, so the Buffer impl carries no CPU pointer (see
 //! `dmabuf_impl` below). One consumer needs the pixels anyway: a
@@ -276,9 +285,11 @@ pub const Device = struct {
         return self.vtable.formats(self.ptr);
     }
 
-    /// Import `attrs`, taking ownership of its plane fds on every path:
-    /// on success the importer keeps what it needs, on failure it closes
-    /// every fd it was given.
+    /// Import `attrs`, consuming its plane fds on every path: on success
+    /// the importer keeps its OWN duplicates and closes the ones it was
+    /// handed (so the buffer it returns exports a complete, still-valid
+    /// description), on failure it closes every fd it was given and
+    /// returns nothing.
     pub fn import(
         self: Device,
         allocator: std.mem.Allocator,
@@ -312,7 +323,8 @@ pub const GbmDevice = struct {
     /// gbm_create_device keeps only a borrowed fd.
     fd: std.posix.fd_t,
     device: *c.gbm_device,
-    /// Owned; `setFormats` takes it over and `deinit` frees it.
+    /// Owned; `setFormats` frees the slice it replaces and `deinit` frees
+    /// the live one.
     formats: []Format = &.{},
     /// dev_t of `fd`, the node clients should target.
     main_dev: u64,
@@ -342,10 +354,15 @@ pub const GbmDevice = struct {
         ) catch return error.NodeOpenFailed;
         errdefer _ = std.os.linux.close(fd);
         const device = c.gbm_create_device(fd) orelse return error.GbmCreateFailed;
-        // dev_t of the node, for the v4+ feedback events. Zig 0.16's
-        // std.posix/std.os.linux have no fstat, so declare the libc one:
-        // struct stat's first member is dev_t on Linux, which is all this
-        // needs.
+        // The DRM device number behind the node, for the v4+ feedback
+        // events. Zig 0.16's std.posix/std.os.linux have no fstat, so
+        // declare the libc one. It is `st_rdev`, not `st_dev`: for a
+        // character device node `st_dev` is the devtmpfs filesystem's
+        // device (every /dev/dri node shares it) while `st_rdev` is the
+        // rendered DRM device itself - what the feedback's main_device /
+        // tranche_target_device advertise and what a client compares
+        // against (wlroots reads the same field in renderer/drm.c:
+        // `major(drm_node_stat.st_rdev)`).
         var st: c.struct_stat = undefined;
         if (c.fstat(fd, &st) != 0) return error.DevStatFailed;
         const self = try allocator.create(GbmDevice);
@@ -353,7 +370,7 @@ pub const GbmDevice = struct {
             .allocator = allocator,
             .fd = fd,
             .device = device,
-            .main_dev = @bitCast(@as(i64, @bitCast(st.st_dev))),
+            .main_dev = @bitCast(@as(i64, @bitCast(st.st_rdev))),
             .iface = .{ .ptr = undefined, .vtable = &vtable },
         };
         // The vtable entry point receives exactly this pointer back.
@@ -361,8 +378,14 @@ pub const GbmDevice = struct {
         return self;
     }
 
-    /// Take ownership of the advertised (format, modifier) pairs.
+    /// Take ownership of the advertised (format, modifier) pairs. The
+    /// previous pair set is released first: this device is asked for its
+    /// capability table more than once (the DRM backend queries GBM,
+    /// then the server narrows it to what the renderer can actually
+    /// import), and dropping the old set would leak it. Only an owned
+    /// non-empty slice is freed — the `&.{}` default is static.
     pub fn setFormats(self: *GbmDevice, formats: []Format) void {
+        if (self.formats.len != 0) self.allocator.free(self.formats);
         self.formats = formats;
     }
 
@@ -396,17 +419,21 @@ fn gbmFormats(ptr: *anyopaque) []const Format {
     return self.formats;
 }
 
-/// GBM usage for an imported buffer: scanout + rendering. The composite
-/// path either hands the buffer to the KMS plane or samples it into a
-/// texture; both need the bo in one of those modes. wlroots uses the same
-/// pair for its fallback allocation (render/allocator/gbm.c:74).
-/// Scanout + rendering + linear. The first two are the pair wlroots uses
-/// for its fallback allocation (render/allocator/gbm.c:74); linear is
-/// added because it is the one layout the compositor actually validates
-/// and advertises (there is no tiling modifier in the set GBM accepts
-/// here), and the nvidia GBM backend refuses an import that does not name
-/// the usage its source object was created with.
-const import_usage: u32 = c.GBM_BO_USE_SCANOUT | c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR;
+/// Native sources need rendering/scanout, not a CPU-linear layout.
+/// Add LINEAR only for an explicitly linear source; forcing it on a
+/// tiled import makes drivers such as NVIDIA reject a valid DMA-BUF.
+const import_usage: u32 = c.GBM_BO_USE_SCANOUT | c.GBM_BO_USE_RENDERING;
+
+/// A private copy of `fd` (CLOEXEC is irrelevant: it never outlives the
+/// import), or null on failure. The wrapper and the bo must not share one
+/// descriptor: the bo takes its own reference at import time, the
+/// wrapper keeps the exportable one, and the two are closed by different
+/// owners.
+fn dupFd(fd: std.posix.fd_t) error{OutOfMemory}!std.posix.fd_t {
+    const rc = std.os.linux.dup(fd);
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.OutOfMemory;
+    return @intCast(rc);
+}
 
 fn gbmImport(
     ptr: *anyopaque,
@@ -444,13 +471,14 @@ fn gbmImport(
         self.device,
         c.GBM_BO_IMPORT_FD_MODIFIER,
         &data,
-        import_usage,
+        import_usage | (if (attrs.modifier == drm_format_mod_linear) @as(u32, @intCast(c.GBM_BO_USE_LINEAR)) else 0),
     ) orelse return error.ImportFailed;
     errdefer c.gbm_bo_destroy(bo);
 
     const buf = try wrapGbmBuffer(allocator, bo, attrs);
-    // The bo owns its own reference to the client's dma-buf now, so the
-    // fds the client lent us can go back.
+    // The bo owns its own reference to the client's dma-buf and the
+    // wrapper holds descriptors of its own, so the fds the client lent
+    // us can go back.
     attrs.closePlanes();
     return buf;
 }
@@ -488,14 +516,20 @@ fn dmabufGetAttributes(buf: *Buffer) ?*anyopaque {
 fn dmabufDestroy(allocator: std.mem.Allocator, data: *anyopaque) void {
     const d: *DmabufBufferData = @ptrCast(@alignCast(data));
     // The user-data destroy callback runs from here, not from
-    // gbm_bo_destroy, so the bo is still valid when it fires.
+    // gbm_bo_destroy, so the bo is still valid when it fires. Our own
+    // plane descriptors close here and only here - exactly once, even
+    // though the same buffer may have been handed out, imported by a
+    // renderer and destroyed late.
     c.gbm_bo_destroy(d.bo);
     d.attrs.closePlanes();
     allocator.destroy(d);
 }
 
-/// Wrap an imported bo in a compositor Buffer. `attrs` is copied; the
-/// caller keeps ownership of the plane fds it still holds.
+/// Wrap an imported bo in a compositor Buffer. The wrapper keeps its OWN
+/// copy of every plane descriptor: `attrs`' fds belong to the caller (the
+/// import path closes them once the wrapper exists) and are duplicated
+/// here, so the exported `get_dmabuf` description stays complete for as
+/// long as the buffer does.
 fn wrapGbmBuffer(
     allocator: std.mem.Allocator,
     bo: *c.gbm_bo,
@@ -505,21 +539,16 @@ fn wrapGbmBuffer(
     errdefer allocator.destroy(d);
     d.* = .{
         .bo = bo,
-        // The plane fds are duplicated into the copy; the struct holds no
-        // ownership until closePlanes runs, and this copy's fds are the
-        // ones imported from (already consumed). Reset them so a later
-        // closePlanes can never close a borrowed fd twice.
-        .attrs = blk: {
-            var copy = attrs;
-            var p: usize = 0;
-            while (p < max_planes) : (p += 1) copy.planes[p].fd = -1;
-            copy.n_planes = 0;
-            break :blk copy;
-        },
+        // Start from the layout, not the descriptors: the fds that
+        // arrive here are consumed by the caller and must not be closed
+        // through this struct, ever. dupPlanes fills them in below.
+        .attrs = emptyPlanes(attrs),
         // SAFETY: assigned from Buffer.init below before the Buffer is
         // reachable from anywhere.
         .buf = undefined,
     };
+    errdefer d.attrs.closePlanes();
+    try dupPlanes(&d.attrs, &attrs);
     const buf = try Buffer.init(allocator, &dmabuf_impl, d, attrs.width, attrs.height);
     errdefer allocator.destroy(buf);
     d.buf = buf;
@@ -528,6 +557,37 @@ fn wrapGbmBuffer(
     // allocator uses for its own bo bookkeeping).
     c.gbm_bo_set_user_data(bo, d, null);
     return buf;
+}
+
+/// The layout of `src` with every descriptor cleared: a wrapper starts
+/// from this and owns nothing until dupPlanes fills it.
+fn emptyPlanes(src: Attributes) Attributes {
+    var copy = src;
+    var p: usize = 0;
+    while (p < max_planes) : (p += 1) copy.planes[p].fd = -1;
+    copy.n_planes = 0;
+    return copy;
+}
+
+/// Fill `dst` with `dst`'s OWN descriptors for the planes of `src`, with
+/// the same offsets and strides. `src`'s fds are untouched: they belong
+/// to whoever produced them and are closed elsewhere, which is what
+/// keeps a wrapper's teardown from closing a descriptor number the client
+/// (or the bo) still owns.
+///
+/// A failure part way through closes the duplicates already made, so no
+/// descriptor escapes this call.
+fn dupPlanes(dst: *Attributes, src: *const Attributes) error{OutOfMemory}!void {
+    errdefer dst.closePlanes();
+    var made: u8 = 0;
+    while (made < src.n_planes) : (made += 1) {
+        dst.planes[made] = .{
+            .fd = try dupFd(src.planes[made].fd),
+            .offset = src.planes[made].offset,
+            .stride = src.planes[made].stride,
+        };
+        dst.n_planes = made + 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -560,12 +620,9 @@ pub const CpuWrite = struct {
 /// a thing this may be handed).
 ///
 /// # Constraints this relies on
-/// - The bo must be mappable in place, which the import path asks
-///   for: `import_usage` includes GBM_BO_USE_LINEAR, so every bo this
-///   module produced was created for a linear mapping. A destination
-///   imported with a tiling modifier is NOT rejected here — GBM
-///   stages it — but the copy then costs a driver round trip instead
-///   of a memcpy, which is the client's choice to make.
+/// - This is explicit screencopy access, never the native texture path.
+///   GBM may map a linear destination in place or stage a tiled one; the
+///   caller must use the returned mapping stride and unmap after writing.
 /// - The caller must already know the format: rows are
 ///   `width * bytes_per_pixel`, and nothing here checks that the
 ///   mapping is tall enough for them. The screencopy destination path
@@ -815,6 +872,45 @@ test "closePlanes closes every fd once and forgets them" {
     for (attrs.planes) |plane| try testing.expectEqual(@as(std.posix.fd_t, -1), plane.fd);
 }
 
+test "a retained description exports working descriptors of its own" {
+    // What an imported buffer hands back through get_dmabuf is the whole
+    // point of dupPlanes: real descriptor numbers, real strides and a
+    // real plane count, owned by the wrapper. A description whose fds are
+    // -1 and whose n_planes is 0 describes nothing - no renderer can
+    // import it, and a single-plane consumer rejects it outright.
+    var src = try singlePlaneSet(256 * 64);
+    defer src.closePlanes();
+    src.planes[1] = .{ .fd = try fakeObject(256 * 16), .offset = 64, .stride = 128 };
+    src.n_planes = 2;
+
+    var dst = emptyPlanes(src);
+    try dupPlanes(&dst, &src);
+    try testing.expectEqual(@as(u8, 2), dst.n_planes);
+    // Same layout, different descriptors: sharing one would make the
+    // wrapper's teardown close the bo's or the caller's handle.
+    try testing.expect(dst.planes[0].fd != src.planes[0].fd);
+    try testing.expect(dst.planes[1].fd != src.planes[1].fd);
+    for (0..2) |i| {
+        try testing.expectEqual(src.planes[i].offset, dst.planes[i].offset);
+        try testing.expectEqual(src.planes[i].stride, dst.planes[i].stride);
+        try testing.expect(dst.planes[i].fd >= 0);
+    }
+    // Each retained descriptor still names its own object, so a consumer
+    // can map, export or re-import from it.
+    try testing.expectEqual(@as(?u64, 256 * 64), planeSize(dst.planes[0].fd));
+    try testing.expectEqual(@as(?u64, 256 * 16), planeSize(dst.planes[1].fd));
+
+    // Tearing the wrapper down closes only its own duplicates: the source
+    // objects survive, which is what makes a late Buffer.destroy safe
+    // after the client has gone.
+    dst.closePlanes();
+    try testing.expectEqual(@as(?u64, 256 * 64), planeSize(src.planes[0].fd));
+    try testing.expectEqual(@as(?u64, 256 * 16), planeSize(src.planes[1].fd));
+    // And the closed numbers must not be closed again through the source.
+    dst.closePlanes();
+    try testing.expectEqual(@as(?u64, 256 * 64), planeSize(src.planes[0].fd));
+}
+
 test "planeSize reads the object length and tolerates a non-seekable fd" {
     const fd = try fakeObject(4096);
     defer _ = std.os.linux.close(fd);
@@ -865,13 +961,6 @@ test "a Device with no formats is not live" {
     try testing.expect(!dev.isLive());
     try testing.expectEqual(@as(u64, 0), dev.mainDevice());
 }
-/// A private copy of `fd` (CLOEXEC), or null on failure. The test client
-/// and the imported bo must not share one descriptor.
-fn dupFd(fd: std.posix.fd_t) ?std.posix.fd_t {
-    const rc = std.os.linux.dup(fd);
-    if (std.os.linux.errno(rc) != .SUCCESS) return null;
-    return @intCast(rc);
-}
 
 test "a real GBM device imports a real dmabuf (skipped without a DRM node)" {
     // The one test that needs hardware. It is a SKIP, never a failure, on a
@@ -912,7 +1001,7 @@ test "a real GBM device imports a real dmabuf (skipped without a DRM node)" {
         .n_planes = 1,
     };
     attrs.planes[0] = .{
-        .fd = dupFd(plane_fd) orelse return error.OutOfMemory,
+        .fd = try dupFd(plane_fd),
         .offset = c.gbm_bo_get_offset(src, 0),
         .stride = c.gbm_bo_get_stride_for_plane(src, 0),
     };
@@ -936,6 +1025,15 @@ test "a real GBM device imports a real dmabuf (skipped without a DRM node)" {
     try testing.expectEqual(format, d.attrs.format);
     try testing.expectEqual(drm_format_mod_linear, d.attrs.modifier);
     try testing.expectEqual(@as(u32, attrs.planes[0].stride), d.attrs.planes[0].stride);
+    // The exported description must be usable on its own: the renderer
+    // and the scanout allocator take descriptors from here, and a
+    // single-plane consumer (screencopy's dmabuf destination) rejects
+    // anything that does not carry its plane count and descriptors.
+    try testing.expectEqual(@as(u8, 1), d.attrs.n_planes);
+    try testing.expect(d.attrs.planes[0].fd >= 0);
+    // Ours, not the caller's: the same number closed twice would take the
+    // bo's own export down with it.
+    try testing.expect(d.attrs.planes[0].fd != attrs.planes[0].fd);
     // gbm_bo_set_user_data tied the two together.
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(d)), c.gbm_bo_get_user_data(d.bo));
     // A dmabuf has no CPU pointer, so the impl must not pretend otherwise.

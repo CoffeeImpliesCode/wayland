@@ -85,6 +85,8 @@ pub const raylib = @import("backend/raylib.zig");
 /// the raylib window. Built only with -Denable_raylib.
 pub const raylib_input = @import("backend/raylib_input.zig");
 pub const output = @import("output/output.zig");
+/// Backend-owned DMA-BUF scanout lease passed through typed output commits.
+pub const gpu_frame = @import("output/gpu_frame.zig");
 /// wl_output protocol global (output/wl_output.zig): exposes an Output
 /// to clients (geometry/mode/scale/name/description).
 pub const wl_output = @import("output/wl_output.zig");
@@ -196,6 +198,7 @@ comptime {
         _ = raylib_input;
     }
     _ = output;
+    _ = gpu_frame;
     _ = wl_output;
     _ = renderer;
     _ = shell;

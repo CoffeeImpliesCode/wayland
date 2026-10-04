@@ -353,6 +353,11 @@ fn testState(_: *output.Output, state: *const output.Output.State) error{Invalid
         output.Output.State.committed_mode |
         output.Output.State.committed_buffer;
     if (state.committed & ~supported != 0) return error.InvalidState;
+    if (state.committed & output.Output.State.committed_buffer != 0) {
+        if (state.buffer) |buffer| {
+            if (buffer == .gpu) return error.InvalidState;
+        }
+    }
 }
 
 /// Upload the committed framebuffer into the parent's wl_shm buffer and
@@ -373,7 +378,10 @@ fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFa
         }
     }
     if (state.buffer) |buf| {
-        const fb: *pixman.Framebuffer = @ptrCast(@alignCast(buf));
+        const fb = switch (buf) {
+            .cpu => |framebuffer| framebuffer,
+            .gpu => return error.CommitFailed,
+        };
         if (od.shm_buf.buffer == null or od.shm_buf.width != fb.width or od.shm_buf.height != fb.height) {
             ensureShmBuffer(od, fb.width, fb.height) catch return error.CommitFailed;
         }
@@ -1070,7 +1078,7 @@ test "nested backend maps a parent surface and uploads committed framebuffers" {
     var state = output.Output.State.init(allocator);
     defer state.deinit();
     state.committed = output.Output.State.committed_buffer;
-    state.buffer = fb;
+    state.buffer = .{ .cpu = fb };
     try out.commitState(&state);
 
     try loop.dispatch(100);
@@ -1095,7 +1103,7 @@ test "nested backend maps a parent surface and uploads committed framebuffers" {
     var state2 = output.Output.State.init(allocator);
     defer state2.deinit();
     state2.committed = output.Output.State.committed_buffer;
-    state2.buffer = fb2;
+    state2.buffer = .{ .cpu = fb2 };
     try out.commitState(&state2);
 
     try loop.dispatch(100);
@@ -1155,7 +1163,7 @@ test "parent frame done fires the output presented event" {
     var state = output.Output.State.init(allocator);
     defer state.deinit();
     state.committed = output.Output.State.committed_buffer;
-    state.buffer = fb;
+    state.buffer = .{ .cpu = fb };
     try out.commitState(&state);
     try std.testing.expectEqual(@as(u64, 1), out.commit_seq);
 

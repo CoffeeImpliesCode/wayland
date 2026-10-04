@@ -504,7 +504,7 @@ fn dragGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i3
             for (drag.manager.devices.items) |dev| {
                 const res = dev.eventResource() orelse continue;
                 if (res.getClient() != target) continue;
-                res.sendMotion(@intCast(time), Fixed.fromInt(@intCast(p.sx)), Fixed.fromInt(@intCast(p.sy)));
+                res.sendMotion(@intCast(time), Fixed.fromDouble(p.sx), Fixed.fromDouble(p.sy));
             }
         }
     } else {
@@ -521,7 +521,7 @@ fn dragGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i3
 /// there are no mime types to advertise and no transfer to make —
 /// "the client is expected to handle the data passing internally".
 /// Its enter carries the NULL offer wayland.xml:1010-1011 allows.
-fn dragSetFocus(drag: *Drag, surface: ?*surface_mod.Surface, sx: i32, sy: i32) void {
+fn dragSetFocus(drag: *Drag, surface: ?*surface_mod.Surface, sx: f64, sy: f64) void {
     const mgr = drag.manager;
     const seat = mgr.seat;
     if (drag.focus == surface) return;
@@ -562,7 +562,7 @@ fn dragSetFocus(drag: *Drag, surface: ?*surface_mod.Surface, sx: i32, sy: i32) v
         for (mgr.devices.items) |dev| {
             const res = dev.eventResource() orelse continue;
             if (res.getClient() != client_wire) continue;
-            res.sendEnter(serial, s.resource, Fixed.fromInt(@intCast(sx)), Fixed.fromInt(@intCast(sy)), null);
+            res.sendEnter(serial, s.resource, Fixed.fromDouble(sx), Fixed.fromDouble(sy), null);
         }
         log.debug("source-less drag entered surface@{d} (initiator only)", mgr.io, mgr.log_cfg, "data_device", .{
             s.resource.getId(),
@@ -586,7 +586,7 @@ fn dragSetFocus(drag: *Drag, surface: ?*surface_mod.Surface, sx: i32, sy: i32) v
             offer.resource.sendSourceActions(@bitCast(src.actions orelse 0));
         }
         const serial = seat.serialFor(client_wire);
-        res.sendEnter(serial, s.resource, Fixed.fromInt(@intCast(sx)), Fixed.fromInt(@intCast(sy)), offer.resource);
+        res.sendEnter(serial, s.resource, Fixed.fromDouble(sx), Fixed.fromDouble(sy), offer.resource);
         drag.offer = offer;
         log.debug("drag entered surface@{d}", mgr.io, mgr.log_cfg, "data_device", .{s.resource.getId()});
     }
@@ -1652,7 +1652,7 @@ const PickState = struct {
 
 fn testPick(ctx: *anyopaque, x: i32, y: i32) ?seat_mod.Seat.PickResult {
     const st: *PickState = @ptrCast(@alignCast(ctx));
-    if (st.surface) |s| return .{ .surface = s, .sx = x, .sy = y };
+    if (st.surface) |s| return .{ .surface = s, .sx = @floatFromInt(x), .sy = @floatFromInt(y) };
     return null;
 }
 

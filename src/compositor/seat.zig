@@ -575,9 +575,14 @@ pub const Seat = struct {
     /// Pointer position in output coordinates.
     pointer_x: i32 = 0,
     pointer_y: i32 = 0,
-    /// Pointer position relative to the focus surface's top-left.
-    focus_x: i32 = 0,
-    focus_y: i32 = 0,
+    /// Pointer position relative to the focus surface's top-left, kept at
+    /// the precision the hit test reported it (f64, PickResult.sx/sy).
+    /// A client that binds the cursor or a pointer constraint reads these
+    /// through PointerConstraints, which compares them against integer
+    /// region rectangles — so this is a LOCAL position, already past the
+    /// camera inverse and the surface-origin subtraction.
+    focus_x: f64 = 0,
+    focus_y: f64 = 0,
     pointer_enter_serial: u32 = 0,
     /// Client cursor surface resource (wl_pointer.set_cursor, applied
     /// when the serial matches the last enter) + hotspot. The compositor
@@ -756,10 +761,22 @@ pub const Seat = struct {
 
     /// Result of a hit test: the surface and the pointer position in
     /// surface-local coordinates.
+    ///
+    /// `sx` / `sy` are f64 because the hit test is where the camera
+    /// inverse happens: the desktop position that arrives is a whole
+    /// output pixel, but the surface it resolves to need not be aligned
+    /// to one, and a zoomed or rotated view puts the surface-local
+    /// point on a fraction of a pixel. Narrowing here would quantize
+    /// every click, drag and touch to the pixel grid, so the value is
+    /// carried to the wire boundary and becomes 24.8 fixed only there
+    /// (Fixed.fromDouble in pointerEnter / touchEnter / touchDown /
+    /// touchMotion). The DESKTOP coordinates stay integer: the pick
+    /// still receives an i32 output pixel, so nothing upstream of the
+    /// hit test changed.
     pub const PickResult = struct {
         surface: *Surface,
-        sx: i32,
-        sy: i32,
+        sx: f64,
+        sy: f64,
     };
 
     pub fn init(
@@ -1233,8 +1250,13 @@ pub const Seat = struct {
             return; // no focus, no motion target
         }
         const time = nowMs(self);
-        const fx = Fixed.fromInt(@intCast(self.focus_x));
-        const fy = Fixed.fromInt(@intCast(self.focus_y));
+        // The WIRE boundary: the local position the hit test produced is
+        // f64 (it came out of the camera inverse), and wl_pointer.motion
+        // carries it as 24.8 fixed. Rounding to a whole pixel first
+        // would quantize every motion to the pixel grid and make the
+        // dedup below coarser than the protocol's own resolution.
+        const fx = Fixed.fromDouble(self.focus_x);
+        const fy = Fixed.fromDouble(self.focus_y);
         // Motion dedup (F8): a move within the same fixed-point cell is
         // dropped (wlroots wlr_seat_pointer_send_motion, wlr_seat_pointer.c:
         // 252-263 — compare against the last sent position).
@@ -2132,7 +2154,7 @@ pub const Seat = struct {
         }
     }
 
-    fn pointerEnter(self: *Seat, surface: *Surface, sx: i32, sy: i32) void {
+    fn pointerEnter(self: *Seat, surface: *Surface, sx: f64, sy: f64) void {
         // Re-arm the surface-destroy listener (wlroots
         // wlr_seat_pointer.c:210-225).
         if (self.pointer_focus_listener.link.prev != null) self.pointer_focus_listener.link.remove();
@@ -2161,8 +2183,8 @@ pub const Seat = struct {
             ptr.sendEnter(
                 self.pointer_enter_serial,
                 res,
-                Fixed.fromInt(@intCast(sx)),
-                Fixed.fromInt(@intCast(sy)),
+                Fixed.fromDouble(sx),
+                Fixed.fromDouble(sy),
             );
             delivered = true;
         }
@@ -2370,8 +2392,12 @@ pub const Seat = struct {
         }
         self.touch_points.append(self.allocator, .{
             .id = id,
-            .x = @floatFromInt(p.sx),
-            .y = @floatFromInt(p.sy),
+            // Stored at the hit test's own precision: the stored point is
+            // what the seat replays to a fresh wl_touch and what the
+            // compositor's own gesture code reads, so quantizing it here
+            // would lose the fraction twice.
+            .x = p.sx,
+            .y = p.sy,
         }) catch {
             // OOM: the client must not be told about a point the seat
             // cannot track, and a focus was just entered — close the
@@ -2385,7 +2411,7 @@ pub const Seat = struct {
         var delivered = false;
         for (self.touches.items) |touch| {
             if (touch.getClient() != wl_client) continue;
-            touch.sendDown(serial, time, p.surface.resource, @intCast(id), Fixed.fromDouble(@floatFromInt(p.sx)), Fixed.fromDouble(@floatFromInt(p.sy)));
+            touch.sendDown(serial, time, p.surface.resource, @intCast(id), Fixed.fromDouble(p.sx), Fixed.fromDouble(p.sy));
             delivered = true;
         }
         if (delivered) self.markTouchFramePending(wl_client);
@@ -2438,12 +2464,12 @@ pub const Seat = struct {
         var delivered = false;
         for (self.touches.items) |touch| {
             if (touch.getClient() != wl_client) continue;
-            touch.sendMotion(time, @intCast(id), Fixed.fromDouble(@floatFromInt(p.sx)), Fixed.fromDouble(@floatFromInt(p.sy)));
+            touch.sendMotion(time, @intCast(id), Fixed.fromDouble(p.sx), Fixed.fromDouble(p.sy));
             delivered = true;
         }
         if (!delivered) return;
-        self.touch_points.items[idx].x = @floatFromInt(p.sx);
-        self.touch_points.items[idx].y = @floatFromInt(p.sy);
+        self.touch_points.items[idx].x = p.sx;
+        self.touch_points.items[idx].y = p.sy;
         self.markTouchFramePending(wl_client);
         self.events.touch.emit(self);
     }
@@ -2586,7 +2612,7 @@ pub const Seat = struct {
     /// the focus transition (see the touch wire model above). Sent to
     /// the surface's OWN client's pointer resources only — libwayland
     /// rejects an event carrying another client's surface.
-    fn touchEnter(self: *Seat, surface: *Surface, sx: i32, sy: i32) void {
+    fn touchEnter(self: *Seat, surface: *Surface, sx: f64, sy: f64) void {
         if (self.touch_focus_listener.link.prev != null) self.touch_focus_listener.link.remove();
         self.touch_focus = surface;
         surface.events.destroy.add(&self.touch_focus_listener);
@@ -2598,8 +2624,8 @@ pub const Seat = struct {
             ptr.sendEnter(
                 serial,
                 surface.resource,
-                Fixed.fromDouble(@floatFromInt(sx)),
-                Fixed.fromDouble(@floatFromInt(sy)),
+                Fixed.fromDouble(sx),
+                Fixed.fromDouble(sy),
             );
             delivered = true;
         }
@@ -2787,8 +2813,8 @@ fn seatRequest(resource: *server.wl.Seat, request: server.wl.Seat.Request, seat:
                     ptr.sendEnter(
                         seat.serialFor(ptr.getClient()),
                         s.resource,
-                        Fixed.fromInt(@intCast(seat.focus_x)),
-                        Fixed.fromInt(@intCast(seat.focus_y)),
+                        Fixed.fromDouble(seat.focus_x),
+                        Fixed.fromDouble(seat.focus_y),
                     );
                     seat.markFramePending(ptr.getClient());
                 }
@@ -3113,6 +3139,13 @@ const PointerEvents = struct {
     /// touch tests need to tell a second touch-focus enter from the
     /// first.
     enters: usize = 0,
+    /// The surface-local position the wire carried, as doubles: the
+    /// 24.8 fixed of the last enter and of the last motion. Tests that
+    /// care about sub-pixel precision read these; the rest only count.
+    enter_x: f64 = 0,
+    enter_y: f64 = 0,
+    motion_x: f64 = 0,
+    motion_y: f64 = 0,
     /// Shared cross-object order log (see OrderLog); null in the tests
     /// that do not need it.
     order: ?*OrderLog = null,
@@ -3124,9 +3157,15 @@ const PointerEvents = struct {
                 data.entered = true;
                 data.enters += 1;
                 if (e.surface) |s| data.enter_surface_id = s.getId();
+                data.enter_x = Fixed.toDouble(e.surface_x);
+                data.enter_y = Fixed.toDouble(e.surface_y);
                 if (data.order) |ord| ord.push(.pointer_enter);
             },
-            .motion => data.motion += 1,
+            .motion => |e| {
+                data.motion += 1;
+                data.motion_x = Fixed.toDouble(e.surface_x);
+                data.motion_y = Fixed.toDouble(e.surface_y);
+            },
             .button => data.button += 1,
             .axis => data.axis += 1,
             .leave => {
@@ -3284,8 +3323,24 @@ const TestPickState = struct {
 
 fn testPick(ctx: *anyopaque, x: i32, y: i32) ?Seat.PickResult {
     const st: *TestPickState = @ptrCast(@alignCast(ctx));
-    if (st.surface) |s| return .{ .surface = s, .sx = x - st.origin_x, .sy = y - st.origin_y };
+    if (st.surface) |s| return .{ .surface = s, .sx = @floatFromInt(x - st.origin_x), .sy = @floatFromInt(y - st.origin_y) };
     return null;
+}
+
+/// A hit test whose surface-local answer the test drives, for the
+/// sub-pixel regressions: the desktop position that reaches a pick is a
+/// whole output pixel, but a camera-inverse pick answers with a point
+/// that need not be on the pixel grid, and the fraction has to survive
+/// to the 24.8 fixed on the wire.
+const FractionalPick = struct {
+    surface: *Surface,
+    x: f64 = 3.25,
+    y: f64 = 7.5,
+};
+
+fn fractionalPick(ctx: *anyopaque, _: i32, _: i32) ?Seat.PickResult {
+    const st: *FractionalPick = @ptrCast(@alignCast(ctx));
+    return .{ .surface = st.surface, .sx = st.x, .sy = st.y };
 }
 
 /// The click-to-focus gate context: the surface the gate denies.
@@ -5863,4 +5918,75 @@ test "a device removed while a client tears down keeps the accounting" {
     try ts.pump();
     try std.testing.expect(a.seat_events.last_capability.pointer);
     try std.testing.expectEqual(@as(usize, 1), seat.pointers.items.len);
+}
+
+test "touch input keeps fractional surface-local coordinates from the camera hit test" {
+    const ts = try initTestServer(std.testing.allocator);
+    defer ts.deinit();
+    const a = &ts.a;
+    _ = try enableTouch(ts, a);
+    const surface = surfaceForClient(ts, a.server.?);
+    // The pick answers off the pixel grid — what a camera inverse
+    // produces whenever the surface it resolves to is not aligned to
+    // the output pixel the finger arrived on. The fraction must survive
+    // to the wire: 3.25 and 7.5 are exact in 24.8 (832 and 1920), so
+    // the client reads back exactly what the hit test reported.
+    var frac: FractionalPick = .{ .surface = surface };
+    ts.seat.?.setPick(fractionalPick, &frac);
+    ts.seat.?.touchDown(1, 20, 30);
+    ts.seat.?.touchFrame();
+    try ts.pump();
+    try std.testing.expectEqual(@as(f64, 3.25), a.touch_events.last_x);
+    try std.testing.expectEqual(@as(f64, 7.5), a.touch_events.last_y);
+    ts.seat.?.touchUp(1);
+    ts.seat.?.touchFrame();
+    try ts.pump();
+}
+
+test "pointer enter and motion carry fractional surface-local coordinates" {
+    const ts = try initTestServer(std.testing.allocator);
+    defer ts.deinit();
+    const a = &ts.a;
+    const surface = surfaceForClient(ts, a.server.?);
+    // The desktop position is a whole output pixel; what the hit test
+    // answers with is not. Both the enter and every motion that leaves
+    // the 1/256 cell must carry that fraction on the wire, and the
+    // motion dedup must work at the PROTOCOL's resolution rather than
+    // the pixel grid: 3.25 and 3.252 are the same 24.8 cell (832), so
+    // the second one is a repeat and must be dropped, while 3.5 (896)
+    // is a new cell and must be delivered.
+    var frac: FractionalPick = .{ .surface = surface };
+    ts.seat.?.setPick(fractionalPick, &frac);
+
+    ts.seat.?.pointerMotion(20, 30);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.enters);
+    try std.testing.expectEqual(@as(f64, 3.25), a.ptr_events.enter_x);
+    try std.testing.expectEqual(@as(f64, 7.5), a.ptr_events.enter_y);
+    // A motion must follow every enter, even in the enter's own cell
+    // (the dedup base is reset by the enter).
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.motion);
+    try std.testing.expectEqual(@as(f64, 3.25), a.ptr_events.motion_x);
+    try std.testing.expectEqual(@as(f64, 7.5), a.ptr_events.motion_y);
+
+    // Same 24.8 cell, different desktop pixel: a repeat of an already
+    // delivered position is dropped (wlroots wlr_seat_pointer.c:
+    // 252-263), and the client must not see the position change by a
+    // twenty-fifth of a pixel.
+    frac.x = 3.252;
+    frac.y = 7.5025;
+    ts.seat.?.pointerMotion(21, 31);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.motion);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.enters);
+
+    // A different cell delivers, and the fraction is intact on the wire.
+    frac.x = 3.5;
+    frac.y = 7.75;
+    ts.seat.?.pointerMotion(22, 32);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), a.ptr_events.motion);
+    try std.testing.expectEqual(@as(f64, 3.5), a.ptr_events.motion_x);
+    try std.testing.expectEqual(@as(f64, 7.75), a.ptr_events.motion_y);
+    try std.testing.expectEqual(@as(usize, 1), a.ptr_events.enters);
 }

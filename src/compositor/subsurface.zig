@@ -600,6 +600,26 @@ fn subsurfaceFromSurface(s: *Surface) ?*Subsurface {
     return @ptrCast(@alignCast(ud));
 }
 
+/// The wl_surface `s` is a wl_subsurface child OF, or null when `s` has
+/// no wl_subsurface role (an ordinary surface or a toplevel), or when the
+/// wl_subsurface is inert because its parent died — the same "no parent
+/// surface" answer wlroots gives (`wl_subsurface_get_parent` on a
+/// surface that is not a sub-surface is NULL).
+///
+/// This is the ROLE-PARENT link a compositor policy needs: whether a
+/// surface is composited with its parent (a child of an overlay inherits
+/// the overlay's output-local placement) cannot be answered from the
+/// surface alone. It is CONSTANT TIME — the role object is the user data
+/// of the wire resource the role was assigned with, so this is one
+/// pointer chase and no registry scan — which is what lets a compositor
+/// walk a whole parent chain per surface per frame.
+pub fn parentSurfaceOf(s: *Surface) ?*Surface {
+    const ss = subsurfaceFromSurface(s) orelse return null;
+    // An inert wl_subsurface's `parent` dangles (see the field docs).
+    if (ss.inert) return null;
+    return ss.parent;
+}
+
 /// Detach all listeners, then destroy the wl_subsurface resource. The
 /// destroy handler runs synchronously: it removes the entry from the
 /// registry and frees `ss` — so `ss` must not be touched after the

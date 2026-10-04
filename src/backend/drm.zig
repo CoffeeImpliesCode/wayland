@@ -12,6 +12,78 @@
 //! (backend/drm/drm.c handle_page_flip: wlr_output_send_frame in the
 //! flip handler) and smithay's dumb.rs scanout path (src/backend/drm/
 //! dumb.rs + surface/atomic.rs page_flip()).
+//! # GPU data path (explicit selection, no CPU fallback)
+//!
+//! The default path above is the CPU one: pixman renders, `copyRows` puts
+//! the rows into a dumb or CPU-mapped GBM buffer, KMS scans that out.
+//! Selection is explicit and never automatic:
+//!
+//!   1. `DrmBackend.prepareGpu(base)` opens the card node and a GBM
+//!      device on this device's own render node (or the primary one),
+//!      BEFORE `start` and without touching the seat, DRM master or any
+//!      KMS object. Idempotent.
+//!   2. the renderer is built on that GBM device and the server hands its
+//!      actual renderable (format, modifier) pairs to
+//!      `DrmBackend.setGpuFormats(base, pairs)`, which borrows them for
+//!      the backend's lifetime. After that point this backend is a GPU
+//!      backend and there is no CPU fallback: a driver whose primary
+//!      plane cannot be negotiated, whose GBM device refuses the pair, or
+//!      whose allocation fails is reported as a capability failure.
+//!   3. per output, BEFORE the first modeset, `createGpuSlots` allocates
+//!      two GEM buffer objects with exported plane descriptors (no CPU
+//!      mapping is ever created on this path) and adds them as KMS
+//!      framebuffers. The renderer leases one at a time through
+//!      `DrmBackend.acquireGpuFrame`, draws into it, and `Output.State`
+//!      `.gpu` hands it back at commit; the flip names that slot's
+//!      framebuffer id and nothing else. No row copy, no gbm_bo_map, no
+//!      readPixels on this path - `copyRows` exists only for the CPU one.
+//!
+//! The negotiated (format, modifier) is real: the plane's IN_FORMATS blob
+//! says which layouts it scans out, GBM says which of those it can
+//! allocate, the renderer says which it can render into, and the
+//! allocation is verified to come back with the modifier that was
+//! requested rather than a guessed LINEAR one.
+//!
+//! # Flip identity: every queued flip is named by an integer
+//!
+//! A flip completion tells us WHICH CRTC finished, never WHICH flip of
+//! that CRTC's history finished. The only thing the kernel hands back is
+//! the `user_data` value the flip was queued with, so that value is the
+//! identity - and it is an INTEGER (`PendingFlip.cookie`), never a
+//! pointer. Nothing in this module dereferences what the kernel holds.
+//!
+//! Which backend a completion belongs to is a scope, not a pointer in the
+//! cookie: every drmHandleEvent runs with `draining` set to the backend
+//! reading the fd, and libdrm calls the handler synchronously from inside
+//! that call, so the scope is exactly as wide as the drain.
+//!
+//! Three rules make a completion safe, and none of them needs an
+//! assumption about what the kernel does with a flip it never completes:
+//!
+//!  1. **A completion acts on the output that is waiting for exactly that
+//!     cookie** (`outputPendingCookie`). An unplugged or torn-down output
+//!     is not waiting for anything, so its late event resolves to nothing
+//!     - no use-after-free, and no tombstone, because the kernel never
+//!     held a pointer into the output at all.
+//!  2. **An invalidation is a new epoch.** Suspend and output teardown
+//!     move `epoch` and clear the pending record, so a cookie from before
+//!     matches no pending flip again, for ever: no ring promotion, no
+//!     presented, no frame, and no later arm can make it current again
+//!     because a cookie is never reissued.
+//!  3. **A refused request disarms.** The kernel refused the flip, so no
+//!     completion will name that cookie and the output goes back to
+//!     waiting for nothing.
+//!
+//! Resume therefore does not "clear the pending flip and hope". It bumps
+//! the epoch, drains what the kernel has already queued (a zero-timeout
+//! poll loop, never a blocking read), re-commits the real modeset for that
+//! CRTC through the same builders start() uses - atomic commit with
+//! DRM_MODE_ATOMIC_ALLOW_MODESET, or drmModeSetCrtc on the legacy
+//! interface - over the buffers, plane and mode blob it already owns,
+//! drains again, adopts the framebuffer that modeset bound as the front of
+//! the ring, and asks for a full repaint. DRM_IOCTL_DROP_MASTER does NOT
+//! drain the file's event queue, and neither the drain nor the modeset is
+//! relied on to make an old completion harmless: the cookie rule is.
 //!
 //! # Wiring contract
 //! The orchestrator wires this module in build.zig like the raylib_c
@@ -56,7 +128,9 @@
 //! DRM_MODE_ATOMIC_*, DRM_FORMAT_XRGB8888.
 //!
 //! Imports: utils/*, backend/backend.zig, output/output.zig,
-//! renderer/pixman.zig, and the translated "drm_c" namespace.
+//! output/gpu_frame.zig, buffers/dmabuf.zig, renderer/pixman.zig,
+//! core/wire.zig (the flip-completion tests count its signals), and
+//! the translated "drm_c" and "gbm_c" namespaces.
 
 const std = @import("std");
 const log_mod = @import("../utils/log.zig");
@@ -65,8 +139,10 @@ const output_mod = @import("../output/output.zig");
 const pixman = @import("../renderer/pixman.zig");
 const c = @import("drm_c");
 const dmabuf = @import("../buffers/dmabuf.zig");
+const gpu_frame = @import("../output/gpu_frame.zig");
 const gbm_c = @import("gbm_c");
 const session_mod = @import("session.zig");
+const wire = @import("../core/wire.zig");
 
 /// DRM_FORMAT_XRGB8888 ('XR24' fourcc, 0x34325258): memory bytes
 /// B,G,R,X (little-endian u32; the alpha byte is ignored on scanout).
@@ -178,9 +254,214 @@ const ScanoutBuffer = struct {
 const ScanoutPath = enum {
     /// CREATE_DUMB (DRM_IOCTL_MODE_CREATE_DUMB/MAP_DUMB).
     dumb,
-    /// A GBM buffer object with a modifier, on a real primary plane.
+    /// A GBM buffer object with a modifier, on a real primary plane,
+    /// mapped for the CPU: the CPU renderer path's plane scanout.
     plane,
+    /// Two GPU-only GEM buffer objects with exported plane descriptors
+    /// (`gpu_frame.GpuFrame` leases). The renderer draws into them and
+    /// KMS scans them out; nothing on this path is ever mapped, copied
+    /// or read back by the compositor.
+    gpu,
 };
+
+/// Where one GPU scanout slot stands in the present ring. The renderer
+/// writes into a leased slot and the kernel reads the front one; nothing
+/// is ever written while it is on screen or waiting to go there.
+///
+/// ```text
+///   free --acquire--> writing --commit--> pending --flip done--> front
+///     ^                 |                                          |
+///     +--- cancel ------+                                          |
+///                                                                   |
+///   (the next completion frees the slot that was front)  ---------+
+/// ```
+/// A completed PENDING slot becomes FRONT, and only then does the slot
+/// it replaced become free - one writer and one queued flip at a time,
+/// with the pixels on screen never belonging to the writer.
+const SlotState = enum {
+    /// Nobody holds it; the renderer may lease it.
+    free,
+    /// Leased to a caller through acquireGpuFrame. The caller owns the
+    /// pixels until it commits or cancels; a FAILED commit leaves it
+    /// here.
+    writing,
+    /// Committed and queued for flip: the framebuffer id is in a KMS
+    /// request, waiting for the completion event.
+    pending,
+    /// Scanned out right now.
+    front,
+};
+
+/// Ring transitions for the two slots of one output, as pure functions
+/// so the ordering rules can be exercised without a card.
+const GpuRing = struct {
+    /// `completed` finished its flip: it is the front buffer now, and the
+    /// one it replaced stops being scanned out and becomes free. A slot
+    /// that is not pending (a cancelled or abandoned one) changes
+    /// nothing else.
+    fn flipCompleted(states: *[2]SlotState, completed: u2) void {
+        if (states[completed] != .pending) return;
+        states[completed] = .front;
+        var i: usize = 0;
+        while (i < states.len) : (i += 1) {
+            if (i != completed and states[i] == .front) states[i] = .free;
+        }
+    }
+
+    /// The first slot nobody holds, or null when both are taken.
+    fn firstFree(states: *const [2]SlotState) ?u2 {
+        for (states, 0..) |state, i| {
+            if (state == .free) return @intCast(i);
+        }
+        return null;
+    }
+};
+
+/// The identity of the one flip an output is waiting for. `cookie` is
+/// what travels: it is handed to the kernel as the `user_data` value of
+/// drmModePageFlip / drmModeAtomicCommit and comes back unchanged in
+/// page_flip_handler2, and it is an INTEGER, never a pointer - nothing in
+/// this module ever dereferences what the kernel holds.
+const PendingFlip = struct {
+    /// Monotonic per backend, never reused while any flip can still be
+    /// outstanding, and never 0 (0 means "no flip in flight").
+    cookie: usize,
+    /// The output's epoch and flip counter when this flip was queued. A
+    /// completion only counts when the output is still at both, which is
+    /// what makes an invalidation final.
+    epoch: u64,
+    seq: u64,
+    /// The CRTC the flip was queued on. The completion carries one too.
+    crtc_id: u32,
+};
+
+/// The backend that is currently reading events, for the duration of one
+/// drain and nothing else. libdrm calls the handler synchronously from
+/// inside drmHandleEvent, so the scope is exactly as wide as that call;
+/// a completion can therefore never be attributed to the wrong backend,
+/// and none is reachable outside a drain at all.
+threadlocal var draining: ?*DrmBackendData = null;
+
+/// Run one drmHandleEvent with `self` as the scope the completion handler
+/// resolves against. Nested drains (the resume barrier inside a session
+/// dispatch) restore the outer scope on the way out.
+fn handleEvents(self: *DrmBackendData, fd: std.posix.fd_t) c_int {
+    const outer = draining;
+    draining = self;
+    defer draining = outer;
+    var evctx = eventContext();
+    return c.drmHandleEvent(fd, &evctx);
+}
+
+/// Name the flip this output is about to queue, and return the cookie to
+/// hand the kernel. The cookie is minted per backend, so it identifies a
+/// flip across every output and every epoch, and it is burned even if the
+/// request is later refused: an identity is never reissued.
+fn armFlip(drm_out: *DrmOutput) ?usize {
+    const self = drm_out.backend;
+    if (self.next_cookie == std.math.maxInt(usize) or drm_out.flip_seq == std.math.maxInt(u64))
+        return null;
+    self.next_cookie += 1;
+    drm_out.pending = .{
+        .cookie = self.next_cookie,
+        .epoch = drm_out.epoch,
+        .seq = drm_out.flip_seq + 1,
+        .crtc_id = drm_out.crtc_id,
+    };
+    drm_out.flip_seq += 1;
+    return self.next_cookie;
+}
+
+/// The kernel refused the request: no completion will name this cookie,
+/// so the output is not waiting for a flip any more.
+fn disarmFlip(drm_out: *DrmOutput) void {
+    drm_out.pending = null;
+}
+
+/// The kernel `user_data` a flip was queued with. Integer only: it is
+/// carried through a `?*anyopaque` because that is libdrm's parameter
+/// type, and it is never dereferenced - not here, not in the handler.
+fn cookiePointer(cookie: usize) *anyopaque {
+    return @ptrFromInt(cookie);
+}
+
+/// The cookie back out of a completion's user_data.
+fn cookieOf(user_data: ?*anyopaque) usize {
+    const ptr = user_data orelse return 0;
+    return @intFromPtr(ptr);
+}
+
+/// The live output that is waiting for exactly this flip, or null. Null is
+/// the answer for every completion this backend no longer wants:
+///
+///  - the output is gone (unplugged, or the backend is tearing down), so
+///    there is nothing to present on and nothing to promote;
+///  - the output moved to another epoch (a resume or a teardown
+///    invalidated the flip), or has since queued another one;
+///  - the cookie names no pending flip of THIS backend - either a value it
+///    never issued, or one another backend issued; a drain only ever
+///    resolves against its own scope, so the two cannot be confused.
+///
+/// An old cookie is not merely ignored once: it matches nothing after any
+/// later arm and stays that way for ever, which is why nothing has to be
+/// tracked, reclaimed or kept alive until the kernel is done with it.
+fn outputPendingCookie(self: *DrmBackendData, cookie: usize) ?*DrmOutput {
+    if (cookie == 0) return null;
+    for (self.outputs.items) |drm_out| {
+        const pending = drm_out.pending orelse continue;
+        if (pending.cookie != cookie) continue;
+        // The record is only the current flip if the output never moved
+        // on since it was armed.
+        if (drm_out.epoch != pending.epoch or drm_out.flip_seq != pending.seq) return null;
+        return drm_out;
+    }
+    return null;
+}
+
+/// One GPU scanout buffer object: what KMS scans out, and the stable
+/// `GpuFrame` the renderer borrows while it draws into it.
+///
+/// There is deliberately no CPU mapping on this path. The only way to the
+/// pixels is a GL target imported from `frame.attributes`.
+const GpuSlot = struct {
+    /// The buffer object; null only in the pure lease tests, which never
+    /// touch a device.
+    bo: ?*gbm_c.struct_gbm_bo = null,
+    /// KMS framebuffer id for `bo`, named by the flip.
+    fb_id: u32 = 0,
+    format: u32 = 0,
+    modifier: u64 = 0,
+    state: SlotState = .free,
+    /// Bumped for every allocation this backend ever makes. It is handed
+    /// out in the frame and checked at commit, so a frame from a
+    /// destroyed output (or a reconnected connector that got a fresh
+    /// one) can never be committed against a recycled slot.
+    generation: u64 = 0,
+    /// Stable address: the renderer holds this across the lease.
+    frame: gpu_frame.GpuFrame = .{
+        .attributes = .{},
+        .fb_id = 0,
+        .owner = undefined,
+        .slot = 0,
+        .generation = 0,
+    },
+};
+
+/// Is `frame` a live writing lease of THIS output's slot? The commit
+/// path trusts nothing else: the owner pointer, the slot index, the
+/// generation and the slot's own state all have to agree, so a frame
+/// from another output, a stale frame from a released slot, or a slot
+/// that is already on screen cannot be flipped to.
+fn gpuFrameValid(drm_out: *const DrmOutput, frame: *const gpu_frame.GpuFrame) bool {
+    const slots = drm_out.gpu_slots orelse return false;
+    const index = frame.slot;
+    if (index >= slots.len) return false;
+    if (frame.owner != @as(*const anyopaque, @ptrCast(drm_out))) return false;
+    const slot = &slots[index];
+    if (frame != &slot.frame) return false;
+    if (frame.generation != slot.generation) return false;
+    return slot.state == .writing;
+}
 
 /// Per-output DRM state: the scanout buffers and the KMS object ids bound
 /// during start(). `out` is the compositor Output wrapper, created once
@@ -224,13 +505,39 @@ const DrmOutput = struct {
     flip_index: u32 = 0,
     /// Mode blob id from drmModeCreatePropertyBlob (destroyed on teardown).
     mode_blob: u32 = 0,
-    /// One flip in flight (guarded by the frame-event pacing).
-    flip_pending: bool = false,
     /// The connector mode's actual refresh interval (ns), carried by the
     /// presented event (the vblank interval of the mode being scanned
     /// out — wlroots drm.c handle_page_flip's refresh).
     refresh_ns: u64 = 0,
-};
+    /// The primary plane chosen for GPU mode. Set even on the legacy KMS
+    /// interface, which commits through the CRTC: the plane's IN_FORMATS
+    /// blob is where the scannable (format, modifier) pairs come from,
+    /// and its id is what keeps two outputs off one plane.
+    gpu_plane_id: u32 = 0,
+    /// The GPU present ring: two GEM buffer objects with exported plane
+    /// descriptors, allocated before the first modeset. Null on the CPU
+    /// paths, which use `buffers` instead.
+    gpu_slots: ?*[2]GpuSlot = null,
+    /// The one flip this output is waiting for, or null. Non-null is the
+    /// frame-pacing guard (a second flip before the completion would
+    /// EBUSY) AND the only thing a completion can ever match.
+    pending: ?PendingFlip = null,
+    /// Bumped whenever this output's flip pipeline is invalidated (resume,
+    /// teardown). A completion carrying an older epoch belongs to a flip
+    /// this output no longer waits for: it is dropped without promoting a
+    /// ring slot and without firing presented or frame. Never reused, so
+    /// repeated invalidation cannot resurrect an earlier identity.
+    epoch: u64 = 1,
+    /// Flips this output has named, monotonic and never reused - a refused
+    /// request burns one, which is the safe direction: no later event can
+    /// ever match a record a different flip once carried.
+    flip_seq: u64 = 0,
+    /// The connector mode as KMS reported it, kept so a resume can re-run
+    /// the same modeset (the legacy drmModeSetCrtc path needs the full
+    /// drmModeModeInfo) without re-enumerating the device. The mode blob
+    /// this produced is still alive too, so no blob is recreated.
+    crtc_mode: c.drmModeModeInfo = .{},
+ };
 
 const DrmBackendData = struct {
     allocator: std.mem.Allocator,
@@ -267,6 +574,20 @@ const DrmBackendData = struct {
     /// The plane scanout path (createPlaneBuffers) uses it too, so a
     /// modifier-capable allocation never needs a second GBM device.
     gbm: ?*dmabuf.GbmDevice = null,
+    /// Renderer-owned renderable (format, modifier) pairs, borrowed for
+    /// this backend's lifetime by setGpuFormats. Non-null means GPU mode
+    /// was selected explicitly, and it is the ONLY switch: the CPU dumb
+    /// path stays the default and is never entered as a fallback.
+    gpu_render_pairs: ?[]const dmabuf.Format = null,
+    /// Set once start() ran. setGpuFormats must refuse afterwards: the
+    /// first modeset has already been negotiated by then.
+    started: bool = false,
+    /// Monotonic slot generations across every output this backend ever
+    /// created, so no two frames in the process share one.
+    next_generation: u64 = 1,
+    /// Last issued native-width cookie. Exhaustion refuses a new flip:
+    /// even a completion delayed across a resume must never alias one.
+    next_cookie: usize = 0,
 };
 
 const backend_impl: backend_mod.Backend.Impl = .{
@@ -309,6 +630,109 @@ pub const DrmBackend = struct {
     pub fn fromBackend(base: *backend_mod.Backend) *DrmBackendData {
         return @ptrCast(@alignCast(base.data));
     }
+
+    /// GPU mode, step 1: open the card node and a GBM device on this
+    /// device's own render node (falling back to the primary one) and
+    /// enumerate what it accepts. Runs BEFORE `start` and touches
+    /// nothing else: no seat, no VT, no DRM master, no modeset, no
+    /// output. `start` then reuses exactly this fd and this GBM device
+    /// (openDevice/openGbm are idempotent), so the renderer the caller
+    /// builds next renders and scans out on the same device the client
+    /// dmabuf global imports into.
+    ///
+    /// Idempotent: a second call returns the same device. An explicit
+    /// failure here IS the capability report - `error.GpuUnavailable`
+    /// means this node cannot do the GPU data path, and the caller must
+    /// report that rather than quietly run the CPU one.
+    pub const PrepareError = error{ OutOfMemory, GpuUnavailable };
+
+    pub fn prepareGpu(base: *backend_mod.Backend) PrepareError!*dmabuf.GbmDevice {
+        const self = fromBackend(base);
+        if (self.gbm) |dev| return dev;
+        try prepareGbm(self);
+        return self.gbm.?;
+    }
+
+    /// GPU mode, step 2: borrow the renderer's actual renderable
+    /// (format, modifier) pairs for this backend's lifetime. Must run
+    /// BEFORE `start`, because the first modeset negotiates against
+    /// them: each output intersects them with what its primary plane
+    /// really scans out and with what GBM can allocate.
+    ///
+    /// The slice is NOT copied - the renderer owns it and outlives the
+    /// backend - and it is not freed here. After this call the backend
+    /// is a GPU backend: no allocation or negotiation failure falls back
+    /// to CPU scanout.
+    pub const SetFormatsError = error{
+        /// prepareGpu has not run, or this node has no GBM device.
+        GpuNotPrepared,
+        /// start() already ran: the first modeset is behind us.
+        AlreadyStarted,
+        /// The renderer renders into nothing this backend could ever
+        /// scan out, so no output could be brought up.
+        NoRenderableFormats,
+    };
+
+    pub fn setGpuFormats(
+        base: *backend_mod.Backend,
+        render_pairs: []const dmabuf.Format,
+    ) SetFormatsError!void {
+        const self = fromBackend(base);
+        if (self.started) return error.AlreadyStarted;
+        if (self.gbm == null) return error.GpuNotPrepared;
+        if (render_pairs.len == 0) return error.NoRenderableFormats;
+        self.gpu_render_pairs = render_pairs;
+        log_mod.info(
+            "drm: GPU scanout selected with {d} renderable pairs",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{render_pairs.len},
+        );
+    }
+
+    /// Lease one of this output's GPU slots for drawing, or null when
+    /// there is none to lease: a CPU-mode output, a torn-down device, or
+    /// both slots taken (one is on screen, the other is being written or
+    /// waiting for its flip).
+    ///
+    /// The returned frame is owned by the output, keeps its plane
+    /// descriptors open for as long as the slot lives, and must be
+    /// handed back exactly once - committed through `Output.State`
+    /// `.gpu`, or given to `cancelGpuFrame` when that commit did not
+    /// happen. A caller that drops it without either starves the output:
+    /// the slot stays `writing` and no further frame can be presented.
+    pub fn acquireGpuFrame(
+        base: *backend_mod.Backend,
+        out: *output_mod.Output,
+    ) ?*gpu_frame.GpuFrame {
+        _ = base;
+        const drm_out: *DrmOutput = @ptrCast(@alignCast(out.data));
+        if (drm_out.backend.fd == null) return null;
+        const slots = drm_out.gpu_slots orelse return null;
+        var states: [2]SlotState = .{ slots[0].state, slots[1].state };
+        const index = GpuRing.firstFree(&states) orelse return null;
+        const slot = &slots[index];
+        slot.state = .writing;
+        return &slot.frame;
+    }
+
+    /// Give a leased slot back without presenting it: the caller's commit
+    /// failed, so the pixels it drew are discarded and the slot returns
+    /// to `free` for the next frame. Anything that is not a live lease
+    /// of this output (a frame from another output, an already
+    /// committed or cancelled one) is ignored - cancelling twice must
+    /// not hand the same buffer to two writers.
+    pub fn cancelGpuFrame(
+        base: *backend_mod.Backend,
+        out: *output_mod.Output,
+        frame: *gpu_frame.GpuFrame,
+    ) void {
+        _ = base;
+        const drm_out: *DrmOutput = @ptrCast(@alignCast(out.data));
+        if (!gpuFrameValid(drm_out, frame)) return;
+        drm_out.gpu_slots.?[frame.slot].state = .free;
+    }
 };
 
 /// The GBM device the server may advertise zwp_linux_dmabuf_v1 with, or
@@ -335,15 +759,57 @@ pub fn pollFd(self: *DrmBackendData) std.posix.fd_t {
 /// handle_drm_event, drm.c:2094-2100).
 pub fn dispatch(self: *DrmBackendData) error{BackendFailed}!void {
     const fd = self.fd orelse return;
-    var evctx: c.drmEventContext = .{
-        .version = 3,
-        // v3 = page_flip_handler2 with crtc_id (wlroots drm.c uses the
-        // same version + handler).
-        .page_flip_handler2 = pageFlipHandler,
-    };
-    if (c.drmHandleEvent(fd, &evctx) != 0) {
+    if (handleEvents(self, fd) != 0) {
         log_mod.err("drm: drmHandleEvent failed", self.io, self.log_cfg, "drm", .{});
         return error.BackendFailed;
+    }
+}
+
+/// The handler context every drain runs with: v3, so libdrm calls
+/// page_flip_handler2 with the CRTC the completion belongs to. Same
+/// version and handler wlroots uses (backend/drm/drm.c handle_drm_event).
+fn eventContext() c.drmEventContext {
+    return .{
+        .version = 3,
+        .page_flip_handler2 = pageFlipHandler,
+    };
+}
+
+/// Drain the KMS event queue as part of a state transition rather than a
+/// poll tick - the resume barrier's two drains. It polls with a zero
+/// timeout and never blocks, and it keeps reading for as long as the fd
+/// stays readable, so an fd with nothing queued costs one poll and an fd
+/// with a backlog costs exactly as many reads as it takes to empty it.
+///
+/// Correctness does not depend on this. A completion the kernel still
+/// holds can arrive after the re-arm; the epoch moved before the first of
+/// these drains is what makes such a completion unmatchable. What the
+/// drain buys is that nothing ALREADY queued is delivered after the
+/// re-arm, and that the queue is not left holding pre-suspend events that
+/// would otherwise land in the middle of the first post-resume frames.
+fn drainFlipEvents(self: *DrmBackendData) void {
+    const fd = self.fd orelse return;
+    var fds = [_]std.posix.pollfd{
+        .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    while (true) {
+        // Timeout 0: a bare "is it readable" check, never a wait. A signal
+        // is retried inside std.posix.poll itself.
+        const ready = std.posix.poll(&fds, 0) catch {
+            log_mod.warn("drm: resume: poll of the KMS fd failed", self.io, self.log_cfg, "drm", .{});
+            return;
+        };
+        if (ready == 0 or fds[0].revents & std.posix.POLL.IN == 0) return;
+        if (handleEvents(self, fd) != 0) {
+            // Not fatal here: the caller is a sleep/resume transition, not
+            // a frame tick, and the event loop's next dispatch reports the
+            // same failure to the server.
+            log_mod.warn("drm: resume: drmHandleEvent drain failed", self.io, self.log_cfg, "drm", .{});
+            return;
+        }
+        // poll(2) clears revents on every call, so the next iteration asks
+        // the kernel again rather than repeating this answer.
+        fds[0].revents = 0;
     }
 }
 
@@ -366,7 +832,8 @@ fn start(base: *backend_mod.Backend) error{BackendFailed}!void {
 ///   2. `selectKmsInterface`    DRM_CLIENT_CAP_ATOMIC, or fall back to legacy.
 ///   3. `openSession`           logind session: CreateSession, Type=wayland,
 ///                               TTY, TakeDevice, PrepareForSleep watch,
-///                               and the VT switch (VT_ACTIVATE + VT_ACK).
+///                               and the VT switch (VT_ACTIVATE +
+///                               bounded VT_GETSTATE confirmation).
 ///   4. `becomeMaster`          DRM_IOCTL_SET_MASTER.
 ///   5. `openGbm`               the GBM device both the dmabuf global and the
 ///                               plane scanout path allocate from.
@@ -392,11 +859,11 @@ fn start(base: *backend_mod.Backend) error{BackendFailed}!void {
 /// drm_mode_crtc_set_property). The primary plane must be resolved before a
 /// framebuffer can be attached to anything, since the atomic commit names
 /// the plane object. And both framebuffers must exist before the modeset
-/// points the plane at one of them. The VT ack is waited for on the DRM fd
-/// before the first flip is queued, which is the only window in which a raw
-/// read there cannot eat a flip event. Phases inside `addOutput` for the
-/// properties and blobs (scanKmsProps, createModeBlob) are atomic-only —
-/// the legacy interface has neither.
+/// points the plane at one of them. The VT switch is confirmed by polling
+/// VT_GETSTATE.v_active on the console fd session.zig opened, so the DRM
+/// fd is read only by `dispatch`, for DRM events. Phases inside
+/// `addOutput` for the properties and blobs (scanKmsProps, createModeBlob)
+/// are atomic-only — the legacy interface has neither.
 ///
 /// One `errdefer drmTeardown` covers every failure: teardown is
 /// null-safe, idempotent and ordered by reverse acquisition, so a phase
@@ -406,10 +873,15 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
     const self: *DrmBackendData = @ptrCast(@alignCast(base.data));
 
     // --- phases 1-2: the device itself. A failed open publishes no fd, so
-    // teardown only starts mattering once the open succeeded.
+    // teardown only starts mattering once the open succeeded. Both phases
+    // are idempotent: prepareGpu may already have opened the node before
+    // start, and start must reuse THAT fd.
     try openDevice(self);
     errdefer drmTeardown(self);
     selectKmsInterface(self);
+    // From here the backend mutates the device, so GPU mode can no longer
+    // be selected: setGpuFormats has to have run before this point.
+    self.started = true;
 
     // --- phase 3: the seat, before anyone can take the master away. Every
     // failure here is non-fatal and logged by openSession itself: the VM
@@ -422,13 +894,13 @@ fn startInner(base: *backend_mod.Backend) error{ BackendFailed, OutOfMemory }!vo
     // ours before we ask for it.
     becomeMaster(self);
 
-    // --- phase 5: the GBM device. Not fatal: a node without GBM (or with
-    // no format GBM accepts) still scans out - on the dumb path - it just
-    // cannot offer zwp_linux_dmabuf_v1 nor scan out a modifier-capable
-    // framebuffer. It sits here, right after the node is open and before
-    // the modeset, because it re-resolves the node from the fd and that is
-    // the last moment the KMS fd is unambiguously ours.
-    try openGbm(self);
+    // --- phase 5: the GBM device. Already opened when prepareGpu ran, so
+    // this is a no-op there and the same device is reused. Not fatal:
+    // a node without GBM (or with no format GBM accepts) still scans out
+    // - on the dumb path - it just cannot offer zwp_linux_dmabuf_v1 nor
+    // scan out a modifier-capable framebuffer. In GPU mode there is
+    // nothing to fall back to, and prepareGbm already refused.
+    try tryOpenGbm(self);
 
     // --- phase 6: one output per usable connector. The loop ends when the
     // enumeration has nothing left; the only error it can raise is a device
@@ -455,6 +927,10 @@ fn destroy(allocator: std.mem.Allocator, data: *anyopaque) void {
         if (drm_out.out) |out| out.destroy();
     }
     drmTeardown(self);
+    // drmTeardown closed the KMS fd. Closing a DRM fd destroys the file's
+    // event queue, so no queued page-flip event can be delivered after it:
+    // a completion can only resolve a cookie to a live output of this
+    // backend, and there are none left.
     for (self.outputs.items) |drm_out| allocator.destroy(drm_out);
     self.outputs.deinit(allocator);
     allocator.destroy(self);
@@ -477,7 +953,15 @@ const PlaneSelection = struct {
 /// Phase 1: open the card node (wlroots drm.c drm_open; O_RDWR|O_CLOEXEC).
 /// The fd is published on the backend so every later phase — and
 /// drmTeardown on the failure paths — can reach it.
+///
+/// Idempotent, and deliberately so: prepareGpu opens the same node BEFORE
+/// start so the renderer can be built on this device's GBM device, and
+/// start then reuses that exact fd. Opening twice would give the
+/// renderer and the KMS path different file descriptions of one card,
+/// which is precisely what wlroots avoids by reopening the node only for
+/// the allocator (render/allocator/allocator.c:35-96).
 fn openDevice(self: *DrmBackendData) error{BackendFailed}!void {
+    if (self.fd != null) return;
     const fd = std.posix.openat(
         std.posix.AT.FDCWD,
         self.device_path,
@@ -547,11 +1031,7 @@ fn becomeMaster(self: *DrmBackendData) void {
 /// session holds the device it will not hand the master to the console
 /// session, which is the entire point.
 fn openSession(self: *DrmBackendData) void {
-    const fd = self.fd orelse return;
     self.session = session_mod.Session.open(self.allocator, self.io, self.log_cfg, .{
-        // The VT ack arrives on the DRM fd: the DRM core queues a
-        // `struct vt_event` to every open card when the console switches.
-        .vt_ack_fd = fd,
         .drm_minor = cardMinor(self.device_path),
         .on_sleep = onSessionSleep,
         .ctx = self,
@@ -578,10 +1058,8 @@ fn onSessionSleep(ctx: ?*anyopaque, sleeping: bool) void {
 /// PrepareForSleep, resolved through the session module's plan so the two
 /// halves cannot disagree: on the way down the device goes back to logind
 /// and DRM master is dropped; on the way up the device is taken back, the
-/// VT is re-activated, DRM master is re-acquired and the flip pipeline is
-/// re-armed (a flip that was in flight when the machine slept never
-/// completes, so `flip_pending` must be cleared or the output would refuse
-/// every commit until the next event).
+/// VT is re-activated, DRM master is re-acquired and every output is put
+/// back into a state this backend can present from.
 fn handlePrepareForSleep(self: *DrmBackendData, sleeping: bool) void {
     const have_logind = self.session != null;
     const phase = if (self.session) |s| s.sleepPhase() else .running;
@@ -597,13 +1075,116 @@ fn handlePrepareForSleep(self: *DrmBackendData, sleeping: bool) void {
     }
     if (plan.work.reacquire) {
         becomeMaster(self);
-        for (self.outputs.items) |drm_out| {
-            // The flip that was in flight across the suspend will never
-            // complete, so its completion event will never arrive.
-            drm_out.flip_pending = false;
-        }
-        log_mod.info("drm: resume: DRM master and flip pacing re-armed", self.io, self.log_cfg, "drm", .{});
+        for (self.outputs.items) |drm_out| resumeOutput(self, drm_out);
+        log_mod.info(
+            "drm: resume: DRM master re-acquired; {d} output(s) re-modeset and repainting",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{self.outputs.items.len},
+        );
     }
+}
+
+/// One output's half of the resume, in the only order that is safe.
+///
+/// A suspend loses the CRTC state: the console takes the card over, the
+/// flip that was in flight when the machine slept may or may not still be
+/// pending in the kernel, and DRM_IOCTL_DROP_MASTER does NOT drain the
+/// file's event queue. So the resume cannot simply drop the pending flip
+/// and hope the old completion never arrives - a completion that lands
+/// after the re-arm would find the current pending slot and present it,
+/// which is a false present and a slot the ring still believes is queued.
+///
+/// What happens instead:
+///
+///  1. the epoch moves and the pending flip is dropped, so every
+///     completion from before this moment names a cookie no output waits
+///     for any more: it cannot touch the ring, present, or the compositor;
+///  2. whatever the kernel has already queued is drained and discarded
+///     under that new epoch;
+///  3. the CRTC is put back into a state this backend owns, by re-running
+///     the same modeset start() ran - atomic commit with
+///     DRM_MODE_ATOMIC_ALLOW_MODESET, or drmModeSetCrtc on the legacy
+///     interface - over the buffers, plane and mode blob this output
+///     already has. Nothing is recreated: no new GBM device, no renderer,
+///     no framebuffer, no blob. On the atomic interface that commit is
+///     blocking, so a flip still pending on the CRTC completes before the
+///     modeset is applied;
+///  4. the queue is drained once more, for a completion the blocking
+///     modeset itself waited for;
+///  5. the framebuffer that modeset bound becomes the ring's front
+///     buffer, everything else is free, and the output is asked for a
+///     full repaint. Pacing restarts from a known state.
+///
+/// A failed re-modeset is reported, not hidden: the ring is still reset
+/// to the one buffer the modeset was asked to bind, because refusing to
+/// present at all would leave the machine with a black screen and a
+/// silent log.
+fn resumeOutput(self: *DrmBackendData, drm_out: *DrmOutput) void {
+    invalidateFlipIdentity(drm_out);
+    drainFlipEvents(self);
+    const bound = reapplyModeset(self, drm_out);
+    drainFlipEvents(self);
+    adoptModesetFront(drm_out, bound);
+    if (drm_out.out) |out| out.sendFrame();
+}
+
+/// Every completion this output ever queued is now irrelevant: the flip
+/// epoch moves and the output stops waiting for a flip. Nothing else has
+/// to be forgotten - the kernel still holds the old cookie, but that
+/// cookie now matches no pending flip on any output, so its completion
+/// can only ever be dropped.
+fn invalidateFlipIdentity(drm_out: *DrmOutput) void {
+    drm_out.epoch += 1;
+    drm_out.pending = null;
+}
+
+/// Re-run this output's modeset over the resources it already owns. False
+/// when the device refused it, which is reported by the caller.
+fn reapplyModeset(self: *DrmBackendData, drm_out: *DrmOutput) bool {
+    if (self.fd == null) return false;
+    var found = FoundConnector{
+        .connector_id = drm_out.connector_id,
+        .crtc_id = drm_out.crtc_id,
+        .crtc_index = 0,
+        .mode = drm_out.crtc_mode,
+    };
+    const plane = PlaneSelection{ .id = drm_out.plane_id, .props = drm_out.props };
+    modeset(self, &found, plane, drm_out) catch |err| {
+        log_mod.err(
+            "drm: resume: modeset of crtc {d} failed ({s})",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{ drm_out.crtc_id, @errorName(err) },
+        );
+        return false;
+    };
+    return true;
+}
+
+/// Derive the ring from what the modeset actually bound: the first
+/// framebuffer of whichever swapchain this output has (the same
+/// `initialFbId` the modeset builders name), front, and the other side
+/// free. A renderer lease that was open across the suspend stops being
+/// valid here - the ring state check in `gpuFrameValid` rejects it, and
+/// the server cancels it like any other refused commit.
+fn adoptModesetFront(drm_out: *DrmOutput, modeset_ok: bool) void {
+    drm_out.flip_index = 0;
+    drm_out.pending = null;
+    if (!modeset_ok) {
+        log_mod.warn(
+            "drm: resume: crtc {d} was not re-modeset; adopting the modeset framebuffer as front anyway",
+            drm_out.backend.io,
+            drm_out.backend.log_cfg,
+            "drm",
+            .{drm_out.crtc_id},
+        );
+    }
+    const slots = drm_out.gpu_slots orelse return;
+    slots[0].state = .front;
+    slots[1].state = .free;
 }
 
 /// Phase 7: the udev monitor that turns connector changes into output
@@ -769,31 +1350,75 @@ fn cardMinor(path: []const u8) u32 {
 /// mesa/drm!110 is about, and a render node carries no modeset
 /// authority we would then have to defend.
 ///
-/// Every failure here is NON-fatal. A node with no GBM (a virtual machine
-/// without a render node, a driver whose gbm_create_device refuses) must
-/// still scan out; it simply does not get a zwp_linux_dmabuf_v1 global.
-/// The reverse is not negotiable: a global without a device behind it is a
-/// promise the client can falsify on its first create request.
-fn openGbm(self: *DrmBackendData) error{OutOfMemory}!void {
-    const node = gbmNodePath(self) orelse {
-        log_mod.info("drm: no GBM node for {s}; dmabuf import disabled", self.io, self.log_cfg, "drm", .{
-            self.device_path,
-        });
-        return;
+/// Two callers, one body: `tryOpenGbm` (start) treats every failure as
+/// NON-fatal, because a node with no GBM (a virtual machine without a
+/// render node, a driver whose gbm_create_device refuses) must still scan
+/// out on the dumb path - it simply does not get a
+/// zwp_linux_dmabuf_v1 global. `prepareGbm` (DrmBackend.prepareGpu) turns
+/// the same failures into an explicit capability error, because a caller
+/// that asked for the GPU data path must be told rather than handed the
+/// CPU one. A global without a device behind it is a promise the client
+/// can falsify on its first create request, and a GPU request answered
+/// with CPU scanout is the same lie in a different place.
+///
+/// Idempotent: prepareGpu runs first in GPU mode and start finds the
+/// device already there.
+fn tryOpenGbm(self: *DrmBackendData) error{OutOfMemory}!void {
+    _ = openGbm(self) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoGbmNode => {
+            log_mod.info("drm: no GBM node for {s}; dmabuf import disabled", self.io, self.log_cfg, "drm", .{
+                self.device_path,
+            });
+            return;
+        },
+        error.NoGbmFormats => {
+            log_mod.info("drm: GBM on {s} advertises no supported format; dmabuf import disabled", self.io, self.log_cfg, "drm", .{self.device_path});
+            return;
+        },
     };
-    const dev = dmabuf.GbmDevice.create(self.allocator, node) catch |err| {
-        log_mod.warn("drm: gbm device on {s} failed ({s}); dmabuf import disabled", self.io, self.log_cfg, "drm", .{
-            node,
-            @errorName(err),
-        });
-        return;
+}
+
+/// The explicit-GPU-mode form of openGbm: same work, failure reported.
+/// Runs before `start`, so the renderer the caller builds next lands on
+/// this exact GBM device.
+fn prepareGbm(self: *DrmBackendData) error{ OutOfMemory, GpuUnavailable }!void {
+    if (self.gbm != null) return;
+    openDevice(self) catch return error.GpuUnavailable;
+    _ = openGbm(self) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoGbmNode => {
+            log_mod.err("drm: {s} has no GBM node; the GPU data path needs one", self.io, self.log_cfg, "drm", .{self.device_path});
+            return error.GpuUnavailable;
+        },
+        error.NoGbmFormats => {
+            log_mod.err("drm: GBM on {s} accepts no (format, modifier) pair; the GPU data path needs one", self.io, self.log_cfg, "drm", .{self.device_path});
+            return error.GpuUnavailable;
+        },
+    };
+}
+
+const GbmOpenError = error{ OutOfMemory, NoGbmNode, NoGbmFormats };
+
+/// Create the GBM device on this device's own node. Publishes it on
+/// `self.gbm` on success only.
+fn openGbm(self: *DrmBackendData) GbmOpenError!void {
+    if (self.gbm != null) return;
+    const node = gbmNodePath(self) orelse return error.NoGbmNode;
+    defer self.allocator.free(node);
+    const dev = dmabuf.GbmDevice.create(self.allocator, node) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NodeOpenFailed, error.GbmCreateFailed, error.DevStatFailed => {
+            log_mod.warn("drm: gbm device on {s} failed ({s}); dmabuf import disabled", self.io, self.log_cfg, "drm", .{
+                node,
+                @errorName(err),
+            });
+            return error.NoGbmNode;
+        },
     };
     errdefer dev.deinit();
     dev.setFormats(try queryGbmFormats(self, dev));
-    if (dev.formats.len == 0) {
-        log_mod.info("drm: GBM on {s} advertises no supported format; dmabuf import disabled", self.io, self.log_cfg, "drm", .{node});
-        return;
-    }
+    if (dev.formats.len == 0) return error.NoGbmFormats;
     self.gbm = dev;
     log_mod.info("drm: GBM {s} on {s} with {d} format/modifier pairs", self.io, self.log_cfg, "drm", .{
         dev.backendName(),
@@ -806,15 +1431,21 @@ fn openGbm(self: *DrmBackendData) error{OutOfMemory}!void {
 /// has one, its primary node otherwise. Both names come from the already
 /// open KMS fd, so they always name the same physical device
 /// (wlroots reopen_drm_node, render/allocator/allocator.c:53-65).
-fn gbmNodePath(self: *DrmBackendData) ?[:0]const u8 {
-    const fd = self.fd.?;
+///
+/// The returned path is OWNED by the caller. libdrm hands back a
+/// malloc'd string that the caller must free, so the bytes are copied
+/// out before that free - returning the span itself (and freeing it in a
+/// `defer`) would hand the caller a path into freed memory, which is
+/// exactly what a GBM device create on the node then reads.
+fn gbmNodePath(self: *DrmBackendData) ?[]u8 {
+    const fd = self.fd orelse return null;
     if (c.drmGetRenderDeviceNameFromFd(fd)) |name| {
         defer std.c.free(name);
-        return std.mem.span(name);
+        return self.allocator.dupe(u8, std.mem.span(name)) catch null;
     }
     if (c.drmGetDeviceNameFromFd2(fd)) |name| {
         defer std.c.free(name);
-        return std.mem.span(name);
+        return self.allocator.dupe(u8, std.mem.span(name)) catch null;
     }
     return null;
 }
@@ -829,13 +1460,15 @@ fn gbmNodePath(self: *DrmBackendData) ?[:0]const u8 {
 /// KMS scanout here is a dumb XRGB8888 buffer, and there is no tiled or
 /// compressed modifier anywhere in the pipeline that could present one.
 ///
-/// The kernel's FULL per-format modifier list (the IN_FORMATS_MODIFIERS
-/// blob on each plane) is deliberately not walked: reading it needs a
-/// per-plane property walk this backend does not otherwise do, and
-/// advertising a tiled modifier we cannot scan out would be a promise the
-/// first page flip would break. A driver that can only do tiled layouts
-/// therefore ends up with no advertised pair, and with no
-/// zwp_linux_dmabuf_v1 global - which is the honest answer.
+/// The kernel's FULL per-format modifier list (the plane's IN_FORMATS
+/// blob) is not walked here, because this list is what the compositor
+/// tells CLIENTS it can import and the client path only ever promises
+/// linear: a tiled buffer this pipeline cannot scan out would be a
+/// promise the first page flip breaks. GPU scanout negotiation does read
+/// the blob - `planeScanoutFormats`, against the renderer's own pairs.
+/// A driver that can only do tiled layouts therefore gets no advertised
+/// import pair and no zwp_linux_dmabuf_v1 global - which is the honest
+/// answer.
 fn queryGbmFormats(self: *DrmBackendData, dev: *dmabuf.GbmDevice) error{OutOfMemory}![]dmabuf.Format {
     var list: std.ArrayList(dmabuf.Format) = .empty;
     errdefer list.deinit(self.allocator);
@@ -898,7 +1531,20 @@ fn addOutput(base: *backend_mod.Backend, self: *DrmBackendData) error{ BackendFa
         }
         return false;
     };
-    const plane = try resolvePlane(self, found);
+    // GPU mode resolves ONE primary plane and uses it both as the commit
+    // target (atomic interface) and as the capability probe (both
+    // interfaces: the legacy one has no plane commit, but it does have
+    // planes, and their IN_FORMATS blob is where the scannable layouts
+    // come from). CPU mode keeps today's behaviour, where the plane is
+    // only looked for on the atomic path.
+    var plane: PlaneSelection = .{};
+    if (gpuModeSelected(self)) {
+        var gpu_props: PlanePropIds = .{};
+        const gpu_plane_id = try resolveGpuPlane(self, found, &gpu_props);
+        plane = .{ .id = gpu_plane_id, .props = gpu_props };
+    } else {
+        plane = try resolvePlane(self, found);
+    }
     const drm_out = try allocOutput(self, found, plane);
     try scanKmsProps(self, found, drm_out);
     try createScanoutBuffers(self, found, drm_out);
@@ -937,6 +1583,8 @@ fn allocOutput(self: *DrmBackendData, found: FoundConnector, plane: PlaneSelecti
         .connector_id = found.connector_id,
         .mode = modeToOutput(found.mode),
         .refresh_ns = modeRefreshNs(found.mode),
+        .gpu_plane_id = plane.id,
+        .crtc_mode = found.mode,
     };
     // Append before the resources exist: drmTeardown walks the list, so a
     // phase that dies after this point releases what did get created.
@@ -958,6 +1606,30 @@ fn resolvePlane(self: *DrmBackendData, found: FoundConnector) error{BackendFaile
         return error.BackendFailed;
     };
     return .{ .id = id, .props = props };
+}
+
+/// The primary plane GPU mode drives, on either KMS interface. Resolved
+/// unconditionally here (unlike resolvePlane, which is atomic-only)
+/// because GPU mode needs the plane as a CAPABILITY statement even when
+/// the legacy interface commits through the CRTC: the negotiated
+/// (format, modifier) comes from this plane's IN_FORMATS blob, and the
+/// plane id is what keeps two outputs off the same hardware.
+fn resolveGpuPlane(
+    self: *DrmBackendData,
+    found: FoundConnector,
+    props: *PlanePropIds,
+) error{BackendFailed}!u32 {
+    const id = findPrimaryPlane(self, found.crtc_index, props) orelse {
+        log_mod.err(
+            "drm: no primary plane for crtc={d}; the GPU data path needs one",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{found.crtc_id},
+        );
+        return error.BackendFailed;
+    };
+    return id;
 }
 
 /// Phase 7: connector + crtc property ids (wlroots properties.c tables).
@@ -1011,7 +1683,17 @@ fn scanKmsProps(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutpu
 /// mmap'd for CPU access, or that has no GBM device at all, must still
 /// scan out. A partial failure is fine either way - drmTeardown is
 /// idempotent and releases whatever was created.
+///
+/// GPU mode has NO such fallback. `setGpuFormats` was an explicit
+/// selection, so failing the allocation fails the output rather than
+/// quietly handing back a CPU path the caller did not ask for and cannot
+/// tell apart from a real one.
 fn createScanoutBuffers(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
+    if (gpuModeSelected(self)) {
+        try createGpuSlots(self, found, drm_out);
+        drm_out.scanout = .gpu;
+        return;
+    }
     if (chooseScanout(self, drm_out.plane_id).use_plane) {
         createPlaneBuffers(self, found, drm_out) catch |err| {
             log_mod.warn(
@@ -1037,6 +1719,432 @@ fn createScanoutBuffers(self: *DrmBackendData, found: FoundConnector, drm_out: *
     }
     drm_out.scanout = .dumb;
     try createDumbBuffers(self, found, drm_out);
+}
+
+/// Was the GPU data path selected explicitly? The single source of truth
+/// for every branch in this file: renderer pairs were handed to
+/// setGpuFormats, so allocation, commit and lease all go through the GPU
+/// ring and never through `buffers`/`copyRows`.
+fn gpuModeSelected(self: *DrmBackendData) bool {
+    const pairs = self.gpu_render_pairs orelse return false;
+    return pairs.len != 0;
+}
+
+/// The (format, modifier) both ends of the pipeline agreed on for one
+/// output: the plane really scans it out, the renderer can render into
+/// it, and GBM can allocate it.
+const GpuScanoutFormat = struct {
+    format: u32,
+    modifier: u64,
+};
+
+/// Pick the pair to allocate scanout buffers with, or null when the
+/// three capability sets have nothing in common.
+///
+/// Order of authority: the renderer's pairs come first, because the
+/// renderer is the one that has to draw into the result. Each is
+/// accepted only when the output's primary plane lists it (from its
+/// IN_FORMATS blob AND its format list) and GBM says it can allocate it
+/// with at least one plane. A modifier no plane reports is never
+/// substituted for a better one - guessing LINEAR here is exactly the
+/// failure this replaces, where a flip then lands on a plane that
+/// cannot present that layout.
+fn chooseGpuFormat(
+    plane_pairs: []const dmabuf.Format,
+    render_pairs: []const dmabuf.Format,
+    ctx: *anyopaque,
+    probe: *const fn (ctx: *anyopaque, format: u32, modifier: u64) bool,
+) ?GpuScanoutFormat {
+    for (render_pairs) |candidate| {
+        if (!dmabuf.supports(plane_pairs, candidate.format, candidate.modifier)) continue;
+        if (!probe(ctx, candidate.format, candidate.modifier)) continue;
+        return .{ .format = candidate.format, .modifier = candidate.modifier };
+    }
+    return null;
+}
+
+/// What GBM can actually allocate for a pair, through the same call the
+/// client import path uses (render/allocator/gbm.c:71-87). Injected into
+/// chooseGpuFormat as a probe so the negotiation itself is testable
+/// without a device.
+fn gbmAcceptsPair(ctx: *anyopaque, format: u32, modifier: u64) bool {
+    const dev: *dmabuf.GbmDevice = @ptrCast(@alignCast(ctx));
+    return gbm_c.gbm_device_get_format_modifier_plane_count(dev.device, format, modifier) >= 1;
+}
+
+/// Allocate this output's GPU ring: two buffer objects with the same
+/// negotiated layout, both added as KMS framebuffers BEFORE the first
+/// modeset (the modeset names one of them as the initial front buffer,
+/// and a plane commit needs its FB_ID to exist first).
+///
+/// Allocation order per slot, and why it is that order: create the bo,
+/// check the modifier it came back with, export its plane descriptors,
+/// then add the framebuffer. Every step after the bo has an `errdefer`
+/// that unwinds exactly what it created - descriptors close before the
+/// bo dies (an EGL image may still hold them), and the bo dies before
+/// the framebuffer can name it. Both slots are allocated before either
+/// is published, so a failure on the second leaves the first to be
+/// released by the caller's error path rather than a half-built ring.
+fn createGpuSlots(self: *DrmBackendData, found: FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
+    const gbm = self.gbm orelse {
+        log_mod.err("drm: GPU mode without a GBM device", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
+    };
+    const plane_id = drm_out.gpu_plane_id;
+    if (plane_id == 0) {
+        log_mod.err("drm: GPU mode without a primary plane", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
+    }
+    const render_pairs = self.gpu_render_pairs orelse return error.BackendFailed;
+
+    const plane_pairs = planeScanoutFormats(self, plane_id) catch return error.BackendFailed;
+    defer self.allocator.free(plane_pairs);
+    const chosen = chooseGpuFormat(plane_pairs, render_pairs, gbm, gbmAcceptsPair) orelse {
+        log_mod.err(
+            "drm: plane {d} scans out none of the renderer's {d} pairs",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{ plane_id, render_pairs.len },
+        );
+        return error.BackendFailed;
+    };
+    log_mod.info(
+        "drm: GPU scanout on plane {d}: format 0x{x} modifier 0x{x}",
+        self.io,
+        self.log_cfg,
+        "drm",
+        .{ plane_id, chosen.format, chosen.modifier },
+    );
+
+    const slots = self.allocator.create([2]GpuSlot) catch return error.BackendFailed;
+    slots.* = .{ .{}, .{} };
+    // Registered in release order: whichever slot fails, both are
+    // released (framebuffers, then descriptors, then the buffer objects)
+    // before the allocation goes back.
+    errdefer self.allocator.destroy(slots);
+    errdefer releaseGpuSlot(self, &slots[0]);
+    errdefer releaseGpuSlot(self, &slots[1]);
+    var i: usize = 0;
+    while (i < slots.len) : (i += 1) {
+        try allocGpuSlot(self, gbm, drm_out, found, @intCast(i), chosen, &slots[i]);
+    }
+    drm_out.gpu_slots = slots;
+}
+
+/// One slot: a GEM buffer object with a modifier GBM really honoured,
+/// its plane descriptors exported for the renderer, and a KMS
+/// framebuffer for the flip to name.
+fn allocGpuSlot(
+    self: *DrmBackendData,
+    gbm: *dmabuf.GbmDevice,
+    drm_out: *DrmOutput,
+    found: FoundConnector,
+    index: u2,
+    format: GpuScanoutFormat,
+    slot: *GpuSlot,
+) error{BackendFailed}!void {
+    const fd = self.fd.?;
+    const width = found.mode.hdisplay;
+    const height = found.mode.vdisplay;
+    // SCANOUT (this is what KMS will display) | RENDERING (this is what
+    // the renderer will draw into). Deliberately NOT LINEAR: nothing on
+    // this path maps the bo, so there is no reason to constrain the
+    // driver to a CPU-visible layout.
+    const modifiers = [1]u64{format.modifier};
+    const bo = gbm_c.gbm_bo_create_with_modifiers2(
+        gbm.device,
+        width,
+        height,
+        format.format,
+        &modifiers,
+        modifiers.len,
+        gbm_c.GBM_BO_USE_SCANOUT | gbm_c.GBM_BO_USE_RENDERING,
+    ) orelse {
+        log_mod.err(
+            "drm: gbm_bo_create_with_modifiers(0x{x}, 0x{x}) failed",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{ format.format, format.modifier },
+        );
+        return error.BackendFailed;
+    };
+    // The slot owns the bo from here: every failure below is unwound by
+    // releaseGpuSlot (createGpuSlots' errdefer), which drops the
+    // descriptors, the framebuffer and then the bo - each id zeroed as it
+    // goes, so a half-built slot releases exactly what it holds.
+    slot.bo = bo;
+    // The driver may hand back a different layout than the one asked
+    // for. Taking that silently would mean the framebuffer's modifier
+    // disagrees with the plane's, which the kernel rejects at the flip
+    // - so it is checked here, where the error can still name both.
+    const got_modifier = gbm_c.gbm_bo_get_modifier(bo);
+    if (got_modifier != format.modifier) {
+        log_mod.err(
+            "drm: GBM returned modifier 0x{x} for a 0x{x} request",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{ got_modifier, format.modifier },
+        );
+        return error.BackendFailed;
+    }
+    slot.format = format.format;
+    slot.modifier = got_modifier;
+
+    // Export the plane descriptors before the framebuffer exists: the FB
+    // add needs the same handles, and a renderer that has not imported
+    // them yet must not see a framebuffer it could not render into.
+    try exportGpuPlanes(self, bo, width, height, &slot.frame.attributes);
+
+    var fb_id: u32 = 0;
+    const planes: usize = slot.frame.attributes.n_planes;
+    var handles: [dmabuf.max_planes]u32 = .{0} ** dmabuf.max_planes;
+    var pitches: [dmabuf.max_planes]u32 = .{0} ** dmabuf.max_planes;
+    var offsets: [dmabuf.max_planes]u32 = .{0} ** dmabuf.max_planes;
+    var fb_modifiers: [dmabuf.max_planes]u64 = .{0} ** dmabuf.max_planes;
+    var p: usize = 0;
+    while (p < planes) : (p += 1) {
+        handles[p] = gbm_c.gbm_bo_get_handle_for_plane(bo, @intCast(p)).u32;
+        pitches[p] = slot.frame.attributes.planes[p].stride;
+        offsets[p] = slot.frame.attributes.planes[p].offset;
+        fb_modifiers[p] = got_modifier;
+    }
+    if (c.drmModeAddFB2WithModifiers(
+        fd,
+        width,
+        height,
+        format.format,
+        &handles,
+        &pitches,
+        &offsets,
+        &fb_modifiers,
+        &fb_id,
+        0,
+    ) != 0) {
+        log_mod.err("drm: drmModeAddFB2WithModifiers failed", self.io, self.log_cfg, "drm", .{});
+        return error.BackendFailed;
+    }
+    slot.fb_id = fb_id;
+
+    self.next_generation += 1;
+    slot.generation = self.next_generation;
+    slot.frame.fb_id = fb_id;
+    slot.frame.owner = drm_out;
+    slot.frame.slot = index;
+    slot.frame.generation = slot.generation;
+    log_mod.debug(
+        "drm: GPU slot {d}: bo planes={d} fb={d} generation={d}",
+        self.io,
+        self.log_cfg,
+        "drm",
+        .{ index, planes, fb_id, slot.generation },
+    );
+}
+
+/// Export every plane of `bo` as descriptors the renderer can import and
+/// the framebuffer can be described by, with the offsets and strides the
+/// bo really uses.
+///
+/// The fds GBM returns are duplicated: `gbm_bo_get_fd_for_plane` hands out
+/// a descriptor the bo owns, and the renderer may still be importing from
+/// ours when the bo is destroyed (the server releases its GL targets
+/// before backend slot memory, which is what makes that ordering safe).
+fn exportGpuPlanes(
+    self: *DrmBackendData,
+    bo: *gbm_c.struct_gbm_bo,
+    width: u32,
+    height: u32,
+    attrs: *dmabuf.Attributes,
+) error{BackendFailed}!void {
+    const count = gbm_c.gbm_bo_get_plane_count(bo);
+    if (count < 1 or count > dmabuf.max_planes) {
+        log_mod.err("drm: GBM buffer has {d} planes", self.io, self.log_cfg, "drm", .{count});
+        return error.BackendFailed;
+    }
+    const planes: u8 = @intCast(count);
+    var made: u8 = 0;
+    errdefer {
+        attrs.n_planes = made;
+        attrs.closePlanes();
+    }
+    while (made < planes) : (made += 1) {
+        const plane_fd = gbm_c.gbm_bo_get_fd_for_plane(bo, @intCast(made));
+        if (plane_fd < 0) {
+            log_mod.err("drm: plane {d} has no exportable fd", self.io, self.log_cfg, "drm", .{made});
+            return error.BackendFailed;
+        }
+        const owned = std.os.linux.dup(plane_fd);
+        if (std.os.linux.errno(owned) != .SUCCESS) return error.BackendFailed;
+        attrs.planes[made] = .{
+            .fd = @intCast(owned),
+            .offset = @intCast(gbm_c.gbm_bo_get_offset(bo, @intCast(made))),
+            .stride = gbm_c.gbm_bo_get_stride_for_plane(bo, @intCast(made)),
+        };
+        attrs.n_planes = made + 1;
+    }
+    attrs.width = @intCast(width);
+    attrs.height = @intCast(height);
+    attrs.format = gbm_c.gbm_bo_get_format(bo);
+    attrs.modifier = gbm_c.gbm_bo_get_modifier(bo);
+}
+
+/// Release one GPU slot: the framebuffer first (it is what the kernel
+/// holds a reference through), then the exported descriptors (a live
+/// EGL image may still be reading them), then the buffer object. Every
+/// id is zeroed as it is released, so this is idempotent and safe on a
+/// slot that never finished being built.
+fn releaseGpuSlot(self: *DrmBackendData, slot: *GpuSlot) void {
+    if (slot.fb_id != 0) {
+        if (self.fd) |fd| _ = c.drmModeRmFB(fd, slot.fb_id);
+        slot.fb_id = 0;
+    }
+    slot.frame.attributes.closePlanes();
+    slot.frame.fb_id = 0;
+    if (slot.bo) |bo| {
+        slot.bo = null;
+        gbm_c.gbm_bo_destroy(bo);
+    }
+    slot.format = 0;
+    slot.modifier = 0;
+    slot.state = .free;
+}
+
+/// Both slots of one output's ring.
+fn releaseGpuSlots(self: *DrmBackendData, drm_out: *DrmOutput) void {
+    const slots = drm_out.gpu_slots orelse return;
+    drm_out.gpu_slots = null;
+    for (slots) |*slot| releaseGpuSlot(self, slot);
+    self.allocator.destroy(slots);
+}
+
+/// The (format, modifier) pairs this output's primary plane really scans
+/// out, read from the plane's IN_FORMATS blob and intersected with the
+/// plane's own fourcc list.
+///
+/// The blob (drm_mode.h "plane framebuffer check") is the authoritative
+/// modifier list: a header, the fourccs, then one `drm_format_modifier`
+/// per format whose `formats` bitmask and `offset` select the fourccs it
+/// applies to. A blob that is absent, truncated or of an unknown version
+/// yields nothing rather than a guess: advertising LINEAR because
+/// nothing was read is the failure this replaces.
+fn planeScanoutFormats(self: *DrmBackendData, plane_id: u32) error{OutOfMemory}![]dmabuf.Format {
+    var list: std.ArrayList(dmabuf.Format) = .empty;
+    errdefer list.deinit(self.allocator);
+    const fd = self.fd orelse return list.toOwnedSlice(self.allocator);
+
+    // The plane's own fourcc list: what the plane claims to scan out,
+    // independent of which layouts apply to which format.
+    const plane = c.drmModeGetPlane(fd, plane_id) orelse return list.toOwnedSlice(self.allocator);
+    defer c.drmModeFreePlane(plane);
+    var list_formats: std.ArrayList(u32) = .empty;
+    defer list_formats.deinit(self.allocator);
+    var fi: u32 = 0;
+    while (fi < plane.*.count_formats) : (fi += 1) {
+        try list_formats.append(self.allocator, plane.*.formats[fi]);
+    }
+
+    // IN_FORMATS: the per-format modifier list.
+    const props = c.drmModeObjectGetProperties(fd, plane_id, c.DRM_MODE_OBJECT_PLANE) orelse
+        return list.toOwnedSlice(self.allocator);
+    defer c.drmModeFreeObjectProperties(props);
+    var blob_id: u32 = 0;
+    var i: u32 = 0;
+    while (i < props.*.count_props) : (i += 1) {
+        const prop = c.drmModeGetProperty(fd, props.*.props[i]) orelse continue;
+        defer c.drmModeFreeProperty(prop);
+        const name_ptr: [*:0]const u8 = @ptrCast(&prop.*.name);
+        if (std.mem.eql(u8, std.mem.sliceTo(name_ptr, 0), "IN_FORMATS")) {
+            // prop_values are u64 in the uapi; a blob id is a 32-bit
+            // object id and anything above that is not one.
+            blob_id = std.math.cast(u32, props.*.prop_values[i]) orelse 0;
+            break;
+        }
+    }
+    if (blob_id == 0) {
+        log_mod.debug(
+            "drm: plane {d} has no IN_FORMATS; no modifier list to negotiate from",
+            self.io,
+            self.log_cfg,
+            "drm",
+            .{plane_id},
+        );
+        return list.toOwnedSlice(self.allocator);
+    }
+    const blob = c.drmModeGetPropertyBlob(fd, blob_id) orelse
+        return list.toOwnedSlice(self.allocator);
+    defer c.drmModeFreePropertyBlob(blob);
+    const data = blob.*.data orelse return list.toOwnedSlice(self.allocator);
+    const bytes = @as([*]const u8, @ptrCast(data))[0..blob.*.length];
+    try parseInFormats(bytes, list_formats.items, &list, self.allocator);
+    return list.toOwnedSlice(self.allocator);
+}
+
+/// Parse one IN_FORMATS blob into (format, modifier) pairs, keeping only
+/// fourccs the plane lists.
+///
+/// The header's counts and offsets come from the kernel, so every read is
+/// bounds-checked against the blob length and a truncated blob stops the
+/// parse instead of walking off it.
+fn parseInFormats(
+    bytes: []const u8,
+    fourccs: []const u32,
+    out: *std.ArrayList(dmabuf.Format),
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}!void {
+    const format_blob_current: u32 = 1;
+    const header_size = 6 * @sizeOf(u32);
+    if (bytes.len < header_size) return;
+    const version = readU32(bytes, 0) orelse return;
+    if (version != format_blob_current) return;
+    const count_formats = readU32(bytes, 2 * @sizeOf(u32)) orelse return;
+    const formats_offset = readU32(bytes, 3 * @sizeOf(u32)) orelse return;
+    const count_modifiers = readU32(bytes, 4 * @sizeOf(u32)) orelse return;
+    const modifiers_offset = readU32(bytes, 5 * @sizeOf(u32)) orelse return;
+
+    // struct drm_format_modifier: u64 formats, u32 offset, u32 pad,
+    // u64 modifier.
+    const modifier_size: usize = 24;
+    var i: u32 = 0;
+    while (i < count_modifiers) : (i += 1) {
+        const base = @as(usize, modifiers_offset) + @as(usize, i) * modifier_size;
+        const formats_mask = readU64(bytes, base) orelse return;
+        const format_offset = readU32(bytes, base + 8) orelse return;
+        const modifier = readU64(bytes, base + 16) orelse return;
+        var bit: u7 = 0;
+        while (bit < 64) : (bit += 1) {
+            if (formats_mask & (@as(u64, 1) << @intCast(bit)) == 0) continue;
+            const index = @as(usize, format_offset) + bit;
+            if (index >= count_formats) continue;
+            const at = @as(usize, formats_offset) + index * @sizeOf(u32);
+            const format = readU32(bytes, at) orelse return;
+            // Both lists must agree: the blob says which layouts apply,
+            // the plane's fourcc list says what it scans out at all.
+            var listed = false;
+            for (fourccs) |candidate| {
+                if (candidate == format) {
+                    listed = true;
+                    break;
+                }
+            }
+            if (!listed) continue;
+            if (dmabuf.supports(out.items, format, modifier)) continue;
+            try out.append(allocator, .{ .format = format, .modifier = modifier });
+        }
+    }
+}
+
+/// A little-endian u32 at `offset`, or null when the blob is too short.
+fn readU32(bytes: []const u8, offset: usize) ?u32 {
+    if (offset + @sizeOf(u32) > bytes.len) return null;
+    return std.mem.readInt(u32, bytes[offset..][0..4], .little);
+}
+
+/// A little-endian u64 at `offset`, or null when the blob is too short.
+fn readU64(bytes: []const u8, offset: usize) ?u64 {
+    if (offset + @sizeOf(u64) > bytes.len) return null;
+    return std.mem.readInt(u64, bytes[offset..][0..8], .little);
 }
 
 /// The dumb path, unchanged: CREATE_DUMB -> MAP_DUMB -> mmap -> ADDFB2,
@@ -1306,13 +2414,29 @@ fn atomicModeset(
         self.io,
         self.log_cfg,
         "drm",
-        .{ plane.id, drm_out.buffers[0].fb_id, drm_out.buffers[1].fb_id, plane.props.fb_damage_clips, damage_blob },
+        .{ plane.id, initialFbId(drm_out), secondFbId(drm_out), plane.props.fb_damage_clips, damage_blob },
     );
     const commit_rc = c.drmModeAtomicCommit(fd, req, c.DRM_MODE_ATOMIC_ALLOW_MODESET, null);
     if (commit_rc != 0) {
         logAtomicModesetFailure(self, found, plane, drm_out, damage_blob, commit_rc);
         return error.BackendFailed;
     }
+}
+
+/// The framebuffer the modeset binds as the initial front buffer: the
+/// GPU ring's first slot in GPU mode, the CPU swapchain's A side
+/// otherwise. Both were allocated before the modeset ran, which is what
+/// the plane commit needs.
+fn initialFbId(drm_out: *const DrmOutput) u32 {
+    if (drm_out.gpu_slots) |slots| return slots[0].fb_id;
+    return drm_out.buffers[0].fb_id;
+}
+
+/// The other buffer of the same swapchain, for logs only: which id a
+/// flip would move to next.
+fn secondFbId(drm_out: *const DrmOutput) u32 {
+    if (drm_out.gpu_slots) |slots| return slots[1].fb_id;
+    return drm_out.buffers[1].fb_id;
 }
 
 /// The property set an atomic modeset commits, in the order wlroots adds
@@ -1337,7 +2461,7 @@ fn addModesetProps(
         c.drmModeAtomicAddProperty(req, found.crtc_id, drm_out.crtc_mode_id, drm_out.mode_blob) < 0 or
         c.drmModeAtomicAddProperty(req, found.crtc_id, drm_out.crtc_active, 1) < 0 or
         c.drmModeAtomicAddProperty(req, plane.id, plane.props.crtc_id, found.crtc_id) < 0 or
-        c.drmModeAtomicAddProperty(req, plane.id, plane.props.fb_id, drm_out.buffers[0].fb_id) < 0 or
+        c.drmModeAtomicAddProperty(req, plane.id, plane.props.fb_id, initialFbId(drm_out)) < 0 or
         c.drmModeAtomicAddProperty(req, plane.id, plane.props.src_x, 0) < 0 or
         c.drmModeAtomicAddProperty(req, plane.id, plane.props.src_y, 0) < 0 or
         c.drmModeAtomicAddProperty(req, plane.id, plane.props.src_w, src_w) < 0 or
@@ -1389,7 +2513,7 @@ fn logAtomicModesetFailure(
             plane.props.crtc_id,
             found.crtc_id,
             plane.props.fb_id,
-            drm_out.buffers[0].fb_id,
+            initialFbId(drm_out),
             plane.props.src_x,
             plane.props.src_y,
             plane.props.src_w,
@@ -1406,13 +2530,14 @@ fn logAtomicModesetFailure(
 
 /// Phase 10b: the legacy modeset — bind the connector to the CRTC and
 /// apply the mode in one call (wlroots legacy.c:121-126 drmModeSetCrtc
-/// with the connector array + mode). buffers[0] is the A side of the
-/// swapchain; the first commit flips to buffers[1].
+/// with the connector array + mode). The first buffer of whichever
+/// swapchain this output has is what the modeset binds: `buffers[0]` on
+/// the CPU paths, GPU ring slot 0 in GPU mode.
 fn legacyModeset(self: *DrmBackendData, found: *FoundConnector, drm_out: *DrmOutput) error{BackendFailed}!void {
     if (c.drmModeSetCrtc(
         self.fd.?,
         found.crtc_id,
-        drm_out.buffers[0].fb_id,
+        initialFbId(drm_out),
         0,
         0,
         &found.connector_id,
@@ -1441,6 +2566,10 @@ fn announceOutput(base: *backend_mod.Backend, self: *DrmBackendData, drm_out: *D
         drm_out.mode,
     );
     drm_out.out = out;
+    // The modeset bound slot 0, so that is what is on screen: the ring
+    // starts with one front buffer and one free one, exactly like the CPU
+    // swapchain's A/B sides.
+    if (drm_out.gpu_slots) |slots| slots[0].state = .front;
     // The page-flip completion IS the real present: presentation
     // feedback gates on this output's presented event instead of
     // synthesizing.
@@ -1475,9 +2604,29 @@ fn testState(out: *output_mod.Output, state: *const output_mod.Output.State) err
         }
     }
     if (state.committed & output_mod.Output.State.committed_buffer != 0) {
-        const fb: *pixman.Framebuffer = @ptrCast(@alignCast(state.buffer orelse return error.InvalidState));
-        if (fb.width != self.mode.width or fb.height != self.mode.height) return error.InvalidState;
-        if (fb.stride < fb.width * 4) return error.InvalidState;
+        switch (state.buffer orelse return error.InvalidState) {
+            .cpu => |fb| {
+                // A CPU buffer is only meaningful on a CPU output: a GPU
+                // output has no CPU front buffer to copy into, so taking
+                // one would mean silently dropping the frame.
+                if (self.gpu_slots != null) return error.InvalidState;
+                if (fb.width != self.mode.width or fb.height != self.mode.height) return error.InvalidState;
+                if (fb.stride < fb.width * 4) return error.InvalidState;
+            },
+            .gpu => |frame| {
+                // The lease must be live and ours: wrong owner, wrong
+                // slot, stale generation, or a slot that is not being
+                // written are rejected here rather than flipped to.
+                if (!gpuModeSelected(self.backend)) return error.InvalidState;
+                if (!gpuFrameValid(self, frame)) return error.InvalidState;
+                if (frame.fb_id == 0) return error.InvalidState;
+                if (frame.attributes.width != self.mode.width or
+                    frame.attributes.height != self.mode.height)
+                {
+                    return error.InvalidState;
+                }
+            },
+        }
     }
 }
 
@@ -1489,7 +2638,7 @@ fn commit(out: *output_mod.Output, state: *const output_mod.Output.State) error{
     // Frame pacing guarantees at most one flip in flight (the event for
     // the previous flip drives the next frame); a second flip before the
     // event would EBUSY. wlroots atomic.c guards the same way.
-    if (self.flip_pending) {
+    if (self.pending != null) {
         // Normal pacing under the requestRender-driven model: a commit
         // can land while the previous flip is still in flight; the flip
         // completion event re-renders it. Not an error.
@@ -1497,7 +2646,18 @@ fn commit(out: *output_mod.Output, state: *const output_mod.Output.State) error{
         return error.CommitFailed;
     }
 
-    const fb: *pixman.Framebuffer = @ptrCast(@alignCast(state.buffer.?));
+    const buffer = state.buffer orelse return error.CommitFailed;
+    switch (buffer) {
+        .gpu => |frame| return commitGpu(self, frame),
+        .cpu => {
+            // A CPU frame on a GPU output has nowhere to go: this output
+            // has no CPU front buffer. testState rejects it, and this is
+            // the same rule enforced where it would otherwise be a silent
+            // dropped frame.
+            if (self.gpu_slots != null) return error.CommitFailed;
+        },
+    }
+    const fb = buffer.cpu;
     // A/B swapchain: draw into the OTHER buffer (the one not currently
     // displayed — the modeset bound buffers[0], so the first commit
     // copies into buffers[1]) and flip to ITS framebuffer id. Every flip
@@ -1520,14 +2680,21 @@ fn commit(out: *output_mod.Output, state: *const output_mod.Output.State) error{
     // Legacy interface (no atomic): drmModePageFlip on the CRTC
     // (wlroots legacy.c:206-209). Asynchronous, like the atomic
     // non-blocking flip — completion arrives as DRM_EVENT_FLIP_COMPLETE
-    // through dispatch() and pageFlipHandler clears flip_pending. No
+    // through dispatch() and pageFlipHandler releases the pending flip. No
     // damage property exists on this path (damage is a plane property).
     if (!self.backend.atomic) {
-        if (c.drmModePageFlip(self.backend.fd.?, self.crtc_id, buf.fb_id, c.DRM_MODE_PAGE_FLIP_EVENT, self) != 0) {
+        const cookie = armFlip(self) orelse return error.CommitFailed;
+        if (c.drmModePageFlip(
+            self.backend.fd.?,
+            self.crtc_id,
+            buf.fb_id,
+            c.DRM_MODE_PAGE_FLIP_EVENT,
+            cookiePointer(cookie),
+        ) != 0) {
+            disarmFlip(self);
             log_mod.err("drm: drmModePageFlip failed", self.backend.io, self.backend.log_cfg, "drm", .{});
             return error.CommitFailed;
         }
-        self.flip_pending = true;
         self.flip_index = 1 - self.flip_index;
         return;
     }
@@ -1566,16 +2733,17 @@ fn commit(out: *output_mod.Output, state: *const output_mod.Output.State) error{
         log_mod.err("drm: atomic add FB_ID/damage failed", self.backend.io, self.backend.log_cfg, "drm", .{});
         return error.CommitFailed;
     }
+    const cookie = armFlip(self) orelse return error.CommitFailed;
     if (c.drmModeAtomicCommit(
         fd,
         req,
         c.DRM_MODE_PAGE_FLIP_EVENT | c.DRM_MODE_ATOMIC_NONBLOCK,
-        self,
+        cookiePointer(cookie),
     ) != 0) {
+        disarmFlip(self);
         log_mod.err("drm: page flip commit failed", self.backend.io, self.backend.log_cfg, "drm", .{});
         return error.CommitFailed;
     }
-    self.flip_pending = true;
     // The flip is queued; the buffer just flipped to is now the
     // displayed one, so the next commit copies into the other. Frame
     // pacing (one flip in flight, the completion event drives the next
@@ -1583,9 +2751,91 @@ fn commit(out: *output_mod.Output, state: *const output_mod.Output.State) error{
     self.flip_index = 1 - self.flip_index;
 }
 
-/// The backend owns all per-output resources; Output.destroy() frees only
-/// the wrapper (headless pattern).
-fn destroyOutput(_: std.mem.Allocator, _: *anyopaque) void {}
+/// Present a leased GPU slot: page-flip the plane onto that slot's
+/// framebuffer and nothing else.
+///
+/// There is no copy on this path, by construction: the renderer already
+/// drew into the buffer object's memory through a GL target imported
+/// from these same plane descriptors, so the compositor has nothing to
+/// move and never looks at the pixels. The one thing that must happen
+/// before the flip is that the renderer's GL work has finished - that is
+/// `Gles2Renderer.finishRendering` (glFinish), the server's job,
+/// immediately before it builds this state, because the kernel reads
+/// the buffer when the flip completes.
+///
+/// The lease only becomes `pending` when the kernel has ACCEPTED the
+/// flip. Any failure leaves the slot `writing`: the caller's commit did
+/// not happen, so it still owns those pixels and must either retry or
+/// cancel. Taking the slot here and failing later would hand a buffer
+/// back to the next writer while the caller believes it is presenting.
+fn commitGpu(self: *DrmOutput, frame: *gpu_frame.GpuFrame) error{CommitFailed}!void {
+    const slots = self.gpu_slots orelse return error.CommitFailed;
+    if (!gpuFrameValid(self, frame)) return error.CommitFailed;
+    const slot = &slots[frame.slot];
+
+    // Legacy interface (no atomic): drmModePageFlip names the CRTC and
+    // the new framebuffer (wlroots legacy.c:206-209). Same asynchronous
+    // contract, same completion event, and it works for a GEM framebuffer
+    // with a modifier - which is what "legacy KMS is allowed here when
+    // the flip actually works" means.
+    if (!self.backend.atomic) {
+        const cookie = armFlip(self) orelse return error.CommitFailed;
+        if (c.drmModePageFlip(
+            self.backend.fd.?,
+            self.crtc_id,
+            slot.fb_id,
+            c.DRM_MODE_PAGE_FLIP_EVENT,
+            cookiePointer(cookie),
+        ) != 0) {
+            disarmFlip(self);
+            log_mod.err("drm: drmModePageFlip failed (gpu slot)", self.backend.io, self.backend.log_cfg, "drm", .{});
+            return error.CommitFailed;
+        }
+        slot.state = .pending;
+        return;
+    }
+
+    const fd = self.backend.fd.?;
+    const req = c.drmModeAtomicAlloc() orelse return error.CommitFailed;
+    defer c.drmModeAtomicFree(req);
+    // Only FB_ID changes: the mode, the source and destination rects and
+    // the framebuffer's modifier were all fixed at the modeset, and the
+    // slot's framebuffer is the one the plane has already proven it can
+    // scan out.
+    if (c.drmModeAtomicAddProperty(req, self.plane_id, self.props.fb_id, slot.fb_id) < 0) {
+        log_mod.err("drm: atomic add FB_ID failed (gpu slot)", self.backend.io, self.backend.log_cfg, "drm", .{});
+        return error.CommitFailed;
+    }
+    const cookie = armFlip(self) orelse return error.CommitFailed;
+    if (c.drmModeAtomicCommit(
+        fd,
+        req,
+        c.DRM_MODE_PAGE_FLIP_EVENT | c.DRM_MODE_ATOMIC_NONBLOCK,
+        cookiePointer(cookie),
+    ) != 0) {
+        disarmFlip(self);
+        log_mod.err("drm: gpu page flip commit failed", self.backend.io, self.backend.log_cfg, "drm", .{});
+        return error.CommitFailed;
+    }
+    slot.state = .pending;
+}
+
+/// Output.destroy() runs this and then frees the wrapper, so it is the
+/// last chance to break every reference to it. A page-flip completion
+/// queued before this can still arrive afterwards; it must not fire a
+/// presented or frame event on freed compositor state, and it must not
+/// promote a ring slot for an output nobody can see any more.
+///
+/// The flip epoch moves here for exactly that reason, and the KMS
+/// resources are released by the caller (removeDisconnectedOutputs or
+/// drmTeardown). The struct itself is freed right after the Output
+/// wrapper is gone: nothing the kernel holds points at it, because a
+/// queued flip is named by an integer cookie, not by this address.
+fn destroyOutput(_: std.mem.Allocator, data: *anyopaque) void {
+    const drm_out: *DrmOutput = @ptrCast(@alignCast(data));
+    drm_out.out = null;
+    invalidateFlipIdentity(drm_out);
+}
 
 // ---------------------------------------------------------------------------
 // DRM helpers
@@ -1599,18 +2849,35 @@ const FoundConnector = struct {
 };
 
 /// Index of the first CRTC a possible_crtcs mask allows (bit i = CRTC
-/// i) within [0, count) — the encoder-fallback CRTC pick: the union mask
-/// comes from drmModeConnectorGetPossibleCrtcs, and the lowest set bit
-/// is the first CRTC a sibling encoder can drive (wlroots realloc_crtcs
-/// matches connectors against every CRTC in possible_crtcs; we take the
-/// first such CRTC, kernels expose <= 32). Null when the mask allows no
-/// CRTC in range.
-fn firstCrtcIndex(possible_crtcs: u32, count: usize) ?usize {
+/// i) within [0, count) that no live output already holds — the
+/// encoder-fallback CRTC pick: the union mask comes from
+/// drmModeConnectorGetPossibleCrtcs, and the lowest set bit is the first
+/// CRTC a sibling encoder can drive (wlroots realloc_crtcs matches
+/// connectors against every CRTC in possible_crtcs; we take the first
+/// such CRTC, kernels expose <= 32). Null when the mask allows no free
+/// CRTC in range, which is how a second connector on a single-CRTC
+/// device is declined instead of being handed the CRTC already in use.
+///
+/// `claimed` is the list of CRTC ids live outputs hold. It is passed in
+/// rather than read from the backend so the allocation rule is testable
+/// on its own; the caller passes the backend's own list.
+fn firstCrtcIndex(possible_crtcs: u32, count: usize, claimed: []const usize) ?usize {
     var i: usize = 0;
     while (i < count and i < 32) : (i += 1) {
-        if (possible_crtcs & (@as(u32, 1) << @as(u5, @intCast(i))) != 0) return i;
+        if (possible_crtcs & (@as(u32, 1) << @as(u5, @intCast(i))) == 0) continue;
+        if (idClaimed(claimed, i)) continue;
+        return i;
     }
     return null;
+}
+
+/// Is `index` one of the claimed slots? The claims are indexes into the
+/// CRTC id array, which is what possible_crtcs bits address.
+fn idClaimed(claimed: []const usize, index: usize) bool {
+    for (claimed) |taken| {
+        if (taken == index) return true;
+    }
+    return false;
 }
 
 /// Find the first connected connector with a mode; prefer the preferred
@@ -1663,8 +2930,13 @@ fn findConnectorMode(self: *DrmBackendData) ?FoundConnector {
         if (possible_crtcs == 0) continue;
 
         // First free CRTC the encoder union can drive (kernels expose
-        // <= 32 CRTCs; wlroots asserts the same bound).
-        const crtc_index = firstCrtcIndex(possible_crtcs, @intCast(res.*.count_crtcs)) orelse continue;
+        // <= 32 CRTCs; wlroots asserts the same bound). "Free" means no
+        // output this backend already drives holds it: two outputs bound
+        // to one CRTC fight over the same hardware, and the second
+        // modeset would silently take the screen from the first.
+        var claims_storage: [32]usize = undefined;
+        const claimed = claimedCrtcs(self, res.*.crtcs[0..@intCast(res.*.count_crtcs)], &claims_storage);
+        const crtc_index = firstCrtcIndex(possible_crtcs, @intCast(res.*.count_crtcs), claimed) orelse continue;
         const crtc_id = res.*.crtcs[crtc_index];
 
         return .{
@@ -1680,8 +2952,17 @@ fn findConnectorMode(self: *DrmBackendData) ?FoundConnector {
 /// Find the primary plane for the CRTC and resolve the property ids used
 /// in commits (wlroots drm.c init_plane: the plane must have the CRTC in
 /// possible_crtcs, type == DRM_PLANE_TYPE_PRIMARY, and support the
-/// scanout format XRGB8888; properties.c plane_info table names the
-/// ids).
+/// scanout format; properties.c plane_info table names the ids).
+///
+/// Two constraints beyond wlroots' single-output case, both about two
+/// outputs living on one device:
+///  - a plane already driven by another live output is skipped, so the
+///    two never fight over one plane's framebuffer (one atomic commit
+///    would unbind the other's scanout);
+///  - in GPU mode the plane must scan out a format this backend could
+///    actually negotiate, which is not necessarily XRGB8888: the
+///    renderer's pairs decide. On the CPU paths XRGB8888 stays the
+///    requirement, exactly as before.
 fn findPrimaryPlane(self: *DrmBackendData, crtc_index: usize, out_props: *PlanePropIds) ?u32 {
     const fd = self.fd.?;
     const res = c.drmModeGetPlaneResources(fd) orelse {
@@ -1694,33 +2975,34 @@ fn findPrimaryPlane(self: *DrmBackendData, crtc_index: usize, out_props: *PlaneP
     var i: u32 = 0;
     while (i < res.*.count_planes) : (i += 1) {
         const plane_id = res.*.planes[i];
+        if (planeDrivenByOutput(self, plane_id)) continue;
         const plane = c.drmModeGetPlane(fd, plane_id) orelse continue;
         defer c.drmModeFreePlane(plane);
         if (plane.*.possible_crtcs & crtc_bit == 0) continue;
 
+        // Classify first, then check the format: "type" is read as a
+        // value, never committed (plane_prop_names has no "type" slot),
+        // and only a primary plane may carry the scanout framebuffer.
         var props: PlanePropIds = .{};
         if (!scanPlaneProps(fd, plane_id, &props)) continue;
         const type_value = getPropValue(fd, plane_id, c.DRM_MODE_OBJECT_PLANE, props.plane_type) orelse continue;
         if (type_value != c.DRM_PLANE_TYPE_PRIMARY) continue;
 
-        // The plane must scan out our XRGB8888 dumb buffer; skip planes
-        // without the format (wlroots drm.c init_plane collects
-        // drm_plane->formats into the plane's format set, drm.c:169-186,
-        // and drm_fb_import refuses buffers whose format is absent from
-        // it, fb.c:144-169).
-        var has_xrgb8888 = false;
-        var fi: u32 = 0;
-        while (fi < plane.*.count_formats) : (fi += 1) {
-            if (plane.*.formats[fi] == drm_format_xrgb8888) {
-                has_xrgb8888 = true;
-                break;
-            }
-        }
-        if (!has_xrgb8888) {
-            log_mod.debug("drm: plane {d} lacks XRGB8888; skipping", self.io, self.log_cfg, "drm", .{plane_id});
+        // The plane must scan out something this backend can put on it
+        // (wlroots drm.c init_plane collects drm_plane->formats into the
+        // plane's format set, drm.c:169-186, and drm_fb_import refuses
+        // buffers whose format is absent from it, fb.c:144-169).
+        const wanted: []const dmabuf.Format = if (gpuModeSelected(self)) self.gpu_render_pairs.? else &cpu_scanout_formats;
+        if (!planeScannable(plane.*, wanted)) {
+            log_mod.debug(
+                "drm: plane {d} scans out none of the wanted formats; skipping",
+                self.io,
+                self.log_cfg,
+                "drm",
+                .{plane_id},
+            );
             continue;
         }
-
         out_props.* = props;
         if (props.fb_damage_clips == 0) {
             // Optional property (wlroots atomic.c guards every damage
@@ -1739,6 +3021,56 @@ fn findPrimaryPlane(self: *DrmBackendData, crtc_index: usize, out_props: *PlaneP
         return plane_id;
     }
     return null;
+}
+
+/// The formats the CPU paths need a plane to scan out: XRGB8888 alone.
+/// Declared as a pair list so one matcher serves both paths; the modifier
+/// is irrelevant to a dumb buffer, so it is LINEAR.
+const cpu_scanout_formats = [_]dmabuf.Format{
+    .{ .format = drm_format_xrgb8888, .modifier = dmabuf.drm_format_mod_linear },
+};
+
+/// Does this plane list any of the wanted fourccs? The modifier half of
+/// the pairs is not consulted: drmModeGetPlane reports the plane's
+/// format list without modifiers, and the modifiers come from the
+/// IN_FORMATS blob `planeScanoutFormats` reads separately.
+fn planeScannable(plane: c.drmModePlane, wanted: []const dmabuf.Format) bool {
+    for (wanted) |pair| {
+        var i: u32 = 0;
+        while (i < plane.count_formats) : (i += 1) {
+            if (plane.formats[i] == pair.format) return true;
+        }
+    }
+    return false;
+}
+
+/// Is this plane already committed by one of our live outputs? Two
+/// outputs sharing a plane would each modeset away the other's scanout:
+/// the second commit's FB_ID simply replaces the first.
+fn planeDrivenByOutput(self: *DrmBackendData, plane_id: u32) bool {
+    for (self.outputs.items) |drm_out| {
+        if (drm_out.gpu_plane_id == plane_id) return true;
+        if (drm_out.plane_id == plane_id) return true;
+    }
+    return false;
+}
+
+/// The positions in `crtcs` that live outputs already hold, using bounded
+/// caller storage. `possible_crtcs` bits address the CRTC array by position, so
+/// the claim is recorded as a position; within one drmModeGetResources
+/// answer the same position always names the same CRTC, and every
+/// enumeration re-derives the list from the outputs we hold.
+fn claimedCrtcs(self: *DrmBackendData, crtcs: []const c_uint, storage: *[32]usize) []const usize {
+    var count: usize = 0;
+    for (crtcs[0..@min(crtcs.len, storage.len)], 0..) |id, index| {
+        for (self.outputs.items) |drm_out| {
+            if (id != drm_out.crtc_id) continue;
+            storage[count] = index;
+            count += 1;
+            break;
+        }
+    }
+    return storage[0..count];
 }
 
 /// Resolve property ids by name for one DRM object (wlroots
@@ -1969,6 +3301,11 @@ fn releaseOutputResources(self: *DrmBackendData, drm_out: *DrmOutput) void {
         _ = c.drmModeDestroyPropertyBlob(fd, drm_out.mode_blob);
         drm_out.mode_blob = 0;
     }
+    // The GPU ring first: its descriptors and buffer objects are what a
+    // renderer import is still pointing at, and this output's Output has
+    // already been destroyed by the time this runs, so the server has
+    // released its GL targets.
+    releaseGpuSlots(self, drm_out);
     releaseBuffers(self, drm_out);
 }
 
@@ -2026,9 +3363,19 @@ fn releaseBuffer(self: *DrmBackendData, buf: *ScanoutBuffer) void {
 /// drift from the kernel's.
 ///
 /// The Output wrapper is destroyed first - that emits the signal the
-/// compositor uses to retire the wl_output - then the KMS resources, then
-/// the struct. The list entry is removed last, because orderedRemove shifts
-/// the tail down and the index has to stay valid for the loop.
+/// compositor uses to retire the wl_output, and `destroyOutput` clears
+/// this output's flip identity - then the KMS resources. The struct is
+/// freed right after: a page flip we queued before the unplug is named by
+/// an integer cookie, not by this address, so a completion still sitting in
+/// the kernel queue resolves to "no output waiting for that cookie" and
+/// changes nothing. The list entry is removed before the free, because
+/// orderedRemove shifts the tail down and the index has to stay valid for
+/// the loop.
+///
+/// A replugged connector gets a brand new DrmOutput whose every slot
+/// carries a fresh generation, and every flip it queues gets a fresh
+/// cookie, so no frame, lease, framebuffer id or queued flip from before
+/// the unplug can ever be mistaken for the new output's.
 fn removeDisconnectedOutputs(self: *DrmBackendData) void {
     const fd = self.fd orelse return;
     var i: usize = 0;
@@ -2047,8 +3394,8 @@ fn removeDisconnectedOutputs(self: *DrmBackendData) void {
         );
         if (drm_out.out) |out| out.destroy();
         releaseOutputResources(self, drm_out);
-        self.allocator.destroy(drm_out);
         _ = self.outputs.orderedRemove(i);
+        self.allocator.destroy(drm_out);
     }
 }
 
@@ -2096,6 +3443,15 @@ fn modeRefreshNs(mode: c.drmModeModeInfo) u64 {
 /// the output's commit sequence: flips are serialized (a commit while
 /// one is in flight fails), so at completion it is the flipped frame's
 /// seq.
+///
+/// The kernel gives us back one thing: the cookie we queued with, as an
+/// integer this module never dereferences. A completion that resolves to
+/// no output - because the output is gone, because a resume or a teardown
+/// moved it to another epoch, or because it has queued a newer flip since
+/// - is dropped without touching the ring or the compositor. It must not
+/// present, and it must not promote a ring slot: either would report a
+/// frame the compositor never committed and hand the next writer a buffer
+/// the kernel is still scanning out.
 fn pageFlipHandler(
     fd: c_int,
     sequence: c_uint,
@@ -2106,17 +3462,38 @@ fn pageFlipHandler(
 ) callconv(.c) void {
     _ = fd;
     _ = sequence;
-    const drm_out: *DrmOutput = @ptrCast(@alignCast(user_data.?));
-    if (crtc_id != drm_out.crtc_id) return;
-    drm_out.flip_pending = false;
-    if (drm_out.out) |out| {
-        // The kernel's tv is the vblank time (CLOCK_MONOTONIC-family:
-        // seconds + microseconds since boot).
-        const when_ns: u64 = @as(u64, tv_sec) * std.time.ns_per_s +
-            @as(u64, tv_usec) * std.time.ns_per_us;
-        out.firePresented(out.commit_seq, drm_present_flags, drm_out.refresh_ns, when_ns);
-        out.sendFrame();
+    // Only reachable from inside one drmHandleEvent, which is what scopes
+    // the backend. Nothing here is reachable between drains.
+    const self = draining orelse return;
+    const drm_out = outputPendingCookie(self, cookieOf(user_data)) orelse return;
+    // The kernel names the CRTC that finished; the record names the one the
+    // flip was queued on. They can only disagree if something queued a
+    // flip under another CRTC's cookie, which nothing does.
+    if (crtc_id != drm_out.pending.?.crtc_id) return;
+    drm_out.pending = null;
+    // The pending slot becomes the front buffer, and only then does the
+    // one it replaced become free (GpuRing.flipCompleted). Both slots are
+    // written back: the old front turns free inside that call, and a
+    // partial write-back would leave the output with no writable buffer
+    // for ever.
+    if (drm_out.gpu_slots) |slots| {
+        var states: [2]SlotState = .{ slots[0].state, slots[1].state };
+        var i: usize = 0;
+        while (i < states.len) : (i += 1) {
+            if (states[i] != .pending) continue;
+            GpuRing.flipCompleted(&states, @intCast(i));
+            slots[0].state = states[0];
+            slots[1].state = states[1];
+            break;
+        }
     }
+    const out = drm_out.out orelse return;
+    // The kernel's tv is the vblank time (CLOCK_MONOTONIC-family:
+    // seconds + microseconds since boot).
+    const when_ns: u64 = @as(u64, tv_sec) * std.time.ns_per_s +
+        @as(u64, tv_usec) * std.time.ns_per_us;
+    out.firePresented(out.commit_seq, drm_present_flags, drm_out.refresh_ns, when_ns);
+    out.sendFrame();
 }
 
 // ---------------------------------------------------------------------------
@@ -2205,24 +3582,38 @@ test "card node path yields the DRM minor logind wants" {
     try testing.expectEqual(@as(u32, 0), cardMinor(""));
 }
 
-test "encoder fallback picks the first CRTC in the possible_crtcs union" {
+test "encoder fallback picks the first FREE CRTC in the possible_crtcs union" {
     // F24: a connector's CRTC set is the union over ALL its encoders
     // (drmModeConnectorGetPossibleCrtcs); the lowest set bit wins.
     // Single-encoder mask: bit 0 -> CRTC 0.
-    try testing.expectEqual(@as(?usize, 0), firstCrtcIndex(0b1, 4));
+    try testing.expectEqual(@as(?usize, 0), firstCrtcIndex(0b1, 4, &.{}));
     // Union of two encoders' masks (bits 0 and 2): first is CRTC 0.
-    try testing.expectEqual(@as(?usize, 0), firstCrtcIndex(0b101, 4));
+    try testing.expectEqual(@as(?usize, 0), firstCrtcIndex(0b101, 4, &.{}));
     // Only the sibling encoder drives CRTC 2 (the connector's own
     // encoder reported 0): fallback must still find it.
-    try testing.expectEqual(@as(?usize, 2), firstCrtcIndex(0b100, 4));
+    try testing.expectEqual(@as(?usize, 2), firstCrtcIndex(0b100, 4, &.{}));
     // Bit 3 is within a 4-CRTC device: index 3 is valid.
-    try testing.expectEqual(@as(?usize, 3), firstCrtcIndex(0b1000, 4));
+    try testing.expectEqual(@as(?usize, 3), firstCrtcIndex(0b1000, 4, &.{}));
     // Mask allows CRTCs past the resources' count: out of range -> null.
-    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0b10000, 4));
+    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0b10000, 4, &.{}));
     // No CRTC reachable at all.
-    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0, 4));
+    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0, 4, &.{}));
     // Zero resources -> null even with a full mask.
-    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0xFFFFFFFF, 0));
+    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0xFFFFFFFF, 0, &.{}));
+
+    // The second output on a two-CRTC connector: CRTC 0 already drives
+    // an output, so it must be skipped rather than modeset away the
+    // first output's scanout.
+    try testing.expectEqual(@as(?usize, 1), firstCrtcIndex(0b11, 2, &.{0}));
+    // A claim on the SECOND CRTC leaves the first free: the rule is the
+    // lowest free CRTC the union allows, not a preference order, so the
+    // answer is the same whichever one the first output took.
+    try testing.expectEqual(@as(?usize, 0), firstCrtcIndex(0b11, 2, &.{1}));
+    // Both taken: this connector cannot be driven, and the caller is
+    // told so instead of getting hardware already in use.
+    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0b11, 2, &.{ 0, 1 }));
+    // A single-CRTC device with that CRTC in use: nothing left.
+    try testing.expectEqual(@as(?usize, null), firstCrtcIndex(0b1, 1, &.{0}));
 }
 
 test "plane property name table" {
@@ -2263,4 +3654,678 @@ fn planePropIndex(name: []const u8) ?usize {
         if (std.mem.eql(u8, name, want)) return idx;
     }
     return null;
+}
+
+test "the GPU ring presents one slot at a time and frees the old front last" {
+    // After the modeset: slot 0 is on screen, slot 1 is free.
+    var states = [2]SlotState{ .front, .free };
+    try testing.expectEqual(@as(?u2, 1), GpuRing.firstFree(&states));
+
+    // Leased and committed: one writer, one queued flip, and the front
+    // buffer is still the one being scanned out.
+    states[1] = .writing;
+    states[1] = .pending;
+    try testing.expectEqual(@as(?u2, null), GpuRing.firstFree(&states));
+
+    // The flip completes: the pending slot becomes the front, and only
+    // then does the slot it replaced become free. Before the completion
+    // there was nothing to lease; after it there is exactly one.
+    GpuRing.flipCompleted(&states, 1);
+    try testing.expectEqual(SlotState.front, states[1]);
+    try testing.expectEqual(SlotState.free, states[0]);
+    try testing.expectEqual(@as(?u2, 0), GpuRing.firstFree(&states));
+
+    // A completion that names a slot which is not pending changes
+    // nothing: a stale or duplicated completion must not free the buffer
+    // on screen, which would let the next writer scribble into it.
+    states[0] = .writing;
+    GpuRing.flipCompleted(&states, 0);
+    try testing.expectEqual(SlotState.writing, states[0]);
+    try testing.expectEqual(SlotState.front, states[1]);
+    try testing.expectEqual(@as(?u2, null), GpuRing.firstFree(&states));
+}
+
+/// A DrmOutput with a GPU ring, built without a device and REGISTERED with
+/// the backend, exactly as allocOutput registers a real one: the lease
+/// rules and the flip-identity rules are pure state and must hold without
+/// a card, and a completion resolves its cookie through the backend's
+/// output list either way.
+///
+/// The caller owns the returned struct and must `deinit` the backend's
+/// output list.
+fn fakeGpuOutput(backend: *DrmBackendData, slots: *[2]GpuSlot) !*DrmOutput {
+    const drm_out = try backend.allocator.create(DrmOutput);
+    errdefer backend.allocator.destroy(drm_out);
+    drm_out.* = .{
+        .backend = backend,
+        .crtc_id = 1,
+        .plane_id = 2,
+        .props = .{},
+        .gpu_plane_id = 2,
+        .mode = .{ .width = 64, .height = 64, .refresh_msec = 16 },
+        .gpu_slots = slots,
+    };
+    var i: usize = 0;
+    while (i < slots.len) : (i += 1) {
+        slots[i].fb_id = @intCast(10 + i);
+        slots[i].generation = @intCast(100 + i);
+        slots[i].frame.fb_id = slots[i].fb_id;
+        slots[i].frame.owner = drm_out;
+        slots[i].frame.slot = @intCast(i);
+        slots[i].frame.generation = slots[i].generation;
+        slots[i].frame.attributes = .{
+            .width = 64,
+            .height = 64,
+            .format = drm_format_xrgb8888,
+            .modifier = dmabuf.drm_format_mod_linear,
+        };
+    }
+    try backend.outputs.append(backend.allocator, drm_out);
+    return drm_out;
+}
+
+/// Counts the signals a flip completion fires into the compositor. Those
+/// are the consumer-visible effects a stale completion must never have:
+/// a presented event reports a frame that was never displayed, and a
+/// frame event asks the renderer to start a new one.
+const FlipSignals = struct {
+    frames: usize = 0,
+    presents: usize = 0,
+    frame_listener: wire.Listener(*output_mod.Output),
+    present_listener: wire.Listener(*output_mod.Output.PresentEvent),
+
+    fn onFrame(listener: *wire.Listener(*output_mod.Output), _: *output_mod.Output) void {
+        @as(*FlipSignals, @fieldParentPtr("frame_listener", listener)).frames += 1;
+    }
+
+    fn onPresented(
+        listener: *wire.Listener(*output_mod.Output.PresentEvent),
+        _: *output_mod.Output.PresentEvent,
+    ) void {
+        @as(*FlipSignals, @fieldParentPtr("present_listener", listener)).presents += 1;
+    }
+
+    fn init() FlipSignals {
+        return .{
+            .frame_listener = wire.Listener(*output_mod.Output).init(FlipSignals.onFrame),
+            .present_listener = wire.Listener(*output_mod.Output.PresentEvent).init(FlipSignals.onPresented),
+        };
+    }
+
+    /// Count everything this output reports from now on.
+    fn watch(self: *FlipSignals, out: *output_mod.Output) void {
+        out.events.frame.add(&self.frame_listener);
+        out.events.presented.add(&self.present_listener);
+    }
+};
+
+/// Deliver a completion the way the kernel does: inside a drain's scope,
+/// exactly as drmHandleEvent invokes the handler. A completion outside a
+/// drain is not reachable in production, and this keeps the tests honest
+/// about that instead of setting up state the driver could never have.
+fn deliverFlip(backend: *DrmBackendData, cookie: usize, crtc_id: u32, tv_sec: c_uint) void {
+    draining = backend;
+    defer draining = null;
+    pageFlipHandler(123, 42, tv_sec, 0, crtc_id, cookiePointer(cookie));
+}
+
+fn fakeGpuBackend(
+    allocator: std.mem.Allocator,
+    io: *std.Io,
+    log_cfg: *const log_mod.Config,
+) DrmBackendData {
+    return .{
+        .allocator = allocator,
+        .io = io,
+        .log_cfg = log_cfg,
+        .device_path = "/dev/dri/card0",
+        .gpu_render_pairs = &.{.{ .format = drm_format_xrgb8888, .modifier = 0 }},
+    };
+}
+
+/// One live GPU output with its ring, its Output wrapper and its signal
+/// counters: the state every flip-completion rule is about. Built without
+/// a card, because the lease rules and the flip-identity rules are pure
+/// state; `fd` is a placeholder because the lease entry points check only
+/// that it is there.
+const FlipFixture = struct {
+    backend: DrmBackendData,
+    base: *backend_mod.Backend,
+    out: *output_mod.Output,
+    drm_out: *DrmOutput,
+    slots: [2]GpuSlot,
+    signals: FlipSignals,
+    /// False once unplug() has freed `drm_out`.
+    owns: bool,
+
+    fn init(
+        self: *FlipFixture,
+        allocator: std.mem.Allocator,
+        io: *std.Io,
+        log_cfg: *const log_mod.Config,
+    ) !void {
+        self.backend = fakeGpuBackend(allocator, io, log_cfg);
+        self.backend.fd = 123;
+        self.slots = .{ .{}, .{} };
+        self.signals = .init();
+        self.base = try backend_mod.Backend.init(allocator, io, log_cfg, &backend_impl, &self.backend);
+        errdefer allocator.destroy(self.base);
+        self.drm_out = try fakeGpuOutput(&self.backend, &self.slots);
+        errdefer allocator.destroy(self.drm_out);
+        self.out = try output_mod.Output.create(allocator, io, log_cfg, self.base, &output_impl, self.drm_out, self.drm_out.mode);
+        self.drm_out.out = self.out;
+        self.owns = true;
+    }
+
+    fn deinit(self: *FlipFixture) void {
+        const allocator = self.backend.allocator;
+        if (self.owns) {
+            self.out.destroy();
+            allocator.destroy(self.drm_out);
+        }
+        self.backend.outputs.deinit(allocator);
+        allocator.destroy(self.base);
+    }
+
+    /// Start counting what this output reports. sendFrame only emits on an
+    /// enabled output (wlroots output.c:833-837), so enable it the way the
+    /// compositor does.
+    fn enable(self: *FlipFixture) void {
+        self.out.enabled = true;
+        self.signals.watch(self.out);
+    }
+
+    /// Queue a flip to the free slot the way commitGpu does once the kernel
+    /// has accepted it: a cookie is armed and the slot is pending until its
+    /// completion.
+    fn queueFlip(self: *FlipFixture) !usize {
+        const index = GpuRing.firstFree(&.{ self.slots[0].state, self.slots[1].state }) orelse
+            return error.TestUnexpectedResult;
+        const cookie = armFlip(self.drm_out) orelse return error.TestUnexpectedResult;
+        self.slots[index].state = .pending;
+        return cookie;
+    }
+
+    /// The kernel delivers the completion for this cookie.
+    fn complete(self: *FlipFixture, cookie: usize) void {
+        deliverFlip(&self.backend, cookie, self.drm_out.crtc_id, 1);
+    }
+
+    /// Take the output apart the way the unplug path does: the Output
+    /// wrapper dies (which drops the flip identity), the KMS resources are
+    /// released, and the struct leaves the backend's list and is freed.
+    /// The kernel still holds whatever cookie it was given.
+    fn unplug(self: *FlipFixture) void {
+        const allocator = self.backend.allocator;
+        self.out.destroy();
+        self.drm_out.gpu_slots = null;
+        for (self.backend.outputs.items, 0..) |entry, i| {
+            if (entry != self.drm_out) continue;
+            _ = self.backend.outputs.orderedRemove(i);
+            break;
+        }
+        allocator.destroy(self.drm_out);
+        self.owns = false;
+    }
+};
+
+test "a completed GPU page flip frees the old front and fires one frame" {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{ .min_level = .err };
+    var fixture: FlipFixture = undefined;
+    try fixture.init(testing.allocator, &io, &log_cfg);
+    defer fixture.deinit();
+    fixture.enable();
+    fixture.slots[0].state = .front;
+
+    const cookie = try fixture.queueFlip();
+    try testing.expect(fixture.drm_out.pending != null);
+
+    fixture.complete(cookie);
+    try testing.expect(fixture.drm_out.pending == null);
+    // BOTH slots move: the completed one is scanned out, and the one it
+    // replaced is free again. A partial write-back would leave the output
+    // with nothing the renderer may draw into.
+    try testing.expectEqual(SlotState.front, fixture.slots[1].state);
+    try testing.expectEqual(SlotState.free, fixture.slots[0].state);
+    try testing.expectEqual(@as(usize, 1), fixture.signals.presents);
+    try testing.expectEqual(@as(usize, 1), fixture.signals.frames);
+
+    // Exactly one slot is leasable, and it is not the one on screen. While
+    // the next flip is in flight there is nothing left to lease at all.
+    const frame = DrmBackend.acquireGpuFrame(fixture.base, fixture.out) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(frame == &fixture.slots[0].frame);
+    DrmBackend.cancelGpuFrame(fixture.base, fixture.out, frame);
+    _ = try fixture.queueFlip();
+    try testing.expect(DrmBackend.acquireGpuFrame(fixture.base, fixture.out) == null);
+}
+
+test "a completion that names a destroyed output touches nothing" {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{ .min_level = .err };
+    var fixture: FlipFixture = undefined;
+    try fixture.init(testing.allocator, &io, &log_cfg);
+    defer fixture.deinit();
+    fixture.enable();
+    fixture.slots[0].state = .front;
+    const dead_crtc: u32 = fixture.drm_out.crtc_id;
+    const cookie = try fixture.queueFlip();
+
+    // A second output on another CRTC, live throughout, which a completion
+    // for the dead one must not touch.
+    var live_slots: [2]GpuSlot = .{ .{}, .{} };
+    const live = try fakeGpuOutput(&fixture.backend, &live_slots);
+    defer testing.allocator.destroy(live);
+    live.crtc_id = 2;
+    const live_out = try output_mod.Output.create(testing.allocator, &io, &log_cfg, fixture.base, &output_impl, live, live.mode);
+    defer live_out.destroy();
+    live.out = live_out;
+    live_out.enabled = true;
+    var signals: FlipSignals = .init();
+    signals.watch(live_out);
+    live_slots[0].state = .front;
+
+    fixture.unplug();
+
+    // The completion arrives after the struct is gone. Its cookie resolves
+    // to no output: no dereference of freed state, and no signal fired on a
+    // wrapper that is gone or on the survivor.
+    deliverFlip(&fixture.backend, cookie, dead_crtc, 1);
+    try testing.expectEqual(@as(usize, 0), signals.presents);
+    try testing.expectEqual(@as(usize, 0), signals.frames);
+    try testing.expectEqual(SlotState.front, live_slots[0].state);
+    try testing.expect(live_slots[1].state != .front);
+    try testing.expect(live.pending == null);
+}
+
+test "a completion from before a resume presents nothing and leaves the ring alone" {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{ .min_level = .err };
+    var fixture: FlipFixture = undefined;
+    try fixture.init(testing.allocator, &io, &log_cfg);
+    defer fixture.deinit();
+    fixture.enable();
+    fixture.slots[0].state = .front;
+    const stale = try fixture.queueFlip();
+
+    // Suspend and resume. The drains and the re-modeset are ioctl work; the
+    // epoch move and the ring re-derivation are the state they exist for,
+    // and they are what makes the old cookie unmatchable.
+    invalidateFlipIdentity(fixture.drm_out);
+    adoptModesetFront(fixture.drm_out, true);
+    try testing.expect(fixture.drm_out.pending == null);
+    try testing.expectEqual(SlotState.front, fixture.slots[0].state);
+    try testing.expectEqual(SlotState.free, fixture.slots[1].state);
+
+    // The compositor repaints and the post-resume flip is queued.
+    const fresh = try fixture.queueFlip();
+
+    // The pre-suspend completion finally arrives. It presents nothing,
+    // promotes nothing, and does not release the flip now in flight.
+    fixture.complete(stale);
+    try testing.expectEqual(SlotState.front, fixture.slots[0].state);
+    try testing.expectEqual(SlotState.pending, fixture.slots[1].state);
+    try testing.expect(fixture.drm_out.pending != null);
+    try testing.expectEqual(@as(usize, 0), fixture.signals.presents);
+    try testing.expectEqual(@as(usize, 0), fixture.signals.frames);
+
+    // The post-resume flip completes normally and paces the next frame.
+    fixture.complete(fresh);
+    try testing.expect(fixture.drm_out.pending == null);
+    try testing.expectEqual(SlotState.front, fixture.slots[1].state);
+    try testing.expectEqual(SlotState.free, fixture.slots[0].state);
+    try testing.expectEqual(@as(usize, 1), fixture.signals.presents);
+    try testing.expectEqual(@as(usize, 1), fixture.signals.frames);
+}
+
+test "a completion that arrives long after the resume changes nothing" {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{ .min_level = .err };
+    var fixture: FlipFixture = undefined;
+    try fixture.init(testing.allocator, &io, &log_cfg);
+    defer fixture.deinit();
+    fixture.enable();
+    fixture.slots[0].state = .front;
+    const ancient = try fixture.queueFlip();
+
+    // Two suspend/resume cycles, then two post-resume flips that are
+    // delivered and presented normally. The old cookie is now several
+    // commits and several drains old.
+    invalidateFlipIdentity(fixture.drm_out);
+    adoptModesetFront(fixture.drm_out, true);
+    invalidateFlipIdentity(fixture.drm_out);
+    adoptModesetFront(fixture.drm_out, true);
+    const first = try fixture.queueFlip();
+    fixture.complete(first);
+    const second = try fixture.queueFlip();
+    fixture.complete(second);
+    try testing.expectEqual(@as(usize, 2), fixture.signals.presents);
+    try testing.expectEqual(SlotState.front, fixture.slots[0].state);
+    try testing.expectEqual(SlotState.free, fixture.slots[1].state);
+
+    // The renderer holds the free buffer when the ancient completion lands.
+    const frame = DrmBackend.acquireGpuFrame(fixture.base, fixture.out) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(frame == &fixture.slots[1].frame);
+
+    fixture.complete(ancient);
+    // No present, no frame, no promotion - and the writer keeps its lease,
+    // because the completion cannot reach a slot or a compositor signal.
+    try testing.expectEqual(@as(usize, 2), fixture.signals.presents);
+    try testing.expectEqual(@as(usize, 2), fixture.signals.frames);
+    try testing.expectEqual(SlotState.front, fixture.slots[0].state);
+    try testing.expectEqual(SlotState.writing, fixture.slots[1].state);
+    try testing.expect(gpuFrameValid(fixture.drm_out, frame));
+
+    // Still inert on a second delivery, and the writer can hand its buffer
+    // in afterwards exactly as if nothing had arrived.
+    fixture.complete(ancient);
+    try testing.expectEqual(@as(usize, 2), fixture.signals.presents);
+    try testing.expectEqual(SlotState.writing, fixture.slots[1].state);
+    try testing.expect(fixture.drm_out.pending == null);
+    DrmBackend.cancelGpuFrame(fixture.base, fixture.out, frame);
+}
+
+test "repeated invalidation cannot resurrect an earlier identity" {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{ .min_level = .err };
+    var fixture: FlipFixture = undefined;
+    try fixture.init(testing.allocator, &io, &log_cfg);
+    defer fixture.deinit();
+    fixture.enable();
+    fixture.slots[0].state = .front;
+
+    const before: u64 = fixture.drm_out.epoch;
+    const first = try fixture.queueFlip();
+
+    // Two suspend/resume cycles, neither of which drains the fd's event
+    // queue: the epoch moves every time and never comes back.
+    invalidateFlipIdentity(fixture.drm_out);
+    invalidateFlipIdentity(fixture.drm_out);
+    try testing.expect(fixture.drm_out.epoch > before);
+    try testing.expect(fixture.drm_out.pending == null);
+    adoptModesetFront(fixture.drm_out, true);
+
+    // The next flip carries a cookie that was never issued before, so no
+    // earlier completion can match it by any route.
+    const fresh = try fixture.queueFlip();
+    try testing.expect(fresh != first);
+
+    // The completion from before both resumes arrives now: inert, and it
+    // leaves the flip that IS in flight alone.
+    fixture.complete(first);
+    try testing.expectEqual(SlotState.front, fixture.slots[0].state);
+    try testing.expectEqual(SlotState.pending, fixture.slots[1].state);
+    try testing.expect(fixture.drm_out.pending != null);
+    try testing.expectEqual(@as(usize, 0), fixture.signals.presents);
+    try testing.expectEqual(@as(usize, 0), fixture.signals.frames);
+
+    fixture.complete(fresh);
+    try testing.expectEqual(@as(usize, 1), fixture.signals.presents);
+}
+
+test "a refused flip leaves the output waiting for nothing" {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{ .min_level = .err };
+    var fixture: FlipFixture = undefined;
+    try fixture.init(testing.allocator, &io, &log_cfg);
+    defer fixture.deinit();
+    fixture.enable();
+    fixture.slots[0].state = .front;
+
+    // The kernel refused the request (EBUSY, EINVAL): the commit paths
+    // disarm, the slot stays the writer's, and no completion will name that
+    // cookie. Were one to arrive anyway it would still be inert.
+    const refused = armFlip(fixture.drm_out) orelse return error.TestUnexpectedResult;
+    try testing.expect(fixture.drm_out.pending != null);
+    disarmFlip(fixture.drm_out);
+    try testing.expect(fixture.drm_out.pending == null);
+    fixture.complete(refused);
+    try testing.expectEqual(@as(usize, 0), fixture.signals.presents);
+    try testing.expectEqual(@as(usize, 0), fixture.signals.frames);
+    try testing.expectEqual(SlotState.front, fixture.slots[0].state);
+    try testing.expectEqual(SlotState.free, fixture.slots[1].state);
+
+    // Pacing is not stuck: the next commit arms a different cookie and the
+    // output presents normally.
+    const fresh = try fixture.queueFlip();
+    try testing.expect(fresh != refused);
+    fixture.complete(fresh);
+    try testing.expectEqual(@as(usize, 1), fixture.signals.presents);
+    try testing.expectEqual(SlotState.front, fixture.slots[1].state);
+    try testing.expectEqual(SlotState.free, fixture.slots[0].state);
+}
+
+test "a GPU frame is only valid while its own output holds its writing lease" {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+    var backend = fakeGpuBackend(testing.allocator, &io, &log_cfg);
+    var slots: [2]GpuSlot = .{ .{}, .{} };
+    const drm_out = try fakeGpuOutput(&backend, &slots);
+    defer backend.outputs.deinit(testing.allocator);
+    defer testing.allocator.destroy(drm_out);
+
+    // Nothing is leased, so no frame is committable.
+    try testing.expect(!gpuFrameValid(drm_out, &slots[0].frame));
+    try testing.expect(!gpuFrameValid(drm_out, &slots[1].frame));
+
+    // A writing lease of this output is valid.
+    slots[1].state = .writing;
+    try testing.expect(gpuFrameValid(drm_out, &slots[1].frame));
+
+    // After the commit the slot is pending: the SAME frame must not be
+    // committable a second time, or the output would queue two flips to
+    // one buffer while the renderer believes it owns it.
+    slots[1].state = .pending;
+    try testing.expect(!gpuFrameValid(drm_out, &slots[1].frame));
+    // Nor is the slot on screen.
+    slots[0].state = .front;
+    try testing.expect(!gpuFrameValid(drm_out, &slots[0].frame));
+}
+
+test "a GPU frame from another output or a stale generation is rejected" {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+    var backend = fakeGpuBackend(testing.allocator, &io, &log_cfg);
+    var first_slots: [2]GpuSlot = .{ .{}, .{} };
+    var second_slots: [2]GpuSlot = .{ .{}, .{} };
+    const first = try fakeGpuOutput(&backend, &first_slots);
+    const second = try fakeGpuOutput(&backend, &second_slots);
+    defer backend.outputs.deinit(testing.allocator);
+    defer testing.allocator.destroy(first);
+    defer testing.allocator.destroy(second);
+
+    first_slots[1].state = .writing;
+    second_slots[1].state = .writing;
+    try testing.expect(gpuFrameValid(first, &first_slots[1].frame));
+    try testing.expect(gpuFrameValid(second, &second_slots[1].frame));
+    // Each output's own lease is the only one it accepts: the frame
+    // pointer, the owner and the slot index all have to agree.
+    try testing.expect(!gpuFrameValid(first, &second_slots[1].frame));
+    try testing.expect(!gpuFrameValid(second, &first_slots[1].frame));
+    try testing.expect(!gpuFrameValid(first, &first_slots[0].frame));
+
+    // A frame whose generation no longer matches its slot is a stale
+    // lease - from before a teardown, or from a slot the backend has
+    // since reallocated.
+    first_slots[1].frame.generation += 1;
+    try testing.expect(!gpuFrameValid(first, &first_slots[1].frame));
+    first_slots[1].frame.generation = first_slots[1].generation;
+    try testing.expect(gpuFrameValid(first, &first_slots[1].frame));
+
+    // A slot index the ring does not have cannot be committed even by
+    // the owning output.
+    first_slots[1].frame.slot = 3;
+    try testing.expect(!gpuFrameValid(first, &first_slots[1].frame));
+}
+
+/// A GBM probe stand-in: accepts only the pairs in `list`. The real one
+/// asks `gbm_device_get_format_modifier_plane_count`; this is the same
+/// question with a table for an answer, which is what makes the
+/// negotiation testable on a machine with no card.
+const PairProbe = struct {
+    list: []const dmabuf.Format,
+    fn probe(ctx: *anyopaque, format: u32, modifier: u64) bool {
+        const self: *PairProbe = @ptrCast(@alignCast(ctx));
+        return dmabuf.supports(self.list, format, modifier);
+    }
+};
+
+test "GPU format negotiation intersects plane, renderer and GBM" {
+    const plane_pairs = [_]dmabuf.Format{
+        .{ .format = drm_format_xrgb8888, .modifier = dmabuf.drm_format_mod_linear },
+        .{ .format = dmabuf.drm_format_argb8888, .modifier = 0x0100_0000_0000_0002 },
+    };
+    const render_pairs = [_]dmabuf.Format{
+        // The renderer's first choice is a modifier no plane reports:
+        // it must be skipped, not silently downgraded to LINEAR.
+        .{ .format = drm_format_xrgb8888, .modifier = 0x0100_0000_0000_0002 },
+        .{ .format = dmabuf.drm_format_argb8888, .modifier = 0x0100_0000_0000_0002 },
+    };
+    // GBM can allocate both of the plane's pairs. The pick is the first
+    // pair all THREE sets have: the renderer's unmatched first choice is
+    // skipped, not downgraded to a modifier the renderer never claimed -
+    // substituting LINEAR here is exactly the failure this negotiation
+    // exists to prevent.
+    var gbm: PairProbe = .{ .list = &plane_pairs };
+    const chosen = chooseGpuFormat(&plane_pairs, &render_pairs, &gbm, PairProbe.probe) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(dmabuf.drm_format_argb8888, chosen.format);
+    try testing.expectEqual(@as(u64, 0x0100_0000_0000_0002), chosen.modifier);
+    // Whatever it picks is in all three sets - nothing is invented.
+    try testing.expect(dmabuf.supports(&render_pairs, chosen.format, chosen.modifier));
+    try testing.expect(dmabuf.supports(&plane_pairs, chosen.format, chosen.modifier));
+    try testing.expect(PairProbe.probe(&gbm, chosen.format, chosen.modifier));
+
+    // The renderer's own order is preserved when the plane agrees with
+    // more than one of its pairs.
+    const render_xrgb_first = [_]dmabuf.Format{
+        .{ .format = drm_format_xrgb8888, .modifier = dmabuf.drm_format_mod_linear },
+        .{ .format = dmabuf.drm_format_argb8888, .modifier = 0x0100_0000_0000_0002 },
+    };
+    const first_choice = chooseGpuFormat(&plane_pairs, &render_xrgb_first, &gbm, PairProbe.probe).?;
+    try testing.expectEqual(drm_format_xrgb8888, first_choice.format);
+
+    // GBM refusing everything leaves no choice - an explicit capability
+    // failure, never a guessed LINEAR.
+    var none: PairProbe = .{ .list = &.{} };
+    try testing.expect(chooseGpuFormat(&plane_pairs, &render_xrgb_first, &none, PairProbe.probe) == null);
+
+    // A plane that scans out nothing the renderer can produce: also no
+    // choice.
+    const unrelated_plane = [_]dmabuf.Format{
+        .{ .format = dmabuf.drm_format_xrgb2101010, .modifier = dmabuf.drm_format_mod_linear },
+    };
+    try testing.expect(chooseGpuFormat(&unrelated_plane, &render_xrgb_first, &gbm, PairProbe.probe) == null);
+    // An empty renderer set is the same answer.
+    try testing.expect(chooseGpuFormat(&plane_pairs, &.{}, &gbm, PairProbe.probe) == null);
+}
+
+test "IN_FORMATS parsing yields the plane's real (format, modifier) pairs" {
+    // Build the blob a driver writes: header, two fourccs, one
+    // drm_format_modifier per modifier, each with a formats bitmask and
+    // the offset of its first format.
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(testing.allocator);
+    const header = [_]u32{ 1, 0, 2, 24, 2, 32 };
+    for (header) |word| {
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf, word, .little);
+        blob.appendSlice(testing.allocator, &buf) catch @panic("test alloc");
+    }
+    // formats: XRGB8888 then ARGB8888.
+    var word: [4]u8 = undefined;
+    std.mem.writeInt(u32, &word, drm_format_xrgb8888, .little);
+    blob.appendSlice(testing.allocator, &word) catch @panic("test alloc");
+    std.mem.writeInt(u32, &word, dmabuf.drm_format_argb8888, .little);
+    blob.appendSlice(testing.allocator, &word) catch @panic("test alloc");
+    // Two modifiers, 24 bytes each: (formats bitmask, offset, pad,
+    // modifier). First covers format 0 with LINEAR, second covers
+    // format 1 with a tiled modifier.
+    for ([_]u64{ 0b01, 0b01 }, 0..) |mask, index| {
+        var wide: [8]u8 = undefined;
+        std.mem.writeInt(u64, &wide, mask, .little);
+        blob.appendSlice(testing.allocator, &wide) catch @panic("test alloc");
+        const offset: u32 = @intCast(index);
+        std.mem.writeInt(u32, &word, offset, .little);
+        blob.appendSlice(testing.allocator, &word) catch @panic("test alloc");
+        std.mem.writeInt(u32, &word, 0, .little);
+        blob.appendSlice(testing.allocator, &word) catch @panic("test alloc");
+        const modifier: u64 = if (index == 0) dmabuf.drm_format_mod_linear else 0x0100_0000_0000_0002;
+        std.mem.writeInt(u64, &wide, modifier, .little);
+        blob.appendSlice(testing.allocator, &wide) catch @panic("test alloc");
+    }
+
+    var out: std.ArrayList(dmabuf.Format) = .empty;
+    defer out.deinit(testing.allocator);
+    try parseInFormats(blob.items, &.{ drm_format_xrgb8888, dmabuf.drm_format_argb8888 }, &out, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expect(dmabuf.supports(out.items, drm_format_xrgb8888, dmabuf.drm_format_mod_linear));
+    try testing.expect(dmabuf.supports(out.items, dmabuf.drm_format_argb8888, 0x0100_0000_0000_0002));
+
+    // A fourcc the plane does not list is not offered, even though the
+    // blob names it.
+    var narrowed: std.ArrayList(dmabuf.Format) = .empty;
+    defer narrowed.deinit(testing.allocator);
+    try parseInFormats(blob.items, &.{drm_format_xrgb8888}, &narrowed, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), narrowed.items.len);
+    try testing.expect(dmabuf.supports(narrowed.items, drm_format_xrgb8888, dmabuf.drm_format_mod_linear));
+
+    // Truncated, empty and unknown-version blobs yield nothing rather
+    // than reading past the end or guessing.
+    for ([_][]const u8{ "", blob.items[0..7], blob.items[0..@min(blob.items.len, 40)] }) |bytes| {
+        var junk: std.ArrayList(dmabuf.Format) = .empty;
+        defer junk.deinit(testing.allocator);
+        try parseInFormats(bytes, &.{ drm_format_xrgb8888, dmabuf.drm_format_argb8888 }, &junk, testing.allocator);
+        try testing.expectEqual(@as(usize, 0), junk.items.len);
+    }
+    const future = try testing.allocator.dupe(u8, blob.items);
+    defer testing.allocator.free(future);
+    std.mem.writeInt(u32, future[0..4], 99, .little);
+    var junk2: std.ArrayList(dmabuf.Format) = .empty;
+    defer junk2.deinit(testing.allocator);
+    try parseInFormats(future, &.{ drm_format_xrgb8888, dmabuf.drm_format_argb8888 }, &junk2, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), junk2.items.len);
+}
+
+test "flip cookie exhaustion cannot alias an earlier completion or claim a writable slot" {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{ .min_level = .err };
+    var fixture: FlipFixture = undefined;
+    try fixture.init(testing.allocator, &io, &log_cfg);
+    defer fixture.deinit();
+    fixture.enable();
+    fixture.slots[0].state = .front;
+    const ancient = try fixture.queueFlip();
+    invalidateFlipIdentity(fixture.drm_out);
+    adoptModesetFront(fixture.drm_out, true);
+
+    fixture.backend.next_cookie = std.math.maxInt(usize) - 1;
+    const final_cookie = try fixture.queueFlip();
+    fixture.complete(ancient);
+    try testing.expect(fixture.drm_out.pending != null);
+    try testing.expectEqual(@as(usize, 0), fixture.signals.presents);
+    try testing.expectEqual(SlotState.front, fixture.slots[0].state);
+    try testing.expectEqual(SlotState.pending, fixture.slots[1].state);
+    fixture.complete(final_cookie);
+    try testing.expectEqual(@as(usize, 1), fixture.signals.presents);
+    try testing.expect(fixture.drm_out.pending == null);
+
+    // Exhaustion refuses the next arm without taking the caller's slot.
+    try testing.expectError(error.TestUnexpectedResult, fixture.queueFlip());
+    try testing.expect(fixture.drm_out.pending == null);
+    try testing.expectEqual(SlotState.free, fixture.slots[0].state);
+    try testing.expectEqual(SlotState.front, fixture.slots[1].state);
+    fixture.complete(ancient);
+    try testing.expectEqual(@as(usize, 1), fixture.signals.presents);
 }

@@ -1,4 +1,4 @@
-//! Canvas pass rasterizer (M4): camera-transformed, bilinearly-sampled
+//! Canvas pass rasterizer: camera-transformed, bilinearly-sampled
 //! texture compositing into a pixman framebuffer.
 //!
 //! Each CanvasItem stamps a texture into a world-space rect. The
@@ -7,34 +7,45 @@
 //! pixels and clips it to the framebuffer (off-screen culling; per-pixel
 //! (u,v) rejection handles the rest of the quad's bounding box). Every
 //! covered pixel then inverts the transform (screenToWorld) to find its
-//! world point, computes item-local texture coordinates (u, v) and
-//! bilinearly samples the texture.
+//! world point, computes the item's surface-normalized (u, v) and
+//! bilinearly samples the texture through pixman.TexelMap.
 //!
 //! Conventions:
+//! - Spaces: an item declares whether its rect is WORLD (camera
+//!   transformed) or SCREEN (the framebuffer's own pixels, drawn through
+//!   the identity mapping over it — see CanvasItem.Space). Draw order is
+//!   the array order either way, and the last item is topmost.
 //! - Draw order: items composite in array order — each item draws over
 //!   all earlier items. The wiring passes items back-to-front
 //!   (bottom-most first); the last item in the array is topmost.
-//! - Sampling: a pixel at (x, y) samples the texture at its top-left
-//!   corner, with texel coordinate (u * width, v * height) — texel (i, j)
-//!   spans [i, i+1) in texel space. A texture stamped 1:1 onto world
-//!   pixels (identity mapping) therefore lands texel (i, j) on screen
-//!   pixel (i, j) exactly.
-//! - Transform: an item's world rect is its SURFACE rect; `transform` is
-//!   the surface's wl_output_transform (buffer -> surface). Sampling
-//!   maps the surface point through the inverse transform first
-//!   (surfaceToTexture), so a rotated surface shows each buffer texel
-//!   where the transform places it. Identity (.normal) is the
-//!   pre-transform sampling, byte for byte.
+//! - Sampling: the ONE contract, shared with the GLES2 pass — a
+//!   destination pixel (x, y) samples the texture at its own CENTRE.
+//!   The camera inverse is therefore evaluated at (x + 0.5, y + 0.5),
+//!   and the raw texture centre that comes out is a texel POSITION
+//!   (texel i spans [i, i+1), centre at i + 0.5), converted to a texel
+//!   index exactly once, by the same crop-aware sampler the generic CPU
+//!   pass uses. A texture stamped 1:1 onto pixels (identity mapping)
+//!   lands texel (i, j) on pixel (i, j) exactly, and a magnified draw
+//!   lands where the GPU fragment shader lands it — one contract, so a
+//!   scaled, cropped, rotated or mirrored surface shows the same texel
+//!   whichever renderer drew it.
+//! - Geometry: an item's rect is its SURFACE rect (the buffer size
+//!   under the committed transform divided by `buffer_scale`, or the
+//!   wp_viewport destination size), `src` is the RAW buffer-pixel crop
+//!   (null = whole texture) and `transform` is the surface's
+//!   wl_output_transform (buffer -> surface). Crop and transform each
+//!   apply exactly once, so a scaled, cropped, rotated or mirrored
+//!   surface shows the texel each of its own pixels displays.
 //! - Blending is premultiplied-over (the wlroots premultiplied
 //!   convention, include/wlr/render/pass.h): out = src_premul +
 //!   dst * (1 - src_a) per channel, alpha included. Opaque pixels
 //!   (a = 255, opacity = 1) are exact copies.
-//! - Fast path: common-case items (normal buffer transform, world size
-//!   == texture size, opacity 1) composite through the real pixman
-//!   library (`pixman_image_composite32`, SIMD-optimized; the
-//!   weston/wlroots model), replacing the per-pixel f64 loop (~545ms
-//!   full-canvas in the VM). Everything else keeps the hand-rolled
-//!   bilinear rasterizer below.
+//! - Fast path: common-case items (whole texture, normal buffer
+//!   transform, world size == texture size, opacity 1) composite through
+//!   the real pixman library (`pixman_image_composite32`, SIMD-optimized;
+//!   the weston/wlroots model), replacing the per-pixel f64 loop
+//!   (~545ms full-canvas in the VM). Everything else keeps the
+//!   hand-rolled bilinear rasterizer below.
 //!
 //! Imports: utils/geom, scene/camera, renderer/{pixman,texture}, the
 //! pixman_c C binding (build.zig).
@@ -49,16 +60,37 @@ const log_mod = @import("../utils/log.zig"); // tests only
 
 const Camera = camera_mod.Camera;
 
-/// A texture stamped into a world-space rect, composited with `opacity`
-/// (0..1) over whatever is already in the framebuffer.
+/// The coordinate space an item's rect is expressed in. Both spaces use
+/// the same four f64 fields; what they MEAN differs, and the rasterizer
+/// picks the mapping from this one tag.
+pub const Space = enum {
+    /// World (scene) coordinates: `render`'s camera maps them onto the
+    /// framebuffer. Ordinary surface content — an xdg_toplevel, a popup,
+    /// a subsurface — lives here, because the desktop IS the world.
+    world,
+    /// The framebuffer's OWN pixels, drawn through the identity mapping
+    /// over it (`screenCamera`): the canvas camera never rotates,
+    /// scales or slides it. Output-local policy belongs here — a
+    /// session-lock screen or a layer surface must COVER its output, and
+    /// a drag icon must sit AT the pointer, whatever the camera is doing.
+    /// Passing an axis-aligned overlay through the world camera instead
+    /// would slide and shrink it off the output it has to cover.
+    screen,
+};
+
+/// A texture stamped into a rect, composited with `opacity` (0..1) over
+/// whatever is already in the framebuffer.
 ///
-/// The world rect is the SURFACE-space rect (surface size, not buffer
-/// size). `transform` is the surface's buffer transform
-/// (wl_output_transform, buffer -> surface): the rasterizer samples the
-/// texture at the point the surface rect maps back to in buffer space, so
-/// a rotated/scaled surface draws correctly. .normal is the identity —
-/// the sampling math is skipped and the pass is byte-identical to the
-/// pre-transform rasterizer.
+/// The rect is the SURFACE-space rect (surface size, not buffer size —
+/// `wl_surface.buffer_scale` divides the buffer out), which is also the
+/// rect a wp_viewport destination stretches its crop into. `src` is the
+/// raw BUFFER-pixel crop (null = the whole texture): the caller
+/// multiplies a surface-local viewport source by the scale and
+/// inverse-transforms it into raw buffer pixels, and this pass applies
+/// it exactly once. `transform` is the surface's wl_output_transform
+/// (buffer -> surface), so a rotated or mirrored surface samples the
+/// texel each of its own pixels displays. `space` says whether the four
+/// coordinates are world or screen (see Space above).
 pub const CanvasItem = struct {
     texture: *texture_mod.Texture,
     world_x: f64,
@@ -66,8 +98,29 @@ pub const CanvasItem = struct {
     world_w: f64,
     world_h: f64,
     opacity: f32,
+    /// Raw buffer-pixel crop; null = the whole texture.
+    src: ?geom.FRect = null,
     transform: geom.Transform = .normal,
+    /// Which space `world_x/y/w/h` are in. `.world` (the default) is
+    /// every surface node's rect; `.screen` is the output-local overlay
+    /// case above.
+    space: Space = .world,
 };
+
+/// The identity mapping over `fb`: the camera a `.screen` item is drawn
+/// through, so a point at (x, y) lands on pixel (x, y) whatever the
+/// canvas camera does. A compositing caller's cursor overlay and every
+/// output-local policy overlay go through exactly this.
+pub fn screenCamera(fb: *const pixman.Framebuffer) Camera {
+    return .{
+        .center_x = @as(f64, @floatFromInt(fb.width)) / 2.0,
+        .center_y = @as(f64, @floatFromInt(fb.height)) / 2.0,
+        .zoom = 1,
+        .rotation = 0,
+        .screen_w = @floatFromInt(fb.width),
+        .screen_h = @floatFromInt(fb.height),
+    };
+}
 
 /// The pixman texture payload (src/renderer/pixman.zig:
 /// `PixmanTextureData`, an `extern struct`): `pixels` holds ARGB8888 rows
@@ -107,10 +160,24 @@ pub fn render(
     defer {
         if (dst_img) |img| _ = pixman_c.pixman_image_unref(img);
     }
+    // A `.screen` item is stamped in the framebuffer's own pixels, so it
+    // goes through the identity mapping over THIS framebuffer rather than
+    // through the canvas camera. Built once per call, and only when the
+    // frame really carries one.
+    var screen_cam: Camera = undefined;
+    var have_screen_cam = false;
     for (items) |item| {
         // `!(opacity > 0)` also skips NaN opacity.
         if (!(item.opacity > 0) or item.world_w <= 0 or item.world_h <= 0) continue;
         if (item.texture.width <= 0 or item.texture.height <= 0) continue;
+        if (item.space == .screen) {
+            if (!have_screen_cam) {
+                screen_cam = screenCamera(fb);
+                have_screen_cam = true;
+            }
+            drawItem(fb, &screen_cam, item, stride, dst_img);
+            continue;
+        }
         drawItem(fb, camera, item, stride, dst_img);
     }
 }
@@ -152,20 +219,24 @@ fn drawItem(
     if (x0 >= x1 or y0 >= y1) return;
 
     const tex_data: *pixman.PixmanTextureData = @ptrCast(@alignCast(item.texture.data));
+    const tw = item.texture.width;
+    const th = item.texture.height;
 
-    // Fast path: the common case — normal buffer transform, 1:1 scale
-    // (world rect == texture size), fully opaque — composites through the
-    // real pixman library instead of the per-pixel f64 loop. Pixman's
-    // SIMD bilinear + fixed-point precision differs slightly from the f64
-    // loop (pixel output changes; tests carry pixman's exact values).
-    // Non-normal transforms, scaled surfaces, and fractional opacity keep
-    // the hand-rolled loop below (the stride/fast-mode logic only exists
-    // there; pixman does not need it — measured: pixman at full res beats
-    // the hand-rolled stride-3 loop ~2-3x even during camera drags).
+    // Fast path: the common case — the WHOLE texture sampled 1:1 (no
+    // crop, normal transform, surface size == texture size, fully
+    // opaque) — composites through the real pixman library instead of
+    // the per-pixel f64 loop. Pixman's SIMD bilinear + fixed-point
+    // precision differs slightly from the f64 loop (pixel output
+    // changes; tests carry pixman's exact values). A crop, a
+    // transformed, scaled or translucent surface keeps the hand-rolled
+    // loop below (the stride/fast-mode logic only exists there; pixman
+    // does not need it — measured: pixman at full res beats the
+    // hand-rolled stride-3 loop ~2-3x even during camera drags).
     if (item.transform == .normal and
+        item.src == null and
         item.opacity == 1.0 and
-        item.world_w == @as(f64, @floatFromInt(item.texture.width)) and
-        item.world_h == @as(f64, @floatFromInt(item.texture.height)))
+        item.world_w == @as(f64, @floatFromInt(tw)) and
+        item.world_h == @as(f64, @floatFromInt(th)))
     {
         if (dst_img) |dst| {
             compositePixman(dst, camera, item, tex_data, x0, y0, x1, y1);
@@ -179,6 +250,9 @@ fn drawItem(
     // per-pixel divisions by zoom and world_w/h — ~6 divisions per pixel
     // were the dominant cost of the full-canvas composite (~450ms in the
     // VM), far more than the trig (already hoisted) or the bilinear.
+    // Every term is f64 and the world origin is subtracted from the
+    // camera centre BEFORE the division, so a surface a billion pixels
+    // out keeps its local geometry (an f32 cannot hold 1e9 + a unit).
     const cos_r = @cos(camera.rotation);
     const sin_r = @sin(camera.rotation);
     const inv_zoom = 1.0 / camera.zoom;
@@ -192,18 +266,28 @@ fn drawItem(
     const wh = item.world_h;
     const inv_ww = 1.0 / ww;
     const inv_wh = 1.0 / wh;
-    const u_c = (ccx - sw2 * inv_zoom * cos_r + sh2 * inv_zoom * sin_r - wx) * inv_ww;
+    const u_c = (ccx - wx - sw2 * inv_zoom * cos_r + sh2 * inv_zoom * sin_r) * inv_ww;
     const u_dx = inv_zoom * cos_r * inv_ww;
     const u_dy = -inv_zoom * sin_r * inv_ww;
-    const v_c = (ccy - sw2 * inv_zoom * sin_r - sh2 * inv_zoom * cos_r - wy) * inv_wh;
+    const v_c = (ccy - wy - sw2 * inv_zoom * sin_r - sh2 * inv_zoom * cos_r) * inv_wh;
     const v_dx = inv_zoom * sin_r * inv_wh;
     const v_dy = inv_zoom * cos_r * inv_wh;
-    const tex_w: f64 = @floatFromInt(item.texture.width);
-    const tex_h: f64 = @floatFromInt(item.texture.height);
-    // Fold the surface->texture map (surfaceToTexture, normal transform) —
-    // the common case (a terminal at scale 1): tu = u * world_w / tex_w.
-    const scale_w = ww / tex_w;
-    const scale_h = wh / tex_h;
+
+    // Surface-normalized (u, v) -> raw texel: the buffer transform's
+    // inverse composed with the item's raw crop, through the SAME
+    // affine the generic CPU pass and the GLES2 pass use (pixman.
+    // TexelMap). One asymmetric fixture therefore lands on the same
+    // texel whichever renderer drew it, and a rotated camera or a
+    // flipped surface cannot land outside the texture (every tap is
+    // clamped, so no float -> int conversion ever sees an
+    // unrepresentable value).
+    //
+    // The crop is held as its own value, not folded away: the sampler
+    // needs it to clamp against the item's own rect instead of the whole
+    // texture, and that is the difference between a wp_viewport crop
+    // sampling correctly at its edges and smearing the buffer's far side.
+    const crop: geom.FRect = item.src orelse pixman.wholeTexture(tw, th);
+    const map = pixman.TexelMap.init(item.transform, tw, th, crop);
 
     const st: i32 = @intCast(@max(stride, 1));
     var y = y0;
@@ -212,27 +296,24 @@ fn drawItem(
         var x = x0;
         while (x < x1) : (x += st) {
             const sx: f64 = @floatFromInt(x);
-            const u = u_c + u_dx * sx + u_dy * sy;
-            const v = v_c + v_dx * sx + v_dy * sy;
+            // The pixel CENTRE, not its corner: the same point the GPU
+            // fragment shader reads, which is what makes a magnified
+            // canvas identical on both paths.
+            const cx = sx + 0.5;
+            const cy = sy + 0.5;
+            const u = u_c + u_dx * cx + u_dy * cy;
+            const v = v_c + v_dx * cx + v_dy * cy;
+            // Reject on the DESTINATION side: a pixel outside the item's
+            // quad keeps the framebuffer, and the clamped taps inside it
+            // never read past the texture.
             if (u < 0 or u >= 1 or v < 0 or v >= 1) continue;
-            // Surface-space (u, v) -> texture-space (tu, tv): the inverse
-            // of the buffer transform. Identity (normal) is (u, v) scaled
-            // by world_w/tex_w (folded above); other transforms use
-            // surfaceToTexture (rare: rotated/flipped surfaces).
-            var tu = u * scale_w;
-            var tv = v * scale_h;
-            if (item.transform != .normal) {
-                // Rotated/flipped surface: the full surfaceToTexture map.
-                const t = surfaceToTexture(item.transform, u, v, ww, wh, item.texture.width, item.texture.height);
-                tu = t.u;
-                tv = t.v;
-            }
-            const sample = sampleBilinear(tex_data, item.texture.width, item.texture.height, tu, tv);
+            const t = map.at(u, v);
+            const sample = pixman.sampleTexelPosition(tex_data, tw, th, crop, t.x, t.y);
             // Full quality: write the pixel. Fast mode: fill the
             // stride x stride block with this sample (blocky until the
             // interaction ends).
             if (st == 1) {
-                blendPremultiplied(fb, x, y, sample, item.opacity);
+                pixman.blendSample(fb, x, y, sample, item.opacity);
             } else if ((sample[3] / 255.0) * item.opacity >= 1.0) {
                 // Opaque fill: the over blend is a copy. Compute the 4
                 // output bytes ONCE + memcpy the block — the per-pixel
@@ -257,7 +338,7 @@ fn drawItem(
                 while (by < st and y + by < y1) : (by += 1) {
                     var bx: i32 = 0;
                     while (bx < st and x + bx < x1) : (bx += 1) {
-                        blendPremultiplied(fb, x + bx, y + by, sample, item.opacity);
+                        pixman.blendSample(fb, x + bx, y + by, sample, item.opacity);
                     }
                 }
             }
@@ -359,118 +440,6 @@ fn compositePixman(
 /// trapping (they draw garbage either way, exactly like weston).
 fn pixmanFixed(v: f64) pixman_c.pixman_fixed_t {
     return @intFromFloat(std.math.clamp(v * 65536.0, -2147483648.0, 2147483647.0));
-}
-
-/// Map a surface point (normalized u, v in [0, 1)) to the normalized
-/// texture (buffer) coordinates it samples, given the surface's buffer
-/// transform.
-///
-/// wl_output_transform maps buffer space -> surface space; sampling needs
-/// the inverse. Surface pixel coords are (sx, sy) = (u·world_w, v·world_h);
-/// the sample is `matrix.transformPoint(sx, sy)` — the exact
-/// pixel-granularity inverse of wlr_box_transform (wlroots util/box.c:
-/// 105-145) — extended linearly to fractional surface coords. The `-1`
-/// terms are what make a 1:1 rotated stamp exact: they keep the sample
-/// inside the texture (never on the far edge), so surface pixel (i, j)
-/// shows buffer texel transformPoint(i, j), and the bilinear weights
-/// stay well-formed. The identity transform reduces to (u, v) — the
-/// pre-transform pass, byte for byte.
-fn surfaceToTexture(
-    transform: geom.Transform,
-    u: f64,
-    v: f64,
-    world_w: f64,
-    world_h: f64,
-    tw: i32,
-    th: i32,
-) struct { u: f64, v: f64 } {
-    const sx = u * world_w;
-    const sy = v * world_h;
-    const tex_w: f64 = @floatFromInt(tw);
-    const tex_h: f64 = @floatFromInt(th);
-    return switch (transform) {
-        .normal => .{ .u = sx / tex_w, .v = sy / tex_h },
-        .@"90" => .{ .u = sy / tex_w, .v = (tex_h - 1.0 - sx) / tex_h },
-        .@"180" => .{ .u = (tex_w - 1.0 - sx) / tex_w, .v = (tex_h - 1.0 - sy) / tex_h },
-        .@"270" => .{ .u = (tex_w - 1.0 - sy) / tex_w, .v = sx / tex_h },
-        .flipped => .{ .u = (tex_w - 1.0 - sx) / tex_w, .v = sy / tex_h },
-        .flipped_90 => .{ .u = sy / tex_w, .v = sx / tex_h },
-        .flipped_180 => .{ .u = sx / tex_w, .v = (tex_h - 1.0 - sy) / tex_h },
-        .flipped_270 => .{ .u = (tex_w - 1.0 - sy) / tex_w, .v = (tex_h - 1.0 - sx) / tex_h },
-    };
-}
-
-/// Bilinear sample at normalized texture coordinates (u, v) in [0, 1).
-/// Texel coordinate is (u * width, v * height); taps outside the texture
-/// contribute 0 (the u,v rejection above keeps the base tap in range).
-/// Returns the color as 0..255 floats in memory byte order (B,G,R,A).
-fn sampleBilinear(data: *pixman.PixmanTextureData, tw: i32, th: i32, u: f64, v: f64) [4]f32 {
-    const x_tex = u * @as(f64, @floatFromInt(tw));
-    const y_tex = v * @as(f64, @floatFromInt(th));
-    const ix0: i32 = @intFromFloat(@floor(x_tex));
-    const jx0: i32 = @intFromFloat(@floor(y_tex));
-    const fx = x_tex - @as(f64, @floatFromInt(ix0));
-    const fy = y_tex - @as(f64, @floatFromInt(jx0));
-    const w0x = 1.0 - fx;
-    const w0y = 1.0 - fy;
-
-    var acc = [4]f32{ 0, 0, 0, 0 };
-    addWeighted(&acc, texelAt(data, ix0, jx0), w0x * w0y);
-    if (ix0 + 1 < tw) addWeighted(&acc, texelAt(data, ix0 + 1, jx0), fx * w0y);
-    if (jx0 + 1 < th) addWeighted(&acc, texelAt(data, ix0, jx0 + 1), w0x * fy);
-    if (ix0 + 1 < tw and jx0 + 1 < th) addWeighted(&acc, texelAt(data, ix0 + 1, jx0 + 1), fx * fy);
-    return acc;
-}
-
-/// One ARGB8888 texel as 0..255 floats in memory byte order (B,G,R,A).
-fn texelAt(data: *pixman.PixmanTextureData, x: i32, y: i32) [4]f32 {
-    const off = @as(usize, @intCast(y)) * @as(usize, @intCast(data.stride)) + @as(usize, @intCast(x)) * 4;
-    const px = data.pixels[off..][0..4];
-    return .{ @floatFromInt(px[0]), @floatFromInt(px[1]), @floatFromInt(px[2]), @floatFromInt(px[3]) };
-}
-
-fn addWeighted(acc: *[4]f32, color: [4]f32, weight: f64) void {
-    const w: f32 = @floatCast(weight);
-    acc[0] += color[0] * w;
-    acc[1] += color[1] * w;
-    acc[2] += color[2] * w;
-    acc[3] += color[3] * w;
-}
-
-/// Premultiplied-over blend (wlroots premultiplied convention,
-/// include/wlr/render/pass.h): out = src_premul + dst * (1 - src_a) per
-/// channel, alpha included. `sample` is the straight sampled color in
-/// memory byte order (B,G,R,A) as 0..255 floats; it is premultiplied by
-/// (a * opacity) here, so opaque texels at opacity 1 are exact copies.
-fn blendPremultiplied(fb: *pixman.Framebuffer, x: i32, y: i32, sample: [4]f32, opacity: f32) void {
-    const off = @as(usize, @intCast(y)) * @as(usize, @intCast(fb.stride)) + @as(usize, @intCast(x)) * 4;
-    const sa = (sample[3] / 255.0) * opacity; // src alpha after opacity, 0..1
-    if (sa >= 1.0) {
-        // Opaque: the over blend with sa=1 is a pure copy — the source
-        // replaces the destination (per-channel `sample*1 + dst*0`).
-        // Skips the per-pixel f32 blend for opaque surfaces (foot); the
-        // result is byte-identical to the general blend.
-        fb.data[off + 0] = @intFromFloat(std.math.round(std.math.clamp(sample[0], 0.0, 255.0)));
-        fb.data[off + 1] = @intFromFloat(std.math.round(std.math.clamp(sample[1], 0.0, 255.0)));
-        fb.data[off + 2] = @intFromFloat(std.math.round(std.math.clamp(sample[2], 0.0, 255.0)));
-        fb.data[off + 3] = @intFromFloat(std.math.round(std.math.clamp(sample[3], 0.0, 255.0)));
-        return;
-    }
-    if (sa <= 0.0) return; // fully transparent: the source contributes nothing
-
-    const dst = fb.pixelAt(x, y);
-    const inv = 1.0 - sa;
-    var out: [4]u8 = undefined;
-    var i: usize = 0;
-    while (i < 3) : (i += 1) {
-        const v = sample[i] * sa + @as(f32, @floatFromInt(dst[i])) * inv;
-        out[i] = @intFromFloat(std.math.round(std.math.clamp(v, 0.0, 255.0)));
-    }
-    // Premultiplied alpha is the alpha itself: a * opacity.
-    const a = sample[3] * opacity + @as(f32, @floatFromInt(dst[3])) * inv;
-    out[3] = @intFromFloat(std.math.round(std.math.clamp(a, 0.0, 255.0)));
-
-    fb.data[off..][0..4].* = out;
 }
 
 test "canvas: identity camera blits a 2x2 texture exactly" {
@@ -689,4 +658,302 @@ test "canvas: 180 and flipped transforms mirror the buffer" {
     render(allocator, fb, &cam90, &f90, 1);
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, fb.pixelAt(0, 0)); // top: red
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, fb.pixelAt(0, 1)); // bottom: green
+}
+
+/// An asymmetric 4x4 fixture whose every channel is a multiple of 4: the
+/// average of any 2x2 bilinear tap is then an exact integer, so an
+/// expectation computed here never depends on a rounding tie, and every
+/// texel is a different colour, so a wrong scale, crop, flip or rotation
+/// shows a DIFFERENT pixel rather than a symmetric coincidence. Memory
+/// bytes are B,G,R,A.
+const ramp4x4 = blk: {
+    var buf: [4 * 4 * 4]u8 = undefined;
+    var y: i32 = 0;
+    while (y < 4) : (y += 1) {
+        var x: i32 = 0;
+        while (x < 4) : (x += 1) {
+            const i = y * 4 + x;
+            buf[i * 4 + 0] = @intCast(4 * i);
+            buf[i * 4 + 1] = @intCast(4 * (15 - i));
+            buf[i * 4 + 2] = @intCast(4 * i + 8);
+            buf[i * 4 + 3] = 255;
+        }
+    }
+    break :blk buf;
+};
+
+fn rampAt(x: i32, y: i32) [4]u8 {
+    const off: usize = @intCast((y * 4 + x) * 4);
+    return ramp4x4[off..][0..4].*;
+}
+
+/// The 2x2 bilinear tap at a fractional texel POSITION, in f64: texel
+/// `i` spans `[i, i + 1)`, so its centre is at `i + 0.5` and the filter
+/// indexes the position minus that half — the same conversion
+/// pixman.sampleTexelPosition makes, on the same frame the GPU's
+/// u_texel_clamp clamps. Edge taps are clamped exactly as the rasterizer
+/// clamps them (a whole-texture crop's centre bounds coincide with the
+/// texture's edge texel centres). The rasterizer accumulates the same
+/// four taps in f32, so a comparison against this allows one unit per
+/// channel.
+fn rampBilinear(px: f64, py: f64) [4]u8 {
+    const u = std.math.clamp(px - 0.5, 0.0, 3.0);
+    const v = std.math.clamp(py - 0.5, 0.0, 3.0);
+    const ix: i32 = @intFromFloat(@floor(u));
+    const iy: i32 = @intFromFloat(@floor(v));
+    const ix1 = @min(ix + 1, 3);
+    const iy1 = @min(iy + 1, 3);
+    const fx = u - @as(f64, @floatFromInt(ix));
+    const fy = v - @as(f64, @floatFromInt(iy));
+    const gx = 1.0 - fx;
+    const gy = 1.0 - fy;
+    var out: [4]u8 = undefined;
+    for (0..4) |ch| {
+        const p00 = @as(f64, @floatFromInt(rampAt(ix, iy)[ch]));
+        const p10 = @as(f64, @floatFromInt(rampAt(ix1, iy)[ch]));
+        const p01 = @as(f64, @floatFromInt(rampAt(ix, iy1)[ch]));
+        const p11 = @as(f64, @floatFromInt(rampAt(ix1, iy1)[ch]));
+        const value = gx * gy * p00 + fx * gy * p10 + gx * fy * p01 + fx * fy * p11;
+        out[ch] = @intFromFloat(std.math.round(std.math.clamp(value, 0.0, 255.0)));
+    }
+    return out;
+}
+
+/// The four texels of the crop (1,1)-(3,3) blended with `wx`/`wy` the
+/// weight of the crop's SECOND column/row (1 - w goes to the first),
+/// in the memory byte order the framebuffer stores.
+fn cropBlend(wx: f64, wy: f64) [4]u8 {
+    const w00 = (1.0 - wx) * (1.0 - wy);
+    const w10 = wx * (1.0 - wy);
+    const w01 = (1.0 - wx) * wy;
+    const w11 = wx * wy;
+    var out: [4]u8 = undefined;
+    for (0..4) |ch| {
+        const v = w00 * @as(f64, @floatFromInt(rampAt(1, 1)[ch])) +
+            w10 * @as(f64, @floatFromInt(rampAt(2, 1)[ch])) +
+            w01 * @as(f64, @floatFromInt(rampAt(1, 2)[ch])) +
+            w11 * @as(f64, @floatFromInt(rampAt(2, 2)[ch]));
+        out[ch] = @intFromFloat(std.math.round(v));
+    }
+    return out;
+}
+
+/// The buffer texel POSITION a surface point samples under `t`, from the
+/// wl_output.transform definition (buffer -> surface, so this is its
+/// continuous inverse) rather than from the map under test: texel `i`
+/// spans `[i, i + 1)`, so the inverse carries no pixel `-1` terms, and a
+/// 1:1 stamp is exact because the surface pixel's centre lands on
+/// `i + 0.5`. `sx`/`sy` are fractional surface coordinates over a 4x4
+/// buffer.
+fn rampSurfaceTexel(t: geom.Transform, sx: f64, sy: f64) geom.FPoint {
+    return switch (t) {
+        .normal => .{ .x = sx, .y = sy },
+        .@"90" => .{ .x = sy, .y = 4 - sx },
+        .@"180" => .{ .x = 4 - sx, .y = 4 - sy },
+        .@"270" => .{ .x = 4 - sy, .y = sx },
+        .flipped => .{ .x = 4 - sx, .y = sy },
+        .flipped_90 => .{ .x = sy, .y = sx },
+        .flipped_180 => .{ .x = sx, .y = 4 - sy },
+        // FLIPPED_270 (wlr_box_transform util/box.c:143-146): x' =
+        // height - y - h, y' = width - x - w, so the surface x axis
+        // maps to the buffer's y axis, bounded by the buffer HEIGHT.
+        .flipped_270 => .{ .x = 4 - sy, .y = 4 - sx },
+    };
+}
+
+test "canvas: a buffer_scale 2 surface filters the buffer at pixel centres" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+    const renderer = try pixman.PixmanRenderer.create(allocator, &io, &log_cfg);
+    defer renderer.destroy();
+
+    const fb = try pixman.Framebuffer.create(allocator, 4, 4);
+    defer fb.deinit();
+    const tex = try pixman.PixmanRenderer.importMemory(renderer, 4, 4, 16, &ramp4x4);
+    defer tex.destroy();
+
+    // Identity-mapping camera: world (0,0) renders at framebuffer (0,0).
+    const camera: Camera = .{ .center_x = 2, .center_y = 2, .zoom = 1, .rotation = 0, .screen_w = 4, .screen_h = 4 };
+    // A 4x4 buffer at buffer_scale 2 is a 2x2 SURFACE (the surface size
+    // is the buffer size divided by the scale, wayland.xml
+    // set_buffer_scale). Each destination pixel centre samples halfway
+    // between four buffer texel centres. Ignoring the scale would draw
+    // different colours and a different surface size.
+    const items = [_]CanvasItem{
+        .{ .texture = tex, .world_x = 0, .world_y = 0, .world_w = 2, .world_h = 2, .opacity = 1.0 },
+    };
+    render(allocator, fb, &camera, &items, 1);
+
+    var j: i32 = 0;
+    while (j < 2) : (j += 1) {
+        var i: i32 = 0;
+        while (i < 2) : (i += 1) {
+            const want = rampBilinear(@as(f64, @floatFromInt(2 * i + 1)), @as(f64, @floatFromInt(2 * j + 1)));
+            try std.testing.expectEqual(want, fb.pixelAt(i, j));
+        }
+    }
+    // The surface really is 2x2: one pixel past its edge is background.
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, fb.pixelAt(2, 0));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, fb.pixelAt(0, 2));
+}
+
+test "canvas: a raw src crop is stretched into the item rect" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+    const renderer = try pixman.PixmanRenderer.create(allocator, &io, &log_cfg);
+    defer renderer.destroy();
+
+    const fb = try pixman.Framebuffer.create(allocator, 4, 4);
+    defer fb.deinit();
+    const tex = try pixman.PixmanRenderer.importMemory(renderer, 4, 4, 16, &ramp4x4);
+    defer tex.destroy();
+
+    // wp_viewport.set_source's middle 2x2 as a RAW buffer crop, magnified
+    // 2x into a 4x4 surface. Drawing the whole texture instead would show
+    // a different quadrant at every pixel.
+    const camera: Camera = .{ .center_x = 2, .center_y = 2, .zoom = 1, .rotation = 0, .screen_w = 4, .screen_h = 4 };
+    const items = [_]CanvasItem{
+        .{
+            .texture = tex,
+            .world_x = 0,
+            .world_y = 0,
+            .world_w = 4,
+            .world_h = 4,
+            .opacity = 1.0,
+            .src = .{ .x = 1, .y = 1, .width = 2, .height = 2 },
+        },
+    };
+    render(allocator, fb, &camera, &items, 1);
+
+    // The rasterizer samples each destination pixel at its CENTRE (the
+    // one contract every backend follows), so pixel (i, j) reads crop
+    // texel position (1 + (i + 0.5)/2, 1 + (j + 0.5)/2), and the
+    // crop-edge clamp pins that to the crop's texel centres [1.5, 2.5]:
+    // the two outer pixel columns and rows show the crop's edge texels
+    // WHOLE, and the interior blends them 3:1 and 1:3. `weight` is the
+    // weight of the crop's SECOND column/row, read off those positions
+    // (index 1.0, 1.25, 1.75, 2.0).
+    const weight = [_]f64{ 0.0, 0.25, 0.75, 1.0 };
+    var j: i32 = 0;
+    while (j < 4) : (j += 1) {
+        var i: i32 = 0;
+        while (i < 4) : (i += 1) {
+            const want = cropBlend(weight[@intCast(i)], weight[@intCast(j)]);
+            std.testing.expectEqual(want, fb.pixelAt(i, j)) catch |err| {
+                std.debug.print("crop stretched 2x at ({d}, {d}): composited {any}, expected {any}\n", .{
+                    i, j, fb.pixelAt(i, j), want,
+                });
+                return err;
+            };
+        }
+    }
+    // Spelled out: the corners are the crop's own texels, and (1, 1) is
+    // the 3:1 blend of the four crop texels (1,1) {20,40,28},
+    // (2,1) {24,36,32}, (1,2) {36,24,44}, (2,2) {40,20,48} —
+    //   B 0.5625·20 + 0.1875·24 + 0.1875·36 + 0.0625·40 = 25
+    //   G 0.5625·40 + 0.1875·36 + 0.1875·24 + 0.0625·20 = 35
+    //   R 0.5625·28 + 0.1875·32 + 0.1875·44 + 0.0625·48 = 33
+    // in memory order B,G,R,A.
+    try std.testing.expectEqual(rampAt(1, 1), fb.pixelAt(0, 0));
+    try std.testing.expectEqual(rampAt(2, 2), fb.pixelAt(3, 3));
+    try std.testing.expectEqual([4]u8{ 25, 35, 33, 255 }, fb.pixelAt(1, 1));
+}
+
+test "canvas: a rotated and a distant camera keep every transform's texels" {
+    const allocator = std.testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log_mod.Config = .{};
+    const renderer = try pixman.PixmanRenderer.create(allocator, &io, &log_cfg);
+    defer renderer.destroy();
+
+    const fb = try pixman.Framebuffer.create(allocator, 8, 8);
+    defer fb.deinit();
+    const tex = try pixman.PixmanRenderer.importMemory(renderer, 4, 4, 16, &ramp4x4);
+    defer tex.destroy();
+
+    // Panned, zoomed AND rotated: the camera's own three factors, so a
+    // probe only lands on the right texel when the whole world -> screen
+    // affine is applied, and every float -> int conversion in the
+    // rasterizer sees a rotated, non-integral bounding box.
+    const rotated: Camera = .{
+        .center_x = 6,
+        .center_y = 5,
+        .zoom = 1.5,
+        .rotation = 0.3,
+        .screen_w = 8,
+        .screen_h = 8,
+    };
+    // A world origin a billion px out with a FRACTIONAL centre: at 1e9
+    // an f32's spacing is 64, so any path that narrows an absolute world
+    // coordinate before the camera centre is subtracted puts the surface
+    // tens of pixels from where Camera.worldToScreen says.
+    const distant: Camera = .{
+        .center_x = 1_000_000_008.5,
+        .center_y = 1_000_000_041.25,
+        .zoom = 1,
+        .rotation = 0,
+        .screen_w = 8,
+        .screen_h = 8,
+    };
+    const cameras = [_]Camera{ rotated, distant };
+
+    const transforms = [_]geom.Transform{
+        .normal,   .@"90",      .@"180",      .@"270",
+        .flipped,  .flipped_90, .flipped_180, .flipped_270,
+    };
+
+    for (cameras) |cam| {
+        for (transforms) |t| {
+            fb.fill(.{ 0, 0, 0, 0 });
+            // The item's top-left lands half a pixel before the
+            // framebuffer's origin, so pixel (0, 0) samples well inside
+            // the quad — one pixel clear of the edge, where the
+            // destination-side rejection could hide a bug.
+            const anchor = cam.screenToWorld(-0.5, -0.5);
+            const items = [_]CanvasItem{
+                .{
+                    .texture = tex,
+                    .world_x = anchor.x,
+                    .world_y = anchor.y,
+                    .world_w = 4,
+                    .world_h = 4,
+                    .opacity = 1.0,
+                    // An explicit whole-texture crop (identical to a null
+                    // src) keeps every case on the f64 rasterizer rather
+                    // than the pixman fast path, whose own tests pin its
+                    // output. This test is about the world -> screen
+                    // mapping the GPU path matches.
+                    .src = pixman.wholeTexture(4, 4),
+                    .transform = t,
+                },
+            };
+            render(allocator, fb, &cam, &items, 1);
+
+            // The expectation: framebuffer pixel (0, 0) is sampled at
+            // its CENTRE — screen (0.5, 0.5) — whose world point is two
+            // steps into the item (the anchor sits half a pixel before
+            // the screen origin); that surface point names a buffer texel
+            // POSITION through the protocol's own transform definition,
+            // and the tap is filtered there.
+            const world = cam.screenToWorld(0.5, 0.5);
+            const texel = rampSurfaceTexel(t, world.x - anchor.x, world.y - anchor.y);
+            const want = rampBilinear(texel.x, texel.y);
+            const got = fb.pixelAt(0, 0);
+            for (0..4) |ch| {
+                const diff = if (want[ch] > got[ch]) want[ch] - got[ch] else got[ch] - want[ch];
+                std.testing.expect(diff <= 1) catch |err| {
+                    std.debug.print(
+                        "transform {s}, camera centre ({d}, {d}): channel {d} composited {any}, expected {any}\n",
+                        .{ @tagName(t), cam.center_x, cam.center_y, ch, got, want },
+                    );
+                    return err;
+                };
+            }
+        }
+    }
 }

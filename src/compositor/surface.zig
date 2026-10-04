@@ -26,7 +26,9 @@
 //!      b. swap pending -> current (committed-mask filtered, F33)
 //!      c. drop the buffer the surface stopped using (its lock was
 //!         already released at the end of the previous commit)
-//!      d. move the get_release callback lists with the buffer
+//!      d. the get_release callbacks move onto the committed buffer,
+//!         which completes them at ITS final unlock — not at this
+//!         commit: a renderer may still be sampling the pixels
 //!      e. role.commit hook
 //!      f. emit the commit signal
 //!      g. map/unmap transition: mapped = isEffectivelyMapped (current
@@ -36,8 +38,7 @@
 //!         signal first, then role — F37)
 //!      h. unlock the current buffer (wlroots wlr_compositor.c:570-574) so
 //!         the client may reuse it (double buffering); the release signal
-//!         fires here (buffers/buffer.zig) and completes get_release
-//!         callbacks
+//!         fires here (buffers/buffer.zig)
 //!
 //! applyCommit also runs directly — without the client_commit phase — when
 //! the subcompositor flushes a deferred (cached) commit on the parent's
@@ -54,8 +55,11 @@
 //! M1 simplifications (documented at each site):
 //! - opaque/input regions are snapshotted as the region's rect list at
 //!   request time (the client may destroy the wl_region afterwards).
-//! - get_release callbacks fire at the commit that releases their buffer
-//!   (M1 has no texture cache, so usage ends at the commit).
+//! - get_release callbacks are NOT fired by this surface. They are handed
+//!   to the buffer they were requested for at the commit, and the buffer
+//!   completes them when the compositor stops reading it — which is the
+//!   protocol promise (wayland.xml, get_release) and outlives both this
+//!   surface and the client-side callback object.
 //!
 //! Cross-module: src/buffers/buffer.zig + src/buffers/shm.zig (buffers
 //! agent). Expected API (confirmed 2026-08-07):
@@ -76,9 +80,9 @@
 //!   };
 //!   pub fn init(allocator, impl: *const Impl, data: *anyopaque, w: i32, h: i32) !*Buffer;
 //!   pub fn drop(b: *Buffer) void;
-//!   pub fn lock(b: *Buffer) !void;
 //!   pub fn unlock(b: *Buffer) void;
 //!   pub fn destroy(b: *Buffer) void;
+//!   pub fn queueReleaseCallback(b: *Buffer, cb: *server.wl.Callback) !void;
 //!   pub const Impl = struct {
 //!       get_dmabuf: ?*const fn (self: *Buffer) ?*anyopaque,
 //!       get_shm: ?*const fn (self: *Buffer) ?*wire.shm.Buffer,
@@ -90,10 +94,13 @@
 //!   pub fn fromResource(allocator: std.mem.Allocator, resource: *wire.Resource) !*Buffer
 //! fromResource does NOT lock; the surface locks on attach and drop()s the
 //! buffer when done presenting. The release signal fires whenever the last
-//! lock drops (n_locks == 0) — at most once per buffer lifetime
-//! (buffers/buffer.zig); ShmState frees tracked wrappers at deinit, and
-//! the surface destroys untracked ones (Buffer.tracked == false) in its
-//! buffer-replace and destroy paths.
+//! lock drops (n_locks == 0) — at most once per lock cycle
+//! (buffers/buffer.zig). A wrapper dies with its wire resource, which is
+//! safe while a surface still points at it: the surface's own destroy
+//! listener clears the slot in the same emission, before it touches the
+//! buffer. Only untracked wrappers are destroyed by the surface
+//! (Buffer.tracked == false); a tracked one stays reachable through
+//! ShmState for as long as its resource lives.
 //!
 //! Cross-module: src/compositor/compositor.zig (this cluster):
 //!   Compositor.removeSurface(*Surface) void — called by Surface.destroy.
@@ -239,6 +246,16 @@ pub const Surface = struct {
         buffer_width: i32 = 0,
         buffer_height: i32 = 0,
     };
+    const OutputAssociation = struct {
+        surface: *Surface,
+        output: *output_mod.Output,
+        destroy_listener: wire.Listener(*output_mod.Output),
+
+        fn onDestroy(listener: *wire.Listener(*output_mod.Output), out: *output_mod.Output) void {
+            const association: *@This() = @fieldParentPtr("destroy_listener", listener);
+            association.surface.leaveOutput(out);
+        }
+    };
     allocator: std.mem.Allocator,
     io: *std.Io,
     log_cfg: *const log.Config,
@@ -247,26 +264,29 @@ pub const Surface = struct {
     compositor: *Compositor,
     /// Current buffer (mirror of current.buffer) for quick access.
     buffer: ?*Buffer = null,
-    /// Whether the pending slot holds a locked reference (attach took a
-    /// lock). False when the pending buffer is a lockless re-attach of
-    /// the current buffer (which already holds the surface's reference).
+    /// The pending attachment owns exactly one consumer lock.
     pending_locked: bool = false,
+    /// The lock being applied, released after scene/role commit hooks.
+    current_locked: bool = false,
     /// The wl_buffer wire resource attached to the pending slot (null
     /// for a null attach). Mirrors wlroots' surface->pending.buffer_resource
-    /// (wlr_compositor.c:38): its destroy listener (F42,
-    /// pending_buffer_destroy) clears the pending slot when the client
-    /// destroys the resource, so the next commit is a NULL-buffer commit
-    /// (unmap) instead of committing a dead wrapper.
+    /// (wlr_compositor.c:38): its destroy listener clears the pending slot
+    /// when the client destroys the resource, so the next commit is a
+    /// NULL-buffer commit (unmap) instead of committing a dead wrapper.
     pending_resource: ?*wire.Resource = null,
     /// Same tracking for the committed (current) slot; pending_resource
     /// moves here at applyCommit. When the client destroys the displayed
     /// buffer's resource, the listener clears current so the surface does
     /// not keep a dead wrapper in its canonical buffer slot (F42).
     current_resource: ?*wire.Resource = null,
-    /// Destroy listener on the buffer resource of the most recently
-    /// attached buffer (the F42 wrapper-death observer). Attached to at
-    /// most one resource at a time; the handler detaches itself.
+    /// Destroy listeners for the two slots above. They are SEPARATE
+    /// records on purpose: one listener can only watch one resource, so a
+    /// single shared listener silently stopped observing the displayed
+    /// buffer the moment a second buffer was attached — the pending one
+    /// is what the client destroys first, and the current slot kept a
+    /// dead mirror with nothing watching it.
     pending_buffer_destroy: wire.Listener(*wire.Resource),
+    current_buffer_destroy: wire.Listener(*wire.Resource),
     current: State,
     pending: State,
     /// Snapshot of the committed state before the last applyCommit
@@ -283,14 +303,10 @@ pub const Surface = struct {
     /// surface holds at most one role, so at most one lock can exist
     /// (wlroots counts multiple synced-object locks).
     cached_state_locks: bool = false,
-    /// The output this surface is currently composited on; null = on no
-    /// output. Single-output world: wlroots' current_outputs list
-    /// (wlr_compositor.h:134-153) collapsed to one slot. Driven by the
-    /// compositor through setEntered/setLeft, which emit the enter/leave
-    /// signals on change (wlroots wlr_surface_send_enter/send_leave,
-    /// wlr_compositor.c:1071-1128 — the wire events are the listener's
-    /// job, not the surface's).
-    outputs: ?*output_mod.Output = null,
+    /// Output memberships have stable storage for their destroy listeners.
+    outputs: std.ArrayList(*OutputAssociation) = .empty,
+    destroying: bool = false,
+
     role: ?*const SurfaceRole = null,
     /// The wire resource that granted the role (e.g. the xdg_surface
     /// resource); the role object is reachable through its user data.
@@ -320,12 +336,12 @@ pub const Surface = struct {
         /// The surface is being destroyed (last event).
         destroy: wire.Signal(*Surface),
     },
-    /// wl_surface.get_release callbacks (protocol v7) for the current
-    /// buffer. M1: buffers are released as soon as they are swapped out
-    /// (no texture cache), so these fire at the commit that replaces
-    /// their buffer, or at surface destroy.
-    release_callbacks_current: std.ArrayList(*server.wl.Callback) = .empty,
-    /// get_release callbacks for the pending (attached) buffer.
+    /// get_release callbacks requested since the last commit. They are
+    /// not owned beyond the commit: at the commit the buffer takes them
+    /// over (buffers/buffer.zig), because the protocol promise is about
+    /// the BUFFER ("when the compositor stops using it"), and this
+    /// surface — or the client — may be gone long before the last reader
+    /// unlocks.
     release_callbacks_pending: std.ArrayList(*server.wl.Callback) = .empty,
 
     pub fn create(
@@ -352,6 +368,7 @@ pub const Surface = struct {
             // SAFETY: initialized via .link.init() immediately after
             // construction, before it can be attached to a resource.
             .pending_buffer_destroy = wire.Listener(*wire.Resource).init(onPendingBufferDestroy),
+            .current_buffer_destroy = wire.Listener(*wire.Resource).init(onCurrentBufferDestroy),
             .events = .{
                 // SAFETY: initialized via .init() immediately after construction, before any emit.
                 .client_commit = undefined,
@@ -376,10 +393,11 @@ pub const Surface = struct {
         s.events.enter.init();
         s.events.leave.init();
         s.events.destroy.init();
-        // Listener.init leaves the intrusive link undefined; put it in the
-        // detached state (link.prev == link.next == &link) so the
-        // attached-or-not check in detachBufferDestroyListener works.
+        // Listener.init leaves the intrusive link undefined; put both in
+        // the detached state (link.prev == link.next == &link) so the
+        // attached-or-not check in detachBufferListener works.
         s.pending_buffer_destroy.link.init();
+        s.current_buffer_destroy.link.init();
         resource.setHandler(*Surface, handleRequest, handleDestroy, s);
         return s;
     }
@@ -388,6 +406,10 @@ pub const Surface = struct {
     /// dying); also used by the compositor at deinit.
     pub fn destroy(s: *Surface) void {
         log.debug("wl_surface@{d} destroyed", s.io, s.log_cfg, "surface", .{s.resource.getId()});
+        s.destroying = true;
+        while (s.outputs.items.len != 0) {
+            s.removeOutputAssociation(s.outputs.items.len - 1);
+        }
         // Inert the wire resource: clear its user data (this Surface) and
         // drop the destroy callback so the later client teardown
         // (display.deinit destroying clients) cannot dereference the freed
@@ -411,57 +433,62 @@ pub const Surface = struct {
         if (s.role) |role| if (role.destroy) |f| f(s);
         s.events.destroy.emit(s);
 
-        // Detach the buffer-resource destroy listener: the client's
-        // wl_buffer resources outlive the surface, and the listener lives
-        // inside the freed Surface. If the resource was already destroyed,
-        // the handler detached itself (link in the detached state).
-        if (s.pending_buffer_destroy.link.prev != null and
-            s.pending_buffer_destroy.link.prev != &s.pending_buffer_destroy.link)
-        {
-            s.pending_buffer_destroy.link.remove();
-        }
+        // Detach both buffer-resource destroy listeners: the client's
+        // wl_buffer resources outlive the surface, and the listeners live
+        // inside the freed Surface. If a resource was already destroyed,
+        // its handler detached itself (link in the detached state).
+        detachBufferListener(&s.pending_buffer_destroy);
+        detachBufferListener(&s.current_buffer_destroy);
 
-        // Release the buffers we referenced. drop() then unlock(): the
-        // release signal fires inside the last unlock, after which the
-        // Buffer may be destroyed by the buffers module — do not touch it.
-        // Untracked wrappers (shm fromResource with no ShmState) are owned
-        // by the surface: destroy them once the drop/unlock completes.
-        // F32/C-CS-5: the presented content lives in `s.buffer` (the
-        // persistent cache); `s.current.buffer` is NULLed at commit end.
+        // Release only locks taken by this surface. Renderer locks may
+        // still retain the source backing until its texture is destroyed.
         const current_buf = s.buffer;
-        if (current_buf) |b| {
-            b.drop();
-            if (b.n_locks > 0) b.unlock();
-            if (!b.tracked) b.destroy();
-        }
         const pending_buf = s.pending.buffer;
-        if (pending_buf) |b| {
-            // A lockless re-attach of the current buffer may leave the same
-            // wrapper in both slots (no extra lock held); it was handled —
-            // and possibly destroyed — above.
-            if (b != current_buf) {
-                b.drop();
-                if (b.n_locks > 0) b.unlock();
-                if (!b.tracked) b.destroy();
-            }
-        }
+        const current_locked = s.current_locked;
+        const pending_locked = s.pending_locked;
         s.current.buffer = null;
         s.pending.buffer = null;
+        s.current_locked = false;
         s.pending_locked = false;
         s.buffer = null;
-        s.fireReleaseCallbacksCurrent();
-        s.fireReleaseCallbacksPending();
+        s.pending_resource = null;
+        s.current_resource = null;
+        // The get_release callbacks outlive the surface: hand them to the
+        // buffer they were requested for BEFORE its last lock goes, and
+        // the buffer completes them when the compositor is really done.
+        if (current_buf) |b| s.transferReleaseCallbacks(b);
+        if (pending_buf) |b| {
+            if (pending_buf != current_buf) s.transferReleaseCallbacks(b);
+        }
+        if (current_buf) |b| {
+            const pending_is_current = pending_buf == b;
+            b.drop();
+            if (!b.tracked) b.destroy();
+            if (current_locked) b.unlock();
+            if (pending_is_current and pending_locked) b.unlock();
+        }
+        if (pending_buf) |b| {
+            if (b != current_buf) {
+                b.drop();
+                if (!b.tracked) b.destroy();
+                if (pending_locked) b.unlock();
+            }
+        }
+        // Whatever is left had no buffer to wait on (an attach never
+        // reached the surface); it dies with the surface, exactly like an
+        // uncompleted frame callback.
+        for (s.release_callbacks_pending.items) |cb| cb.destroy();
 
         // Frame callbacks that were never completed: destroy the wire
         // resources (no done event is sent for a destroyed surface).
         for (s.current.frame_callbacks.items) |cb| cb.destroy();
         for (s.pending.frame_callbacks.items) |cb| cb.destroy();
 
-        s.release_callbacks_current.deinit(s.allocator);
         s.release_callbacks_pending.deinit(s.allocator);
         s.current.deinit(s.allocator);
         s.pending.deinit(s.allocator);
         s.compositor.removeSurface(s);
+        s.outputs.deinit(s.allocator);
         s.allocator.destroy(s);
     }
 
@@ -476,36 +503,31 @@ pub const Surface = struct {
     /// pending buffer (no commit in between) undoes the redundant lock
     /// instead.
     pub fn attachBuffer(s: *Surface, buffer: ?*Buffer) void {
+        const previous_locked = s.pending_locked;
         if (buffer) |b| {
             b.lock() catch {
-                // Could not take a reference; nothing to present.
-                b.drop();
                 s.resource.postNoMemory();
                 return;
             };
-            s.pending_locked = true;
-        } else {
-            s.pending_locked = false;
         }
         if (s.pending.buffer) |old| {
-            if (old != buffer) {
-                // The previously attached (never committed) buffer is done.
-                s.fireReleaseCallbacksPending();
-                old.drop();
-                if (old.n_locks > 0) old.unlock();
-            } else {
-                // Re-attaching the same buffer: undo the extra lock (only
-                // when the previous attach actually took one).
-                if (s.pending_locked) {
-                    buffer.?.unlock();
-                    s.pending_locked = false;
-                }
+            if (old == buffer) {
+                // The original pending lock survives a repeated attach.
+                buffer.?.unlock();
+                s.pending_locked = previous_locked;
+                s.pending.committed.buffer = true;
+                return;
             }
+            // The get_release callbacks requested against the buffer we
+            // just dropped belong to THAT buffer: hand them over before
+            // its last lock goes, and it completes them when the
+            // compositor is really done with it.
+            s.transferReleaseCallbacks(old);
+            old.drop();
+            if (previous_locked) old.unlock();
         }
         s.pending.buffer = buffer;
-        // The attach request changed the pending buffer (F33 committed
-        // mask); a null attach sets it too, so a NULL-buffer commit swaps
-        // the pending null into current and unmaps.
+        s.pending_locked = buffer != null;
         s.pending.committed.buffer = true;
     }
 
@@ -599,33 +621,36 @@ pub const Surface = struct {
         // buffer's drop is skipped.
         const buffer_committed = s.pending.committed.buffer;
         swapState(&s.current, s.allocator, &s.pending);
-        // The buffer resource moves with the buffer (F42): the destroy
-        // listener now watches the current slot.
-        s.current_resource = s.pending_resource;
-        s.pending_resource = null;
+        if (buffer_committed) {
+            s.current_locked = s.pending_locked;
+            s.pending_locked = false;
+            // The resource observer moves with the slot it describes: the
+            // pending slot is empty now, so its listener comes off, and
+            // the current slot watches its own resource until the next
+            // commit replaces it. Sharing one listener (the old shape)
+            // left the displayed buffer unobserved the moment a second
+            // buffer was attached.
+            detachBufferListener(&s.pending_buffer_destroy);
+            detachBufferListener(&s.current_buffer_destroy);
+            s.current_resource = s.pending_resource;
+            s.pending_resource = null;
+            if (s.current_resource) |res| res.addDestroyListener(&s.current_buffer_destroy);
+        }
 
-        // 8. The surface stopped using the previous buffer. Its lock was
-        // already released at the end of the previous commit, so this only
-        // marks the producer done; the guard keeps a zero-count buffer
-        // (lockless re-attach) from being unlocked. Only a commit that
-        // replaced the buffer drops the old one (F32: a damage-only
-        // commit keeps the presented content).
+        // The old presented mirror owns no surface lock. A renderer may
+        // retain it independently until the scene updates its texture.
         if (buffer_committed) {
             if (old_buffer) |old| {
                 if (old != s.current.buffer) {
                     old.drop();
-                    if (old.n_locks > 0) old.unlock();
                     // Untracked wrappers are caller-owned: this was the
-                    // surface's last reference, so free the wrapper (detaches
-                    // its resource listeners). Tracked wrappers belong to
-                    // ShmState, which frees them at deinit.
+                    // surface's last reference, so retire it. Tracked
+                    // wrappers belong to the module that made them and
+                    // die with their wl_buffer resource.
                     if (!old.tracked) old.destroy();
                 }
             }
         }
-        // Release callbacks ride along with the current buffer.
-        std.mem.swap(std.ArrayList(*server.wl.Callback), &s.release_callbacks_current, &s.release_callbacks_pending);
-        s.release_callbacks_pending.clearRetainingCapacity();
         // F32/C-CS-5: the mirror follows the swap only when the commit
         // carried a buffer; otherwise the presented content persists.
         if (buffer_committed) s.buffer = s.current.buffer;
@@ -645,24 +670,31 @@ pub const Surface = struct {
         // subsurface parent chain, wayland.xml:3254-3258).
         s.updateMapped();
 
-        // 11. Unlock the current buffer (wlroots wlr_compositor.c:570-574)
-        // so the client can reuse it immediately (double buffering). The
-        // lockless re-attach special case leaves n_locks at 0, so guard the
-        // unlock; the release signal fires here (buffers/buffer.zig) and
-        // the get_release callbacks for this buffer complete.
+        // Scene import hooks retain their own source locks. The get_release
+        // callbacks ride the BUFFER: hand them over BEFORE this surface
+        // releases its attachment lock, so a renderer still sampling the
+        // pixels keeps them pending and the client is not told "reusable"
+        // while the compositor is still reading it.
         if (s.current.buffer) |b| {
-            if (b.n_locks > 0) b.unlock();
-            s.fireReleaseCallbacksCurrent();
+            s.transferReleaseCallbacks(b);
+            if (s.current_locked) {
+                s.current_locked = false;
+                b.unlock();
+            }
+        } else {
+            // A commit without a buffer leaves nothing to wait on.
+            for (s.release_callbacks_pending.items) |cb| cb.destroy();
+            s.release_callbacks_pending.clearRetainingCapacity();
         }
         // F32/C-CS-5: NULL the committed slot at commit end like wlroots
         // (wlr_compositor.c:570-574 — current.buffer is not held across
         // commits). The scene-facing `s.buffer` mirror (set above, step 8)
         // is the per-surface cache that persists until the buffer is
-        // replaced or its resource dies (F42 clears it); consumers must
-        // read `s.buffer`, never `s.current.buffer`, for the presented
-        // content. current_resource is KEPT: the F42 resource-death
-        // listener matches it to clear the mirror when the client
-        // destroys the displayed buffer.
+        // replaced or its resource dies; consumers must read `s.buffer`,
+        // never `s.current.buffer`, for the presented content.
+        // current_resource is KEPT, watched by current_buffer_destroy,
+        // which clears the mirror when the client destroys the displayed
+        // buffer.
         s.current.buffer = null;
     }
 
@@ -726,22 +758,55 @@ pub const Surface = struct {
         s.current.frame_callbacks.clearRetainingCapacity();
     }
 
-    /// The surface entered `out`: it is now composited on that output.
-    /// Idempotent (no-op when already on it); emits events.enter on the
-    /// change. The wire wl_surface.enter event is the listener's job
-    /// (wlroots wlr_surface_send_enter, wlr_compositor.c:1071-1103).
+    pub fn hasOutput(s: *const Surface, out: *output_mod.Output) bool {
+        for (s.outputs.items) |association| {
+            if (association.output == out) return true;
+        }
+        return false;
+    }
+
+    /// Add one output membership; entering another does not replace it.
     pub fn setEntered(s: *Surface, out: *output_mod.Output) void {
-        if (s.outputs == out) return;
-        s.outputs = out;
+        if (s.destroying or s.hasOutput(out)) return;
+        const association = s.allocator.create(OutputAssociation) catch {
+            s.resource.postNoMemory();
+            return;
+        };
+        s.outputs.append(s.allocator, association) catch {
+            s.allocator.destroy(association);
+            s.resource.postNoMemory();
+            return;
+        };
+        association.* = .{
+            .surface = s,
+            .output = out,
+            .destroy_listener = wire.Listener(*output_mod.Output).init(OutputAssociation.onDestroy),
+        };
+        out.events.destroy.add(&association.destroy_listener);
         s.events.enter.emit(out);
     }
 
-    /// The surface left its output. Idempotent; emits events.leave on the
-    /// change (wlroots wlr_surface_send_leave, wlr_compositor.c:1105-1128).
+    /// Leave only this output, retaining all other memberships.
+    pub fn leaveOutput(s: *Surface, out: *output_mod.Output) void {
+        for (s.outputs.items, 0..) |association, i| {
+            if (association.output != out) continue;
+            s.removeOutputAssociation(i);
+            s.events.leave.emit(out);
+            return;
+        }
+    }
+
+    /// Leave every output; surface teardown instead removes them silently.
     pub fn setLeft(s: *Surface) void {
-        const prev = s.outputs orelse return;
-        s.outputs = null;
-        s.events.leave.emit(prev);
+        while (s.outputs.items.len != 0) {
+            s.leaveOutput(s.outputs.items[s.outputs.items.len - 1].output);
+        }
+    }
+
+    fn removeOutputAssociation(s: *Surface, index: usize) void {
+        const association = s.outputs.swapRemove(index);
+        association.destroy_listener.link.remove();
+        s.allocator.destroy(association);
     }
 
     /// Validate the pending state (posts a wl_surface protocol error and
@@ -838,20 +903,17 @@ pub const Surface = struct {
             // pending_buffer_resource_handle_destroy, wlr_compositor.c:49-54)
             // so a client destroying the resource clears the pending slot
             // and the next commit unmaps instead of presenting a dead
-            // wrapper. The listener watches one resource at a time (the
-            // most recently attached); the handler matches it against both
-            // slots by resource pointer.
-            if (s.pending_buffer_destroy.link.prev != null and
-                s.pending_buffer_destroy.link.prev != &s.pending_buffer_destroy.link)
-            {
-                s.pending_buffer_destroy.link.remove();
-            }
+            // wrapper. This is the PENDING slot's own listener; the
+            // displayed buffer keeps its own (see applyCommit), so
+            // attaching a second buffer never blinds the first.
+            detachBufferListener(&s.pending_buffer_destroy);
             res.addDestroyListener(&s.pending_buffer_destroy);
             s.pending_resource = res;
             return;
         }
-        // Null attach: no pending buffer; the F42 listener stays where it
-        // is (it may be watching the current buffer).
+        // Null attach: the pending slot is empty, so its listener has
+        // nothing left to watch.
+        detachBufferListener(&s.pending_buffer_destroy);
         s.pending_resource = null;
         s.attachBuffer(null);
     }
@@ -974,13 +1036,24 @@ pub const Surface = struct {
     /// every attach — is answered normally.
     fn handleOffset(_: *Surface, _: i32, _: i32) void {}
 
-    fn fireReleaseCallbacksCurrent(s: *Surface) void {
-        for (s.release_callbacks_current.items) |cb| cb.destroySendDone(0);
-        s.release_callbacks_current.clearRetainingCapacity();
-    }
-
-    fn fireReleaseCallbacksPending(s: *Surface) void {
-        for (s.release_callbacks_pending.items) |cb| cb.destroySendDone(0);
+    /// Hand the queued get_release callbacks to `buf` (or to `old`, when
+    /// the surface stops using a buffer). The Buffer owns them from
+    /// here and completes them at its final unlock — which may be long
+    /// after this surface is gone.
+    ///
+    /// On OOM the callback cannot be tracked, so it is destroyed rather
+    /// than left alive: a wl_callback the client waits on forever is
+    /// worse than one that dies with the client-side id, and the failure
+    /// is reported (a live surface can still be told). Queueing also
+    /// completes immediately when nothing holds a lock, which is the
+    /// common case and never allocates.
+    fn transferReleaseCallbacks(s: *Surface, buf: *Buffer) void {
+        for (s.release_callbacks_pending.items) |cb| {
+            buf.queueReleaseCallback(cb) catch {
+                cb.destroy();
+                if (!s.destroying) s.resource.postNoMemory();
+            };
+        }
         s.release_callbacks_pending.clearRetainingCapacity();
     }
 
@@ -1045,37 +1118,65 @@ fn clipDamage(rects: *std.ArrayList(Rect), bounds: Rect) void {
     rects.shrinkRetainingCapacity(out);
 }
 
-/// The client destroyed the wl_buffer resource backing the attached
-/// (pending) or committed (current) buffer (F42). Mirrors wlroots'
-/// pending_buffer_resource_handle_destroy (wlr_compositor.c:49-54): the
-/// pending slot must not commit a dead wrapper — a commit after this
-/// clears the pending slot becomes a NULL-buffer commit and unmaps. The
-/// shm module's own resource listener runs first in this emission (it
-/// registered at wrapper creation): by the time this runs the wrapper is
-/// dropped, nulled, and possibly freed (F52's OOM fallback), so this
-/// handler ONLY compares resource pointers and nulls its own slots — it
-/// must never dereference the wrapper.
+/// Take a buffer-resource listener off its resource if it is attached.
+/// A removed link has `prev == null` (wire list.Link.remove) and a
+/// never-attached one is self-linked (Listener.link.init).
+fn detachBufferListener(listener: *wire.Listener(*wire.Resource)) void {
+    if (listener.link.prev != null and listener.link.prev != &listener.link) {
+        listener.link.remove();
+    }
+}
+
+/// The client destroyed the wl_buffer resource behind the PENDING
+/// attachment (F42). Mirrors wlroots'
+/// pending_buffer_resource_handle_destroy (wlr_compositor.c:49-54): a
+/// commit after this clears the pending slot and unmaps instead of
+/// committing a dead wrapper.
+///
+/// The module's own listener on that resource runs first in this
+/// emission (it registered at wrapper creation): by the time this runs
+/// the wrapper is invalidated, dropped and handed to Buffer.destroy,
+/// which frees it as soon as the LAST lock goes — the one held here.
+/// So the slot is cleared before the unlock, and the unlock releases
+/// only this surface's own attachment lock; a renderer's lock on the
+/// same buffer is never touched.
 fn onPendingBufferDestroy(listener: *wire.Listener(*wire.Resource), resource: *wire.Resource) void {
     const s: *Surface = @fieldParentPtr("pending_buffer_destroy", listener);
     // Self-detach: the observed resource is going away; the link must not
     // outlive it (the destroy-path detach checks the link state).
-    if (s.pending_buffer_destroy.link.prev != null and
-        s.pending_buffer_destroy.link.prev != &s.pending_buffer_destroy.link)
-    {
-        s.pending_buffer_destroy.link.remove();
+    detachBufferListener(&s.pending_buffer_destroy);
+    if (s.pending_resource != resource) return;
+    const buf = s.pending.buffer;
+    const locked = s.pending_locked;
+    s.pending.buffer = null;
+    s.pending_resource = null;
+    s.pending_locked = false;
+    // The get_release callbacks asked for against this buffer belong to
+    // the buffer: hand them over before its last lock goes, and let the
+    // unlock below (this surface's own lock) be what may complete them.
+    if (buf) |b| {
+        s.transferReleaseCallbacks(b);
+        if (locked) b.unlock();
     }
-    if (s.pending_resource == resource) {
-        s.pending.buffer = null;
-        s.pending_locked = false;
-        s.pending_resource = null;
-        s.fireReleaseCallbacksPending();
-    }
-    if (s.current_resource == resource) {
-        s.current.buffer = null;
-        s.current_resource = null;
-        s.buffer = null;
-        s.fireReleaseCallbacksCurrent();
-    }
+}
+
+/// The client destroyed the wl_buffer resource behind the DISPLAYED
+/// buffer (F42). The committed slot and the scene-facing mirror must not
+/// keep pointing at a wrapper whose resource is gone, and the next commit
+/// must be a NULL-buffer commit. The surface holds no lock on this slot
+/// (the commit released it), so nothing is unlocked here — a renderer
+/// that still samples the pixels keeps its own lock and its backing.
+fn onCurrentBufferDestroy(listener: *wire.Listener(*wire.Resource), resource: *wire.Resource) void {
+    const s: *Surface = @fieldParentPtr("current_buffer_destroy", listener);
+    detachBufferListener(&s.current_buffer_destroy);
+    if (s.current_resource != resource) return;
+    const locked = s.current_locked;
+    const buf = s.current.buffer;
+    s.current.buffer = null;
+    s.current_resource = null;
+    s.current_locked = false;
+    s.buffer = null;
+    if (locked and buf != null) buf.?.unlock();
 }
 
 /// Apply pending to current (wlroots surface_state_move,
@@ -1332,11 +1433,14 @@ pub fn testBuffer(allocator: std.mem.Allocator, b: *Buffer) void {
         .dropped = false,
         .n_locks = 0,
         .allocator = allocator,
-        // SAFETY: both signals are initialized via .init() below, before any emit.
+        // SAFETY: signals and the callback list are initialized via
+        // .init() below, before any use.
         .events = .{ .release = undefined, .destroy = undefined },
+        .release_callbacks = undefined,
     };
     b.events.release.init();
     b.events.destroy.init();
+    b.release_callbacks.init();
 }
 
 fn fakeBufferDestroy(_: std.mem.Allocator, _: *anyopaque) void {}
@@ -1370,26 +1474,76 @@ test "enter/leave signals fire once per output transition" {
     s.events.enter.add(&test_enter_listener);
     s.events.leave.add(&test_leave_listener);
 
-    // SAFETY: test fixture; the payload pointer is only passed through
-    // the signal, never dereferenced.
-    const fake_out: *output_mod.Output = @ptrFromInt(0x100);
-    try testing.expect(s.outputs == null);
+    var output: output_mod.Output = undefined;
+    output.events.destroy.init();
+    try testing.expectEqual(@as(usize, 0), s.outputs.items.len);
 
-    s.setEntered(fake_out);
-    try testing.expect(s.outputs == fake_out);
+    s.setEntered(&output);
+    try testing.expect(s.hasOutput(&output));
     try testing.expectEqual(@as(usize, 1), test_enter_count);
 
     // Idempotent: re-entering the same output fires nothing.
-    s.setEntered(fake_out);
+    s.setEntered(&output);
     try testing.expectEqual(@as(usize, 1), test_enter_count);
 
     s.setLeft();
-    try testing.expect(s.outputs == null);
+    try testing.expectEqual(@as(usize, 0), s.outputs.items.len);
     try testing.expectEqual(@as(usize, 1), test_leave_count);
 
     // Idempotent: leaving without an output fires nothing.
     s.setLeft();
     try testing.expectEqual(@as(usize, 1), test_leave_count);
+}
+
+test "a surface keeps both output memberships until it leaves them" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, &io_storage, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, &io_storage, &log_cfg, comp, &tw);
+    defer s.destroy();
+    const Observer = struct {
+        enters: usize = 0,
+        leaves: usize = 0,
+        enter: wire.Listener(*output_mod.Output),
+        leave: wire.Listener(*output_mod.Output),
+
+        fn onEnter(listener: *wire.Listener(*output_mod.Output), _: *output_mod.Output) void {
+            const self: *@This() = @fieldParentPtr("enter", listener);
+            self.enters += 1;
+        }
+
+        fn onLeave(listener: *wire.Listener(*output_mod.Output), _: *output_mod.Output) void {
+            const self: *@This() = @fieldParentPtr("leave", listener);
+            self.leaves += 1;
+        }
+    };
+    var observer: Observer = .{
+        .enter = wire.Listener(*output_mod.Output).init(Observer.onEnter),
+        .leave = wire.Listener(*output_mod.Output).init(Observer.onLeave),
+    };
+    s.events.enter.add(&observer.enter);
+    s.events.leave.add(&observer.leave);
+    defer observer.enter.link.remove();
+    defer observer.leave.link.remove();
+    // Membership only needs the output's destroy signal. These output
+    // fixtures remain alive until their surface is destroyed.
+    var a: output_mod.Output = undefined;
+    var b: output_mod.Output = undefined;
+    a.events.destroy.init();
+    b.events.destroy.init();
+    s.setEntered(&a);
+    s.setEntered(&b);
+    s.setEntered(&a);
+    try testing.expectEqual(@as(usize, 2), observer.enters);
+    try testing.expectEqual(@as(usize, 0), observer.leaves);
+    s.setLeft();
+    try testing.expectEqual(@as(usize, 2), observer.leaves);
+    s.setLeft();
+    try testing.expectEqual(@as(usize, 2), observer.leaves);
 }
 
 var test_enter_count: usize = 0;
@@ -1771,36 +1925,97 @@ test "re-attach of the current buffer does not double-lock" {
     try testing.expect(!b.dropped);
 }
 
-test "get_release callbacks fire when the buffer is released at commit end" {
+test "surface replacement never consumes a renderer's buffer lock" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
-    const io: *std.Io = &io_storage;
     var log_cfg: log.Config = .{ .min_level = .err };
-
     var tw = try TestWire.init();
-    const comp = try testCompositor(allocator, io, &log_cfg);
+    const comp = try testCompositor(allocator, &io_storage, &log_cfg);
     defer allocator.destroy(comp);
     defer tw.deinit();
-    const s = try testSurface(allocator, io, &log_cfg, comp, &tw);
-
-    var b1: Buffer = undefined;
-    testBuffer(allocator, &b1);
-    s.attachBuffer(&b1);
-    s.handleGetRelease(tw.newId());
-    try testing.expectEqual(@as(usize, 1), s.release_callbacks_pending.items.len);
+    const s = try testSurface(allocator, &io_storage, &log_cfg, comp, &tw);
+    var buffer: Buffer = undefined;
+    testBuffer(allocator, &buffer);
+    try buffer.lock();
+    defer if (buffer.n_locks != 0) buffer.unlock();
+    defer s.destroy();
+    s.attachBuffer(&buffer);
     s.commit();
-    // M1: usage ends at the commit, which releases the buffer; the
-    // callback is completed in the same commit.
-    try testing.expectEqual(@as(usize, 0), s.release_callbacks_current.items.len);
-    try testing.expectEqual(@as(usize, 0), s.release_callbacks_pending.items.len);
-
-    // Replacing the buffer drops the old one; its callbacks already fired.
-    var b2: Buffer = undefined;
-    testBuffer(allocator, &b2);
-    s.attachBuffer(&b2);
+    try testing.expectEqual(@as(u32, 1), buffer.n_locks);
+    s.attachBuffer(null);
     s.commit();
-    try testing.expectEqual(@as(usize, 0), s.release_callbacks_current.items.len);
-    try testing.expect(b1.dropped);
+    try testing.expectEqual(@as(u32, 1), buffer.n_locks);
+}
+
+test "get_release waits for retained renderer usage and sends done on final unlock" {
+    const allocator = testing.allocator;
+    const buffer = try allocator.create(Buffer);
+    testBuffer(allocator, buffer);
+    defer buffer.destroy();
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, &io_storage, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, &io_storage, &log_cfg, comp, &tw);
+    try buffer.lock();
+    defer if (buffer.n_locks != 0) buffer.unlock();
+    s.attachBuffer(buffer);
+    const callback_id = tw.newId();
+    s.handleGetRelease(callback_id);
+    s.commit();
+    tw.server.flushClients();
+
+    var bytes: [128]u8 = undefined;
+    const before = std.os.linux.recvfrom(tw.peer_fd, &bytes, bytes.len, std.os.linux.MSG.DONTWAIT, null, null);
+    try testing.expectEqual(-@as(isize, @intFromEnum(std.os.linux.E.AGAIN)), @as(isize, @bitCast(before)));
+    buffer.unlock();
+    tw.server.flushClients();
+    const after = std.os.linux.recvfrom(tw.peer_fd, &bytes, bytes.len, std.os.linux.MSG.DONTWAIT, null, null);
+    try testing.expect(@as(isize, @bitCast(after)) >= 12);
+    const endian = @import("builtin").target.cpu.arch.endian();
+    try testing.expectEqual(callback_id, std.mem.readInt(u32, bytes[0..4], endian));
+    try testing.expectEqual(@as(u32, 12 << 16), std.mem.readInt(u32, bytes[4..8], endian));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[8..12], endian));
+}
+
+test "a get_release callback survives its surface and completes when the reader is done" {
+    const allocator = testing.allocator;
+    const buffer = try allocator.create(Buffer);
+    testBuffer(allocator, buffer);
+    defer buffer.destroy();
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, &io_storage, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, &io_storage, &log_cfg, comp, &tw);
+    try buffer.lock(); // a renderer is still sampling the pixels
+    defer if (buffer.n_locks != 0) buffer.unlock();
+    s.attachBuffer(buffer);
+    const callback_id = tw.newId();
+    s.handleGetRelease(callback_id);
+    s.commit();
+
+    // The surface dies with the callback outstanding: the promise is the
+    // buffer's, and the client is waiting on it.
+    s.destroy();
+
+    var bytes: [128]u8 = undefined;
+    tw.server.flushClients();
+    const before = std.os.linux.recvfrom(tw.peer_fd, &bytes, bytes.len, std.os.linux.MSG.DONTWAIT, null, null);
+    try testing.expectEqual(-@as(isize, @intFromEnum(std.os.linux.E.AGAIN)), @as(isize, @bitCast(before)));
+
+    buffer.unlock();
+    tw.server.flushClients();
+    const after = std.os.linux.recvfrom(tw.peer_fd, &bytes, bytes.len, std.os.linux.MSG.DONTWAIT, null, null);
+    try testing.expect(@as(isize, @bitCast(after)) >= 12);
+    const endian = @import("builtin").target.cpu.arch.endian();
+    try testing.expectEqual(callback_id, std.mem.readInt(u32, bytes[0..4], endian));
+    try testing.expectEqual(@as(u32, 12 << 16), std.mem.readInt(u32, bytes[4..8], endian));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[8..12], endian));
 }
 
 test "get_release without a pending buffer is a protocol error" {
@@ -2407,6 +2622,9 @@ test "destroying the attached buffer resource unmaps on the next commit" {
     var buffer: Buffer = undefined;
     testBuffer(allocator, &buffer);
     s.attachBuffer(&buffer);
+    // A renderer is also reading the buffer: the surface must give up
+    // exactly the lock it took and leave the rest alone.
+    try buffer.lock();
     // Simulate handleAttach's wiring: the pending slot tracks the wire
     // resource and observes its death.
     const buf_res = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
@@ -2418,6 +2636,9 @@ test "destroying the attached buffer resource unmaps on the next commit" {
     try testing.expect(s.pending.buffer == null);
     try testing.expect(!s.pending_locked);
     try testing.expect(s.pending_resource == null);
+    // The surface's attachment lock is released, the renderer's is not.
+    try testing.expectEqual(@as(u32, 1), buffer.n_locks);
+    buffer.unlock();
 
     // The commit is now a NULL-buffer commit: nothing maps.
     s.commit();
@@ -2459,6 +2680,51 @@ test "destroying the displayed buffer's resource clears the current slot" {
     s.commit();
     try testing.expect(!s.mapped);
 }
+
+test "destroying a displayed buffer while another attachment is pending clears only the displayed slot" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+    var tw = try TestWire.init();
+    const comp = try testCompositor(allocator, &io_storage, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try testSurface(allocator, &io_storage, &log_cfg, comp, &tw);
+    var current: Buffer = undefined;
+    testBuffer(allocator, &current);
+    var pending: Buffer = undefined;
+    testBuffer(allocator, &pending);
+    const current_resource = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    const pending_resource = try wire.Resource.create(tw.client, wire.wl.Buffer, 1, tw.newId());
+    s.attachBuffer(&current);
+    s.pending_resource = current_resource;
+    current_resource.addDestroyListener(&s.pending_buffer_destroy);
+    s.commit();
+    s.attachBuffer(&pending);
+    // A renderer is reading the pending buffer: nothing about the
+    // displayed buffer's death may touch it.
+    try pending.lock();
+    detachBufferListener(&s.pending_buffer_destroy);
+    s.pending_resource = pending_resource;
+    pending_resource.addDestroyListener(&s.pending_buffer_destroy);
+
+    current_resource.destroy();
+    try testing.expect(s.buffer == null);
+    try testing.expect(s.current_resource == null);
+    try testing.expect(s.pending.buffer == &pending);
+    try testing.expect(s.pending_resource == pending_resource);
+    // The pending slot keeps both of its locks: the attachment and the
+    // renderer's.
+    try testing.expectEqual(@as(u32, 2), pending.n_locks);
+    s.commit();
+    try testing.expect(s.mapped);
+    try testing.expect(s.buffer == &pending);
+    // The commit released the attachment lock; the renderer's remains.
+    try testing.expectEqual(@as(u32, 1), pending.n_locks);
+    pending.unlock();
+    defer s.destroy();
+}
+
 
 test "attach of an unknown buffer type posts an error and keeps the previous pending" {
     // F56: a wl_buffer the internal shm pipeline never created fails the

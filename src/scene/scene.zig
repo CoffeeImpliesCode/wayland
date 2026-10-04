@@ -1,16 +1,26 @@
-//! Scene graph (int mode, M2): the plain-desktop form of the canvas-first
-//! scene (§2 scene/ of the spec).
+//! Scene graph: the plain-desktop form of the canvas-first scene
+//! (§2 scene/ of the spec).
 //!
 //! A Scene is a tree of SceneNodes rooted at an invisible .tree node.
-//! Nodes carry an integer position (x/y) relative to their parent;
-//! absolutePosition() sums ancestors. Two drawable kinds:
+//! Nodes carry an f64 world position (x/y) relative to their parent;
+//! absolutePosition() sums the ancestors in f64 and returns the node's
+//! world FRect, so a surface can sit at a fractional position and a
+//! quarter of a world pixel is a position the compositor can name. Two
+//! drawable kinds:
 //!   - SceneRectNode: solid rect fill (add_rect);
-//!   - SceneBufferNode: texture blit (add_texture), with optional src crop,
-//!     dst size scaling and opacity.
-//! A SceneOutput places a wlr_output in scene space (x/y offset) and
-//! composites the tree into the renderer target: nodes whose absolute rect
-//! does not intersect the output rect are culled; disabled nodes (and their
-//! subtrees) are skipped. Draw order = children order (painter's algorithm).
+//!   - SceneBufferNode: texture blit (add_texture), with an optional raw
+//!     buffer-pixel src crop, dst size scaling, the surface's buffer
+//!     transform and opacity.
+//! A SceneOutput is ONE VIEW of that tree onto one output: the output's
+//! world origin (x/y, used when the view has no camera) or its camera's
+//! visible world rect when it has one. The view composites the tree into
+//! the renderer target for that output — nodes outside the view's visible
+//! world rect are culled, disabled nodes (and their subtrees) are
+//! skipped. Draw order = children order (painter's algorithm).
+//!
+//! One scene, one SceneOutput per output: each view owns its presented
+//! list, its damage ring, its wl_output association and its borrowed
+//! camera. Nothing about a view lives on the Scene.
 //!
 //! Imports: utils/*, renderer/*, output/* (sibling modules).
 
@@ -33,12 +43,23 @@ const surface_mod = @import("../compositor/surface.zig");
 const subsurface_mod = @import("../compositor/subsurface.zig");
 const wl_output_mod = @import("../output/wl_output.zig");
 const surface_node_mod = @import("surface_node.zig");
+const camera_mod = @import("camera.zig");
+
+const Camera = camera_mod.Camera;
 
 const Rect = geom.Rect;
 const FRect = geom.FRect;
 
-/// The scene graph: owns the tree, allocator and logging. One scene can be
-/// composited by several SceneOutputs (each places it via x/y).
+/// Coordinate space chosen by compositor policy. A local surface without
+/// an output is hidden; it must not fall back to the shared world.
+pub const SurfacePlacement = union(enum) {
+    world,
+    output_local: ?*output_mod.Output,
+};
+
+/// The scene graph: owns the tree, allocator and logging. One scene is
+/// composited by one SceneOutput per output (each view owns its own
+/// camera, damage ring, presented list and wl_output association).
 pub const Scene = struct {
     allocator: std.mem.Allocator,
     io: *std.Io,
@@ -49,20 +70,17 @@ pub const Scene = struct {
     /// surfaces get bindings (trackSurface call sites); the bindings own
     /// the surface→node lifecycle.
     surface_nodes: std.AutoHashMap(*surface_mod.Surface, *surface_node_mod.SurfaceNode),
-    /// The frame's presented surfaces (presentation feedback targets),
-    /// rebuilt per frame by collectPresented.
-    presented: std.ArrayList(*surface_mod.Surface) = .empty,
     /// The scene's output views (SceneOutput.create registers itself):
-    /// the surface enter/leave association (which output a node is
-    /// rendered on) resolves against these.
+    /// the surface enter/leave association and the culling rect of
+    /// every tracked surface resolve against these.
     scene_outputs: std.ArrayList(*SceneOutput) = .empty,
-    /// The compositor's wl_output global: the surface enter/leave wire
-    /// events go to the wl_output resources bound by the surface's
-    /// client (set by the compositor; null = no wire enter/leave).
-    wl_output: ?*wl_output_mod.WlOutput = null,
     /// The compositor's subcompositor: subsurface tree parenting (set by
     /// the compositor; null = no subsurface support).
     subcompositor: ?*subsurface_mod.Subcompositor = null,
+    /// Borrowed compositor policy, used for membership, presentation and
+    /// damage. Clear it before its context is destroyed.
+    placement_ctx: ?*anyopaque = null,
+    placement_fn: ?*const fn (?*anyopaque, *surface_mod.Surface) SurfacePlacement = null,
     /// A tracked surface committed new content: the compositor should
     /// schedule a render (the commit→present wake — note 137 F1).
     /// Without it the node is synced but no frame is ever composited, so
@@ -88,6 +106,20 @@ pub const Scene = struct {
         return self;
     }
 
+    pub fn setSurfacePlacementPolicy(
+        self: *Scene,
+        ctx: ?*anyopaque,
+        classify: ?*const fn (?*anyopaque, *surface_mod.Surface) SurfacePlacement,
+    ) void {
+        self.placement_ctx = ctx;
+        self.placement_fn = classify;
+    }
+
+    pub fn surfacePlacement(self: *const Scene, surface: *surface_mod.Surface) SurfacePlacement {
+        const classify = self.placement_fn orelse return .world;
+        return classify(self.placement_ctx, surface);
+    }
+
     /// Destroy the scene: every tracked surface binding first (their
     /// nodes + surface listeners), then every node and the scene itself.
     /// The compositor may destroy its surfaces after the scene, so the
@@ -95,24 +127,28 @@ pub const Scene = struct {
     pub fn deinit(scene: *Scene) void {
         surface_node_mod.untrackAll(scene);
         scene.surface_nodes.deinit();
-        scene.presented.deinit(scene.allocator);
         scene.scene_outputs.deinit(scene.allocator);
         scene.root.destroy(scene.allocator);
         const allocator = scene.allocator;
         allocator.destroy(scene);
     }
 
-    /// Topmost drawable node whose absolute rect contains (x, y): the
-    /// seat's hit test. Walks children in reverse draw order (the last
-    /// child draws on top); skips disabled and non-pickable nodes and
-    /// their subtrees. Returns only .buffer nodes (surface content) —
-    /// rect nodes are decoration. Null when the point hits nothing.
-    pub fn pick(scene: *Scene, x: i32, y: i32) ?*SceneNode {
+    /// Topmost drawable node whose world rect contains the f64 world
+    /// point (x, y): the seat's hit test. The point arrives in the same
+    /// space absolutePosition() reports — the caller converts screen px
+    /// through the view's camera first, in f64. Walks children in
+    /// reverse draw order (the last child draws on top); skips disabled
+    /// and non-pickable nodes and their subtrees. Returns only .buffer
+    /// nodes (surface content) — rect nodes are decoration. Null when
+    /// the point hits nothing.
+    pub fn pick(scene: *Scene, x: f64, y: f64) ?*SceneNode {
         return pickNode(scene.root, x, y);
     }
 };
 
-/// A node in the scene tree. Position (x/y) is relative to the parent.
+/// A node in the scene tree. Position (x/y) is the node's offset from
+/// its parent in WORLD pixels: f64, so a surface can be placed between
+/// two pixels and a whole chain of fractional offsets still sums exactly.
 /// Only .tree nodes may have children appended. Disabled nodes and their
 /// subtrees are skipped at render time.
 pub const SceneNode = struct {
@@ -123,8 +159,17 @@ pub const SceneNode = struct {
     /// Pickable by the seat's hit test. Decoration nodes (the cursor)
     /// disable this so the pointer never targets them.
     pickable: bool = true,
-    x: i32 = 0,
-    y: i32 = 0,
+    /// World position relative to the parent, in world px (f64).
+    x: f64 = 0,
+    y: f64 = 0,
+
+    /// Move the node to a world position relative to its parent. The
+    /// placement pass uses this instead of writing x/y directly, so a
+    /// move is one call site and the f64 type is stated once.
+    pub fn setPosition(node: *SceneNode, x: f64, y: f64) void {
+        node.x = x;
+        node.y = y;
+    }
 
     /// Creation tag for create().
     pub const Kind = enum { tree, buffer, rect };
@@ -257,11 +302,14 @@ pub const SceneNode = struct {
         }
     }
 
-    /// Bounding rect in scene space: the sum of all ancestor x/y (including
-    /// this node) as origin, sized by the node's own extent (tree nodes have
-    /// zero size; buffer nodes use dst_size, falling back to the texture
-    /// size; rect nodes use their width/height).
-    pub fn absolutePosition(node: *const SceneNode) Rect {
+    /// Bounding rect in WORLD space: the sum of all ancestor x/y
+    /// (including this node), summed in f64, as origin, sized by the
+    /// node's own extent (tree nodes have zero size; buffer nodes use
+    /// dst_size, falling back to the texture size; rect nodes use their
+    /// width/height). The size is widened from the integer dst/size
+    /// fields here — the world boundary is the one place the protocol's
+    /// integer geometry becomes f64.
+    pub fn absolutePosition(node: *const SceneNode) FRect {
         var x = node.x;
         var y = node.y;
         var parent = node.parent;
@@ -269,13 +317,27 @@ pub const SceneNode = struct {
             x += p.x;
             y += p.y;
         }
-        return .{ .x = x, .y = y, .width = nodeWidth(node), .height = nodeHeight(node) };
+        const size: geom.Size = switch (node.kind) {
+            .tree => .{ .w = 0, .h = 0 },
+            .buffer => |bn| .{
+                .w = if (bn.dst_width != 0) bn.dst_width else if (bn.texture) |texture| texture.width else 0,
+                .h = if (bn.dst_height != 0) bn.dst_height else if (bn.texture) |texture| texture.height else 0,
+            },
+            .rect => |rn| .{ .w = rn.width, .h = rn.height },
+        };
+        return .{
+            .x = x,
+            .y = y,
+            .width = @floatFromInt(size.w),
+            .height = @floatFromInt(size.h),
+        };
     }
 };
 
-/// Recursive hit test: children in reverse draw order; tree nodes recurse,
-/// buffer nodes win on containment, rect nodes are skipped.
-fn pickNode(node: *SceneNode, x: i32, y: i32) ?*SceneNode {
+/// Recursive hit test in world space: children in reverse draw order;
+/// tree nodes recurse, buffer nodes win on containment (half-open, at
+/// the node's fractional edges), rect nodes are skipped.
+fn pickNode(node: *SceneNode, x: f64, y: f64) ?*SceneNode {
     var i = node.children.items.len;
     while (i > 0) {
         i -= 1;
@@ -285,18 +347,26 @@ fn pickNode(node: *SceneNode, x: i32, y: i32) ?*SceneNode {
             if (pickNode(child, x, y)) |hit| return hit;
             continue;
         }
-        if (child.kind == .buffer and child.absolutePosition().containsPoint(.{ .x = x, .y = y })) return child;
+        if (child.kind == .buffer and child.absolutePosition().containsPoint(x, y)) return child;
     }
     return null;
 }
 
-/// Texture blit node: draws `texture` (cropped to `src`, null = whole
-/// texture) at the absolute position, sized dst_width x dst_height
-/// (0 = texture size, 1:1), at `opacity`.
+/// Texture blit node: draws `texture` at the node's world position,
+/// sized dst_width x dst_height (0 = texture size, 1:1), at `opacity`.
 pub const SceneBufferNode = struct {
     node: SceneNode,
     texture: ?*texture_mod.Texture = null,
-    src: ?FRect = null, // crop; null = whole texture
+    /// RAW BUFFER-pixel crop of the texture (null = whole texture). A
+    /// wp_viewport source arrives surface-local; the binding that
+    /// publishes it multiplies by buffer_scale and inverse-transforms it
+    /// into buffer pixels, so the renderer samples buffer texels and
+    /// never applies the crop twice.
+    src: ?FRect = null,
+    /// The surface's wl_output_transform for this draw (buffer ->
+    /// surface). buffer_scale is already folded into `src` and the dst
+    /// size, so this is the raw buffer -> surface map alone.
+    transform: geom.Transform = .normal,
     dst_width: i32 = 0, // 0 = texture size (1:1)
     dst_height: i32 = 0,
     opacity: f32 = 1.0,
@@ -311,18 +381,48 @@ pub const SceneRectNode = struct {
     height: i32 = 0,
 };
 
-/// A view of the scene onto one output: the output rect in scene space is
-/// (x, y, output.width, output.height). render() composites the tree into
-/// the renderer target for this output. The damage ring tracks what
-/// changed on this output: the compositor accumulates per-surface damage
-/// via addDamage before render, rotates the ring after render, and reads
-/// the frame's rects back via takeDamage for the output commit.
+/// ONE view of the shared scene tree onto one output. Everything that
+/// used to be a single-output decision lives here, per output: the world
+/// origin (x/y) used when the view has no camera, the camera itself
+/// (borrowed), the wl_output global the enter/leave wire events ride,
+/// the frame's presented list and the damage ring.
+///
+/// `render` composites the tree into the renderer target for this
+/// output. The damage ring tracks what changed ON THIS OUTPUT: the
+/// compositor accumulates per-surface damage via addDamage before
+/// render, rotates the ring after render, and reads the frame's rects
+/// back via takeDamage for the output commit.
 pub const SceneOutput = struct {
     output: *output_mod.Output,
     scene: *Scene,
     damage_ring: damage_mod.DamageRing,
-    x: i32 = 0, // position in scene space
-    y: i32 = 0,
+    /// World position of this view's screen (0,0). Used as the view's
+    /// world rect origin when no camera is installed.
+    x: f64 = 0,
+    y: f64 = 0,
+    /// The output view's camera, BORROWED from its canonical owner (the
+    /// server's per-output view). Null = a camera-less view: world
+    /// coordinates are screen coordinates offset by (x, y). Only read.
+    camera: ?*const Camera = null,
+    /// This output's wl_output global. The surface enter/leave wire
+    /// events go to the resources its own client bound here — an event
+    /// for output A never rides output B's global.
+    wl_output: ?*wl_output_mod.WlOutput = null,
+    /// This frame's presented surfaces (presentation feedback targets)
+    /// for THIS output, rebuilt per frame by collectPresented.
+    presented: std.ArrayList(*surface_mod.Surface) = .empty,
+    /// output.events.destroy: the output died, so `output` dangles.
+    /// The handler revokes every membership this view carried — while
+    /// the view is still resolvable, so the real wl_surface.leave can
+    /// ride this output's own wl_output — then tombstones the view and
+    /// detaches it from the scene. It does NOT free the view: its owner
+    /// frees it exactly once through destroy(), so a listener ordering
+    /// difference cannot double-free it.
+    destroy_listener: wire.Listener(*output_mod.Output),
+    /// False once this view is dead (its output died, or destroy ran).
+    /// `output` must not be dereferenced while this is false, and the
+    /// view is no longer in the scene's output list.
+    live: bool = true,
 
     /// `allocator` must be the scene's allocator: destroy() recovers it
     /// from the scene.
@@ -335,15 +435,29 @@ pub const SceneOutput = struct {
     ) !*SceneOutput {
         const self = try allocator.create(SceneOutput);
         errdefer allocator.destroy(self);
+        // The ring owns two allocations (the history slot array and the
+        // slot's rect list); acquire it before the struct so a failure
+        // here leaks nothing.
+        var ring = try damage_mod.DamageRing.init(allocator, 2);
+        errdefer ring.deinit();
         self.* = .{
             .output = output,
             .scene = scene,
-            .damage_ring = try damage_mod.DamageRing.init(allocator, 2),
+            .damage_ring = ring,
             .x = 0,
             .y = 0,
+            .camera = null,
+            .wl_output = null,
+            .presented = .empty,
+            .destroy_listener = wire.Listener(*output_mod.Output).init(onOutputDestroy),
+            .live = true,
         };
-        // (the errdefer frees self on failure)
+        // Join the scene BEFORE the output can call back into this view:
+        // a destroy listener left on a view create then failed would run
+        // against freed memory when the output is destroyed. Nothing
+        // below this append can fail, so no rollback is needed.
         try scene.scene_outputs.append(allocator, self);
+        output.events.destroy.add(&self.destroy_listener);
         log.debug(
             "scene output created for output {d}x{d}",
             io,
@@ -354,25 +468,135 @@ pub const SceneOutput = struct {
         return self;
     }
 
-    /// Destroy this output view (and its damage ring). The scene tree is
-    /// NOT freed: a scene can be shared across outputs — call Scene.deinit
-    /// to destroy the tree.
+    /// Destroy this output view: revoke the memberships it carried, then
+    /// free its damage ring and presented list and drop it from the
+    /// scene. The scene tree is NOT freed — a scene is shared across
+    /// outputs, call Scene.deinit for that.
+    ///
+    /// FREES `so`. It is not idempotent: the view's owner calls this
+    /// exactly once, whether the output died first or not (after the
+    /// output died, live == false and the memberships are already gone).
     pub fn destroy(so: *SceneOutput) void {
         const scene = so.scene;
         const allocator = scene.allocator;
+        // The leave events must name THIS output on the wire, so they go
+        // out while the view is still live, still registered and still
+        // carries its wl_output (see revokeMemberships).
+        so.revokeMemberships();
+        so.live = false;
+        if (so.destroy_listener.link.prev != null) so.destroy_listener.link.remove();
+        so.camera = null;
+        so.wl_output = null;
         so.damage_ring.deinit();
-        // Unregister from the scene (surface enter/leave association).
-        if (std.mem.findScalar(*SceneOutput, scene.scene_outputs.items, so)) |idx| {
-            _ = scene.scene_outputs.orderedRemove(idx);
-        }
+        so.presented.deinit(allocator);
+        // Unregister from the scene (surface enter/leave association and
+        // culling iterate scene_outputs).
+        so.unregister();
         allocator.destroy(so);
     }
 
-    /// Accumulate `rect` (in output coordinates) into this frame's
-    /// damage. Called by the compositor for every damaged surface region
-    /// (and cursor move) before render; takeDamage after rotate carries
-    /// the frame's region to the output commit (wlr_damage_ring_add_box,
-    /// types/wlr_damage_ring.c:40).
+    /// Revoke every tracked surface's membership in THIS view's output.
+    ///
+    /// Surface.leaveOutput fires the surface's leave signal, and the
+    /// surface node's listener turns that into a real wl_surface.leave
+    /// naming the output — but only while this view is still resolvable
+    /// (sceneOutputFor) and still carries its wl_output. That is why the
+    /// revocation runs FIRST, before live=false, before the borrowed
+    /// pointers are dropped and before the view leaves the scene.
+    ///
+    /// The output association also listens for the output's death on its
+    /// own; whichever order the two listeners are linked in, the second
+    /// one finds nothing left to revoke, so the client hears exactly one
+    /// leave per lost output either way. A no-op once the view is dead:
+    /// `output` dangles from then on.
+    fn revokeMemberships(so: *SceneOutput) void {
+        if (!so.live) return;
+        const out = so.output;
+        var it = so.scene.surface_nodes.valueIterator();
+        while (it.next()) |sn| {
+            const surface = sn.*.surface;
+            if (surface.hasOutput(out)) surface.leaveOutput(out);
+        }
+    }
+
+    /// Drop this view from the scene's output list. Idempotent.
+    fn unregister(so: *SceneOutput) void {
+        const scene = so.scene;
+        if (std.mem.findScalar(*SceneOutput, scene.scene_outputs.items, so)) |idx| {
+            _ = scene.scene_outputs.orderedRemove(idx);
+        }
+    }
+
+    /// The world rect this view can show: the camera's visible world
+    /// rect when it has one (the culling frustum AND the membership
+    /// test), else the output's rectangle placed at the view's world
+    /// origin.
+    pub fn visibleWorldRect(so: *const SceneOutput) FRect {
+        if (so.camera) |cam| return cam.visibleWorldRect();
+        return .{
+            .x = so.x,
+            .y = so.y,
+            .width = @floatFromInt(so.output.width),
+            .height = @floatFromInt(so.output.height),
+        };
+    }
+
+    /// Map a world point to this output's screen px. With a camera the
+    /// subtraction happens inside the f64 transform (so a world point
+    /// 1e9 px from the origin never reaches an f32 as an absolute
+    /// coordinate); without one the view's world origin is subtracted.
+    pub fn worldToScreen(so: *const SceneOutput, wx: f64, wy: f64) geom.FPoint {
+        if (so.camera) |cam| return cam.worldToScreen(wx, wy);
+        return .{ .x = wx - so.x, .y = wy - so.y };
+    }
+
+    /// This output's screen in screen px: (0, 0, width, height).
+    pub fn screenBounds(so: *const SceneOutput) FRect {
+        return .{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(so.output.width),
+            .height = @floatFromInt(so.output.height),
+        };
+    }
+
+    /// Project a WORLD rect into this output's screen pixels: the four
+    /// world corners through worldToScreen, their screen-space bounding
+    /// box, clipped to the screen in f64, and only then narrowed to whole
+    /// pixels (origin floors, far edges ceil).
+    ///
+    /// The clip-before-narrow order is the contract: a world rect a
+    /// billion pixels off-screen saturates onto the screen edge when it
+    /// is narrowed first, which would report damage or a drawn quad on an
+    /// edge the output never had. Null when nothing lands on screen.
+    pub fn projectWorldRect(so: *const SceneOutput, world: FRect) ?Rect {
+        if (world.isEmpty()) return null;
+        const corners = [_]geom.FPoint{
+            so.worldToScreen(world.x, world.y),
+            so.worldToScreen(world.right(), world.y),
+            so.worldToScreen(world.x, world.bottom()),
+            so.worldToScreen(world.right(), world.bottom()),
+        };
+        var min_x = corners[0].x;
+        var min_y = corners[0].y;
+        var max_x = corners[0].x;
+        var max_y = corners[0].y;
+        for (corners[1..]) |c| {
+            min_x = @min(min_x, c.x);
+            min_y = @min(min_y, c.y);
+            max_x = @max(max_x, c.x);
+            max_y = @max(max_y, c.y);
+        }
+        const screen: FRect = .{ .x = min_x, .y = min_y, .width = max_x - min_x, .height = max_y - min_y };
+        const clipped = screen.intersect(so.screenBounds()) orelse return null;
+        return clipped.toPixelRect();
+    }
+
+    /// Accumulate `rect` (in output/screen coordinates) into this
+    /// frame's damage. Called by the compositor for every damaged
+    /// surface region (and cursor move) before render; takeDamage after
+    /// rotate carries the frame's region to the output commit
+    /// (wlr_damage_ring_add_box, types/wlr_damage_ring.c:40).
     pub fn addDamage(so: *SceneOutput, rect: geom.Rect) void {
         so.damage_ring.add(rect) catch {
             // Out of memory: whole-output damage is the conservative
@@ -397,71 +621,74 @@ pub const SceneOutput = struct {
         return frame.rects.items;
     }
 
-    /// Composite the scene into the renderer target (framebuffer) for this
-    /// output: walk the tree, cull nodes outside the output rect, draw rect
-    /// nodes via add_rect and buffer nodes via add_texture, submit.
+    /// Composite the scene into the renderer target (framebuffer) for
+    /// this output: walk the tree, cull nodes outside this view's
+    /// visible world rect, draw rect nodes via add_rect and buffer nodes
+    /// via add_texture, submit.
     pub fn render(so: *SceneOutput, renderer: *renderer_mod.Renderer, target: *anyopaque) void {
+        std.debug.assert(so.live);
         std.debug.assert(so.output.width > 0);
         std.debug.assert(so.output.height > 0);
-        const out_rect: Rect = .{
-            .x = so.x,
-            .y = so.y,
-            .width = so.output.width,
-            .height = so.output.height,
-        };
+        const visible = so.visibleWorldRect();
         const pass = renderer.beginPass(target) orelse {
             log.trace("render: target unsupported, skipping", so.scene.io, so.scene.log_cfg, "scene", .{});
             return;
         };
         defer pass.submit();
-        renderNode(pass, so.scene.root, out_rect, true);
+        renderNode(pass, so.scene.root, visible, true);
     }
 };
 
-fn renderNode(pass: *pass_mod.Pass, node: *SceneNode, out_rect: Rect, ancestors_enabled: bool) void {
-    const visible = ancestors_enabled and node.enabled;
-    if (!visible) return;
+/// The output died: `so.output` dangles from here on. The memberships
+/// this view carried are revoked FIRST, while the view is still live,
+/// still in the scene's output list and still carries its wl_output, so
+/// each surface's client hears a real wl_surface.leave naming THAT
+/// output. Then the view is tombstoned: it stops referencing the output
+/// and leaves the scene's output list. The view itself stays allocated
+/// — its owner frees it through SceneOutput.destroy, so a listener order
+/// that frees it before this runs cannot double-free it.
+fn onOutputDestroy(listener: *wire.Listener(*output_mod.Output), _: *output_mod.Output) void {
+    const so: *SceneOutput = @fieldParentPtr("destroy_listener", listener);
+    so.revokeMemberships();
+    so.live = false;
+    so.camera = null;
+    so.wl_output = null;
+    so.presented.clearRetainingCapacity();
+    so.unregister();
+}
+
+fn renderNode(pass: *pass_mod.Pass, node: *SceneNode, visible: FRect, ancestors_enabled: bool) void {
+    const shown = ancestors_enabled and node.enabled;
+    if (!shown) return;
     switch (node.kind) {
         .tree => {},
-        .buffer => |bn| renderBuffer(pass, node, bn, out_rect),
-        .rect => |rn| renderRect(pass, node, rn, out_rect),
+        .buffer => |bn| renderBuffer(pass, node, bn, visible),
+        .rect => |rn| renderRect(pass, node, rn, visible),
     }
-    for (node.children.items) |child| renderNode(pass, child, out_rect, visible);
+    for (node.children.items) |child| renderNode(pass, child, visible, shown);
 }
 
-fn renderBuffer(pass: *pass_mod.Pass, node: *const SceneNode, bn: *SceneBufferNode, out_rect: Rect) void {
+fn renderBuffer(pass: *pass_mod.Pass, node: *const SceneNode, bn: *SceneBufferNode, visible: FRect) void {
     const texture = bn.texture orelse return;
-    const rect = node.absolutePosition();
-    if (out_rect.intersect(rect) == null) return;
-    pass.addTexture(texture, bn.src, .{
-        .x = @floatFromInt(rect.x),
-        .y = @floatFromInt(rect.y),
-        .width = @floatFromInt(rect.width),
-        .height = @floatFromInt(rect.height),
-    }, bn.opacity);
+    const world = node.absolutePosition();
+    // Cull in world space in f64: a node whose fractional rect misses the
+    // view is dropped, and one that only half lands still draws with its
+    // exact world rect (dst is never narrowed here — the renderer owns
+    // the projection into its target).
+    if (!visible.intersects(world)) return;
+    pass.addTexture(texture, .{
+        .src = bn.src,
+        .dst = world,
+        .alpha = bn.opacity,
+        .transform = bn.transform,
+    });
 }
 
-fn renderRect(pass: *pass_mod.Pass, node: *const SceneNode, rn: *SceneRectNode, out_rect: Rect) void {
+fn renderRect(pass: *pass_mod.Pass, node: *const SceneNode, rn: *SceneRectNode, visible: FRect) void {
     if (rn.width <= 0 or rn.height <= 0) return;
-    const rect = node.absolutePosition();
-    if (out_rect.intersect(rect) == null) return;
-    pass.addRect(rect, rn.color);
-}
-
-fn nodeWidth(node: *const SceneNode) i32 {
-    return switch (node.kind) {
-        .tree => 0,
-        .buffer => |bn| if (bn.dst_width != 0) bn.dst_width else (if (bn.texture) |t| t.width else 0),
-        .rect => |rn| rn.width,
-    };
-}
-
-fn nodeHeight(node: *const SceneNode) i32 {
-    return switch (node.kind) {
-        .tree => 0,
-        .buffer => |bn| if (bn.dst_height != 0) bn.dst_height else (if (bn.texture) |t| t.height else 0),
-        .rect => |rn| rn.height,
-    };
+    const world = node.absolutePosition();
+    if (!visible.intersects(world)) return;
+    pass.addRect(world, rn.color);
 }
 
 const testing = std.testing;
@@ -515,72 +742,6 @@ fn dummyTextureDestroy(texture: *texture_mod.Texture) void {
 
 const dummy_texture_impl: texture_mod.Texture.Impl = .{ .destroy = dummyTextureDestroy };
 
-const RecordedRect = struct { rect: Rect, color: [4]f32 };
-
-const RecordedTexture = struct {
-    texture: *texture_mod.Texture,
-    src: ?FRect,
-    dst: FRect,
-    alpha: f32,
-};
-
-const Recorder = struct {
-    allocator: std.mem.Allocator,
-    rects: std.ArrayList(RecordedRect) = .empty,
-    textures: std.ArrayList(RecordedTexture) = .empty,
-    submits: usize = 0,
-
-    fn deinit(r: *Recorder) void {
-        r.rects.deinit(r.allocator);
-        r.textures.deinit(r.allocator);
-        // Z030: caller-owned receiver — invalidate to catch use-after-free.
-        r.* = undefined;
-    }
-};
-
-const RecorderData = struct {
-    rec: *Recorder,
-    pass: pass_mod.Pass,
-};
-
-const recorder_pass_impl: pass_mod.Pass.Impl = .{
-    .add_texture = onTexture,
-    .add_rect = onRect,
-    .submit = onSubmit,
-};
-
-const recorder_renderer_impl: renderer_mod.Renderer.Impl = .{
-    .begin_pass = onBeginPass,
-    .destroy = onRendererDestroy,
-};
-
-fn onTexture(pass: *pass_mod.Pass, texture: *texture_mod.Texture, src: ?FRect, dst: FRect, alpha: f32) void {
-    const rd: *RecorderData = @ptrCast(@alignCast(pass.data));
-    rd.rec.textures.append(rd.rec.allocator, .{
-        .texture = texture,
-        .src = src,
-        .dst = dst,
-        .alpha = alpha,
-    }) catch return;
-}
-
-fn onRect(pass: *pass_mod.Pass, rect: Rect, color: [4]f32) void {
-    const rd: *RecorderData = @ptrCast(@alignCast(pass.data));
-    rd.rec.rects.append(rd.rec.allocator, .{ .rect = rect, .color = color }) catch return;
-}
-
-fn onSubmit(pass: *pass_mod.Pass) void {
-    const rd: *RecorderData = @ptrCast(@alignCast(pass.data));
-    rd.rec.submits += 1;
-}
-
-fn onBeginPass(renderer: *renderer_mod.Renderer, _: *anyopaque) ?*pass_mod.Pass {
-    const rd: *RecorderData = @ptrCast(@alignCast(renderer.data));
-    rd.pass = .{ .impl = &recorder_pass_impl, .data = rd };
-    return &rd.pass;
-}
-
-fn onRendererDestroy(_: std.mem.Allocator, _: *anyopaque) void {}
 
 test "scene tree construction, append, remove, enable" {
     const allocator = testing.allocator;
@@ -686,121 +847,39 @@ test "absolutePosition sums nested offsets" {
     defer scene.deinit();
 
     const t1 = try SceneNode.create(allocator, scene.root, .tree);
-    t1.x = 10;
-    t1.y = 20;
+    t1.setPosition(10, 20);
 
     // Buffer: position + texture size when dst unset.
     var dummy: DummyTexture = .{};
     var tex: texture_mod.Texture = .{ .impl = &dummy_texture_impl, .data = &dummy, .width = 64, .height = 32 };
     const buf = try SceneNode.create(allocator, t1, .buffer);
-    buf.x = 5;
-    buf.y = 7;
+    buf.setPosition(5, 7);
     buf.kind.buffer.texture = &tex;
-    try testing.expectEqual(Rect{ .x = 15, .y = 27, .width = 64, .height = 32 }, buf.absolutePosition());
+    try testing.expectEqual(FRect{ .x = 15, .y = 27, .width = 64, .height = 32 }, buf.absolutePosition());
 
     // dst_size overrides the texture size.
     buf.kind.buffer.dst_width = 128;
     buf.kind.buffer.dst_height = 96;
-    try testing.expectEqual(Rect{ .x = 15, .y = 27, .width = 128, .height = 96 }, buf.absolutePosition());
+    try testing.expectEqual(FRect{ .x = 15, .y = 27, .width = 128, .height = 96 }, buf.absolutePosition());
     buf.kind.buffer.dst_width = 0;
     buf.kind.buffer.dst_height = 0;
 
     // Rect: position + own size.
     const rect_node = try SceneNode.create(allocator, t1, .rect);
-    rect_node.x = 3;
-    rect_node.y = 4;
+    rect_node.setPosition(3, 4);
     rect_node.kind.rect.width = 100;
     rect_node.kind.rect.height = 50;
-    try testing.expectEqual(Rect{ .x = 13, .y = 24, .width = 100, .height = 50 }, rect_node.absolutePosition());
+    try testing.expectEqual(FRect{ .x = 13, .y = 24, .width = 100, .height = 50 }, rect_node.absolutePosition());
 
     // Tree nodes have zero size.
-    try testing.expectEqual(Rect{ .x = 10, .y = 20, .width = 0, .height = 0 }, t1.absolutePosition());
-    try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 0, .height = 0 }, scene.root.absolutePosition());
+    try testing.expectEqual(FRect{ .x = 10, .y = 20, .width = 0, .height = 0 }, t1.absolutePosition());
+    try testing.expectEqual(FRect{ .x = 0, .y = 0, .width = 0, .height = 0 }, scene.root.absolutePosition());
 
-    // Negative offsets accumulate too.
+    // Negative and fractional offsets accumulate too: the world is f64,
+    // so a node placed between pixels keeps its fraction.
     const t2 = try SceneNode.create(allocator, scene.root, .tree);
-    t2.x = -10;
-    t2.y = -10;
-    try testing.expectEqual(Rect{ .x = -10, .y = -10, .width = 0, .height = 0 }, t2.absolutePosition());
-}
-
-test "render composites background rect and buffer nodes" {
-    const allocator = testing.allocator;
-    var io_impl: std.Io.Threaded = .init_single_threaded;
-    var io = io_impl.io();
-    var log_cfg: log.Config = .{ .min_level = .err };
-
-    const scene = try makeScene(allocator, &io, &log_cfg);
-    defer scene.deinit();
-    const created = try makeOutput(allocator, &io, &log_cfg);
-    const out = created[0];
-    defer out.destroy();
-    defer created[1].destroy();
-
-    const so = try SceneOutput.create(allocator, &io, &log_cfg, scene, out);
-    defer so.destroy();
-    try testing.expectEqual(@as(i32, 0), so.x);
-    try testing.expectEqual(@as(i32, 0), so.y);
-    try testing.expect(so.damage_ring.isEmpty());
-
-    // Background rect covering the whole output.
-    const bg = try SceneNode.create(allocator, scene.root, .rect);
-    bg.kind.rect.width = 800;
-    bg.kind.rect.height = 600;
-    bg.kind.rect.color = .{ 0.1, 0.2, 0.3, 1.0 };
-
-    // Scaled, cropped, translucent buffer on top.
-    var dummy: DummyTexture = .{};
-    var tex: texture_mod.Texture = .{ .impl = &dummy_texture_impl, .data = &dummy, .width = 64, .height = 32 };
-    const buf = try SceneNode.create(allocator, scene.root, .buffer);
-    buf.x = 100;
-    buf.y = 100;
-    buf.kind.buffer.texture = &tex;
-    buf.kind.buffer.src = .{ .x = 0, .y = 0, .width = 32, .height = 32 };
-    buf.kind.buffer.dst_width = 128;
-    buf.kind.buffer.dst_height = 64;
-    buf.kind.buffer.opacity = 0.5;
-
-    // 1:1 buffer: no src, no dst -> texture size at the absolute position.
-    const buf2 = try SceneNode.create(allocator, scene.root, .buffer);
-    buf2.x = 300;
-    buf2.y = 50;
-    buf2.kind.buffer.texture = &tex;
-
-    var rec: Recorder = .{ .allocator = allocator };
-    defer rec.deinit();
-    var rd: RecorderData = .{
-        .rec = &rec,
-        // SAFETY: pass is filled by onBeginPass before any use.
-        .pass = undefined,
-    };
-    const renderer = try renderer_mod.Renderer.create(allocator, &io, &log_cfg, &recorder_renderer_impl, &rd, &.{});
-    defer renderer.destroy();
-    var target: u8 = 0;
-
-    so.render(renderer, &target);
-
-    try testing.expectEqual(@as(usize, 1), rec.rects.items.len);
-    try testing.expectEqual(RecordedRect{
-        .rect = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
-        .color = .{ 0.1, 0.2, 0.3, 1.0 },
-    }, rec.rects.items[0]);
-
-    try testing.expectEqual(@as(usize, 2), rec.textures.items.len);
-    try testing.expectEqual(RecordedTexture{
-        .texture = &tex,
-        .src = .{ .x = 0, .y = 0, .width = 32, .height = 32 },
-        .dst = .{ .x = 100, .y = 100, .width = 128, .height = 64 },
-        .alpha = 0.5,
-    }, rec.textures.items[0]);
-    try testing.expectEqual(RecordedTexture{
-        .texture = &tex,
-        .src = null,
-        .dst = .{ .x = 300, .y = 50, .width = 64, .height = 32 },
-        .alpha = 1.0,
-    }, rec.textures.items[1]);
-
-    try testing.expectEqual(@as(usize, 1), rec.submits);
+    t2.setPosition(-10.5, -10.25);
+    try testing.expectEqual(FRect{ .x = -10.5, .y = -10.25, .width = 0, .height = 0 }, t2.absolutePosition());
 }
 
 test "SceneOutput damage ring accumulates and takeDamage returns the frame's rects" {
@@ -839,7 +918,7 @@ test "SceneOutput damage ring accumulates and takeDamage returns the frame's rec
     try testing.expectEqual(@as(usize, 0), so.takeDamage().len);
 }
 
-test "render culls nodes outside the output rect" {
+test "two outputs keep independent views, damage and projection" {
     const allocator = testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
     var io = io_impl.io();
@@ -847,84 +926,139 @@ test "render culls nodes outside the output rect" {
 
     const scene = try makeScene(allocator, &io, &log_cfg);
     defer scene.deinit();
+    const first = try makeOutput(allocator, &io, &log_cfg);
+    const second = try makeOutput(allocator, &io, &log_cfg);
+    // Registered backend-first so LIFO teardown destroys each output
+    // BEFORE its backend (the views' own defers, registered later, run
+    // before both).
+    defer first[1].destroy();
+    defer first[0].destroy();
+    defer second[1].destroy();
+    defer second[0].destroy();
+
+    // The left view is camera-less at the world origin; the right one
+    // pans its camera to the far side of the world. Neither shares state
+    // with the other: separate cameras, separate damage rings, separate
+    // presented lists.
+    // Not deferred: the test destroys this view explicitly at the end to
+    // observe the survivor, and a double free is worse than a leak report
+    // on an early test failure.
+    const so_left = try SceneOutput.create(allocator, &io, &log_cfg, scene, first[0]);
+    var cam: Camera = .{
+        .center_x = 5_000_000_000.5,
+        .center_y = 0,
+        .zoom = 1,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    const so_right = try SceneOutput.create(allocator, &io, &log_cfg, scene, second[0]);
+    defer so_right.destroy();
+    so_right.camera = &cam;
+    try testing.expectEqual(@as(usize, 2), scene.scene_outputs.items.len);
+    try testing.expect(so_left.camera == null);
+    try testing.expect(so_right.camera == &cam);
+
+    // The camera-less view's world rect is its origin rectangle; the
+    // camera view's is the camera's frustum (centred on the far world
+    // point, not the origin).
+    try testing.expectEqual(
+        FRect{ .x = 0, .y = 0, .width = 800, .height = 600 },
+        so_left.visibleWorldRect(),
+    );
+    try testing.expect(so_right.visibleWorldRect().x > 4_999_999_600);
+
+    // A world rect at the origin lands on the left view's screen but not
+    // the right one (whose camera is 5e9 away).
+    const origin_rect: FRect = .{ .x = 10, .y = 20, .width = 100, .height = 50 };
+    try testing.expectEqual(
+        Rect{ .x = 10, .y = 20, .width = 100, .height = 50 },
+        so_left.projectWorldRect(origin_rect).?,
+    );
+    try testing.expect(so_right.projectWorldRect(origin_rect) == null);
+    // ...and a rect at the camera's far world centre lands on the right
+    // view's screen but not the left.
+    const far_rect: FRect = .{
+        .x = cam.center_x,
+        .y = 0,
+        .width = 100,
+        .height = 50,
+    };
+    try testing.expect(so_left.projectWorldRect(far_rect) == null);
+    // The camera centre maps to the screen centre (400, 300); the rect is
+    // 100x50 extending right and down from it.
+    try testing.expectEqual(
+        Rect{ .x = 400, .y = 300, .width = 100, .height = 50 },
+        so_right.projectWorldRect(far_rect).?,
+    );
+
+    // A fractional world edge covers the pixel box that contains it.
+    const frac: FRect = .{ .x = 10.25, .y = 20.75, .width = 3.5, .height = 2.5 };
+    try testing.expectEqual(
+        Rect{ .x = 10, .y = 20, .width = 4, .height = 4 },
+        so_left.projectWorldRect(frac).?,
+    );
+
+    // Damage rings are per view: damaging the left one leaves the right
+    // one empty.
+    so_left.addDamage(.{ .x = 1, .y = 2, .width = 3, .height = 4 });
+    so_right.addDamage(.{ .x = 50, .y = 60, .width = 7, .height = 8 });
+    so_left.damage_ring.rotate();
+    so_right.damage_ring.rotate();
+    try testing.expectEqual(@as(usize, 1), so_left.takeDamage().len);
+    try testing.expectEqual(Rect{ .x = 1, .y = 2, .width = 3, .height = 4 }, so_left.takeDamage()[0]);
+    try testing.expectEqual(@as(usize, 1), so_right.takeDamage().len);
+    try testing.expectEqual(Rect{ .x = 50, .y = 60, .width = 7, .height = 8 }, so_right.takeDamage()[0]);
+
+    // Destroying one view leaves the other and the scene intact.
+    so_left.destroy();
+    try testing.expectEqual(@as(usize, 1), scene.scene_outputs.items.len);
+    try testing.expect(so_right.live);
+}
+
+test "scene rendering respects visibility and pixel-centre rectangle coverage" {
+    const allocator = testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+    const scene = try makeScene(allocator, &io, &log_cfg);
+    defer scene.deinit();
     const created = try makeOutput(allocator, &io, &log_cfg);
     const out = created[0];
     defer out.destroy();
     defer created[1].destroy();
-
-    // Output placed at (100, 50): its rect is (100, 50, 800, 600).
     const so = try SceneOutput.create(allocator, &io, &log_cfg, scene, out);
     defer so.destroy();
-    so.x = 100;
-    so.y = 50;
 
-    var dummy: DummyTexture = .{};
-    var tex: texture_mod.Texture = .{ .impl = &dummy_texture_impl, .data = &dummy, .width = 64, .height = 32 };
-
-    // Outside the output rect: culled.
-    const outside = try SceneNode.create(allocator, scene.root, .buffer);
-    outside.x = 2000;
-    outside.y = 2000;
-    outside.kind.buffer.texture = &tex;
-
-    const outside_rect = try SceneNode.create(allocator, scene.root, .rect);
-    outside_rect.x = -500;
-    outside_rect.y = -500;
-    outside_rect.kind.rect.width = 10;
-    outside_rect.kind.rect.height = 10;
-
-    // Inside, but undrawable: skipped.
-    const no_texture = try SceneNode.create(allocator, scene.root, .buffer);
-    no_texture.x = 150;
-    no_texture.y = 150;
-
-    const zero_size = try SceneNode.create(allocator, scene.root, .rect);
-    zero_size.x = 150;
-    zero_size.y = 150;
-
-    const hidden = try SceneNode.create(allocator, scene.root, .rect);
-    hidden.x = 150;
-    hidden.y = 150;
-    hidden.kind.rect.width = 50;
-    hidden.kind.rect.height = 50;
-    hidden.enable(false);
-
-    // Disabled subtree with a visible child: skipped entirely.
     const hidden_tree = try SceneNode.create(allocator, scene.root, .tree);
     hidden_tree.enable(false);
-    const hidden_child = try SceneNode.create(allocator, hidden_tree, .buffer);
-    hidden_child.x = 150;
-    hidden_child.y = 150;
-    hidden_child.kind.buffer.texture = &tex;
-
-    // In rect: drawn.
+    const hidden = try SceneNode.create(allocator, hidden_tree, .rect);
+    hidden.kind.rect.width = 4;
+    hidden.kind.rect.height = 4;
+    hidden.kind.rect.color = .{ 0, 1, 0, 1 };
+    const empty = try SceneNode.create(allocator, scene.root, .rect);
+    empty.kind.rect.color = .{ 0, 0, 1, 1 };
     const visible = try SceneNode.create(allocator, scene.root, .rect);
-    visible.x = 200;
-    visible.y = 100;
-    visible.kind.rect.width = 10;
-    visible.kind.rect.height = 10;
-    visible.kind.rect.color = .{ 0.5, 0.5, 0.5, 1.0 };
+    visible.setPosition(0.75, 0.75);
+    visible.kind.rect.width = 2;
+    visible.kind.rect.height = 2;
+    visible.kind.rect.color = .{ 1, 0, 0, 1 };
 
-    var rec: Recorder = .{ .allocator = allocator };
-    defer rec.deinit();
-    var rd: RecorderData = .{
-        .rec = &rec,
-        // SAFETY: pass is filled by onBeginPass before any use.
-        .pass = undefined,
-    };
-    const renderer = try renderer_mod.Renderer.create(allocator, &io, &log_cfg, &recorder_renderer_impl, &rd, &.{});
+    const pixman = @import("../renderer/pixman.zig");
+    const renderer = try pixman.PixmanRenderer.create(allocator, &io, &log_cfg);
     defer renderer.destroy();
-    var target: u8 = 0;
-
-    so.render(renderer, &target);
-
-    try testing.expectEqual(@as(usize, 0), rec.textures.items.len);
-    try testing.expectEqual(@as(usize, 1), rec.rects.items.len);
-    try testing.expectEqual(RecordedRect{
-        .rect = .{ .x = 200, .y = 100, .width = 10, .height = 10 },
-        .color = .{ 0.5, 0.5, 0.5, 1.0 },
-    }, rec.rects.items[0]);
-    try testing.expectEqual(@as(usize, 1), rec.submits);
+    const fb = try pixman.Framebuffer.create(allocator, 4, 4);
+    defer fb.deinit();
+    so.render(renderer, fb);
+    for (0..4) |y| {
+        for (0..4) |x| {
+            const want: [4]u8 = if (x >= 1 and x <= 2 and y >= 1 and y <= 2)
+                .{ 0, 0, 255, 255 }
+            else
+                .{ 0, 0, 0, 0 };
+            try testing.expectEqual(want, fb.pixelAt(@intCast(x), @intCast(y)));
+        }
+    }
 }
 
 test "SceneOutput destroy and Scene deinit free the tree" {
@@ -952,3 +1086,220 @@ test "SceneOutput destroy and Scene deinit free the tree" {
     created[1].destroy(); // frees the backend
     // testing.allocator reports any leak above.
 }
+
+fn allocationFailureOutputLifecycle(allocator: std.mem.Allocator) !void {
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+    const scene = try makeScene(allocator, &io, &log_cfg);
+    defer scene.deinit();
+    const created = try makeOutput(allocator, &io, &log_cfg);
+    defer created[1].destroy();
+    const out = created[0];
+    var output_live = true;
+    defer if (output_live) out.destroy();
+    const so = try SceneOutput.create(allocator, &io, &log_cfg, scene, out);
+    defer so.destroy();
+
+    so.x = 5_000_000_000.25;
+    so.y = -5_000_000_000.5;
+    const projected = so.projectWorldRect(.{
+        .x = 5_000_000_007.5,
+        .y = -4_999_999_996.0,
+        .width = 10.5,
+        .height = 7.5,
+    }) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Rect{ .x = 7, .y = 4, .width = 11, .height = 8 }, projected);
+    out.destroy();
+    output_live = false;
+    try testing.expect(!so.live);
+}
+
+test "output view allocation failures leave output destruction safe" {
+    try testing.checkAllAllocationFailures(testing.allocator, allocationFailureOutputLifecycle, .{});
+}
+
+
+
+test "absolutePosition keeps fractional world coords at far-from-origin nodes" {
+    const allocator = testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    // World coordinates carry fractions at ANY magnitude. The world is
+    // 5e9 px from the origin — past INT32_MAX, where an integer world
+    // cannot even hold the position, let alone a quarter pixel inside
+    // it — and every level of the tree carries a fraction, so the sum
+    // is right only if all of them are. At 5e9 one f64 ulp is ~1e-6, so
+    // the tolerance below is a few ulp: orders of magnitude tighter than
+    // the whole-pixel snap an integer world imposes.
+    const far_x: f64 = 5_000_000_000.5;
+    const far_y: f64 = -5_000_000_000.75;
+    const half: f64 = 0.5;
+    const quarter: f64 = 0.25;
+    const eighth: f64 = 0.125;
+
+    const scene = try makeScene(allocator, &io, &log_cfg);
+    defer scene.deinit();
+
+    var dummy: DummyTexture = .{};
+    var tex: texture_mod.Texture = .{ .impl = &dummy_texture_impl, .data = &dummy, .width = 64, .height = 32 };
+
+    // root -> far -> quarter -> eighth -> buffer.
+    const far = try SceneNode.create(allocator, scene.root, .tree);
+    far.setPosition(far_x, far_y);
+    const quarter_tree = try SceneNode.create(allocator, far, .tree);
+    quarter_tree.setPosition(quarter, quarter);
+    const eighth_tree = try SceneNode.create(allocator, quarter_tree, .tree);
+    eighth_tree.setPosition(eighth, eighth);
+    const buf = try SceneNode.create(allocator, eighth_tree, .buffer);
+    buf.setPosition(quarter, eighth);
+    buf.kind.buffer.texture = &tex;
+
+    // x: 5000000000.5 + 0.25 + 0.125 + 0.25 = 5000000001.125
+    // y: -5000000000.75 + 0.25 + 0.125 + 0.125 = -5000000000.25
+    const abs = buf.absolutePosition();
+    try testing.expectApproxEqAbs(5_000_000_001.125, abs.x, 1e-3);
+    try testing.expectApproxEqAbs(-5_000_000_000.25, abs.y, 1e-3);
+    // The world really is past the old integer limit — the case an
+    // integer accumulator could not represent at all.
+    try testing.expect(abs.x > @as(f64, std.math.maxInt(i32)));
+    try testing.expect(abs.y < @as(f64, std.math.minInt(i32)));
+    // The node's own extent is exact: it comes from the integer dst
+    // fields, widened once at the world boundary.
+    try testing.expectEqual(@as(f64, 64), abs.width);
+    try testing.expectEqual(@as(f64, 32), abs.height);
+
+    // The same accumulation near the origin, where every value is
+    // exactly representable: 0.5 + 0.25 + 0.125 must not collapse to a
+    // whole pixel.
+    const near = try SceneNode.create(allocator, scene.root, .tree);
+    near.setPosition(half, half);
+    const near_mid = try SceneNode.create(allocator, near, .tree);
+    near_mid.setPosition(quarter, quarter);
+    const near_buf = try SceneNode.create(allocator, near_mid, .buffer);
+    near_buf.setPosition(eighth, eighth);
+    near_buf.kind.buffer.dst_width = 12;
+    near_buf.kind.buffer.dst_height = 8;
+
+    const near_abs = near_buf.absolutePosition();
+    try testing.expectEqual(@as(f64, 0.875), near_abs.x);
+    try testing.expectEqual(@as(f64, 0.875), near_abs.y);
+    try testing.expectEqual(@as(f64, 12), near_abs.width);
+    try testing.expectEqual(@as(f64, 8), near_abs.height);
+}
+
+test "pick hit-tests fractional world placement and returns the topmost node" {
+    const allocator = testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    // The literals are the world points and edges the hit test must use.
+    // A world rect is half-open: the left/top edge is inside, the
+    // right/bottom edge is not.
+    const scene = try makeScene(allocator, &io, &log_cfg);
+    defer scene.deinit();
+
+    var dummy: DummyTexture = .{};
+    var tex: texture_mod.Texture = .{ .impl = &dummy_texture_impl, .data = &dummy, .width = 64, .height = 32 };
+
+    // World rects: back [4.5, 24.5)², front [12.5, 32.5)²,
+    // nested [111, 121) x [220.375, 230.375).
+    // Two overlapping surfaces; front is appended last, so it draws on
+    // top and owns the overlap.
+    const back = try SceneNode.create(allocator, scene.root, .buffer);
+    back.setPosition(4.5, 4.5);
+    back.kind.buffer.texture = &tex;
+    back.kind.buffer.dst_width = 20;
+    back.kind.buffer.dst_height = 20;
+
+    const front = try SceneNode.create(allocator, scene.root, .buffer);
+    front.setPosition(12.5, 12.5);
+    front.kind.buffer.texture = &tex;
+    front.kind.buffer.dst_width = 20;
+    front.kind.buffer.dst_height = 20;
+
+    // A surface nested under an offset tree: the hit test must add the
+    // ancestors' fractions, not just the node's own.
+    const tree = try SceneNode.create(allocator, scene.root, .tree);
+    tree.setPosition(100.5, 200.25);
+    const nested = try SceneNode.create(allocator, tree, .buffer);
+    nested.setPosition(10.5, 20.125);
+    nested.kind.buffer.texture = &tex;
+    nested.kind.buffer.dst_width = 10;
+    nested.kind.buffer.dst_height = 10;
+
+    // The overlap belongs to the topmost drawable node.
+    try testing.expect(scene.pick(15.0, 15.0) == front);
+    // A band only one node covers selects that node.
+    try testing.expect(scene.pick(5.0, 5.0) == back);
+    try testing.expect(scene.pick(111.0, 220.375) == nested);
+
+    // The fractional left/top edge is inside the rect; the right/bottom
+    // edge is not (the rect is half-open).
+    try testing.expect(scene.pick(4.5, 5.0) == back);
+    try testing.expect(scene.pick(24.5, 5.0) == null);
+    // A quarter world px left of that edge is outside it: the hit test
+    // must not round a node's edge down to a whole pixel.
+    try testing.expect(scene.pick(4.25, 5.0) == null);
+
+    // The nested chain, same two rules against the fractional origin
+    // the ancestor offsets produce (100.5 + 10.5 = 111,
+    // 200.25 + 20.125 = 220.375).
+    try testing.expect(scene.pick(121.0, 220.5) == null);
+    try testing.expect(scene.pick(110.5, 220.5) == null);
+
+    // Decoration is not a hit target: a rect drawn over the overlap does
+    // not steal the seat's pick.
+    const decoration = try SceneNode.create(allocator, scene.root, .rect);
+    decoration.setPosition(15.0, 15.0);
+    decoration.kind.rect.width = 200;
+    decoration.kind.rect.height = 200;
+    try testing.expect(scene.pick(15.0, 15.0) == front);
+
+    // A disabled or non-pickable surface is transparent to the seat:
+    // the node below it is the hit.
+    front.enable(false);
+    try testing.expect(scene.pick(15.0, 15.0) == back);
+    front.enable(true);
+    front.pickable = false;
+    try testing.expect(scene.pick(15.0, 15.0) == back);
+}
+
+test "pick hit-tests a surface far from the origin at fractional edges" {
+    const allocator = testing.allocator;
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var io = io_impl.io();
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    // A surface 7e9 px from the origin, where one f64 ulp is ~1e-6 and
+    // an integer world cannot hold the position at all. Every probe sits
+    // a quarter world pixel from one of its edges: narrowing either side
+    // first collapses each probe onto the edge and the hit test has no
+    // answer left.
+    const scene = try makeScene(allocator, &io, &log_cfg);
+    defer scene.deinit();
+
+    var dummy: DummyTexture = .{};
+    var tex: texture_mod.Texture = .{ .impl = &dummy_texture_impl, .data = &dummy, .width = 64, .height = 32 };
+
+    const origin_x: f64 = 7_000_000_000.5;
+    const origin_y: f64 = -3_000_000_000.25;
+    const far = try SceneNode.create(allocator, scene.root, .buffer);
+    far.setPosition(origin_x, origin_y);
+    far.kind.buffer.texture = &tex;
+    far.kind.buffer.dst_width = 40;
+    far.kind.buffer.dst_height = 40;
+
+    // Inside: a quarter world px inside the far edge is a hit.
+    try testing.expect(scene.pick(origin_x + 39.75, origin_y + 39.75) == far);
+    // The edge itself and a quarter pixel beyond it are not.
+    try testing.expect(scene.pick(origin_x + 40, origin_y + 20) == null);
+    try testing.expect(scene.pick(origin_x + 40.25, origin_y + 20) == null);
+    // The same rules on the near edges.
+    try testing.expect(scene.pick(origin_x + 0.25, origin_y + 20) == far);
+    try testing.expect(scene.pick(origin_x - 0.25, origin_y + 20) == null);
+}
+

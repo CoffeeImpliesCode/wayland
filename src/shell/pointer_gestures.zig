@@ -155,10 +155,13 @@
 //! - Coordinates are converted to whole pixels ONCE, at the entry
 //!   boundary (touchPixel, below), so every threshold on this path is
 //!   the pointer path's exact integer square comparison on the same i32
-//!   pixel space — no float, no rounding, no second numeric model.
-//!   The seat stores whole pixels anyway (`@floatFromInt(p.sx)` of its
-//!   i32 pick, Seat.touchDown), so the conversion is the identity for
-//!   every point this compositor produces.
+//!   pixel space — no float, no rounding, no second numeric model once
+//!   the point is in. The thresholds themselves (swipe_threshold_px,
+//!   pinch_threshold_px) are whole pixels, so this is the integer
+//!   boundary the module's own policy is expressed in. The seat stores
+//!   the hit test's surface-local point at f64 (Seat.touchDown), which
+//!   a camera inverse can place off the pixel grid; the conversion here
+//!   is below a pixel per event, and a run of deltas telescopes.
 //! - TOUCH PINCH: the pair (the two points that were down when the
 //!   second finger landed) is PINNED once and its exact squared
 //!   separation kept as the denominator of every later scale
@@ -279,16 +282,16 @@ fn fixedFromDouble(d: f64) Fixed {
 /// arithmetic and the two paths cannot drift apart.
 const Point = struct { x: i32, y: i32 };
 
-/// Seat.TouchPoint carries f64, but every comparator in this module is
-/// an exact integer square comparison, so a touch position is converted
-/// to WHOLE PIXELS exactly once, here, at the entry boundary. The
-/// conversion is the IDENTITY for every point this compositor produces
-/// — the seat stores `@floatFromInt(p.sx)` of its own i32 pick result
-/// (Seat.touchDown) — so the rounding matters only for a backend that
-/// reports sub-pixel positions, and it is the rule the seat itself
-/// applies to one (Seat.pickCoord, `@intFromFloat(@round(v))`). NaN
-/// fails every comparison and maps to zero with an out-of-range value
-/// rather than trapping @intFromFloat.
+/// Seat.TouchPoint carries f64 (the seat stores the hit test's own
+/// surface-local point, which a camera inverse can put on a fraction of
+/// a pixel), but every comparator in this module is an exact integer
+/// square comparison against a whole-pixel threshold, so a touch
+/// position is converted to WHOLE PIXELS exactly once, here, at the
+/// entry boundary. This is a genuine integer boundary — the module's
+/// own thresholds (swipe_threshold_px, pinch_threshold_px) are whole
+/// pixels — and it is below a pixel per event, so it cannot drift the
+/// detection. NaN fails every comparison and maps to zero with an
+/// out-of-range value rather than trapping @intFromFloat.
 fn touchPixel(v: f64) i32 {
     // The bounds are the pointer path's i32 pixel range, so a converted
     // touch position is the same kind of number squaredDistance and
@@ -1719,7 +1722,7 @@ const PickState = struct {
 
 fn testPick(ctx: *anyopaque, x: i32, y: i32) ?seat_mod.Seat.PickResult {
     const st: *PickState = @ptrCast(@alignCast(ctx));
-    if (st.surface) |s| return .{ .surface = s, .sx = x, .sy = y };
+    if (st.surface) |s| return .{ .surface = s, .sx = @floatFromInt(x), .sy = @floatFromInt(y) };
     return null;
 }
 

@@ -389,3 +389,101 @@ test "parseEnv rejects garbage" {
     try testing.expect(parseEnv("cx=1.5,,zoom=2", 800, 600) == null); // empty field
     try testing.expect(parseEnv("cx=1.5;zoom=2", 800, 600) == null); // wrong separator
 }
+
+test "camera far from the origin keeps sub-pixel world offsets" {
+    // A world 5e9 px from the origin, where one f64 ulp is already ~1e-6:
+    // an integer world cannot reach this position at all, let alone hold
+    // a quarter-pixel offset in it. Both mapping directions carry it.
+    const cam: Camera = .{
+        .center_x = 5_000_000_000.5,
+        .center_y = -5_000_000_000.25,
+        .zoom = 0.25,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    // The camera centre is the viewport centre at any world magnitude.
+    const c = cam.worldToScreen(cam.center_x, cam.center_y);
+    try testing.expectApproxEqAbs(400.0, c.x, 1e-9);
+    try testing.expectApproxEqAbs(300.0, c.y, 1e-9);
+
+    // Forward: a quarter world px off the centre is 1/16 of a screen px
+    // at this zoom — a whole-pixel result would mean the fraction was
+    // dropped on the way out.
+    const s = cam.worldToScreen(cam.center_x + 0.25, cam.center_y - 0.5);
+    try testing.expectApproxEqAbs(400.0 + 0.0625, s.x, 1e-9);
+    try testing.expectApproxEqAbs(300.0 - 0.125, s.y, 1e-9);
+
+    // Inverse: the same point comes back at its offset from the centre,
+    // not snapped onto it. The tolerance is the coordinate's own
+    // representation resolution at 5e9 (a few ulp) — far tighter than
+    // the whole-pixel snap an integer world imposes.
+    const w = cam.screenToWorld(s.x, s.y);
+    try testing.expectApproxEqAbs(cam.center_x + 0.25, w.x, 1e-4);
+    try testing.expectApproxEqAbs(cam.center_y - 0.5, w.y, 1e-4);
+
+    // The culling rect keeps the same fractional edges: zoom 0.25 shows
+    // 800/0.25 = 3200 world px across.
+    const vis = cam.visibleWorldRect();
+    try testing.expectApproxEqAbs(cam.center_x - 1600.0, vis.x, 1e-4);
+    try testing.expectApproxEqAbs(cam.center_y - 1200.0, vis.y, 1e-4);
+    try testing.expectApproxEqAbs(3200.0, vis.width, 1e-4);
+    try testing.expectApproxEqAbs(2400.0, vis.height, 1e-4);
+}
+
+test "camera rotated far from the origin: forward and inverse agree within representation error" {
+    const cam: Camera = .{
+        .center_x = -7_000_000_000.5,
+        .center_y = 3_000_000_000.75,
+        .zoom = 0.25,
+        .rotation = 0.7,
+        .screen_w = 1920,
+        .screen_h = 1080,
+    };
+    // At 7e9 one f64 ulp is ~1e-6, so the round trip agrees to a few ulp
+    // rather than to the 1e-9 the near-origin cameras reach, and stays
+    // orders of magnitude tighter than the whole-pixel resolution an
+    // integer world would impose.
+    const tol = 1e-4;
+    const probes = [_][2]f64{
+        .{ 0, 0 },
+        .{ 1, 0 },
+        .{ 0, 1 },
+        .{ 1, 1 },
+        .{ -1, 1 },
+        .{ 0.25, -0.5 },
+        .{ 100, -100 },
+    };
+    for (probes) |d| {
+        const wx = cam.center_x + d[0];
+        const wy = cam.center_y + d[1];
+        const s = cam.worldToScreen(wx, wy);
+        const w = cam.screenToWorld(s.x, s.y);
+        try testing.expectApproxEqAbs(wx, w.x, tol);
+        try testing.expectApproxEqAbs(wy, w.y, tol);
+    }
+
+    // Rotation does not snap the offset away: a quarter world px on the
+    // x axis lands a quarter zoom px off the viewport centre, rotated.
+    const off = cam.worldToScreen(cam.center_x + 0.25, cam.center_y);
+    try testing.expectApproxEqAbs(960.0 + 0.25 * 0.25 * @cos(cam.rotation), off.x, 1e-9);
+    try testing.expectApproxEqAbs(540.0 - 0.25 * 0.25 * @sin(cam.rotation), off.y, 1e-9);
+
+    // The input path and the cull path read the same transform: every
+    // viewport corner back-transforms inside the visible world rect.
+    // The margin is a few ulp at this magnitude (re-deriving the AABB
+    // edge from min+width rounds), still far below a whole world px.
+    const vis = cam.visibleWorldRect();
+    const eps = 1e-4;
+    const corners = [_][2]f64{
+        .{ 0, 0 },
+        .{ 1920, 0 },
+        .{ 0, 1080 },
+        .{ 1920, 1080 },
+    };
+    for (corners) |k| {
+        const corner = cam.screenToWorld(k[0], k[1]);
+        try testing.expect(corner.x >= vis.x - eps and corner.x <= vis.x + vis.width + eps);
+        try testing.expect(corner.y >= vis.y - eps and corner.y <= vis.y + vis.height + eps);
+    }
+}

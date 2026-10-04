@@ -4,8 +4,18 @@
 //! announces an output. On bind the current state is sent (geometry,
 //! mode, scale, name, description, done). Committed mode/scale/transform
 //! changes are re-broadcast to every bound resource with a coalesced
-//! done (wlroots output_apply_state + schedule_done). Output destruction
-//! removes the global and frees the module state.
+//! done (wlroots output_apply_state + schedule_done).
+//!
+//! Output teardown is two-phased and this module spans both. The destroy
+//! phase (Output.events.destroy) only stops the world from hearing about
+//! the output again: the global is withdrawn and the coalesced done is
+//! dropped, while every bound resource stays LIVE and addressable — that
+//! is when the compositor still has to send a real wl_surface.leave
+//! naming this output (scene/surface_node.zig sendEnter). Freeing
+//! anything here would strand those events. The finalize phase
+//! (Output.events.finalize) runs after every consumer listener: it hands
+//! each resource back to its client as an inert, release-only object,
+//! detaches this module's listeners and frees the module state.
 //!
 //! Imports: utils/*, core/wire.zig, core/display.zig, output/output.zig
 //! (sibling modules).
@@ -31,9 +41,18 @@ pub const WlOutput = struct {
     display: *display_mod.CompositorDisplay,
     global: ?*wire.Global = null,
     /// Per-client wl_output resources; also the identity check for
-    /// protocols that take a wl_output argument (screencopy).
+    /// protocols that take a wl_output argument (screencopy). A resource
+    /// the client destroys is removed here by its own destroy callback,
+    /// so a rebroadcast never reaches a freed Resource.
     resources: std.ArrayList(*server.wl.Output) = .empty,
+    /// output.events.destroy: the output died. Its consumers still have to
+    /// reach their clients through this module, so nothing is freed and no
+    /// resource is touched here — see the module doc.
     destroy_listener: wire.Listener(*Output),
+    /// output.events.finalize: every destroy listener has run, so the
+    /// resources can be handed back to their clients and this module can
+    /// be released while the output itself is still readable.
+    finalize_listener: wire.Listener(*Output),
     /// Re-broadcast changed state (mode/scale/transform) to every bound
     /// resource and coalesce the trailing done into one idle callback
     /// (wlroots schedule_done, output.c:169-176).
@@ -64,6 +83,7 @@ pub const WlOutput = struct {
             .display = display,
             .resources = .empty,
             .destroy_listener = wire.Listener(*Output).init(onOutputDestroy),
+            .finalize_listener = wire.Listener(*Output).init(onOutputFinalize),
             .commit_listener = wire.Listener(*Output.CommitEvent).init(onOutputCommit),
             .name = name,
             .description = description,
@@ -71,6 +91,7 @@ pub const WlOutput = struct {
         errdefer self.resources.deinit(allocator);
         self.global = try display.addGlobal(server.wl.Output, *WlOutput, bindOutput, output_version, self);
         output.events.destroy.add(&self.destroy_listener);
+        output.events.finalize.add(&self.finalize_listener);
         output.events.commit.add(&self.commit_listener);
         log.debug("wl_output global for {d}x{d}", io, log_cfg, "wl_output", .{
             output.mode.width, output.mode.height,
@@ -188,25 +209,90 @@ pub const WlOutput = struct {
             cli.postNoMemory();
             return;
         };
-        resource.setHandler(*WlOutput, outputRequest, null, wl_output);
+        resource.setHandler(*WlOutput, outputRequest, outputResourceDestroy, wl_output);
         wl_output.resources.append(wl_output.allocator, resource) catch {
+            // The resource exists but never entered the list: destroy it
+            // now. Leaving it alive would keep a live object's destroy
+            // callback pointing at a list that never held it, and the
+            // no-memory error makes the client go away anyway.
+            resource.destroy();
             cli.postNoMemory();
             return;
         };
         wl_output.sendState(resource);
     }
 
+    /// The output died: withdraw the global and drop the coalesced done,
+    /// and free nothing. The bound resources must survive this phase —
+    /// the compositor's own destroy listeners still send wl_surface.leave
+    /// events naming THIS output through them, and they are the only
+    /// way the client learns the output is gone. The module state goes in
+    /// the finalize phase.
     fn onOutputDestroy(listener: *wire.Listener(*Output), _: *Output) void {
         const self: *WlOutput = @fieldParentPtr("destroy_listener", listener);
-        if (self.done_source) |src| src.remove();
-        if (self.global) |g| g.remove();
+        self.dropIdle();
+        if (self.global) |g| {
+            g.destroy();
+            self.global = null;
+        }
+    }
+
+    /// Every destroy listener has run, so nothing may reach a client
+    /// through this module any more. Each surviving resource becomes an
+    /// inert release-only object — the client may still hold it and must
+    /// be able to release it without touching freed state — and the
+    /// module frees itself. `output` is still readable here; the Output
+    /// itself is freed by the caller after this signal.
+    fn onOutputFinalize(listener: *wire.Listener(*Output), _: *Output) void {
+        const self: *WlOutput = @fieldParentPtr("finalize_listener", listener);
+        for (self.resources.items) |res| {
+            res.setHandler(?*WlOutput, inertOutputRequest, null, null);
+        }
+        self.dropIdle();
+        if (self.global) |g| {
+            g.destroy();
+            self.global = null;
+        }
+        self.finalize_listener.link.remove();
+        self.destroy_listener.link.remove();
+        self.commit_listener.link.remove();
         const allocator = self.allocator;
         self.resources.deinit(allocator);
         allocator.destroy(self);
     }
+
+    /// Cancel the coalesced-done idle source, once. Nulling the field
+    /// keeps a second teardown pass from removing it again.
+    fn dropIdle(self: *WlOutput) void {
+        if (self.done_source) |src| {
+            self.done_source = null;
+            src.remove();
+        }
+    }
 };
 
 fn outputRequest(resource: *server.wl.Output, request: server.wl.Output.Request, _: *WlOutput) void {
+    switch (request) {
+        .release => resource.destroy(),
+    }
+}
+
+/// The client destroyed a wl_output it had bound here (wl_output.release
+/// or a client teardown): drop it from the broadcast list NOW. A resource
+/// left in the list is freed memory the next mode/scale commit would send
+/// an event to.
+fn outputResourceDestroy(resource: *server.wl.Output, wl_output: *WlOutput) void {
+    const idx = std.mem.indexOfScalar(*server.wl.Output, wl_output.resources.items, resource) orelse return;
+    _ = wl_output.resources.orderedRemove(idx);
+}
+
+/// A wl_output whose output died: the resource stays alive because the
+/// client still holds it, but nothing about it may reach the freed
+/// WlOutput any more. The only request the protocol defines is release,
+/// which frees the resource itself — that is the whole contract of an
+/// inert object. The null user data is what makes it inert (the generated
+/// setHandler takes a nullable data type for exactly this case).
+fn inertOutputRequest(resource: *server.wl.Output, request: server.wl.Output.Request, _: ?*WlOutput) void {
     switch (request) {
         .release => resource.destroy(),
     }
@@ -330,8 +416,9 @@ const TestServer = struct {
         );
         ts.output = out;
         errdefer if (ts.output) |o| o.destroy();
-        // The wl_output global is freed by onOutputDestroy when the output
-        // is destroyed; no separate teardown.
+        // Output.destroy runs both teardown phases: the destroy phase
+        // withdraws the global, the finalize phase frees this module. No
+        // separate teardown here.
         ts.wl_output = try WlOutput.create(
             allocator,
             &ts.io,
@@ -366,7 +453,8 @@ const TestServer = struct {
     fn deinit(ts: *TestServer) void {
         if (ts.c_display) |d| d.disconnect();
         if (ts.client) |c| c.destroy();
-        // Output.destroy emits the destroy signal, which frees the WlOutput.
+        // Output.destroy frees the WlOutput in its finalize phase, after
+        // every destroy listener has run.
         if (ts.output) |o| o.destroy();
         if (ts.backend) |b| b.destroy();
         if (ts.display) |d| d.deinit();
@@ -471,4 +559,62 @@ test "mode/scale commit rebroadcasts to bound resources with a coalesced done" {
     try std.testing.expectEqual(@as(usize, 2), events.geometry_count);
     try std.testing.expectEqual(@as(usize, 2), events.scale_count);
     try std.testing.expectEqual(@as(usize, 2), events.done_count);
+}
+
+test "releasing one wl_output leaves another binding receiving mode changes" {
+    const ts = try TestServer.init(std.testing.allocator, 4);
+    defer ts.deinit();
+    var first_events: OutputEvents = .{};
+    ts.wl_output_proxy.?.setListener(*OutputEvents, OutputEvents.listener, &first_events);
+    try ts.pump();
+    const registry = try ts.c_display.?.getRegistry();
+    var capture: RegistryCapture = .{};
+    registry.setListener(*RegistryCapture, RegistryCapture.listener, &capture);
+    try ts.pump();
+    const survivor = try registry.bind(capture.output_name.?, client.wl.Output, 4);
+    var survivor_events: OutputEvents = .{};
+    survivor.setListener(*OutputEvents, OutputEvents.listener, &survivor_events);
+    try ts.pump();
+    try std.testing.expectEqual(@as(i32, 1920), survivor_events.mode_width);
+
+    ts.wl_output_proxy.?.release();
+    ts.wl_output_proxy = null;
+    try ts.pump();
+    var state = Output.State.init(std.testing.allocator);
+    defer state.deinit();
+    state.committed = Output.State.committed_mode;
+    state.mode = .{ .width = 1280, .height = 720, .refresh_msec = 16 };
+    try ts.output.?.commitState(&state);
+    try ts.pump();
+    try std.testing.expectEqual(@as(usize, 2), survivor_events.mode_count);
+    try std.testing.expectEqual(@as(i32, 1280), survivor_events.mode_width);
+    try std.testing.expectEqual(@as(i32, 720), survivor_events.mode_height);
+}
+
+test "a bound wl_output can be released after its output is unplugged" {
+    const ts = try TestServer.init(std.testing.allocator, 4);
+    defer ts.deinit();
+    var events: OutputEvents = .{};
+    ts.wl_output_proxy.?.setListener(*OutputEvents, OutputEvents.listener, &events);
+    try ts.pump();
+    try std.testing.expectEqual(@as(i32, 1920), events.mode_width);
+    ts.output.?.destroy();
+    ts.output = null;
+    ts.wl_output = null;
+    try ts.pump();
+    ts.wl_output_proxy.?.release();
+    ts.wl_output_proxy = null;
+    try ts.pump();
+    // A live roundtrip after the release distinguishes a valid inert
+    // wl_output from a request dispatched through freed global state.
+    const callback = try ts.c_display.?.sync();
+    var done: bool = false;
+    callback.setListener(*bool, outputReleaseSync, &done);
+    try ts.pump();
+    try std.testing.expect(done);
+}
+
+fn outputReleaseSync(callback: *client.wl.Callback, _: client.wl.Callback.Event, done: *bool) void {
+    done.* = true;
+    callback.destroy();
 }

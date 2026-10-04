@@ -7,15 +7,19 @@
 // versions.
 //
 // The API used from drm.zig (documented contract):
-//   enumeration   drmModeGetResources/Connector/Encoder/Crtc/Plane*
+//   enumeration   drmModeGetResources/Connector/Encoder/Crtc/Plane* +
+//                 drmModeGetPlaneResources;
 //                 drmModeGetProperty/ObjectGetProperties + Free* pairs
-//   properties    drmModeCreatePropertyBlob/DestroyPropertyBlob
+//   properties    drmModeCreatePropertyBlob/DestroyPropertyBlob/
+//                 GetPropertyBlob (the primary plane's IN_FORMATS blob,
+//                 which is where a plane's real (format, modifier) list
+//                 comes from)
 //   atomic        drmModeAtomicAlloc/Free/AddProperty/Commit
 //   event         drmHandleEvent + drmEventContext (page_flip_handler2)
 //   caps          drmSetClientCap (DRM_CLIENT_CAP_ATOMIC)
 //   ioctl         drmIoctl (DRM_IOCTL_MODE_CREATE_DUMB / MAP_DUMB /
-//                 DESTROY_DUMB / ADDFB2 / RM_FB / SET_MASTER / DROP_MASTER)
-//   fourcc        DRM_FORMAT_ARGB8888 (drm_fourcc.h)
+//                 DESTROY_DUMB / ADDFB2 / SET_MASTER / DROP_MASTER)
+//   fourcc        DRM_FORMAT_XRGB8888 (drm_fourcc.h)
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm.h>

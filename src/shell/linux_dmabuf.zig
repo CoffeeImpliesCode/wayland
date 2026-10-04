@@ -44,13 +44,15 @@
 //!
 //! # Buffer lifetime
 //! `create` / `create_immed` produce a `wl_buffer` resource plus a
-//! `buffer.Buffer` wrapper (buffers/buffer.zig). The wrapper is owned by
-//! this module: `buffers` is the live set, `dead_buffers` the graveyard
-//! for wrappers whose wl_buffer the client already destroyed but which a
-//! surface may still hold a lock on. This is the same discipline
-//! buffers/shm.zig uses, and for the same reason: freeing a wrapper from
-//! inside the resource-destroy signal would be a use-after-free for a
-//! surface that still references it.
+//! `buffer.Buffer` wrapper (buffers/buffer.zig). This module owns the
+//! PROTOCOL half — the `buffers` registry and the per-wl_buffer wrapper
+//! that answers the Buffer's release signal with wl_buffer.release — and
+//! it drops both the moment the client destroys the wl_buffer.
+//!
+//! The PIXELS do not live there. `Buffer.destroy` keeps the wrapper and
+//! its gbm bo alive until the last consumer lock drops, so a surface or
+//! a GL texture still reading them keeps them valid, and nothing needs a
+//! graveyard to wait out the reader.
 //!
 //! Cross-module contract:
 //!   - `init` needs a `*dmabuf.Device` and owns nothing but its own state;
@@ -105,15 +107,6 @@ pub const LinuxDmabuf = struct {
     /// recycled resource pointer must get a fresh wrapper, so the entry
     /// is dropped on resource destruction).
     buffers: std.AutoHashMap(*wire.Resource, *DmabufBuffer) = undefined,
-    /// Wrappers whose wl_buffer is gone but which a surface may still
-    /// reference; freed by deinit.
-    dead_buffers: std.ArrayList(*DmabufBuffer) = .empty,
-    /// Fixed-size overflow for the graveyard when its append OOMs: a
-    /// wrapper with outstanding consumer locks cannot be freed inside the
-    /// destroy signal, so it parks here (no allocation) until deinit. A
-    /// full stash leaks — bounded, OOM-only, the same trade shm.zig makes.
-    dead_stash: [8]?*DmabufBuffer = [_]?*DmabufBuffer{null} ** 8,
-    dead_stash_len: usize = 0,
 
     pub const InitError = error{ OutOfMemory, FormatTableFailed, GlobalCreateFailed };
 
@@ -176,18 +169,15 @@ pub const LinuxDmabuf = struct {
         }
         // Destroy the wl_buffers we still own. Each destroy runs
         // bufferResourceDestroy, which takes the entry out of the
-        // registry and parks the wrapper, so the iterator restarts from
-        // the top every round (shm.zig's deinit shape).
+        // registry, retires the protocol wrapper and hands the Buffer to
+        // its deferred teardown, so the iterator restarts from the top
+        // every round.
         while (self.buffers.count() > 0) {
             var it = self.buffers.keyIterator();
             const key = (it.next() orelse unreachable).*;
             const state = self.buffers.get(key).?;
             state.res.?.destroy();
         }
-        for (self.dead_stash[0..self.dead_stash_len]) |state| state.?.finish();
-        self.dead_stash_len = 0;
-        for (self.dead_buffers.items) |state| state.finish();
-        self.dead_buffers.deinit(allocator);
         self.buffers.deinit();
         allocator.free(self.indices);
         if (self.table_fd >= 0) {
@@ -530,9 +520,10 @@ fn paramsCreate(
             return;
         },
     };
-    // The registry owns the wrapper, so `tracked` stays true: the surface
-    // only ever destroys UNtracked wrappers (surface.zig:430, :617), and
-    // LinuxDmabuf.deinit is the single place the wrapper is freed.
+    // `tracked` stays true: this module owns the wrapper, so the surface
+    // must not destroy it when it stops using it — the wl_buffer resource
+    // does, exactly once, and the Buffer keeps the backing until the last
+    // consumer is done.
 
     const client_wire = res.getClient();
     const wl_buffer = server.wl.Buffer.create(client_wire, 1, buffer_id) catch {
@@ -553,12 +544,15 @@ fn paramsCreate(
         .buf = buf,
         .release = wire.Listener(*Buffer).init(onBufferRelease),
     };
+    // Listener.init leaves the intrusive link undefined, and
+    // bufferResourceDestroy removes it unconditionally: put it in the
+    // removable detached state before the wrapper can reach a destroy.
+    state.release.link.init();
     wl_buffer.setHandler(*DmabufBuffer, wlBufferRequest, bufferResourceDestroy, state);
     linux.buffers.put(@ptrCast(wl_buffer), state) catch {
-        state.release.link.remove();
-        linux.allocator.destroy(state);
+        // The destroy retires the wrapper and the Buffer with it, so
+        // nothing here may touch `state` afterwards.
         wl_buffer.destroy();
-        Buffer.destroy(buf);
         res.postNoMemory();
         return;
     };
@@ -596,9 +590,10 @@ fn postValidationError(res: *zwp.LinuxBufferParamsV1, err: dmabuf.ValidationErro
 // The wl_buffer the params object produces
 // ---------------------------------------------------------------------------
 
-/// Per-wl_buffer state: the wire resource, the compositor Buffer and the
-/// listener that answers the Buffer's release signal with
-/// wl_buffer.release.
+/// Per-wl_buffer protocol state: the wire resource, the compositor
+/// Buffer and the listener that answers the Buffer's release signal with
+/// wl_buffer.release. It dies WITH the wire resource; the Buffer it
+/// describes outlives it and carries the backing on its own.
 const DmabufBuffer = struct {
     allocator: std.mem.Allocator,
     linux: *LinuxDmabuf,
@@ -606,15 +601,6 @@ const DmabufBuffer = struct {
     res: ?*server.wl.Buffer,
     buf: *Buffer,
     release: wire.Listener(*Buffer),
-
-    /// Free the wrapper and the Buffer. Only legal from deinit: the
-    /// Buffer may still be referenced by a surface, and Buffer.destroy
-    /// emits a signal, so it must not run inside a destroy handler.
-    fn finish(self: *DmabufBuffer) void {
-        self.release.link.remove();
-        Buffer.destroy(self.buf);
-        self.allocator.destroy(self);
-    }
 };
 
 fn wlBufferRequest(res: *server.wl.Buffer, request: server.wl.Buffer.Request, _: *DmabufBuffer) void {
@@ -623,34 +609,26 @@ fn wlBufferRequest(res: *server.wl.Buffer, request: server.wl.Buffer.Request, _:
     }
 }
 
-/// The client destroyed the wl_buffer resource. The Buffer itself lives
-/// on: a surface may still hold a lock on it, and the backing gbm_bo must
-/// stay valid until then (the same graveyard discipline as
-/// buffers/shm.zig's resourceDestroy).
+/// The client destroyed the wl_buffer resource. The protocol wrapper
+/// goes away with it: the registry entry, the release listener and the
+/// wrapper itself. What survives is the Buffer and its gbm bo, which
+/// `Buffer.destroy` holds until the last consumer unlock — a renderer
+/// still sampling the pixels keeps them valid, and a consumer still
+/// drawing from them keeps the wrapper's data reachable. That deferred
+/// teardown is why no graveyard is needed here.
 fn bufferResourceDestroy(res: *server.wl.Buffer, state: *DmabufBuffer) void {
     const linux = state.linux;
     _ = res;
     // Remove the registry entry first: libwayland recycles freed resource
     // memory, and a recycled pointer must resolve to a fresh wrapper.
-    _ = linux.buffers.remove(@ptrCast(@as(*server.wl.Buffer, @ptrCast(state.res.?))));
-    // Invalidate before the graveyard append: if the append OOMs the
-    // wrapper is unreachable and must not keep pointing at the freed
-    // client resource.
+    _ = linux.buffers.remove(@ptrCast(state.res.?));
     state.res = null;
     if (!state.buf.dropped) state.buf.drop();
-
-    linux.dead_buffers.append(linux.allocator, state) catch {
-        if (state.buf.n_locks == 0) {
-            // Safe inside the destroy signal: nothing else runs in this
-            // emission for this wrapper, and the surface-side listeners
-            // that follow only compare resource pointers.
-            state.finish();
-        } else if (linux.dead_stash_len < linux.dead_stash.len) {
-            linux.dead_stash[linux.dead_stash_len] = state;
-            linux.dead_stash_len += 1;
-        }
-        // Stash full: the wrapper leaks at deinit (bounded, OOM-only).
-    };
+    // Detach before the wrapper is freed: the Buffer may outlive us and
+    // fire its release signal again.
+    state.release.link.remove();
+    Buffer.destroy(state.buf);
+    state.allocator.destroy(state);
 }
 
 /// The compositor is done with the buffer (dropped && n_locks == 0): tell
@@ -744,6 +722,7 @@ const FakeDevice = struct {
     formats: []const dmabuf.Format,
     /// How many imports reached us (valid or not).
     imports: u32 = 0,
+    destroyed_backings: u32 = 0,
     /// Make the next import fail the way a driver rejection does.
     fail_next: bool = false,
     /// The interface view. `ptr` is filled in by `device`, because it must
@@ -753,6 +732,7 @@ const FakeDevice = struct {
     const FakeData = struct {
         width: i32,
         height: i32,
+        owner: *FakeDevice,
     };
 
     const impl: buffer_mod.Impl = .{
@@ -765,6 +745,7 @@ const FakeDevice = struct {
 
     fn fakeDestroy(allocator: std.mem.Allocator, data: *anyopaque) void {
         const d: *FakeData = @ptrCast(@alignCast(data));
+        d.owner.destroyed_backings += 1;
         allocator.destroy(d);
     }
 
@@ -794,7 +775,7 @@ const FakeDevice = struct {
         if (self.fail_next) return error.ImportFailed;
         const d = try allocator.create(FakeData);
         errdefer allocator.destroy(d);
-        d.* = .{ .width = attrs.width, .height = attrs.height };
+        d.* = .{ .width = attrs.width, .height = attrs.height, .owner = self };
         return Buffer.init(allocator, &impl, d, attrs.width, attrs.height);
     }
 
@@ -1550,7 +1531,7 @@ test "create on an import the device refuses is the failed event, not an error" 
     try testing.expectEqual(@as(usize, 0), ts.linux.?.buffers.count());
 }
 
-test "a client that destroys its wl_buffer frees the registry entry but not the wrapper" {
+test "destroying a DMA-BUF resource retains its backing only until the final consumer unlocks" {
     const allocator = testing.allocator;
     var ts = try TestServer.init(allocator);
     defer ts.deinit();
@@ -1563,17 +1544,15 @@ test "a client that destroys its wl_buffer frees the registry entry but not the 
     params.create(64, 64, dmabuf.drm_format_xrgb8888, .{});
     try ts.pump();
     const wl_buffer = cap.created.?;
-    try testing.expectEqual(@as(usize, 1), ts.linux.?.buffers.count());
-    try testing.expectEqual(@as(usize, 0), ts.linux.?.dead_buffers.items.len);
-
-    // The registry entry must go with the resource: libwayland recycles
-    // freed resource memory, and a recycled pointer has to resolve to a
-    // fresh wrapper. The wrapper itself survives, because a surface may
-    // still hold a lock on the Buffer.
+    const resource = ts.serverBuffer(wl_buffer.getId()) orelse return error.NoServerBuffer;
+    const buffer = ts.linux.?.fromResource(@ptrCast(resource)) orelse return error.NoBuffer;
+    try buffer.lock();
+    try testing.expectEqual(@as(u32, 0), ts.fake.?.destroyed_backings);
     wl_buffer.destroy();
     try ts.pump();
-    try testing.expectEqual(@as(usize, 0), ts.linux.?.buffers.count());
-    try testing.expectEqual(@as(usize, 1), ts.linux.?.dead_buffers.items.len);
+    try testing.expectEqual(@as(u32, 0), ts.fake.?.destroyed_backings);
+    buffer.unlock();
+    try testing.expectEqual(@as(u32, 1), ts.fake.?.destroyed_backings);
 }
 
 test "a buffer created through the global reaches the surface's buffer and damage path" {
@@ -1657,11 +1636,4 @@ test "the compositor finishing with a buffer sends wl_buffer.release" {
     try ts.pump();
     try testing.expectEqual(@as(u32, 2), releases);
 
-    // Destroying the resource while the compositor still holds the
-    // wrapper must not crash: the wrapper goes to the graveyard and the
-    // release listener becomes a no-op.
-    wl_buffer.destroy();
-    try ts.pump();
-    try testing.expectEqual(@as(usize, 1), ts.linux.?.dead_buffers.items.len);
-    try testing.expectEqual(@as(usize, 0), ts.linux.?.buffers.count());
 }

@@ -20,7 +20,10 @@
 //            gbm_bo_get_modifier / gbm_bo_get_fd_for_plane /
 //            gbm_bo_get_offset / gbm_bo_get_stride_for_plane /
 //            gbm_bo_set_user_data / gbm_bo_get_user_data
-//   usage    GBM_BO_USE_SCANOUT / GBM_BO_USE_RENDERING
+//   alloc    gbm_bo_create_with_modifiers (backend/drm.zig scanout
+//            slots: allocate a scanout buffer in one specific layout the
+//            plane actually reports, instead of guessing LINEAR)
+//   usage    GBM_BO_USE_SCANOUT / GBM_BO_USE_RENDERING / GBM_BO_USE_LINEAR
 //
 // drm_fourcc.h is deliberately NOT included here: the fourccs the
 // compositor needs are hard-coded next to their DRM_FORMAT_* names in

@@ -134,27 +134,29 @@ pub fn parseRendererEnv(value: ?[]const u8) ?RendererKind {
     return null;
 }
 
-/// The renderer's scene -> target affine for `cam`: the camera's
-/// world -> screen map as the one `mat3` the GLES2 shader uploads, so
-/// a dst rect given in WORLD pixels lands exactly where
-/// `Camera.worldToScreen` puts it.
+/// The renderer's scene -> target affine for `cam`, for CAMERA-RELATIVE
+/// world coordinates.
 ///
 /// camera.zig defines
 ///
-///     M = T(W/2, H/2) . S(zoom) . R(-rotation) . T(-center)
+///     p_screen = zoom * R(-rotation) * (p_world - center) + (W/2, H/2)
 ///
-/// i.e. p_screen = zoom * R(-rotation) * (p_world - center) + (W/2, H/2).
-/// `Affine.m` is COLUMN-major (gles2.zig:188), so the linear part
+/// and the GLES2 shader multiplies every dst rect by `u_transform`. The
+/// server hands the shader `p_world - center` (compositeBaseGles2
+/// subtracts the camera centre in f64, per surface, BEFORE the f32
+/// narrowing), so this matrix is the linear part plus the viewport
+/// centre and carries NO world offset. That split is the point of step
+/// 5: one f32 cannot represent 1e9 + 0.5, so a matrix carrying the world
+/// offset would land a distant surface tens of pixels away, while
+/// `p - center` is small and exact.
+///
+/// `Affine.m` is COLUMN-major (see gles2.Affine), so the linear part
 /// stores d x'/d x, d y'/d x, d x'/d y, d y'/d y in that order and the
 /// translation in indices 6 and 7. The arithmetic runs in f64 (the
 /// camera's own precision) and narrows once, to what the uniform takes.
 pub fn cameraAffine(cam: Camera) gles2.Affine {
     const cos_r = @cos(cam.rotation);
     const sin_r = @sin(cam.rotation);
-    // R(-rotation) * (p - center), then scaled, then centered on the
-    // viewport: the translation is (W/2, H/2) minus the scaled center.
-    const tx = cam.screen_w / 2 - cam.zoom * (cos_r * cam.center_x + sin_r * cam.center_y);
-    const ty = cam.screen_h / 2 - cam.zoom * (-sin_r * cam.center_x + cos_r * cam.center_y);
     return .{ .m = .{
         @floatCast(cam.zoom * cos_r),
         @floatCast(-cam.zoom * sin_r),
@@ -162,44 +164,10 @@ pub fn cameraAffine(cam: Camera) gles2.Affine {
         @floatCast(cam.zoom * sin_r),
         @floatCast(cam.zoom * cos_r),
         0,
-        @floatCast(tx),
-        @floatCast(ty),
+        @floatCast(cam.screen_w / 2),
+        @floatCast(cam.screen_h / 2),
         1,
     } };
-}
-
-/// The world rect that `cam` maps onto the whole output, rounded OUT to
-/// whole world pixels: the background fill's dst rect for the GLES2
-/// pass. It is `Camera.visibleWorldRect` — exact at rotation 0, the
-/// conservative AABB of the back-transformed screen corners otherwise —
-/// and because the map is affine, the forward image of a superset is
-/// still a superset, so the fill can never leave a bare corner.
-fn worldRectForOutput(cam: Camera) geom.Rect {
-    const fr = cam.visibleWorldRect();
-    const x0 = @floor(fr.x);
-    const y0 = @floor(fr.y);
-    const x1 = @ceil(fr.x + fr.width);
-    const y1 = @ceil(fr.y + fr.height);
-    return .{
-        .x = finiteI32(x0),
-        .y = finiteI32(y0),
-        // The width/height are a DIFFERENCE of two coordinates that are
-        // already representable, so the subtraction cannot overflow i32
-        // for any pair this function produces; the clamp only guards the
-        // non-finite case (a zoom of 0 maps the whole world into nothing).
-        .width = finiteI32(@min(x1 - x0, @as(f64, std.math.maxInt(i32)))),
-        .height = finiteI32(@min(y1 - y0, @as(f64, std.math.maxInt(i32)))),
-    };
-}
-
-/// `v` as an i32, or 0 when it is not finite (NaN/inf, e.g. a camera
-/// zoom of 0), clamped into i32 range otherwise. A degenerate fill
-/// rect is skipped by the pass; an out-of-range one would be undefined.
-fn finiteI32(v: f64) i32 {
-    if (std.math.isNan(v)) return 0;
-    if (v <= @as(f64, std.math.minInt(i32))) return std.math.minInt(i32);
-    if (v >= @as(f64, std.math.maxInt(i32))) return std.math.maxInt(i32);
-    return @intFromFloat(v);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,20 +268,6 @@ const lock_blank_color = [4]f32{ 0.0, 0.0, 0.0, 1.0 };
 /// panning the camera.
 const drag_threshold_sq: i32 = 16; // 4 px
 
-/// The camera the server starts with: the world origin centered on the
-/// viewport center at zoom 1, no rotation, whose worldToScreen is the
-/// identity mapping. An unset or unparseable WAYLAND_CAMERA falls back to
-/// exactly this (see parseCameraEnv), and `last_camera` starts here too so
-/// the first frame observes no camera change.
-const default_camera: Camera = .{
-    .center_x = @as(f64, @floatFromInt(output_width)) / 2.0,
-    .center_y = @as(f64, @floatFromInt(output_height)) / 2.0,
-    .zoom = 1,
-    .rotation = 0,
-    .screen_w = @floatFromInt(output_width),
-    .screen_h = @floatFromInt(output_height),
-};
-
 const ServerState = struct {
     allocator: std.mem.Allocator,
     io: *std.Io,
@@ -386,33 +340,14 @@ const ServerState = struct {
     pixman_renderer: *wayland.renderer.Renderer,
     /// Which renderer `compositeBase` composites with.
     renderer_kind: RendererKind = .pixman,
-    /// The GLES2 FBO the canvas is composited into (null unless
-    /// `renderer_kind` is `.gles2`). Created at the framebuffer's size
-    /// on first use and re-created after an output resize; destroyed
-    /// with the rest of the render targets. GL objects need the
-    /// renderer's EGL context current, which it is for the whole life
-    /// of the process (Gles2Renderer.create leaves it bound and every
-    /// composite runs on this thread).
-    gles2_target: ?*gles2.Gles2Target = null,
     backend: *wayland.backend.Backend,
-    /// The display framebuffer the backends scan out, the cursor draws
-    /// into and screencopy reads (all three are CPU-side, see
-    /// compositeCanvas): with WAYLAND_RENDERER=gles2 the CANVAS is
-    /// composited on the GPU and read back into this buffer.
-    framebuffer: *pixman.Framebuffer,
-    /// M4 camera: the world→screen mapping for the canvas pass. Parsed
-    /// from WAYLAND_CAMERA in onNewOutput once the real output size is
-    /// known (the DRM mode can differ from the 1280x720 defaults); the
-    /// default camera centers the world origin on the viewport center
-    /// (zoom 1, no rotation), so worldToScreen is the identity mapping —
-    /// today's no-camera composite.
-    camera: Camera,
     /// Raw WAYLAND_CAMERA value, borrowed from the process environ
-    /// (parsed in onNewOutput with the output size).
+    /// (parsed per view, with that view's own output size).
     camera_env: ?[]const u8,
-    /// M2 scene graph: one scene and one output view (single-output server).
+    /// M2 scene graph: ONE scene shared by every output view. The views
+    /// are the per-output `OutputView`s below; the scene is their common
+    /// world (scene space = the desktop layout), never per output.
     scene: ?*wayland.scene.Scene = null,
-    scene_output: ?*wayland.scene.SceneOutput = null,
     /// M3 input: the seat (keyboard + pointer) and its input source (the
     /// raylib window when the raylib backend is active).
     seat: *wayland.seat.Seat,
@@ -428,6 +363,12 @@ const ServerState = struct {
     raylib_input: RaylibInputPtr = if (build_options.enable_raylib) null else {},
     /// The libinput backend (evdev input source), when active.
     input_backend: ?*wayland.backend.Backend = null,
+    /// The desktop extent absolute input devices are normalized onto, as
+    /// last published to `input_backend` (syncInputExtent). The record
+    /// is what keeps the setter off the per-frame path: a layout that
+    /// has not changed shape publishes nothing.
+    input_extent_w: u32 = 0,
+    input_extent_h: u32 = 0,
     /// The DRM backend's poll fd watcher state (page-flip events).
     drm_poll_fd: c_int = -1,
     /// The optional fds the loop was actually asked to watch, each -1
@@ -443,6 +384,12 @@ const ServerState = struct {
     drm_hotplug_poll_fd: c_int = -1,
     /// The DRM backend (when WAYLAND_BACKEND=drm).
     drm_backend: ?*wayland.backend.Backend = null,
+    /// GPU DRM scanout is live: the renderer was created on the backend's
+    /// GBM device and the backend accepted the renderer's renderable
+    /// format pairs BEFORE start(). Only then do per-view leased-slot
+    /// targets exist and the canvas is drawn straight into the scanout
+    /// buffer instead of being read back for a CPU front.
+    gpu_scanout: bool = false,
     // SAFETY: initialized in main() before the backend starts.
     new_input_listener: wire.Listener(*wayland.backend.Backend.InputDevice),
     /// Backend.events.input_removed: a device the new_input signal
@@ -450,8 +397,6 @@ const ServerState = struct {
     /// subscribe(); the handler forwards it to the seat so the wl_seat
     /// capability the LAST device of that kind provided is withdrawn.
     input_removed_listener: wire.Listener(*wayland.backend.Backend.InputDevice),
-    /// wl_output protocol global for the backend output.
-    wl_output: ?*wayland.wl_output.WlOutput = null,
     screencopy: ?*wayland.screencopy.Screencopy = null,
     /// The seat's pointer cursor (compositor/cursor.zig): owns the
     /// cursor scene nodes, the client cursor surface (wl_pointer.
@@ -481,7 +426,6 @@ const ServerState = struct {
     /// setTimer arms an un-armed timer, so a re-arm on a disabled watchdog
     /// would re-add it and it would still fire on an idle demo.
     watchdog_enabled: bool = true,
-    output: ?*wayland.output.Output = null,
     /// Toplevels created by clients (tracked for observability).
     toplevels: std.ArrayList(*wayland.shell.XdgToplevel) = .empty,
     /// Layer surfaces created by clients (tracked for observability).
@@ -495,42 +439,24 @@ const ServerState = struct {
     /// is grabbed by it and the pre-grab focus is restored when the
     /// pointer leaves. Null while no grab is active.
     layer_kbd_grab: ?LayerKbdGrab = null,
-    frames_rendered: u32 = 0,
-    /// Idle-frame skip: a frame only renders when something changed this
-    /// cycle (a surface commit, a camera move, a cursor move). Cleared
-    /// after a successful render+flip; when set, requestRender() wakes
-    /// the renderer via output.sendFrame(). Without this the DRM flip
-    /// chain renders + flips a full composite every vsync (~60fps) even
-    /// with nothing on screen — the observed ~95% idle CPU.
-    repaint_pending: bool = true,
-    /// True while renderFrame is on the stack. requestRender() must not
-    /// synchronously emit output.sendFrame() while a render is already in
-    /// progress: a render can re-trigger requestRender (the synth input's
-    /// seat.pointerMotion, camera/seat events) and an emit from inside
-    /// the frame event handler re-enters renderFrame, recursing until the
-    /// frame-event emit GP-faults. When set, requestRender only marks
-    /// repaint_pending — the in-flight render has already read the
-    /// changed state (the synth runs before the composite) and consumes
-    /// it at the end.
-    in_render: bool = false,
-    /// The canvas WITHOUT the cursor (background + camera-transformed
-    /// surfaces), persisted so a hover cursor move restores a region from
-    /// it instead of recompositing the whole canvas (~450ms full-canvas
-    /// bilinear in the VM). Recomposited only when the canvas changes; the
-    /// display framebuffer = base + cursor overlay.
-    base_framebuffer: ?*pixman.Framebuffer = null,
-    /// Hover cursor move in progress: renderFrame skips the full composite
-    /// and instead restores the old cursor region from base_framebuffer +
-    /// redraws the cursor at the new pointer (set by onSeatPointerMove).
-    cursor_repaint: bool = false,
-    /// A client has a pending wl_surface.frame callback (it is ready for
-    /// the next frame) but the canvas is otherwise unchanged. The
-    /// idle-frame skip would starve it: the client waits for the
-    /// wl_callback.done to render its next update (foot's render loop),
-    /// which only fires on a present. renderFrame presents the unchanged
-    /// framebuffer (no recomposite) so the callback fires and the client
-    /// can commit its pending content.
-    frame_kick: bool = false,
+    /// EVERY output the backend has announced, as a stable heap view each.
+    /// There is no single "the output" any more: each view owns its
+    /// camera, render and capture targets, damage ring, pacing, frame
+    /// listeners and idle state, and the list IS the desktop layout.
+    output_views: std.ArrayList(*OutputView) = .empty,
+    /// Where each tracked surface's node lives: the view it was placed
+    /// on and whether its node position has been written yet. Scene
+    /// space is the desktop, so a view owns the region `view.rect`
+    /// and a surface placed there belongs to it. Removed views drop
+    /// their surfaces here so the next sync re-places them.
+    surface_place: std.AutoHashMapUnmanaged(*Surface, SurfacePlace) = .{},
+    /// What the tree-order draw walk needs per scene node: the tracked
+    /// surface behind it (buffer node AND container) and the space it is
+    /// composited in. The scene's own table is keyed the other way round;
+    /// this index is rebuilt per frame (indexCanvasNodes) and retained, so
+    /// a steady-state frame allocates nothing and classifies each surface
+    /// exactly once instead of once per node per output.
+    canvas_index: std.AutoHashMapUnmanaged(*wayland.scene.SceneNode, CanvasNode) = .{},
     /// Stop after this many frames; 0 = run until watchdog/error.
     run_frames: u32 = 0,
     watchdog_fired: bool = false,
@@ -542,6 +468,27 @@ const ServerState = struct {
     /// surface identity so re-maps of the same surface do not re-click.
     synth_input: bool = false,
     synth_clicked: std.AutoHashMapUnmanaged(*Surface, void) = .{},
+    /// WAYLAND_SYNTH_INPUT=2: mode 1's one click + key press + wheel
+    /// notch, PLUS one real pointer motion after every DISTINCT committed
+    /// content/state change on any tracked surface. The transform-parity
+    /// acceptance needs a FRESH pointer per case: it asserts the
+    /// surface-local coordinate it is handed lies inside the box the
+    /// CURRENT transform/scale/viewport implies, and one motion for the
+    /// whole run proves nothing about the cases after the first.
+    ///
+    /// Not per commit: a client's own verifyZoom round re-commits the same
+    /// surface with identical state, and a motion per commit turns the
+    /// server's own input into a self-triggered commit/motion loop. Not
+    /// per render either: a frame is not a state change.
+    synth_pointer_moves: bool = false,
+    /// The committed state each surface was last pointed at, so a motion
+    /// goes out exactly once per distinct change. A commit that only
+    /// advances a frame callback leaves the snapshot identical.
+    synth_pointed: std.AutoHashMapUnmanaged(*Surface, SynthSurfaceState) = .{},
+    /// The one surface mode 2 points at for the whole run (see
+    /// synthPointerMotion). Null until the first eligible one appears, and
+    /// cleared when that surface leaves the scene.
+    synth_target: ?*Surface = null,
     /// M4 Phase B: the synth wheel-zoom step (one wheel-up notch once
     /// the client's FIRST screencopy capture has been served, plus a
     /// 2-frame grace) has been sent. Separate from synth_fired: the
@@ -559,10 +506,13 @@ const ServerState = struct {
     /// down as ONE seat pointer grab and the left-button release ends
     /// both — see PointerGestures.
     gestures: PointerGestures = .{},
-    /// The camera state at the last render: a change (pan/zoom) forces
-    /// whole-output damage so the partial upload never smears the
-    /// previous canvas (the drag-streak bug).
-    last_camera: Camera = default_camera,
+    /// The cursor's texture imported into the SELECTED renderer, for the
+    /// GPU passes that draw the cursor as a texture instead of through
+    /// Cursor.draw. Keyed on the CPU texture it was uploaded from, so a
+    /// cursor change re-uploads once and every frame after that reuses
+    /// the same GL texture: no per-frame copy, no per-frame alloc.
+    cursor_gl: ?*Texture = null,
+    cursor_gl_source: ?*Texture = null,
     /// WAYLAND_PERF=1: log per-frame pipeline timings (import -> render
     /// -> present) in microseconds.
     perf: bool = false,
@@ -600,7 +550,6 @@ const ServerState = struct {
     cursor_hidden: bool = false,
 
     new_output_listener: wire.Listener(*wayland.output.Output),
-    frame_listener: wire.Listener(*wayland.output.Output),
     /// A surface committed new content (scene.events.content_dirty):
     /// schedule a render so the update actually composites (note 137 F1).
     content_dirty_listener: wire.Listener(*wayland.scene.Scene),
@@ -620,6 +569,196 @@ const ServerState = struct {
     seat_button_listener: wire.Listener(*wayland.seat.Seat),
     seat_pointer_move_listener: wire.Listener(*wayland.seat.Seat),
     seat_axis_listener: wire.Listener(*wayland.seat.Seat),
+};
+
+/// Where a tracked surface's scene node lives: the view it was placed on
+/// and whether its node position has been written yet.
+const SurfacePlace = struct {
+    view: *OutputView,
+    /// False until the node exists and its position has been written to
+    /// the view's desktop origin. SurfaceNode creates the node on the
+    /// first map, which is after any placement sync that ran before it.
+    placed: bool = false,
+};
+
+/// ONE output's whole compositor-side state: the view a client sees and
+/// the view the renderer draws. Every field the old ServerState carried
+/// for "the output" lives here instead, per view, so a second output is
+/// a second instance of this struct rather than a clobbered singleton
+/// (`self.output = out` used to overwrite the first connector outright).
+///
+/// The view owns, for its output:
+///   - `camera`, parsed from WAYLAND_CAMERA at that output's real size
+///     and moved only by the gestures pinned to this view;
+///   - `scene_output`, the library's per-output view of the ONE shared
+///     scene, carrying this view's camera and wl_output so output
+///     membership and enter/leave name the real output;
+///   - the CPU scanout framebuffer, the persisted base (canvas without
+///     the cursor) and, under WAYLAND_RENDERER=gles2, the FBO the canvas
+///     is rasterized into before it is read back for scanout;
+///   - on a GPU DRM scanout, the cached `Gles2Target` per leased slot and
+///     the frame currently leased from the backend;
+///   - the capture target/framebuffers a zwlr_screencopy_v1 read of THIS
+///     output needs, filled by an explicit read-back and nothing else;
+///   - its own damage ring (in the scene output), frame pacing
+///     (`frame_pending` lives on the Output), idle state, and frame and
+///     destroy listeners.
+const OutputView = struct {
+    /// The owning server state (log config, renderer, allocator).
+    state: *ServerState,
+    allocator: std.mem.Allocator,
+    io: *std.Io,
+    log_cfg: *const log.Config,
+    /// The backend output this view renders.
+    output: *wayland.output.Output,
+    /// wl_output for this output, created with the view and destroyed by
+    /// the output's destroy signal.
+    wl_output: *wayland.wl_output.WlOutput,
+    /// The library's per-output scene view. `camera` points at this
+    /// view's camera and `wl_output` at this view's wl_output.
+    scene_output: *wayland.scene.SceneOutput,
+    /// This view's region of the desktop, in global pixels: the layout
+    /// every global pointer/touch/tablet coordinate is routed through.
+    rect: geom.Rect,
+    /// World -> screen for this output, in scene space. Parsed from
+    /// WAYLAND_CAMERA at this output's real size; the default centres
+    /// this view's own origin, so worldToScreen is the identity mapping
+    /// — today's no-camera composite.
+    camera: Camera,
+    /// The camera at the last render: a change of centre, zoom OR
+    /// rotation moves every pixel, so the whole output is damaged
+    /// (a partial upload would smear the previous canvas).
+    last_camera: Camera,
+    /// The CPU scanout buffer this view's backends read, the cursor
+    /// draws into and a screencopy with overlay_cursor=1 reads.
+    framebuffer: *pixman.Framebuffer,
+    /// The canvas WITHOUT the cursor, persisted so a hover cursor move
+    /// restores a region from it instead of recompositing the whole
+    /// canvas. Lazily created at this view's size.
+    base_framebuffer: ?*pixman.Framebuffer = null,
+    /// The GLES2 FBO the canvas is rasterized into on the CPU-scanout
+    /// path (null unless `renderer_kind` is `.gles2`): created at this
+    /// view's size on first use, re-created after a mode change.
+    gles2_target: ?*gles2.Gles2Target = null,
+    /// This view's canvas item list, RETAINED across frames: the pass
+    /// clears it and refills it, so a steady-state frame allocates
+    /// nothing. Per view, because the item list is filtered by the view
+    /// a surface was placed on and two outputs never share it. Freed with
+    /// the view.
+    items: std.ArrayList(CanvasItem) = .empty,
+    /// A GPU DRM scanout: the renderer's EGL display was created on the
+    /// backend's GBM device, the backend was told the renderer's real
+    /// renderable format pairs before start, and the canvas is drawn
+    /// straight into the leased frame's target. No read-back, no CPU
+    /// front buffer, no framebuffer copy on this path.
+    gpu: bool = false,
+    /// The EGL image FBO per leased slot, cached by slot index so a
+    /// slot's native image is imported once and then reused for the life
+    /// of the buffer behind it.
+    gpu_targets: [2]?*gles2.Gles2Target = .{ null, null },
+    /// The frame leased from the backend for the frame being composited.
+    /// Set only between acquireGpuFrame and the commit (which consumes
+    /// it); a failed commit cancels it and clears this.
+    gpu_lease: ?*wayland.gpu_frame.GpuFrame = null,
+    /// The explicit screencopy path: an offscreen FBO this view renders
+    /// into only when a client captures it, and the CPU buffers the read
+    /// lands in. `capture_base` is the overlay_cursor=0 image (no
+    /// cursor); `capture_frame` the overlay_cursor=1 one.
+    capture_target: ?*gles2.Gles2Target = null,
+    capture_base: ?*pixman.Framebuffer = null,
+    capture_frame: ?*pixman.Framebuffer = null,
+    /// Whether each capture buffer already shows this view's CURRENT
+    /// canvas. Cleared by every composite so the next capture re-reads.
+    capture_base_valid: bool = false,
+    capture_frame_valid: bool = false,
+    /// Frames this view has presented. Per view, because pacing and the
+    /// WAYLAND_RUN_FRAMES budget are per output.
+    frames_rendered: u32 = 0,
+    /// Idle-frame skip state, per view (the ServerState-level one would
+    /// make one output's activity repaint the other).
+    repaint_pending: bool = true,
+    /// True while this view's renderFrame is on the stack. A
+    /// requestRender from inside the frame (the synth input's pointer
+    /// motion, a camera or seat event) must not emit another frame
+    /// signal, or the emit re-enters renderFrame until the frame-event
+    /// emit faults.
+    in_render: bool = false,
+    /// Hover cursor move in progress: skip the full composite and
+    /// restore the old cursor region from the base instead.
+    cursor_repaint: bool = false,
+    /// A client is waiting for its next frame callback but this view's
+    /// canvas is unchanged: present the unchanged frame so the callback
+    /// fires (see the ServerState field of the same name).
+    frame_kick: bool = false,
+    /// Output.events.frame: this view's render entry point.
+    frame_listener: wire.Listener(*wayland.output.Output),
+    /// Output.events.commit: a state was applied to this output, which is
+    /// where a MODE change shows up. It fires on every present, so the
+    /// handler is a two-field compare that returns immediately while the
+    /// mode still matches this view's slice of the desktop.
+    commit_listener: wire.Listener(*wayland.output.Output.CommitEvent),
+    /// Output.events.destroy: the backend took the output away (unplug,
+    /// modeset, teardown). Frees every target this view owns and drops
+    /// it from the layout, leaving every other view's cameras and
+    /// targets untouched.
+    destroy_listener: wire.Listener(*wayland.output.Output),
+
+    /// This view's local scanout rect: (0,0) to the mode size. Output
+    /// damage and capture coordinates are in THIS space, never the
+    /// desktop's.
+    fn localRect(view: *const OutputView) geom.Rect {
+        return .{ .x = 0, .y = 0, .width = view.output.mode.width, .height = view.output.mode.height };
+    }
+
+    /// The camera change that invalidates the whole output. Centre, zoom
+    /// AND rotation all move every pixel, so all three are compared: a
+    /// rotated camera whose centre did not move still shows a different
+    /// canvas, and damaging only the moved surfaces would leave the old
+    /// rotation under the cursor.
+    fn cameraChanged(view: *const OutputView) bool {
+        return view.last_camera.center_x != view.camera.center_x or
+            view.last_camera.center_y != view.camera.center_y or
+            view.last_camera.zoom != view.camera.zoom or
+            view.last_camera.rotation != view.camera.rotation;
+    }
+
+    /// Free every render and capture target this view owns. GL objects
+    /// first (they need the renderer's EGL context, still current), and
+    /// the lease cancelled BEFORE the backend's slots go away.
+    fn freeTargets(view: *OutputView) void {
+        if (view.gpu_lease) |frame| {
+            if (view.state.drm_backend) |b| drm_mod.DrmBackend.cancelGpuFrame(b, view.output, frame);
+            view.gpu_lease = null;
+        }
+        for (&view.gpu_targets) |*slot| {
+            if (slot.*) |t| t.destroy();
+            slot.* = null;
+        }
+        if (view.capture_target) |t| {
+            t.destroy();
+            view.capture_target = null;
+        }
+        if (view.gles2_target) |t| {
+            t.destroy();
+            view.gles2_target = null;
+        }
+        if (view.capture_base) |f| {
+            f.deinit();
+            view.capture_base = null;
+        }
+        if (view.capture_frame) |f| {
+            f.deinit();
+            view.capture_frame = null;
+        }
+        if (view.base_framebuffer) |f| {
+            f.deinit();
+            view.base_framebuffer = null;
+        }
+        view.items.deinit(view.allocator);
+        view.capture_base_valid = false;
+        view.capture_frame_valid = false;
+        view.framebuffer.deinit();
+    }
 };
 
 /// M4 Phase B: the drag-pan gesture anchor — the pointer position while
@@ -645,6 +784,13 @@ const PointerGestures = struct {
     /// pointer grab until the button release (the client sees no pointer
     /// events during the move).
     moving_toplevel: ?*wayland.shell.XdgToplevel = null,
+    /// The view both gestures are PINNED to: the one that held the
+    /// pointer when the gesture armed. The camera pan moves that view's
+    /// camera and the interactive move converts the pointer delta
+    /// through it, so a drag over the second output pans the second
+    /// output's camera and leaves every other view's camera alone.
+    /// Cleared with the rest of the gesture state.
+    view: ?*OutputView = null,
     /// The pointer's WORLD position at the last move tick; the node
     /// moves by the delta between ticks.
     move_anchor: geom.FPoint = .{ .x = 0, .y = 0 },
@@ -685,7 +831,12 @@ fn grabPointerForGesture(seat: *wayland.seat.Seat, g: *PointerGestures) void {
 fn endPointerGestures(seat: *wayland.seat.Seat, g: *PointerGestures) bool {
     g.moving_toplevel = null;
     g.camera_drag = null;
+    // A pan that is no longer armed is not dragging, whatever it was a
+    // moment ago. Leaving `drag_active` set is what made the first motion
+    // after a session latch keep panning with no button held, and kept
+    // the fast-render blockiness latched to a canvas nobody is dragging.
     g.drag_active = false;
+    g.view = null;
     g.fast_render = false;
     const ours = g.own_grab orelse return false;
     g.own_grab = null;
@@ -861,15 +1012,36 @@ const OutputModules = struct {
     is_drm: bool,
     is_nested: bool,
     linux_dmabuf: *wayland.linux_dmabuf.LinuxDmabuf,
+    /// The DRM backend's GBM device, opened by prepareGpu before the
+    /// backend started and reused for the renderer that draws into the
+    /// GPU scanout buffers. Null on every other backend.
+    gpu_device: ?*wayland.dmabuf.GbmDevice = null,
+    /// The renderable (format, modifier) pairs the renderer really
+    /// supports, BORROWED from it (they live as long as it does) and
+    /// handed to the backend before start, so output creation intersects
+    /// them with the plane's real capabilities.
+    gpu_formats: []const wayland.dmabuf.Format = &.{},
+    /// Whether GPU DRM scanout is live: a DRM backend with a prepared
+    /// device, a GLES2 renderer created ON that device, and format pairs
+    /// accepted. Only then do the per-view leased-slot targets exist.
+    gpu_scanout: bool = false,
 
     /// The reverse of buildOutput's construction order, and still
     /// load-bearing: the dmabuf resolver is cleared BEFORE the module
-    /// dies (no wl_surface.attach can then call into a freed module — the
-    /// window in between is unreachable in practice, the event loop has
-    /// stopped, but the ordering makes it impossible rather than merely
-    /// unlikely); the module dies before the backend (its GBM device
-    /// belongs to the DRM backend); the backend dies before the renderer;
-    /// the pixman renderer dies last.
+    /// dies (no wl_surface.attach can then call into a freed module);
+    /// the module dies before the backend (its GBM device belongs to the
+    /// DRM backend); the backend dies before the renderer; the pixman
+    /// renderer dies last.
+    ///
+    /// Everything that can still be HOLDING a dmabuf Buffer import or a
+    /// GBM handle must already be gone by the time this runs: the GL
+    /// renderer textures (one per tracked surface node), the cached
+    /// per-slot EGL targets and the screencopy destination buffers.
+    /// main()'s defers give exactly that — freeStateResources (which
+    /// destroys the scene, and with it every surface texture, and frees
+    /// the per-view targets through freeOutputViews) is registered
+    /// AFTER this defer, so it unwinds FIRST. This method is the last
+    /// thing to touch the backend and the device.
     fn deinit(self: *const OutputModules, compositor: *wayland.compositor.Compositor) void {
         compositor.clearDmabufResolver();
         self.linux_dmabuf.deinit();
@@ -950,15 +1122,14 @@ pub fn main(init: std.process.Init) !void {
     const input_backend = try buildInputBackend(&start, core.seat, seat_mods.tablet);
     defer if (input_backend) |ib| ib.destroy();
 
-    const framebuffer = try pixman.Framebuffer.create(allocator, output_width, output_height);
-    // NOTE: no defer framebuffer.deinit() here — the ServerState owns the
-    // framebuffer (state.framebuffer), and onNewOutput resizes it by
-    // freeing the old + assigning a new one. A defer on this local would
-    // point at the (possibly freed) original and double-free at shutdown
-    // (DebugAllocator segfault); freeRenderTargets frees the CURRENT one
-    // after the event loop instead.
-
-    var state = try initServerState(&start, &core, &seat_mods, &output, framebuffer);
+    var state = try initServerState(&start, &core, &seat_mods, &output);
+    // freeStateResources frees the clients, the cursor, every OutputView
+    // (with its render, capture and GPU-slot targets and any open GPU
+    // lease) and the one shared scene. It is registered HERE, after
+    // output.deinit above, so it unwinds FIRST — every GL texture
+    // holding a dmabuf Buffer import, and every EGL image behind a
+    // cached scanout target, is released while the renderer, the GBM
+    // device and the dmabuf module are still alive.
     defer freeStateResources(&state);
     state.input_backend = input_backend;
     subscribe(&state);
@@ -999,7 +1170,6 @@ pub fn main(init: std.process.Init) !void {
     armBackendPollers(&state, &output, input_backend, &timers);
 
     runEventLoop(&state);
-    freeRenderTargets(&state);
 }
 
 /// The ServerState's own resources, freed in the order main()'s `defer`s
@@ -1016,13 +1186,32 @@ pub fn main(init: std.process.Init) !void {
 /// entry is freed twice.
 fn freeStateResources(state: *ServerState) void {
     state.display.destroyClients();
+    // The output views go BEFORE the scene and the cursor: every GL
+    // object they own (the CPU-path FBO, the per-slot scanout images, the
+    // capture FBO) belongs to the renderer's EGL context, and every open
+    // GPU lease belongs to the backend's slots — both must be released
+    // while the renderer and the backend are still alive. The scene's
+    // surface textures go next (they hold the dmabuf Buffer imports),
+    // still before linux_dmabuf.deinit() and backend.destroy() run in
+    // OutputModules.deinit.
+    freeOutputViews(state);
     cleanupSurfaceEntries(state);
-    if (state.scene_output) |so| so.destroy();
+    if (state.cursor_gl) |t| {
+        t.destroy();
+        state.cursor_gl = null;
+    }
+    state.cursor_gl_source = null;
+    // The scene's placement policy names this state; drop it before the
+    // state dies and before the scene's own teardown can ask again.
+    clearScenePlacementPolicy(state);
     if (state.scene) |scene| scene.deinit();
+    state.canvas_index.deinit(state.allocator);
+    state.surface_place.deinit(state.allocator);
     state.layer_popups.deinit(state.allocator);
     state.layer_surfaces.deinit(state.allocator);
     state.toplevels.deinit(state.allocator);
     state.synth_clicked.deinit(state.allocator);
+    state.synth_pointed.deinit(state.allocator);
 }
 
 /// zwlr_screencopy_v1: captures the compositor framebuffer (shm only).
@@ -1405,13 +1594,60 @@ fn buildProtocolModules(start: *Startup, core: *const CoreModules, mods: *SeatMo
     mods.foreign_toplevel = foreign_toplevel;
 }
 
-/// Phase 3: the renderer (WAYLAND_RENDERER), the backend
-/// (WAYLAND_BACKEND) and zwp_linux_dmabuf_v1.
+/// Phase 3: the backend (WAYLAND_BACKEND), its GPU device, the renderer
+/// (WAYLAND_RENDERER), the GPU scanout formats and zwp_linux_dmabuf_v1.
+///
+/// The ORDER is the contract, and it is the opposite of what this phase
+/// used to do (renderer, then backend). A GPU scanout has one device
+/// shared by the three parties, so each one must exist before the next
+/// needs it:
+///
+///   1. the backend — prepareGpu opens the DRM node and its GBM device
+///      here, before start(), without touching modesetting or acquiring
+///      a seat/master/session;
+///   2. the renderer — on a GPU DRM run it is created ON that device
+///      (createOnDevice), so the EGL display, the GBM import path and
+///      the scanout buffers' native images are one device's, and a
+///      cross-device import is never attempted;
+///   3. the format negotiation — the backend is told the renderer's REAL
+///      renderable pairs (setGpuFormats) BEFORE start(), because output
+///      creation happens inside start() and intersects the pairs with the
+///      primary plane's actual format/modifier support to allocate the
+///      GPU-only scanout buffers;
+///   4. zwp_linux_dmabuf_v1 — with the device already open, so the
+///      module advertises its real formats to clients. No client can
+///      connect before the socket is announced, and main() announces it
+///      BEFORE this phase, so every client sees a fully advertised
+///      import device.
+///
+/// A capability failure is explicit: prepareGpu or setGpuFormats
+/// returning an error propagates out of main(). Nothing here falls back
+/// to a CPU front buffer behind the operator's back — GPU scanout is
+/// either negotiated or the server does not start with it.
 fn buildOutput(start: *Startup, core: *const CoreModules) !OutputModules {
     const allocator = start.allocator;
     const io = start.io;
     const log_cfg = start.log_cfg;
     const display = core.display;
+
+    // 1. The renderer choice comes FIRST, because it decides whether a
+    //    GPU device is opened at all. A pixman run is the CPU baseline
+    //    and must not require a GBM node: on a card that cannot provide
+    //    one the old order failed with error.GpuUnavailable even though
+    //    nothing about a CPU canvas needs it. An explicit
+    //    WAYLAND_RENDERER=gles2 failure still propagates — that is the
+    //    capability report, never a silent CPU fallback.
+    const renderer_kind = selectRendererKind(start);
+
+    // 2. The backend, then its GPU device. prepareGpu is idempotent and
+    //    uses the SAME fd/GBM handle the backend itself reuses in start,
+    //    so there is one DRM node and one GBM device in the process.
+    const chosen = try buildBackend(start, display);
+    errdefer chosen.backend.destroy();
+    var gpu_device: ?*wayland.dmabuf.GbmDevice = null;
+    if (chosen.is_drm and renderer_kind == .gles2) {
+        gpu_device = try drm_mod.DrmBackend.prepareGpu(chosen.backend);
+    }
 
     // The cursor always needs a pixman renderer of its own:
     // compositor/cursor.zig draws into a `*pixman.Framebuffer` and
@@ -1422,31 +1658,68 @@ fn buildOutput(start: *Startup, core: *const CoreModules) !OutputModules {
     // is a second object only under WAYLAND_RENDERER=gles2.
     const pixman_renderer = try pixman.PixmanRenderer.create(allocator, io, log_cfg);
     errdefer pixman_renderer.destroy();
-    const renderer_kind = selectRendererKind(start);
+
+    // 3. The renderer, on the backend's own device when there is one. A
+    //    DRM run without a prepared device, or with the CPU renderer
+    //    selected, gets the ordinary surfaceless context: the CPU
+    //    backends scan out CPU bytes and are explicitly not GPU scanout.
     const renderer = switch (renderer_kind) {
         .pixman => pixman_renderer,
-        .gles2 => try gles2.Gles2Renderer.create(allocator, io, log_cfg),
+        .gles2 => if (gpu_device) |device|
+            try gles2.Gles2Renderer.createOnDevice(allocator, io, log_cfg, device)
+        else
+            try gles2.Gles2Renderer.create(allocator, io, log_cfg),
     };
     errdefer if (renderer != pixman_renderer) renderer.destroy();
 
-    const chosen = try buildBackend(start, display);
+    // 4. The scanout formats, BEFORE start(). The pairs are the
+    //    renderer's own (it allocated the native images behind them), so
+    //    they are borrowed for the backend's lifetime and outlive it
+    //    only as long as the renderer does — which teardown guarantees.
+    var gpu_formats: []const wayland.dmabuf.Format = &.{};
+    var gpu_scanout = false;
+    if (gpu_device) |device| {
+        gpu_formats = gles2.Gles2Renderer.renderFormats(renderer);
+        if (gpu_formats.len == 0) return error.NoRenderableFormats;
+        try drm_mod.DrmBackend.setGpuFormats(chosen.backend, gpu_formats);
+        gpu_scanout = true;
+        // 4b. zwp_linux_dmabuf_v1 advertises Device.formats(), which is
+        //     read at LinuxDmabuf.init below, so the advertised set is
+        //     narrowed HERE to exactly the pairs this renderer proved it
+        //     can both import and render. GBM's own enumeration is a
+        //     superset — it lists what the BOOM can allocate — and a
+        //     client that attaches a pair the sampler cannot draw gets a
+        //     surface that imports and then never appears. An OWNED copy:
+        //     setFormats takes ownership and GbmDevice.deinit frees it.
+        const advertised = try allocator.dupe(wayland.dmabuf.Format, gpu_formats);
+        device.setFormats(advertised);
+        log.info(
+            "gpu scanout: {d} renderable format pair(s) negotiated with the DRM backend and advertised to clients",
+            io,
+            log_cfg,
+            "server",
+            .{gpu_formats.len},
+        );
+    }
 
-    // zwp_linux_dmabuf_v1 (stable/linux-dmabuf): DMA-BUF buffer import.
-    // Constructed AFTER the backend because the module needs its GBM
-    // device, and it is destroyed BEFORE backend.destroy(): the GBM device
-    // belongs to the DRM backend and must outlive the module.
+    // 5. zwp_linux_dmabuf_v1 (stable/linux-dmabuf): DMA-BUF buffer
+    //    import. Constructed AFTER the device exists (the module needs
+    //    it) and destroyed BEFORE backend.destroy(): the GBM device
+    //    belongs to the DRM backend and must outlive the module.
     //
-    // The module registers its global ONLY for a GBM device, and only the
-    // DRM backend has one — headless / raylib / nested pass null and get
-    // no zwp_linux_dmabuf_v1 global at all (the module's documented gate,
-    // shell/linux_dmabuf.zig). So this server advertises 25 globals and a
-    // DRM one advertises 26.
+    // The module registers its global ONLY for a device, and the only
+    // device this server has is the GPU renderer's GBM one. A pixman run
+    // therefore advertises NO zwp_linux_dmabuf_v1 at all: the CPU
+    // compositor cannot sample a native image without mapping it, so
+    // offering the global would promise a path that does not exist
+    // (shell/linux_dmabuf.zig's documented gate). wl_shm is unaffected
+    // and stays the CPU path.
     const linux_dmabuf = try wayland.linux_dmabuf.LinuxDmabuf.init(
         allocator,
         io,
         log_cfg,
         display,
-        if (chosen.is_drm) drm_mod.gbmDevice(drm_mod.DrmBackend.fromBackend(chosen.backend)) else null,
+        if (gpu_device) |dev| &dev.iface else null,
     );
     errdefer linux_dmabuf.deinit();
 
@@ -1455,7 +1728,7 @@ fn buildOutput(start: *Startup, core: *const CoreModules) !OutputModules {
     // so it runs before linux_dmabuf.deinit(): no attach can ever call
     // into a freed module.
     //
-    // The resolver is set even with no GBM device: LinuxDmabuf.init
+    // The resolver is set even with no device: LinuxDmabuf.init
     // returns an inert module (no global, empty registry), so
     // fromResource answers null for every resource and the shm path runs
     // exactly as before on headless / raylib / nested.
@@ -1470,6 +1743,9 @@ fn buildOutput(start: *Startup, core: *const CoreModules) !OutputModules {
         .is_drm = chosen.is_drm,
         .is_nested = chosen.is_nested,
         .linux_dmabuf = linux_dmabuf,
+        .gpu_device = gpu_device,
+        .gpu_formats = gpu_formats,
+        .gpu_scanout = gpu_scanout,
     };
 }
 
@@ -1616,7 +1892,6 @@ fn initServerState(
     core: *const CoreModules,
     seat_mods: *const SeatModules,
     output: *const OutputModules,
-    framebuffer: *pixman.Framebuffer,
 ) !ServerState {
     return .{
         .allocator = start.allocator,
@@ -1650,8 +1925,7 @@ fn initServerState(
         .linux_dmabuf = output.linux_dmabuf,
         .backend = output.backend,
         .drm_backend = if (output.is_drm) output.backend else null,
-        .framebuffer = framebuffer,
-        .camera = default_camera,
+        .gpu_scanout = output.gpu_scanout,
         .camera_env = start.env.get("WAYLAND_CAMERA"),
         .presentation = core.presentation,
         .toplevels = .empty,
@@ -1660,7 +1934,6 @@ fn initServerState(
         .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
         .new_input_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onNewInput),
         .input_removed_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onInputRemoved),
-        .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
         .content_dirty_listener = wire.Listener(*wayland.scene.Scene).init(onSceneContentDirty),
         .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
         .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
@@ -1801,7 +2074,16 @@ fn applyEnvironment(start: *Startup, state: *ServerState, output: *const OutputM
         }
     }
     if (start.env.get("WAYLAND_SYNTH_INPUT")) |v| {
+        // "1" is the original M3/M4 behaviour, byte for byte. "2" is that
+        // PLUS a real pointer motion per distinct committed content/state
+        // change (synth_pointer_moves). Anything else — including "0" and
+        // an unset variable — stays off, exactly as before.
         if (std.mem.eql(u8, v, "1")) state.synth_input = true;
+        if (std.mem.eql(u8, v, "2")) {
+            state.synth_input = true;
+            state.synth_pointer_moves = true;
+            log.info("WAYLAND_SYNTH_INPUT=2: click/key/wheel once, plus a pointer motion per committed state change", start.io, start.log_cfg, "server", .{});
+        }
     }
     if (start.env.get("WAYLAND_PERF")) |v| {
         if (std.mem.eql(u8, v, "1")) state.perf = true;
@@ -1991,26 +2273,23 @@ fn runEventLoop(state: *ServerState) void {
             break;
         };
     }
-    log.info("event loop exited: frames={d} watchdog_fired={}", state.io, state.log_cfg, "server", .{
-        state.frames_rendered,
+    log.info("event loop exited: views={d} frames={d} watchdog_fired={}", state.io, state.log_cfg, "server", .{
+        state.output_views.items.len,
+        totalFrames(state),
         state.watchdog_fired,
     });
     state.loop = null;
 }
 
-/// The render targets the ServerState owns, freed here after the event
-/// loop: the GLES2 target first (its GL objects need the renderer's
-/// context, still current — the renderer itself is destroyed later, by
-/// OutputModules.deinit), then the CPU base (the canvas without the
-/// cursor) and the display framebuffer the backends scanned out. The
-/// backend is already torn down, so nothing references them.
-fn freeRenderTargets(state: *ServerState) void {
-    if (state.gles2_target) |t| t.destroy();
-    state.gles2_target = null;
-    if (state.base_framebuffer) |base| base.deinit();
-    state.base_framebuffer = null;
-    state.framebuffer.deinit();
+/// The session's total presented frames across every view. The frame
+/// budget is a session budget, not a per-output one: a two-output server
+/// must still stop after WAYLAND_RUN_FRAMES frames overall.
+fn totalFrames(state: *ServerState) u32 {
+    var total: u32 = 0;
+    for (state.output_views.items) |v| total += v.frames_rendered;
+    return total;
 }
+
 
 // ---------------------------------------------------------------------------
 // Listeners
@@ -2057,103 +2336,18 @@ fn onInputRemoved(
     self.seat.inputDeviceRemoved(device);
 }
 
+/// A backend announced an output: build its OutputView.
+///
+/// Idempotent in the sense that matters: a second announcement of an
+/// output that already has a view is ignored, so the view list can
+/// never hold two views for one connector.
 fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.output.Output) void {
     const self: *ServerState = @fieldParentPtr("new_output_listener", listener);
-    self.output = out;
+    if (viewForOutput(self, out) != null) return;
     log.info("new output {d}x{d} refresh={d}ms", self.io, self.log_cfg, "server", .{
         out.mode.width, out.mode.height, out.mode.refresh_msec,
     });
-    // The DRM backend drives its connector's preferred mode: resize the
-    // render framebuffer to match (headless/raylib stay at the defaults).
-    if (out.mode.width != output_width or out.mode.height != output_height) {
-        const fb = pixman.Framebuffer.create(self.allocator, out.mode.width, out.mode.height) catch |err| {
-            log.err("framebuffer resize failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-            return;
-        };
-        self.framebuffer.deinit();
-        self.framebuffer = fb;
-        // The base (canvas-without-cursor) is lazily recreated at the new
-        // size on the next composite; a stale-sized base would copy wrong.
-        if (self.base_framebuffer) |base| base.deinit();
-        self.base_framebuffer = null;
-        // The GLES2 canvas target follows the framebuffer: its FBO's
-        // color texture was allocated at the old size and every pass
-        // renders at the target's own size (u_viewport is the target's).
-        if (self.gles2_target) |t| t.destroy();
-        self.gles2_target = null;
-        log.info("framebuffer resized to {d}x{d}", self.io, self.log_cfg, "server", .{
-            out.mode.width, out.mode.height,
-        });
-    }
-
-    // M4 camera: parse WAYLAND_CAMERA with the REAL output size — the
-    // camera's viewport must match the framebuffer, so this runs after
-    // the resize above (unset/unparseable keeps the identity-behavior
-    // default, see parseCameraEnv).
-    self.camera = parseCameraEnv(self.camera_env, out.mode.width, out.mode.height);
-
-    // M2: build the scene for this output (one scene, one output view).
-    const scene = wayland.scene.Scene.init(self.allocator, self.io, self.log_cfg) catch |err| {
-        log.err("scene init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
-    };
-    const scene_output = wayland.scene.SceneOutput.create(
-        self.allocator,
-        self.io,
-        self.log_cfg,
-        scene,
-        out,
-    ) catch |err| {
-        scene.deinit();
-        log.err("scene output init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
-    };
-    // M4: the background is drawn by the canvas pass (fb.fill) instead of
-    // a scene rect node — the scene graph is no longer rendered.
-    self.scene = scene;
-    self.scene_output = scene_output;
-    // The scene's surface bindings need the compositor's subcompositor
-    // (subsurface tree parenting) and wl_output (the surface enter/leave
-    // wire events). Set before any surface is tracked (surfaces only
-    // appear after backend.start()).
-    scene.subcompositor = self.subcompositor;
-    scene.events.content_dirty.add(&self.content_dirty_listener);
-    out.events.frame.add(&self.frame_listener);
-
-    // M3: expose the output to clients (geometry/mode/scale/name) and
-    // build the cursor nodes (drawn above the surfaces, never picked).
-    self.wl_output = wayland.wl_output.WlOutput.create(
-        self.allocator,
-        self.io,
-        self.log_cfg,
-        self.display,
-        out,
-        "WL-1",
-        "wayland debug output",
-    ) catch |err| {
-        log.err("wl_output create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
-    };
-    // The surface enter/leave wire events ride the wl_output resources.
-    scene.wl_output = self.wl_output;
-    // The seat's pointer cursor: its scene nodes are drawn above the
-    // surfaces, never picked.
-    self.cursor = wayland.cursor.Cursor.create(
-        self.allocator,
-        self.io,
-        self.log_cfg,
-        scene,
-        self.compositor,
-        self.seat,
-        // The pixman renderer, never `self.renderer`: Cursor.draw takes
-        // a *pixman.Framebuffer and its textures are imported through
-        // PixmanRenderer.importMemory (cursor.zig:260, :337), so under
-        // WAYLAND_RENDERER=gles2 the two are different objects.
-        self.pixman_renderer,
-    ) catch |err| {
-        log.err("cursor init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
-    };
+    const view = createOutputView(self, out) orelse return;
 
     // Enable the output up front: sendFrame gates the frame signal on
     // enabled (wlroots output.c:833-837), so the first requestRender
@@ -2170,6 +2364,457 @@ fn onNewOutput(listener: *wire.Listener(*wayland.output.Output), out: *wayland.o
         log.err("output enable commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return;
     };
+    requestRenderView(self, view);
+}
+
+/// Build the heap OutputView for `out` and add it to the layout. Null on
+/// any allocation or module failure, with everything already built
+/// unwound; the caller (onNewOutput) only logs and leaves the output
+/// unrendered in that case, exactly as a failed scene creation did.
+fn createOutputView(self: *ServerState, out: *wayland.output.Output) ?*OutputView {
+    // M2: ONE scene for every output, created with the first view and
+    // shared by all the rest — the views are the per-output state, the
+    // scene is their common world.
+    const scene = self.scene orelse blk: {
+        const created = wayland.scene.Scene.init(self.allocator, self.io, self.log_cfg) catch |err| {
+            log.err("scene init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            return null;
+        };
+        // The scene's surface bindings need the compositor's
+        // subcompositor (subsurface tree parenting). Set before any
+        // surface is tracked (surfaces only appear after backend.start()).
+        created.subcompositor = self.subcompositor;
+        created.events.content_dirty.add(&self.content_dirty_listener);
+        self.scene = created;
+        break :blk created;
+    };
+    // The library classifies a tracked surface's output placement through
+    // the compositor's own rules, so membership, presented lists and
+    // damage agree with what the canvas pass draws. Idempotent: the
+    // second output finds the scene already there.
+    installScenePlacementPolicy(self);
+
+    // M3: expose the output to clients (geometry/mode/scale/name). The
+    // output's destroy signal owns this global, so the view never frees
+    // it by hand.
+    const wl_output = wayland.wl_output.WlOutput.create(
+        self.allocator,
+        self.io,
+        self.log_cfg,
+        self.display,
+        out,
+        "WL-1",
+        "wayland debug output",
+    ) catch |err| {
+        log.err("wl_output create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return null;
+    };
+
+    const scene_output = wayland.scene.SceneOutput.create(
+        self.allocator,
+        self.io,
+        self.log_cfg,
+        scene,
+        out,
+    ) catch |err| {
+        log.err("scene output init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return null;
+    };
+
+    const framebuffer = pixman.Framebuffer.create(self.allocator, out.mode.width, out.mode.height) catch |err| {
+        log.err("framebuffer create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        scene_output.destroy();
+        return null;
+    };
+
+    // The view's slice of the desktop. Appended at the RIGHT END of the
+    // current extent and never moved afterwards, so adding or removing an
+    // output leaves every other view's rect, camera and targets exactly
+    // as they were — the property the hotplug requirement is about. A
+    // removal leaves its column unused rather than shifting the rest.
+    var origin_x: i32 = 0;
+    for (self.output_views.items) |other| {
+        origin_x = @max(origin_x, other.rect.x + other.rect.width);
+    }
+    const rect: geom.Rect = .{
+        .x = origin_x,
+        .y = 0,
+        .width = out.mode.width,
+        .height = out.mode.height,
+    };
+
+    // M4 camera, parsed with THIS output's real size (the DRM mode can
+    // differ from the 1280x720 defaults) and then shifted into scene
+    // space by the view's desktop origin: the camera's world space is the
+    // shared scene, not the view's local canvas.
+    const local = parseCameraEnv(self.camera_env, out.mode.width, out.mode.height);
+    const camera: Camera = .{
+        .center_x = local.center_x + @as(f64, @floatFromInt(rect.x)),
+        .center_y = local.center_y + @as(f64, @floatFromInt(rect.y)),
+        .zoom = local.zoom,
+        .rotation = local.rotation,
+        .screen_w = local.screen_w,
+        .screen_h = local.screen_h,
+    };
+
+    const view = self.allocator.create(OutputView) catch |err| {
+        log.err("output view alloc failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        framebuffer.deinit();
+        scene_output.destroy();
+        return null;
+    };
+    view.* = .{
+        .state = self,
+        .allocator = self.allocator,
+        .io = self.io,
+        .log_cfg = self.log_cfg,
+        .output = out,
+        .wl_output = wl_output,
+        .scene_output = scene_output,
+        .rect = rect,
+        .camera = camera,
+        .last_camera = camera,
+        .framebuffer = framebuffer,
+        .gpu = self.gpu_scanout,
+        .frame_listener = wire.Listener(*wayland.output.Output).init(onViewFrame),
+        .commit_listener = wire.Listener(*wayland.output.Output.CommitEvent).init(onViewCommit),
+        .destroy_listener = wire.Listener(*wayland.output.Output).init(onViewDestroyed),
+    };
+    // The library's output view reads the camera and the wl_output it
+    // reports on: output membership (the camera's visible world rect) and
+    // the surface enter/leave wire events both come from here.
+    scene_output.camera = &view.camera;
+    scene_output.wl_output = wl_output;
+    scene_output.x = @floatFromInt(rect.x);
+    scene_output.y = @floatFromInt(rect.y);
+
+    out.events.frame.add(&view.frame_listener);
+    out.events.commit.add(&view.commit_listener);
+    out.events.destroy.add(&view.destroy_listener);
+    self.output_views.append(self.allocator, view) catch |err| {
+        log.err("output view list append failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        unlinkViewListeners(view);
+        scene_output.destroy();
+        framebuffer.deinit();
+        self.allocator.destroy(view);
+        return null;
+    };
+    // The desktop grew by this column, so absolute input devices now
+    // normalize onto a different extent.
+    syncInputExtent(self);
+
+    // The seat's pointer cursor is a single object for the whole session
+    // (one pointer, one image) built against the shared scene; only its
+    // DRAW is per view.
+    if (self.cursor == null) {
+        self.cursor = wayland.cursor.Cursor.create(
+            self.allocator,
+            self.io,
+            self.log_cfg,
+            scene,
+            self.compositor,
+            self.seat,
+            // The pixman renderer, never `self.renderer`: the cursor's
+            // CPU textures are imported through PixmanRenderer
+            // (cursor.zig:260, :337), so under WAYLAND_RENDERER=gles2 the
+            // two are different objects.
+            self.pixman_renderer,
+        ) catch |err| blk: {
+            log.err("cursor init failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    log.info("output view at desktop ({d},{d}) {d}x{d}{s}", self.io, self.log_cfg, "server", .{
+        rect.x, rect.y, rect.width, rect.height, if (view.gpu) ", gpu scanout" else "",
+    });
+    return view;
+}
+
+/// The view for `out`, or null when this backend output has none (a
+/// view whose creation failed, or one already torn down).
+fn viewForOutput(self: *ServerState, out: *wayland.output.Output) ?*OutputView {
+    for (self.output_views.items) |v| {
+        if (v.output == out) return v;
+    }
+    return null;
+}
+
+/// The view a global DESKTOP pixel belongs to: the one whose layout rect
+/// contains it, else the nearest by centre distance, else the first.
+/// Every input path (pointer, touch, tablet) resolves its coordinates
+/// through this before any camera is consulted, so a position outside
+/// every output still lands on a real view instead of being clamped.
+fn viewAtGlobalPoint(self: *ServerState, x: i32, y: i32) ?*OutputView {
+    var best: ?*OutputView = null;
+    var best_distance: i64 = std.math.maxInt(i64);
+    for (self.output_views.items) |v| {
+        if (v.rect.containsPoint(.{ .x = x, .y = y })) return v;
+        const cx = v.rect.x + @divTrunc(v.rect.width, 2);
+        const cy = v.rect.y + @divTrunc(v.rect.height, 2);
+        const dx = @as(i64, x) - cx;
+        const dy = @as(i64, y) - cy;
+        const d = dx * dx + dy * dy;
+        if (d < best_distance) {
+            best_distance = d;
+            best = v;
+        }
+    }
+    return best;
+}
+
+/// The view whose camera can SEE the world point: the first whose
+/// visible world rect contains it, else null. Input that starts from a
+/// world coordinate rather than a pixel — the synthesized click — has to
+/// go through this, because the world is one space and each output is
+/// only a window onto it. Converting through the wrong output's camera
+/// puts the pointer somewhere the user is not looking.
+fn viewSeeingWorldPoint(self: *ServerState, p: geom.FPoint) ?*OutputView {
+    for (self.output_views.items) |view| {
+        if (view.scene_output.visibleWorldRect().containsPoint(p.x, p.y)) return view;
+    }
+    return null;
+}
+
+/// The view a compositor gesture and new-surface placement act on: the
+/// one under the pointer, else the one the live gesture pinned, else the
+/// first. This is what "the selected output" means now that there is no
+/// single output.
+///
+/// NULL when the desktop has no output at all — every connector gone,
+/// before the first one arrives. There is no "first" to fall back to
+/// then, and indexing an empty list is the crash an unplug of the last
+/// output used to be. Every caller treats null as "place it nowhere for
+/// now": a client can still map and be configured, and the surface is
+/// placed on the next output that appears.
+fn selectedView(self: *ServerState) ?*OutputView {
+    if (self.output_views.items.len == 0) return null;
+    if (self.gestures.view) |v| {
+        if (std.mem.indexOfScalar(*OutputView, self.output_views.items, v) != null) return v;
+    }
+    if (viewAtGlobalPoint(self, self.seat.pointer_x, self.seat.pointer_y)) |v| return v;
+    return self.output_views.items[0];
+}
+
+/// The view `surface`'s node is placed on: its recorded placement when
+/// that view is still live, else the selected view (a new surface goes
+/// where the user is looking).
+fn viewForSurface(self: *ServerState, surface: *Surface) ?*OutputView {
+    if (self.surface_place.get(surface)) |place| {
+        if (std.mem.indexOfScalar(*OutputView, self.output_views.items, place.view) != null) return place.view;
+    }
+    return selectedView(self);
+}
+
+/// Put every tracked surface's tree on its view's desktop origin.
+///
+/// Scene space is the desktop, so a plain surface's tree — the container
+/// SurfaceNode puts under the scene root — carries the view's origin and
+/// the surface's own canvas-local position (0,0 to start, then whatever
+/// the interactive move made of it). Run once per frame and after every
+/// view change; a surface whose view disappeared loses its placement and
+/// lands on the selected one.
+fn syncSurfacePlacement(self: *ServerState) void {
+    const scene = self.scene orelse return;
+    var it = scene.surface_nodes.valueIterator();
+    while (it.next()) |sn| {
+        const surface = sn.*.surface;
+        if (self.surface_place.getPtr(surface)) |place| {
+            // The placed view is gone (unplug): drop the placement so the
+            // surface is re-homed on the next pass.
+            if (std.mem.indexOfScalar(*OutputView, self.output_views.items, place.view) == null) {
+                _ = self.surface_place.remove(surface);
+                continue;
+            }
+            // The node was destroyed by an unmap: re-apply on remap.
+            if (place.placed and sn.*.node == null) place.placed = false;
+        } else {
+            const view = selectedView(self) orelse return;
+            self.surface_place.put(self.allocator, surface, .{ .view = view }) catch |err| {
+                log.warn("surface placement OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+                return;
+            };
+        }
+        const entry = self.surface_place.getPtr(surface) orelse continue;
+        if (entry.placed) continue;
+        const tree = sn.*.tree orelse continue;
+        tree.setPosition(
+            @as(f64, @floatFromInt(entry.view.rect.x)),
+            @as(f64, @floatFromInt(entry.view.rect.y)),
+        );
+        entry.placed = true;
+    }
+}
+
+/// Output.events.frame for one view: this view's render entry point.
+fn onViewFrame(listener: *wire.Listener(*wayland.output.Output), _: *wayland.output.Output) void {
+    const view: *OutputView = @fieldParentPtr("frame_listener", listener);
+    renderFrame(view);
+}
+
+/// Output.events.destroy for one view: the backend took the output away
+/// (connector unplug, modeset, backend teardown). Free this view's
+/// targets, drop it from the layout and hand its surfaces back to the
+/// remaining views. NO other view's camera, target, damage or pacing is
+/// touched, and a gesture pinned to it is ended rather than left
+/// dangling on freed memory.
+fn onViewDestroyed(listener: *wire.Listener(*wayland.output.Output), out: *wayland.output.Output) void {
+    const view: *OutputView = @fieldParentPtr("destroy_listener", listener);
+    log.info("output removed ({d}x{d})", view.io, view.log_cfg, "server", .{
+        out.mode.width, out.mode.height,
+    });
+    removeOutputView(view.state, view);
+}
+
+/// Forget `view`: its targets and its place in the layout. The output
+/// itself is NOT freed here — the backend owns it and is about to.
+fn removeOutputView(self: *ServerState, view: *OutputView) void {
+    // A gesture pinned to the view that is going away must be ended NOW,
+    // while the view is still readable: its release path reads the view.
+    if (self.gestures.view == view) _ = endPointerGestures(self.seat, &self.gestures);
+
+    unlinkViewListeners(view);
+    view.freeTargets();
+    // The library's view holds borrowed camera/wl_output pointers into
+    // this struct and its output; dropping it now stops any surface
+    // membership test from reading them.
+    view.scene_output.destroy();
+
+    if (std.mem.indexOfScalar(*OutputView, self.output_views.items, view)) |idx| {
+        _ = self.output_views.orderedRemove(idx);
+    }
+    // Only the DEAD view's placements are dropped. Every survivor keeps
+    // the view it was placed on, where it sits and the size it was
+    // configured for: an unplug is not a relayout, and clearing the whole
+    // table re-homed every window on the next pass.
+    var it = self.surface_place.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.view == view) {
+            self.surface_place.removeByPtr(entry.key_ptr);
+        }
+    }
+    // The desktop extent absolute input devices are normalized onto just
+    // changed shape.
+    syncInputExtent(self);
+    self.allocator.destroy(view);
+    // Whatever is left has to repaint: the desktop just lost a column.
+    requestRender(self);
+}
+
+/// Output.events.commit for one view: a MODE change resizes this view's
+/// slice of the desktop. The view's ORIGIN never moves — the layout is
+/// append-only and a removal leaves its column unused — so a surviving
+/// output keeps both its position and its pixels across any other
+/// output's change. What does move is the size the compositor draws
+/// into and the extent absolute input devices are normalized onto.
+fn onViewCommit(
+    listener: *wire.Listener(*wayland.output.Output.CommitEvent),
+    ev: *wayland.output.Output.CommitEvent,
+) void {
+    const view: *OutputView = @fieldParentPtr("commit_listener", listener);
+    const w = ev.output.mode.width;
+    const h = ev.output.mode.height;
+    // The common case: every present carries the mode we already have.
+    if (view.rect.width == w and view.rect.height == h) return;
+    view.rect.width = w;
+    view.rect.height = h;
+    // The camera's viewport follows the mode. Its centre stays where the
+    // user (or WAYLAND_CAMERA) put it: a mode change is not a camera
+    // change, and re-centring would silently move the canvas.
+    view.camera.screen_w = @as(f64, @floatFromInt(w));
+    view.camera.screen_h = @as(f64, @floatFromInt(h));
+    resizeFramebuffers(view);
+    // Every pixel of a resized output is new, and cameraChanged() only
+    // compares centre/zoom/rotation, so the whole-output invalidation
+    // is stated here rather than inferred from the camera.
+    view.scene_output.addDamage(OutputView.localRect(view));
+    syncInputExtent(view.state);
+    requestRenderView(view.state, view);
+}
+
+/// Re-create this view's CPU storage after a mode change. The scanout
+/// buffer must match the mode the output scans out or the commit hands
+/// the backend the wrong geometry; the persisted base, both capture
+/// buffers and the cached per-slot GL images are dropped so the next
+/// frame rebuilds them at the new size. The CPU-scanout GLES2 FBO is
+/// already size-checked where it is used (ensureGles2Target).
+fn resizeFramebuffers(view: *OutputView) void {
+    const w = view.output.mode.width;
+    const h = view.output.mode.height;
+    const fb = pixman.Framebuffer.create(view.allocator, w, h) catch |err| {
+        // Keep the old buffer: this output simply keeps its previous size
+        // until a later mode change succeeds, and the frame is dropped
+        // rather than the server faulting.
+        log.err("framebuffer resize failed: {s}", view.io, view.log_cfg, "server", .{@errorName(err)});
+        return;
+    };
+    view.framebuffer.deinit();
+    view.framebuffer = fb;
+    if (view.base_framebuffer) |base| {
+        base.deinit();
+        view.base_framebuffer = null;
+    }
+    if (view.capture_base) |base| {
+        base.deinit();
+        view.capture_base = null;
+    }
+    if (view.capture_frame) |frame| {
+        frame.deinit();
+        view.capture_frame = null;
+    }
+    view.capture_base_valid = false;
+    view.capture_frame_valid = false;
+    for (&view.gpu_targets) |*slot| {
+        if (slot.*) |target| target.destroy();
+        slot.* = null;
+    }
+}
+
+/// Publish the current desktop extent to the input backend: the bounding
+/// box of the output layout, which is what an absolute pointer or tablet
+/// tool is normalized against (libinput reports a fraction of the screen
+/// it was given; LibinputBackend.setDesktopSize supplies it).
+///
+/// The layout never moves an existing view — an output is appended at
+/// the right end and a removal leaves its column unused — so this only
+/// ever changes the extent, never the pixels a survivor occupies. With
+/// no output at all there is no desktop to report into, and the last
+/// published extent stays until a connector comes back.
+fn syncInputExtent(self: *ServerState) void {
+    const backend = self.input_backend orelse return;
+    if (self.output_views.items.len == 0) return;
+    var width: i32 = 0;
+    var height: i32 = 0;
+    for (self.output_views.items) |view| {
+        width = @max(width, view.rect.x + view.rect.width);
+        height = @max(height, view.rect.y + view.rect.height);
+    }
+    if (width <= 0 or height <= 0) return;
+    const w: u32 = @intCast(width);
+    const h: u32 = @intCast(height);
+    if (w == self.input_extent_w and h == self.input_extent_h) return;
+    self.input_extent_w = w;
+    self.input_extent_h = h;
+    libinput_mod.LibinputBackend.setDesktopSize(backend, w, h);
+}
+
+/// Detach a view's listeners, idempotently (teardown reaches them twice).
+fn unlinkViewListeners(view: *OutputView) void {
+    if (view.frame_listener.link.prev != null) view.frame_listener.link.remove();
+    if (view.destroy_listener.link.prev != null) view.destroy_listener.link.remove();
+    if (view.commit_listener.link.prev != null) view.commit_listener.link.remove();
+}
+
+/// Free every output view and empty the list (the event loop is over).
+fn freeOutputViews(self: *ServerState) void {
+    for (self.output_views.items) |view| {
+        unlinkViewListeners(view);
+        view.freeTargets();
+        view.scene_output.destroy();
+        self.allocator.destroy(view);
+    }
+    self.output_views.deinit(self.allocator);
+    self.output_views = .empty;
+    self.gestures.view = null;
 }
 
 /// Per-toplevel listeners owned by main.zig (F10/F14): title/app_id change
@@ -2228,54 +2873,67 @@ fn onToplevelAppId(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *way
     log.info("toplevel app_id changed: {s}", tl.state.io, tl.state.log_cfg, "server", .{t.app_id orelse "(none)"});
 }
 
-/// The output's FULL box (its mode rect at the origin): the area a
+/// The output's FULL box (its mode rect at the local origin): the area a
 /// fullscreen surface covers. Distinct from usableArea — a fullscreen
 /// window covers panels, only a maximized one does not (wlroots keeps
 /// the full and the usable box apart, types/wlr_output.c:1106-1114;
 /// tinywl answers set_fullscreen with the full output size and
 /// set_maximized with the usable area, tinywl.c handle_toplevel_configure).
-fn fullscreenBox(self: *ServerState, named: ?*wayland.server.wl.Output) ?geom.Rect {
-    // set_fullscreen may name the output; the wl_output resource is this
-    // compositor's only when WlOutput.owns says so (a resource of a
-    // foreign global is ignored — the same identity check the rest of the
-    // server uses for protocols that take a wl_output, e.g. screencopy).
+///
+/// `named` is the wl_output resource the client asked for; it belongs to
+/// this compositor only when some view's WlOutput owns it (a resource of
+/// a foreign global is ignored — the same identity check screencopy uses).
+/// With no usable name the answer is the output the SURFACE is on, which
+/// is what wlroots falls back to (the output containing the surface).
+fn fullscreenBox(
+    self: *ServerState,
+    surface: ?*Surface,
+    named: ?*wayland.server.wl.Output,
+) ?geom.Rect {
     if (named) |res| {
-        if (self.wl_output) |wo| {
-            if (wo.owns(res)) return outputRect(wo.output);
+        for (self.output_views.items) |view| {
+            if (view.wl_output.owns(res)) return outputRect(view.output);
         }
     }
-    // No usable name (null, or an output that is gone): this server has
-    // a single output, so it is the one the surface belongs to
-    // (wlroots falls back to the output containing the surface).
-    return if (self.output) |out| outputRect(out) else null;
+    if (surface) |s| {
+        if (viewForSurface(self, s)) |view| return outputRect(view.output);
+    }
+    if (selectedView(self)) |view| return outputRect(view.output);
+    return null;
 }
 
-/// The output's mode rect at the origin: this server places its single
-/// output at (0,0) (one canvas, no multi-output layout yet).
+/// The output's mode rect at ITS OWN origin: (0,0) to the mode size. The
+/// configure sizes a maximized/fullscreen surface needs are output-local
+/// (the surface lives in this output's canvas), which is why the desktop
+/// layout origin never appears here.
 fn outputRect(out: *wayland.output.Output) geom.Rect {
     return .{ .x = 0, .y = 0, .width = out.mode.width, .height = out.mode.height };
 }
 
-/// The output's USABLE area: its mode rect shrunk by every exclusive
-/// zone the layer shell reserved (wlroots wlr_output usable_area,
-/// types/wlr_output.c:1106-1114 — a mapped layer surface's exclusive
-/// zone takes its edge off the usable area, which is exactly why a
-/// maximized window must not hide under a panel). A negative zone
-/// reserves the layer surface's own extent along that edge
-/// (wlr_layer_surface_v1: a negative zone lets the compositor size it).
+/// The view's USABLE area: its mode rect shrunk by every exclusive zone
+/// the layer shell reserved ON THAT VIEW (wlroots wlr_output usable_area,
+/// types/wlr_output.c:1106-1114 — a mapped layer surface's exclusive zone
+/// takes its edge off the usable area, which is exactly why a maximized
+/// window must not hide under a panel). A negative zone reserves the layer
+/// surface's own extent along that edge (wlr_layer_surface_v1: a negative
+/// zone lets the compositor size it).
 ///
 /// A reserved strip comes off BOTH ends of the axis it sits on: the top
 /// strip moves the origin down AND takes its pixels off the height (a
-/// rect that only moved its origin would still run off the bottom of
-/// the output). wlroots applies the reservation through the same
-/// two-sided shrink — `wlr_output_layout` reserves each edge with
+/// rect that only moved its origin would still run off the bottom of the
+/// output). wlroots applies the reservation through the same two-sided
+/// shrink — `wlr_output_layout` reserves each edge with
 /// `output_layout_reserve` semantics, where a top reservation shifts
 /// `usable.y` and subtracts from `usable.height`
 /// (types/wlr_output_layout.c, `wlr_output_layout_get_usable_area`).
-fn usableArea(self: *ServerState) geom.Rect {
-    const out = self.output orelse return geom.Rect.empty();
-    var area = outputRect(out);
+///
+/// Only layer surfaces PLACED ON THIS VIEW shrink it: a panel on the second
+/// output must not resize a window maximized on the first.
+fn usableArea(self: *ServerState, view: *OutputView) geom.Rect {
+    var area = outputRect(view.output);
     for (self.layer_shell.layer_surfaces.items) |ls| {
+        const surface = ls.surface;
+        if ((viewForSurface(self, surface) orelse continue) != view) continue;
         const edge = ls.exclusiveEdge() orelse continue;
         const px: i32 = if (ls.current.exclusive_zone > 0)
             ls.current.exclusive_zone
@@ -2307,14 +2965,14 @@ fn usableArea(self: *ServerState) geom.Rect {
 /// left the client waiting for a configure forever (a protocol deadlock:
 /// xdg_toplevel has no "request was denied" event).
 ///
-/// Policy: this server has one output and imposes no size constraints,
-/// so it agrees, and configures the surface to the output's USABLE area
-/// (usableArea) — the answer tinywl gives (tinywl.c
-/// handle_toplevel_configure sends the usable width/height for a
-/// maximized surface). Unmaximizing hands the size back to the client:
-/// the protocol has no "restore size" state and this server stores no
-/// pre-maximize geometry, so 0,0 ("client decides",
-/// xdg_toplevel.configure width/height) is the honest answer.
+/// Policy: the compositor imposes no size constraints, so it agrees, and
+/// configures the surface to the USABLE area of THE OUTPUT THE SURFACE IS
+/// ON (usableArea) — the answer tinywl gives (tinywl.c
+/// handle_toplevel_configure sends the usable width/height for a maximized
+/// surface). Unmaximizing hands the size back to the client: the protocol
+/// has no "restore size" state and this server stores no pre-maximize
+/// geometry, so 0,0 ("client decides", xdg_toplevel.configure
+/// width/height) is the honest answer.
 fn onToplevelMaximize(
     listener: *wire.Listener(*wayland.shell.XdgToplevel),
     t: *wayland.shell.XdgToplevel,
@@ -2329,15 +2987,17 @@ fn onToplevelMaximize(
         // A fullscreen surface covers the FULL output box whatever the
         // maximize request says: xdg-shell.xml:1049-1051 — set_maximized
         // "has no direct effect" while the surface is fullscreen — and
-        // xdg-shell.xml:850-854 requires a fullscreened surface to be
-        // able to cover the fullscreened area. So the STATE is recorded
-        // (a later un-fullscreen needs it) and the GEOMETRY is left as
-        // the fullscreen handler wrote it: the usable area would pull the
+        // xdg-shell.xml:850-854 requires a fullscreened surface to be able
+        // to cover the fullscreened area. So the STATE is recorded (a later
+        // un-fullscreen needs it) and the GEOMETRY is left as the
+        // fullscreen handler wrote it: the usable area would pull the
         // window out from under the panel a fullscreen window covers.
         if (!t.scheduled.fullscreen) {
-            const area = usableArea(self);
-            t.scheduled.width = area.width;
-            t.scheduled.height = area.height;
+            if (viewForSurface(self, t.xdg_surface.surface)) |view| {
+                const usable = usableArea(self, view);
+                t.scheduled.width = usable.width;
+                t.scheduled.height = usable.height;
+            }
         }
     } else {
         t.scheduled.width = 0;
@@ -2355,10 +3015,10 @@ fn onToplevelMaximize(
 }
 
 /// xdg_toplevel.set_fullscreen / unset_fullscreen (P1-8 + F10). The
-/// same request/answer contract as maximize, with the FULL output box
-/// (fullscreen covers panels, wlroots / tinywl.c handle_toplevel_configure)
-/// taken from the output the client named, or from this server's single
-/// output when it named none.
+/// same request/answer contract as maximize, with the FULL box of the
+/// output the client NAMED, of the one the surface is on, or of the
+/// selected view — in that order (fullscreen covers panels, wlroots /
+/// tinywl.c handle_toplevel_configure).
 fn onToplevelFullscreen(
     listener: *wire.Listener(*wayland.shell.FullscreenRequest),
     req: *wayland.shell.FullscreenRequest,
@@ -2367,24 +3027,26 @@ fn onToplevelFullscreen(
     const self = tl.state;
     const t = req.toplevel;
     t.scheduled.fullscreen = req.fullscreen;
-    // Leaving fullscreen hands the size back to the client (same reason
-    // as unmaximize: no stored pre-fullscreen geometry to restore) —
-    // unless the window is STILL maximized, in which case the box that
-    // maximizes means is the answer, exactly as onToplevelMaximize wrote
-    // it. 0x0 would tell the client to pick its own size for a state it
-    // was just told it has, and discard a geometry the two handlers
-    // otherwise disagree about.
+    // Leaving fullscreen hands the size back to the client (same reason as
+    // unmaximize: no stored pre-fullscreen geometry to restore) — unless
+    // the window is STILL maximized, in which case the box that maximizes
+    // means is the answer, exactly as onToplevelMaximize wrote it. 0x0
+    // would tell the client to pick its own size for a state it was just
+    // told it has, and discard a geometry the two handlers otherwise
+    // disagree about.
     t.scheduled.width = 0;
     t.scheduled.height = 0;
     if (req.fullscreen) {
-        if (fullscreenBox(self, req.output)) |box| {
+        if (fullscreenBox(self, t.xdg_surface.surface, req.output)) |box| {
             t.scheduled.width = box.width;
             t.scheduled.height = box.height;
         }
     } else if (t.scheduled.maximized) {
-        const area = usableArea(self);
-        t.scheduled.width = area.width;
-        t.scheduled.height = area.height;
+        if (viewForSurface(self, t.xdg_surface.surface)) |view| {
+            const usable = usableArea(self, view);
+            t.scheduled.width = usable.width;
+            t.scheduled.height = usable.height;
+        }
     }
     log.info("toplevel fullscreen -> {s} ({d}x{d})", self.io, self.log_cfg, "server", .{
         if (req.fullscreen) "on" else "off",
@@ -2398,26 +3060,45 @@ fn onToplevelFullscreen(
 
 /// xdg_toplevel.set_minimized (P1-8). The protocol carries no minimized
 /// STATE (xdg-shell.xml set_minimized: "There is no way to tell the
-/// client that it is minimized"), so the compositor records the request
-/// — the module keeps it in ToplevelState.minimized for exactly this —
-/// and takes the surface off screen: a minimized window is a window the
-/// user cannot see. This server has no iconifier to un-hide it, so the
-/// window comes back when the client commits again (the surface node's
-/// own update re-enables it, surface_node.zig:172).
+/// client that it is minimized"), so the compositor records the request —
+/// the module keeps it in ToplevelState.minimized for exactly this — and
+/// takes the surface off screen: a minimized window is a window the user
+/// cannot see. This server has no iconifier to un-hide it, so the window
+/// comes back when the client commits again (surfaceNodeBeforeUpdate
+/// re-enables the container this hid).
 fn onToplevelMinimize(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *wayland.shell.XdgToplevel) void {
     const tl: *ToplevelListeners = @fieldParentPtr("request_minimize", listener);
     const self = tl.state;
     log.info("toplevel minimize requested (recorded)", self.io, self.log_cfg, "server", .{});
     const scene = self.scene orelse return;
     const sn = wayland.surface_node.surfaceNodeFor(scene, t.xdg_surface.surface) orelse return;
-    if (sn.node) |node| node.enable(false);
-    if (self.scene_output) |so| {
-        so.addDamage(.{ .x = 0, .y = 0, .width = self.framebuffer.width, .height = self.framebuffer.height });
+    // The surface's CONTAINER, not its buffer node: a minimized window
+    // takes its popups and subsurfaces down with it, which is what the
+    // canvas pass prunes on (a disabled subtree is skipped whole) and
+    // what the hit test already skipped.
+    if (sn.tree) |tree| {
+        tree.enable(false);
+    } else if (sn.node) |node| {
+        // Unmapped: no container exists yet, so there is no subtree.
+        node.enable(false);
     }
-    requestRender(self);
+    // A window that vanishes leaves its pixels behind on EVERY camera
+    // that could see it — which, now that membership is the camera's
+    // visible world rect, is not only the output it was placed on.
+    var damaged = false;
+    if (sn.node) |node| {
+        const rect = node.absolutePosition();
+        for (self.output_views.items) |view| {
+            if (!view.scene_output.visibleWorldRect().intersects(rect)) continue;
+            view.scene_output.addDamage(OutputView.localRect(view));
+            requestRenderView(self, view);
+            damaged = true;
+        }
+    }
+    if (!damaged) requestRender(self);
 }
-
-fn onToplevelMove(listener: *wire.Listener(*wayland.shell.MoveRequest), req: *wayland.shell.MoveRequest) void {
+ 
+ fn onToplevelMove(listener: *wire.Listener(*wayland.shell.MoveRequest), req: *wayland.shell.MoveRequest) void {
     const tl: *ToplevelListeners = @fieldParentPtr("request_move", listener);
     const self = tl.state;
     const seat = req.seat;
@@ -2434,15 +3115,20 @@ fn onToplevelMove(listener: *wire.Listener(*wayland.shell.MoveRequest), req: *wa
         if (sl.isLocked()) return;
     }
     const toplevel_client = req.toplevel.xdg_surface.surface.resource.getClient();
-    // The serial must be a recent input-event serial on the request's
-    // seat (wlroots wlr_xdg_toplevel_move validates the same way).
+    // The serial must be a recent input-event serial on the request's seat
+    // (wlroots wlr_xdg_toplevel_move validates the same way).
     if (!seat.validateEventSerial(toplevel_client, req.serial)) return;
     // The move owns the gesture: cancel any armed camera drag.
     self.gestures.camera_drag = null;
     self.gestures.drag_active = false;
     self.gestures.fast_render = false;
     self.gestures.moving_toplevel = req.toplevel;
-    const wp = self.camera.screenToWorld(@floatFromInt(seat.pointer_x), @floatFromInt(seat.pointer_y));
+    // PIN the gesture to the output the pointer is on, and convert the
+    // pointer through THAT view's camera: the drag then moves the window in
+    // the output it started in, in that output's own units.
+    const view = viewAtGlobalPoint(self, seat.pointer_x, seat.pointer_y) orelse return;
+    self.gestures.view = view;
+    const wp = screenToWorldIn(view, seat.pointer_x, seat.pointer_y);
     self.gestures.move_anchor = .{ .x = wp.x, .y = wp.y };
     grabPointerForGesture(seat, &self.gestures);
     const surface_id = req.toplevel.xdg_surface.surface.resource.getId();
@@ -2519,10 +3205,11 @@ fn onNewLayerSurface(
         log.warn("failed to track layer surface: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
     };
     // L2: the compositor assigns the real size for the zero desired
-    // dimensions — the (single) output's mode size is the fallback the
-    // module uses in the initial configure.
-    if (self.output) |out| {
-        ls.setFallbackSize(@intCast(out.mode.width), @intCast(out.mode.height));
+    // dimensions — the SELECTED view's mode size is the fallback the
+    // module uses in the initial configure, so a panel created while the
+    // pointer is on the second output is sized for that output.
+    if (selectedView(self)) |view| {
+        ls.setFallbackSize(@intCast(view.output.mode.width), @intCast(view.output.mode.height));
     }
     // L-D6: the compositor drives the initial configure. One heap struct
     // per layer surface (freed by its destroy listener).
@@ -2590,16 +3277,21 @@ fn onNewLayerPopup(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *waylan
 fn onNewPopup(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.shell.XdgPopup) void {
     const self: *ServerState = @fieldParentPtr("new_popup_listener", listener);
     // F1: the compositor supplies the usable area for popup placement —
-    // the (single) output's mode rect in parent-surface-local coords. The
-    // popup configure then applies the client's constraint_adjustment bits
-    // (flip/slide/resize) to stay inside it.
-    if (self.output) |out| {
-        p.setConstraintBox(.{
-            .x = 0,
-            .y = 0,
-            .width = out.mode.width,
-            .height = out.mode.height,
-        });
+    // the mode rect of the output the PARENT surface is on, in that
+    // output's own coordinates. The popup configure then applies the
+    // client's constraint_adjustment bits (flip/slide/resize) to stay
+    // inside it. A popup on the second output is bounded by the second
+    // output, not by whichever one happens to be first.
+    const parent_surface = if (p.parent) |px| px.surface else p.layer_parent;
+    if (parent_surface) |ps| {
+        if (viewForSurface(self, ps)) |view| {
+            p.setConstraintBox(.{
+                .x = 0,
+                .y = 0,
+                .width = view.output.mode.width,
+                .height = view.output.mode.height,
+            });
+        }
     }
     // X08: the compositor drives the initial configure. One heap struct
     // per popup (freed by its destroy listener).
@@ -2902,16 +3594,21 @@ fn onDisplayReady(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
     // update), so present the unchanged canvas to fire the callback. Only
     // when the renderer is otherwise idle — a real change already queues
     // a render that presents everything.
-    if (!self.repaint_pending and !self.in_render) {
-        if (self.scene) |scene| {
-            var it = scene.surface_nodes.valueIterator();
-            while (it.next()) |sn| {
-                if (sn.*.surface.current.frame_callbacks.items.len > 0) {
-                    self.frame_kick = true;
-                    requestRender(self);
-                    break;
-                }
-            }
+    // A surface with a pending wl_surface.frame is ready for the next
+    // frame. The idle-frame skip would starve it (foot's render loop waits
+    // for the wl_callback.done before drawing + committing its next
+    // update), so the views whose canvas is idle present it unchanged to
+    // fire the callback. Only when a renderer is otherwise idle — a real
+    // change already queues a render that presents everything — and only
+    // for a view that actually shows the waiting surface.
+    if (self.scene) |scene| {
+        var it = scene.surface_nodes.valueIterator();
+        while (it.next()) |sn| {
+            if (sn.*.surface.current.frame_callbacks.items.len == 0) continue;
+            const view = viewForSurface(self, sn.*.surface) orelse continue;
+            if (view.repaint_pending or view.in_render) continue;
+            view.frame_kick = true;
+            requestRenderView(self, view);
         }
     }
     // Synth input (headless/DRM E2E) fires on every dispatch, not in
@@ -2991,10 +3688,20 @@ fn onRaylibPollTick(loop: *zio.ev.Loop, completion: *zio.ev.Completion) void {
 /// - M3: one pointer click + key press once the first surface is mapped.
 /// - M4 Phase B: one wheel-up notch once the client's FIRST screencopy
 ///   capture has been served (captures_served >= 1) plus a 2-call grace.
-/// The notch goes through the seat (pointerAxis), so the axis signal
-/// zooms the camera (2 -> 2.5 under the E2E).
+///   The notch goes through the seat (pointerAxis), so the axis signal
+///   zooms the camera (2 -> 2.5 under the E2E).
+/// - WAYLAND_SYNTH_INPUT=2 only: everything above, unchanged and once
+///   each, PLUS one real pointer motion per distinct committed
+///   content/state change (synthPointerMotion). A mode-1 run is not
+///   affected in any way.
 fn maybeSynthInput(self: *ServerState) void {
     if (!self.synth_input) return;
+    // Mode 2 rides on the same dispatch hook, and runs BEFORE the click
+    // below: it must see every tracked surface, not only the not-yet-
+    // clicked one the M3 click targets, because a client that re-commits
+    // the same surface with a new transform or crop is exactly the case a
+    // fresh motion exists for.
+    if (self.synth_pointer_moves) synthPointerMotion(self);
     // Target every NOT-yet-clicked mapped surface (see synth_clicked):
     // the first client gets the original M3 click+key, later clients
     // (selection roundtrips) get focus + a serial too.
@@ -3015,8 +3722,19 @@ fn maybeSynthInput(self: *ServerState) void {
     const t = target orelse return;
     const tsurf = target_surface.?;
     const rect = t.absolutePosition();
-    const sx = rect.x + @divTrunc(rect.width, 2);
-    const sy = rect.y + @divTrunc(rect.height, 2);
+    // The click is aimed at the node's f64 centre, but the seat takes
+    // DESKTOP PIXELS: a world coordinate narrowed straight to i32 is
+    // wrong by every zoom and rotation, and off by a billion on a canvas
+    // placed far from the origin. So the centre is projected through the
+    // camera of the output that can SEE it, and only that screen result
+    // is narrowed — the one narrowing this path is allowed.
+    const centre = geom.FPoint{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 };
+    const view = viewSeeingWorldPoint(self, centre) orelse
+        viewForSurface(self, tsurf) orelse
+        return;
+    const at = view.camera.worldToScreen(centre.x, centre.y);
+    const sx: i32 = view.rect.x + @as(i32, @intFromFloat(@floor(at.x)));
+    const sy: i32 = view.rect.y + @as(i32, @intFromFloat(@floor(at.y)));
     self.synth_clicked.put(self.allocator, tsurf, {}) catch return;
     const seat = self.seat;
     seat.pointerMotion(sx, sy);
@@ -3040,6 +3758,159 @@ fn maybeSynthInput(self: *ServerState) void {
     }
 }
 
+/// `*Buffer` as Surface.State stores it.
+/// SAFETY: type-derivation only; the undefined value is never evaluated at runtime.
+const CommittedBuffer = @TypeOf(@as(Surface, undefined).current.buffer);
+
+/// The committed state a mode-2 synth pointer motion is derived from: the
+/// surface's buffer and the three requests that change WHAT it displays
+/// (buffer_transform, buffer_scale, wp_viewport). A commit that changes
+/// none of them draws the same picture, so it must not draw a fresh
+/// motion: the client's own verifyZoom round re-commits identical state,
+/// and a motion per commit is a self-triggered motion/commit loop.
+///
+/// The buffer is compared by identity, not by content. A client that
+/// re-attaches the SAME wl_buffer for every case — which the
+/// transform matrix does — is caught by the transform, scale or viewport
+/// fields instead, because those are what the case actually varies.
+const SynthSurfaceState = struct {
+    buffer: CommittedBuffer = null,
+    transform: geom.Transform = .normal,
+    scale: i32 = 1,
+    has_src: bool = false,
+    src: geom.FRect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    has_dst: bool = false,
+    dst: geom.Size = .{ .w = 0, .h = 0 },
+
+    fn of(surface: *Surface) SynthSurfaceState {
+        const vp = surface.current.viewport;
+        return .{
+            .buffer = surface.current.buffer,
+            .transform = surface.current.transform,
+            .scale = surface.current.scale,
+            .has_src = vp.has_src,
+            .src = vp.src,
+            .has_dst = vp.has_dst,
+            .dst = vp.dst,
+        };
+    }
+};
+
+/// WAYLAND_SYNTH_INPUT=2: point at the one designated surface whenever it
+/// commits something NEW — once per distinct change, never per commit and
+/// never per frame (see SynthSurfaceState).
+///
+/// ONE surface for the whole run, designated the first eligible one to
+/// appear. The motion is the acceptance datum for a transform matrix, so
+/// it must always describe THE surface whose box the client is about to
+/// assert: a popup, a drag icon or a second client committing content
+/// must not steal the pointer and leave that assertion reading some other
+/// surface's coordinates. The target is released when it leaves the
+/// scene, and the next eligible surface takes over.
+///
+/// Eligibility: ORDINARY world content with a buffer node. An
+/// output-local overlay (a layer surface, a lock surface, the drag icon
+/// and every descendant composited with one of them) is drawn in its own
+/// output's pixels and is not what the matrix exercises; the client's
+/// cursor surface is the pointer image itself and must never take focus.
+fn synthPointerMotion(self: *ServerState) void {
+    const scene = self.scene orelse return;
+    var target = self.synth_target;
+    if (target) |t| {
+        if (scene.surface_nodes.get(t) == null) target = null;
+    }
+    if (target == null) target = synthPointerCandidate(self, scene);
+    self.synth_target = target;
+    const surface = target orelse return;
+    const node = (scene.surface_nodes.get(surface) orelse return).node orelse return;
+    const now = SynthSurfaceState.of(surface);
+    if (self.synth_pointed.get(surface)) |was| {
+        if (std.meta.eql(was, now)) return;
+    }
+    // The snapshot is taken even when nothing can be pointed at: a
+    // surface no output can see has no pointer position, and a later
+    // motion for the same state would be one with no commit behind it.
+    self.synth_pointed.put(self.allocator, surface, now) catch return;
+    const at = synthPointerTarget(self, surface, node) orelse return;
+    self.seat.pointerMotion(at.x, at.y);
+    log.info("synth input: pointer motion to {d},{d} (surface {*})", self.io, self.log_cfg, "server", .{ at.x, at.y, surface });
+}
+
+/// The first mapped world surface mode 2 may point at, or null when there
+/// is none yet.
+fn synthPointerCandidate(self: *ServerState, scene: *wayland.scene.Scene) ?*Surface {
+    const cursor_res = self.seat.cursorSurface();
+    var it = scene.surface_nodes.valueIterator();
+    while (it.next()) |sn| {
+        const surface = sn.*.surface;
+        if (sn.*.node == null or !surface.mapped) continue;
+        if (cursor_res) |cr| {
+            if (surface.resource == cr) continue;
+        }
+        if (isLocalSpace(localSpaceOf(self, surface))) continue;
+        return surface;
+    }
+    return null;
+}
+
+/// The desktop pixel a mode-2 motion should carry `node` to: the middle
+/// of the surface's box as it is DISPLAYED.
+///
+/// That box is the node's own rect — the destination, not
+/// wp_viewport.set_source, which only remaps which texels fill it and
+/// never changes the coordinates the client is handed.
+///
+/// The centre is projected through the camera of the output that can see
+/// it (a world coordinate narrowed straight to i32 would be wrong by
+/// every zoom and rotation), then clamped into THAT output's own pixels
+/// so the motion cannot land on a second connector. The clamp is the
+/// projected bounding box intersected with the output, so a surface
+/// clipped by an edge is pointed at its visible interior. A rotated
+/// surface's bounding box also contains pixels that are not on it, so
+/// the result is verified by inverting the camera: a point that misses
+/// the surface sends no motion rather than one that would.
+fn synthPointerTarget(self: *ServerState, surface: *Surface, node: *wayland.scene.SceneNode) ?geom.Point {
+    const rect = node.absolutePosition();
+    if (rect.isEmpty()) return null;
+    const centre = geom.FPoint{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 };
+    const view = viewSeeingWorldPoint(self, centre) orelse
+        viewForSurface(self, surface) orelse
+        return null;
+    // The four corners, so a ROTATED surface's projected box is a real
+    // bounding box rather than the centre scaled by one factor.
+    const corners = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ 1, 1 } };
+    const near = view.camera.worldToScreen(rect.x, rect.y);
+    var min_x = near.x;
+    var min_y = near.y;
+    var max_x = near.x;
+    var max_y = near.y;
+    for (corners[1..]) |corner| {
+        const p = view.camera.worldToScreen(
+            rect.x + corner[0] * rect.width,
+            rect.y + corner[1] * rect.height,
+        );
+        min_x = @min(min_x, p.x);
+        min_y = @min(min_y, p.y);
+        max_x = @max(max_x, p.x);
+        max_y = @max(max_y, p.y);
+    }
+    const projected = geom.FRect{
+        .x = min_x,
+        .y = min_y,
+        .width = max_x - min_x,
+        .height = max_y - min_y,
+    };
+    const visible = projected.intersect(OutputView.localRect(view).toFloatRect()) orelse return null;
+    const px = visible.x + visible.width / 2;
+    const py = visible.y + visible.height / 2;
+    const back = view.camera.screenToWorld(px, py);
+    if (!rect.containsPoint(back.x, back.y)) return null;
+    return .{
+        .x = view.rect.x + geom.floorToI32(px),
+        .y = view.rect.y + geom.floorToI32(py),
+    };
+}
+
 /// A surface committed new content: schedule a render so the update is
 /// composited this frame (the commit→present wake, note 137 F1).
 fn onSceneContentDirty(listener: *wire.Listener(*wayland.scene.Scene), _: *wayland.scene.Scene) void {
@@ -3047,26 +3918,26 @@ fn onSceneContentDirty(listener: *wire.Listener(*wayland.scene.Scene), _: *wayla
     requestRender(self);
 }
 
-fn onOutputFrame(listener: *wire.Listener(*wayland.output.Output), out: *wayland.output.Output) void {
-    const self: *ServerState = @fieldParentPtr("frame_listener", listener);
-    renderFrame(self, out);
+/// Mark that EVERY view must render (something scene-global changed) and
+/// wake each renderer. Per-view changes (a camera move, the cursor) call
+/// requestRenderView with the one view they touch, so a second output's
+/// camera and targets are never disturbed by the first one's activity.
+fn requestRender(self: *ServerState) void {
+    for (self.output_views.items) |view| requestRenderView(self, view);
 }
 
-/// Mark that the next frame must render (something changed) and wake the
-/// renderer via output.sendFrame(). The DRM frame chain is driven by the
-/// flip event (sendFrame -> renderFrame -> commit -> flip -> event), so a
-/// change while idle needs this kick to start a frame; subsequent frames
-/// then pace off the flips until the change is consumed. While a frame is
-/// in flight (frame_pending, set by the last commit) the kick is skipped:
-/// the backend's next frame event renders it — starting a second frame
-/// now would duplicate the frame signal (note 135 F2).
-fn requestRender(self: *ServerState) void {
-    self.repaint_pending = true;
-    if (!self.in_render) {
-        if (self.output) |out| {
-            if (!out.frame_pending) out.sendFrame();
-        }
-    }
+/// Mark that `view` must render and wake it via output.sendFrame(). The
+/// DRM frame chain is driven by the flip event (sendFrame -> renderFrame
+/// -> commit -> flip -> event), so a change while idle needs this kick to
+/// start a frame; subsequent frames then pace off the flips until the
+/// change is consumed. While a frame is in flight (frame_pending, set by
+/// the last commit) the kick is skipped: the backend's next frame event
+/// renders it — starting a second frame now would duplicate the frame
+/// signal (note 135 F2).
+fn requestRenderView(_: *ServerState, view: *OutputView) void {
+    view.repaint_pending = true;
+    if (view.in_render) return;
+    if (!view.output.frame_pending) view.output.sendFrame();
 }
 
 // ---------------------------------------------------------------------------
@@ -3074,13 +3945,19 @@ fn requestRender(self: *ServerState) void {
 // ---------------------------------------------------------------------------
 
 /// What the render phases share, captured once per frame by beginFrame:
-/// the session-lock decision (read ONCE, the privilege boundary), the
-/// cursor footprints (captured BEFORE the cursor nodes move) and the
-/// scene output this frame composites into.
+/// the view being rendered, the session-lock decision (read ONCE, the
+/// privilege boundary) and the cursor footprints (captured BEFORE the
+/// cursor nodes move).
 const FrameInput = struct {
+    view: *OutputView,
     lock: LockedFrame,
     cursor_fp: wayland.cursor.Cursor.Footprints,
     scene_output: *wayland.scene.SceneOutput,
+    /// The pointer's position in THIS view's own pixels (the global
+    /// desktop position minus the view's layout origin). Null when the
+    /// pointer is not over this view, which is what keeps one output's
+    /// cursor out of another's frame.
+    pointer: ?geom.Point,
 };
 
 /// The five marks one frame takes, in the order the phases take them.
@@ -3088,7 +3965,7 @@ const FrameInput = struct {
 const FramePerf = struct {
     /// Frame start, after the idle skip.
     t0: u64,
-    /// After the scene sync (subsurfaces, popups, drag icon).
+    /// After the scene sync (placement, subsurfaces, popups, drag icon).
     sync: u64,
     /// After the cursor update.
     cursor: u64,
@@ -3098,62 +3975,60 @@ const FramePerf = struct {
     present: u64,
 };
 
-/// One frame, in five phases: gather what the frame needs (beginFrame),
-/// accumulate its damage, composite the canvas, commit it to the output,
-/// then finish (frame callbacks, presentation, bookkeeping). The order
-/// and every short-circuit in between are the frame's contract: a locked
-/// session must be the FIRST thing a composited frame sees, and a failed
-/// commit must skip every finishing step so the next flip re-renders.
-fn renderFrame(self: *ServerState, out: *wayland.output.Output) void {
+/// One frame for ONE view, in five phases: gather what the frame needs
+/// (beginFrame), accumulate its damage, composite its canvas, commit it
+/// to its output, then finish (frame callbacks, presentation, bookkeeping).
+/// The order and every short-circuit in between are the frame's contract:
+/// a locked session must be the FIRST thing a composited frame sees, and
+/// a failed commit must skip every finishing step so the next flip
+/// re-renders.
+fn renderFrame(view: *OutputView) void {
     const zone = tracy.Zone.begin(.{ .src = @src() });
     defer zone.end();
+    const self = view.state;
     // See the in_render field: guard against re-entrant emits from
     // requestRender while this render is on the stack.
-    self.in_render = true;
-    defer self.in_render = false;
+    view.in_render = true;
+    defer view.in_render = false;
     // Close the seat's input batch: everything the backends fed since
     // the last frame forms one wl_pointer.frame group (F7, note 132).
     self.seat.pointerFrame();
     // Idle-frame skip: nothing changed since the last render, so skip the
     // full composite + flip. Without this the flip chain runs a full
-    // 1280x800 bilinear composite + fb copy at every vsync (~60fps) even
-    // with a static canvas — the observed ~95% idle CPU. Changes set
-    // repaint_pending (requestRender); it is cleared after a successful
-    // render, and a flip-pending collision leaves it set so the next
-    // flip event re-renders.
-    if (!self.repaint_pending) {
-        return;
-    }
+    // composite at every vsync even with a static canvas — the observed
+    // ~95% idle CPU. Changes set repaint_pending (requestRender); it is
+    // cleared after a successful render, and a flip-pending collision
+    // leaves it set so the next flip event re-renders.
+    if (!view.repaint_pending) return;
     var perf: FramePerf = .{ .t0 = perfNs(self), .sync = 0, .cursor = 0, .render = 0, .present = 0 };
 
-    const input = beginFrame(self, out, &perf) orelse return;
-    accumulateFrameDamage(self, out, input);
-    compositeFrame(self, input);
+    const input = beginFrame(view, &perf) orelse return;
+    accumulateFrameDamage(view, input);
     // A failed commit skips the whole finishing phase: no frame callback,
     // no presentation, no watchdog re-arm — the repaint flag stays set
     // so the flip event re-renders the same frame.
-    if (!presentFrame(self, out, input, &perf)) return;
-    finishFrame(self, out, &perf);
+    if (!compositeAndPresent(view, input, &perf)) return;
+    finishFrame(view, &perf);
 }
 
 /// Phase 1: the frame's inputs. Reads the session-lock latch ONCE (see
 /// the ext_session_lock_manager_v1 wiring item 1 in the body), syncs the
 /// scene, moves the cursor and captures its footprints. Null when there
-/// is no scene output to render into.
-fn beginFrame(
-    self: *ServerState,
-    out: *wayland.output.Output,
-    perf: *FramePerf,
-) ?FrameInput {
+/// is nothing to render into.
+fn beginFrame(view: *OutputView, perf: *FramePerf) ?FrameInput {
+    const self = view.state;
     // ext_session_lock_manager_v1, wiring item 1: the latch is read HERE,
     // once per frame, and every composite decision below uses this value.
     // Nothing caches "was I unlocked" across a dispatch, so the first
     // frame composited after the `locked` signal (which is emitted inside
     // the lock surface's commit dispatch, before this runs) is already a
     // locked frame.
-    const lock = lockedFrameFor(self, out);
+    const lock = lockedFrameFor(self, view.output);
 
     perf.sync = perfNs(self);
+    // Scene space is the desktop: every surface's tree belongs on the view
+    // its surface was placed on (an unplug re-homes the survivors).
+    syncSurfacePlacement(self);
     // Subsurfaces: position child nodes over their mapped parent.
     syncSubsurfaceNodes(self);
     // F12: popups position over their parent at the geometry offset and
@@ -3164,125 +4039,239 @@ fn beginFrame(
     // scene coordinates while its drag lives.
     syncDragIconNodes(self);
 
-    const so = self.scene_output orelse {
-        log.err("render: no scene output", self.io, self.log_cfg, "server", .{});
+    const cursor = self.cursor orelse {
+        log.err("render: no cursor", self.io, self.log_cfg, "server", .{});
         return null;
     };
-
     // M3 cursor: follow the seat pointer, show the client cursor surface
     // or the fallback rect. update() captures the previous frame's
     // footprints BEFORE moving the nodes: a partial upload must repaint
     // both the old and the new position.
-    const cursor_fp = self.cursor.?.update();
+    const cursor_fp = cursor.update();
     perf.cursor = perfNs(self);
-    return .{ .lock = lock, .cursor_fp = cursor_fp, .scene_output = so };
+    // The pointer in THIS view's pixels: the seat carries global desktop
+    // coordinates, and a view draws the cursor only while the pointer is
+    // inside its own rectangle.
+    const gx = self.seat.pointer_x;
+    const gy = self.seat.pointer_y;
+    const pointer: ?geom.Point = if (view.rect.containsPoint(.{ .x = gx, .y = gy }))
+        .{ .x = gx - view.rect.x, .y = gy - view.rect.y }
+    else
+        null;
+    return .{
+        .view = view,
+        .lock = lock,
+        .cursor_fp = cursor_fp,
+        .scene_output = view.scene_output,
+        .pointer = pointer,
+    };
 }
 
-/// Phase 2: this frame's damage ring — the region the raylib backend
-/// uploads and the commit reports.
-fn accumulateFrameDamage(self: *ServerState, out: *wayland.output.Output, input: FrameInput) void {
+/// Phase 2: this view's damage ring — the region the backend uploads and
+/// the commit reports.
+fn accumulateFrameDamage(view: *OutputView, input: FrameInput) void {
+    const self = view.state;
     const so = input.scene_output;
-    // Damage accumulation: this frame's surface damage translated into
-    // output coordinates, plus the cursor's old+new footprints. The ring
-    // is the upload region for the raylib backend; the pixman repaint
-    // below stays a full repaint. The first frame damages the whole
-    // output — the window texture starts blank, so a partial first upload
-    // would leave the background uninitialized. A CAMERA change (pan,
-    // zoom) moves every pixel, so the whole output is damaged too —
-    // otherwise the partial upload smears the previous canvas around the
-    // dragged cursor (the drag-streak bug).
-    const camera_changed = self.last_camera.center_x != self.camera.center_x or
-        self.last_camera.center_y != self.camera.center_y or
-        self.last_camera.zoom != self.camera.zoom;
-    self.last_camera = self.camera;
-    if (self.frames_rendered == 0 or camera_changed) {
-        so.addDamage(.{ .x = 0, .y = 0, .width = out.mode.width, .height = out.mode.height });
+    const out_rect = OutputView.localRect(view);
+    // Damage accumulation: this frame's surface damage projected into THIS
+    // output's coordinates, plus the cursor's old+new footprints. The ring
+    // is the upload region; the pixman repaint below stays a full repaint.
+    // The first frame damages the whole output — the window texture starts
+    // blank, so a partial first upload would leave the background
+    // uninitialized. A CAMERA change (pan, zoom, ROTATION) moves every
+    // pixel, so the whole output is damaged too — otherwise the partial
+    // upload smears the previous canvas (the drag-streak bug).
+    const camera_changed = view.cameraChanged();
+    view.last_camera = view.camera;
+    if (view.frames_rendered == 0 or camera_changed) {
+        so.addDamage(out_rect);
     }
-    const out_rect: geom.Rect = .{ .x = 0, .y = 0, .width = out.mode.width, .height = out.mode.height };
-    // The surfaces about to be drawn this frame (presentation feedback
-    // targets) + their damage: the library's per-frame surface pass.
-    // collectPresented rebuilds the scene's presented list; the
-    // addSurfaceDamage loop translates each node's committed damage
-    // (surface coordinates) by the node's absolute position into output
-    // coordinates, clipped to the output (damage is a hint; clipping is
-    // safe). The compositor drives the pass; the scene.presented list is
-    // consumed below for frame callbacks + presentation feedback.
-    wayland.surface_node.collectPresented(self.scene.?);
-    wayland.surface_node.addSurfaceDamage(self.scene.?, so, out_rect);
-    if (!std.meta.eql(input.cursor_fp.old[0], input.cursor_fp.new[0]) or
-        !std.meta.eql(input.cursor_fp.old[1], input.cursor_fp.new[1]))
-    {
-        for (input.cursor_fp.old) |r| if (r) |rr| so.addDamage(rr);
-        for (input.cursor_fp.new) |r| if (r) |rr| so.addDamage(rr);
+    // The library queues damage on each surface commit. Re-reading its
+    // current damage here would replay an idle overlay's damage forever.
+    // Rebuild only THIS output's visible presentation-feedback targets.
+    // Output membership decides enter/leave and the visible set, and it is
+    // expressed through each scene output's camera visible world rect — so
+    // it is refreshed here, after the frame's camera and placement work.
+    if (self.scene) |scene| {
+        wayland.surface_node.updateOutputAssociations(scene);
+        wayland.surface_node.collectPresented(scene, so);
+    }
+    // The cursor's old and new footprints, projected through this view's
+    // camera: a cursor that only ever touched another output contributes
+    // nothing here. The footprints are f64 WORLD rects (Cursor.footprints
+    // no longer narrows them), so a cursor parked a billion pixels out at
+    // a fractional offset reaches this projection with its fraction
+    // intact and is clipped there — never rounded into an i32 edge first.
+    for ([_][2]?geom.FRect{ input.cursor_fp.old, input.cursor_fp.new }) |pair| {
+        for (pair) |maybe_rect| {
+            if (maybe_rect) |r| addProjectedDamage(so, r);
+        }
     }
 }
 
-/// Phase 3: put this frame's canvas on screen — a full composite, or one
-/// of the two cheap paths the frame policy allows. M4: the canvas pass
-/// (background fill + camera-transformed surface textures +
-/// screen-space cursor) replaces the scene-output render; the
-/// damage-ring accounting is unchanged.
-fn compositeFrame(self: *ServerState, input: FrameInput) void {
+/// Project one WORLD rect into its output's screen pixels and accumulate
+/// it there. Uses the library's own f64 projection (clip in f64, narrow
+/// once) so a rect a billion pixels off-screen contributes nothing
+/// instead of saturating onto an edge the output never had.
+fn addProjectedDamage(so: *wayland.scene.SceneOutput, world: geom.FRect) void {
+    if (so.projectWorldRect(world)) |on_screen| so.addDamage(on_screen);
+}
+
+/// Phases 3 and 4: composite this view's canvas into the target it scans
+/// out from, then hand that target to the output.
+///
+/// The GPU DRM path leases the slot FIRST, because the canvas has to be
+/// drawn into that very buffer: no CPU front, no read-back, no framebuffer
+/// copy. Every CPU backend composites into the view's own framebuffer. A
+/// failed lease or commit is explicit — the frame is dropped and the
+/// repaint flag kept, never silently replaced by a CPU composite the
+/// operator did not ask for.
+fn compositeAndPresent(view: *OutputView, input: FrameInput, perf: *FramePerf) bool {
+    const self = view.state;
+    if (!view.gpu) {
+        if (!compositeFrame(view, input, null)) return false;
+        return presentFrame(view, input, perf, null);
+    }
+    const backend = self.drm_backend orelse {
+        log.err("gpu scanout: no DRM backend", self.io, self.log_cfg, "server", .{});
+        return false;
+    };
+    const frame = drm_mod.DrmBackend.acquireGpuFrame(backend, view.output) orelse {
+        log.err("gpu scanout: no free slot on {d}x{d}; frame dropped", self.io, self.log_cfg, "server", .{
+            view.output.mode.width, view.output.mode.height,
+        });
+        return false;
+    };
+    view.gpu_lease = frame;
+    const target = gpuTargetForSlot(view, frame) orelse {
+        drm_mod.DrmBackend.cancelGpuFrame(backend, view.output, frame);
+        view.gpu_lease = null;
+        return false;
+    };
+    if (!compositeFrame(view, input, target)) {
+        drm_mod.DrmBackend.cancelGpuFrame(backend, view.output, frame);
+        view.gpu_lease = null;
+        return false;
+    }
+    // The lease is a WRITING lease: the buffer's contents must be complete
+    // before it is scanned out. finishRendering is that barrier (glFinish
+    // on the first implementation); the contract it keeps is "nothing is
+    // scanned out before the writes land".
+    gles2.Gles2Renderer.finishRendering(self.renderer) catch |err| {
+        log.err("gpu scanout: render completion failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        drm_mod.DrmBackend.cancelGpuFrame(backend, view.output, frame);
+        view.gpu_lease = null;
+        return false;
+    };
+    return presentFrame(view, input, perf, frame);
+}
+
+/// The EGL image FBO for the frame's slot, imported once per slot and then
+/// reused: a cached target belongs to the dmabuf behind that slot, and the
+/// backend re-validates the frame's identity, owner, generation and slot
+/// before every commit.
+fn gpuTargetForSlot(view: *OutputView, frame: *wayland.gpu_frame.GpuFrame) ?*gles2.Gles2Target {
+    if (view.gpu_targets[frame.slot]) |t| return t;
+    const target = gles2.Gles2Target.fromDmabuf(view.allocator, view.state.renderer, &frame.attributes) catch |err| {
+        log.err("gpu scanout: slot {d} import failed: {s}", view.io, view.log_cfg, "server", .{
+            frame.slot, @errorName(err),
+        });
+        return null;
+    };
+    view.gpu_targets[frame.slot] = target;
+    return target;
+}
+
+/// Phase 3: put this frame's canvas into the view's scanout target.
+/// `gpu_target` is non-null only on the GPU DRM path, where the canvas goes
+/// straight into the leased buffer.
+fn compositeFrame(view: *OutputView, input: FrameInput, gpu_target: ?*gles2.Gles2Target) bool {
     const lock = input.lock;
+    if (gpu_target != null) {
+        // The GPU path always draws the full canvas: a fresh lease is a
+        // fresh buffer, and there is no persisted base to restore a region
+        // from — so the hover/present-unchanged shortcuts below, which are
+        // CPU framebuffer tricks, do not apply.
+        return compositeCanvas(view, input, gpu_target);
+    }
     if (lock.locked) {
         // A locked session never reuses the previous canvas: the two
         // shortcuts below (hover cursor restore, present-unchanged) would
         // show a frame composited BEFORE the latch, which is exactly what
         // the privilege boundary forbids. Refill the output instead.
-        self.cursor_repaint = false;
-        self.frame_kick = false;
-        compositeCanvas(self, lock);
-        return;
+        view.cursor_repaint = false;
+        view.frame_kick = false;
+        return compositeCanvas(view, input, null);
     }
-    if (self.cursor_repaint) {
-        // Hover cursor move: the canvas is static, so restore the old
-        // cursor region from the persisted base + redraw the cursor at the
-        // new pointer — no full-canvas recomposite (the ~450ms bilinear).
-        // The base is only invalidated by a real canvas change, which takes
-        // the compositeCanvas path.
-        self.cursor_repaint = false;
-        if (self.base_framebuffer) |base| {
+    if (view.cursor_repaint) {
+        // Hover cursor move: the canvas is static, so restore the old cursor
+        // region from the persisted base + redraw the cursor at the new
+        // pointer — no full-canvas recomposite.
+        view.cursor_repaint = false;
+        if (view.base_framebuffer) |base| {
             // Restore BOTH old footprints (the fallback-rect node AND the
-            // client-cursor node — weston-terminal sets a cursor surface,
-            // so the visible cursor is the buf node, not the rect node).
-            // Restoring only the rect node left the old client cursor in
-            // place, smearing a trail behind the moving pointer.
+            // client-cursor node). Restoring only the rect node left the
+            // old client cursor in place, smearing a trail behind the
+            // moving pointer.
             for (input.cursor_fp.old) |r| {
-                if (r) |rr| copyRegion(base, self.framebuffer, rr);
+                if (r) |rr| copyRegion(base, view.framebuffer, localRectOf(view, rr));
             }
         }
-        if (!lock.cursor_hidden) self.cursor.?.draw(self.framebuffer);
-        return;
+        if (!lock.cursor_hidden and input.pointer != null) compositeCursor(view, view.framebuffer);
+        return true;
     }
-    if (self.frame_kick) {
-        // A client is ready for the next frame (pending wl_callback) but
-        // the canvas is unchanged. Present the current framebuffer so the
+    if (view.frame_kick) {
+        // A client is ready for the next frame (pending wl_callback) but the
+        // canvas is unchanged. Present the current framebuffer so the
         // callback fires and the client can render + commit its pending
         // update — no recomposite.
-        self.frame_kick = false;
-        return;
+        view.frame_kick = false;
+        return true;
     }
-    compositeCanvas(self, lock);
+    return compositeCanvas(view, input, null);
 }
 
-/// Phase 4: hand the framebuffer to the output. The output damage is the
-/// ring's rects for this frame — the raylib backend uploads only that
-/// region. An empty ring (nothing changed, or whole damage) falls back to
-/// a whole-output damage. False when the commit failed; the repaint flag
-/// stays set so the flip event re-renders.
+/// A world-space rect as this view's own pixel rect, clipped to the
+/// output. The damage ring and the cursor restore both speak output-local
+/// coordinates while the cursor nodes are positioned in DESKTOP ones, and
+/// `Cursor.footprints` hands them over as f64 world rects — so the shift
+/// and the clip happen in f64, against the output rect in f64, and only
+/// the clipped box is narrowed once. A footprint a billion pixels out at
+/// a fractional offset therefore either lands on the output it really
+/// covers or clips away entirely; it can never round onto an edge the
+/// output never had.
+fn localRectOf(view: *OutputView, world: geom.FRect) geom.Rect {
+    const local = geom.FRect{
+        .x = world.x - @as(f64, @floatFromInt(view.rect.x)),
+        .y = world.y - @as(f64, @floatFromInt(view.rect.y)),
+        .width = world.width,
+        .height = world.height,
+    };
+    const clipped = local.intersect(OutputView.localRect(view).toFloatRect()) orelse
+        return geom.Rect.empty();
+    return clipped.toPixelRect();
+}
+
+/// Phase 4: hand the frame to the output. The output damage is the ring's
+/// rects for this frame — the backend uploads only that region. An empty
+/// ring falls back to a whole-output damage. False when the commit failed;
+/// the repaint flag stays set so the flip event re-renders, and a GPU
+/// lease the backend did not consume is cancelled.
 fn presentFrame(
-    self: *ServerState,
-    out: *wayland.output.Output,
+    view: *OutputView,
     input: FrameInput,
     perf: *FramePerf,
+    gpu_frame: ?*wayland.gpu_frame.GpuFrame,
 ) bool {
+    const self = view.state;
+    const out = view.output;
     // wp_tearing_control_manager_v1: the present path consults the
     // committed hint of every surface it is about to scan out, per frame.
-    _ = consultTearingHints(self, out);
+    _ = consultTearingHints(self, view);
     _ = input.scene_output.damage_ring.rotate();
     // The render span ends here — after the tearing consult and the ring
-    // rotation, which is where the perf trace has always taken it — and
-    // before the commit, so the present span covers the commit alone.
+    // rotation — and before the commit, so the present span covers the
+    // commit alone.
     perf.render = perfNs(self);
 
     var state = wayland.output.Output.State.init(self.allocator);
@@ -3292,7 +4281,7 @@ fn presentFrame(
         wayland.output.Output.State.committed_buffer;
     state.enabled = true;
     state.mode = .{ .width = out.mode.width, .height = out.mode.height, .refresh_msec = out.mode.refresh_msec };
-    state.buffer = @ptrCast(self.framebuffer);
+    state.buffer = if (gpu_frame) |f| .{ .gpu = f } else .{ .cpu = view.framebuffer };
     const damage_rects = input.scene_output.takeDamage();
     if (damage_rects.len == 0) {
         state.damage.addWhole();
@@ -3305,31 +4294,46 @@ fn presentFrame(
         }
     }
     out.commitState(&state) catch |err| {
-        // Usually the flip-pending pacing collision (a commit while a
-        // flip is in flight); the DRM logs real failures itself. The
-        // repaint flag stays set so the flip event re-renders it.
+        // A GPU lease the backend did not consume goes back: the slot stays
+        // owned by the server and the buffer is never scanned out.
+        if (gpu_frame) |f| {
+            if (self.drm_backend) |b| drm_mod.DrmBackend.cancelGpuFrame(b, out, f);
+            view.gpu_lease = null;
+        }
+        // Usually the flip-pending pacing collision (a commit while a flip
+        // is in flight); the DRM logs real failures itself. The repaint
+        // flag stays set so the flip event re-renders it.
         log.debug("output commit failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
         return false;
     };
+    // The commit consumed the lease: the backend owns the buffer until it
+    // flips, and the view must neither cancel nor re-render into it.
+    view.gpu_lease = null;
     perf.present = perfNs(self);
     return true;
 }
 
-/// Phase 5: what a committed frame owes its clients — the frame
-/// callbacks, the presentation feedback, the counters and the loop
-/// bookkeeping that follows a successful present.
-fn finishFrame(self: *ServerState, out: *wayland.output.Output, perf: *FramePerf) void {
-    // Frame callbacks: the surfaces presented this frame get
-    // wl_callback.done at present time (wlroots wlr_surface_send_frame_done,
-    // wlr_compositor.c:1131-1139). The time is the monotonic clock in ms
-    // (.awake = CLOCK_MONOTONIC in the 0.16 std.Io.Clock); the u32
-    // wrap-around is fine — the protocol defines an undefined base.
+/// Phase 5: what a committed frame owes its clients — the frame callbacks,
+/// the presentation feedback, the counters and the loop bookkeeping that
+/// follows a successful present. EVERYTHING here is per view: only the
+/// surfaces visible on THIS output get a callback, and the presentation
+/// names THIS output's wl_output.
+fn finishFrame(view: *OutputView, perf: *FramePerf) void {
+    const self = view.state;
+    const out = view.output;
+    const presented = view.scene_output.presented.items;
+    // Frame callbacks: the surfaces presented on this output get
+    // wl_callback.done at present time (wlroots wlr_surface_send_frame_done).
+    // The time is the monotonic clock in ms (.awake = CLOCK_MONOTONIC in the
+    // 0.16 std.Io.Clock); the u32 wrap-around is fine — the protocol
+    // defines an undefined base.
     const now_ms: u32 = @truncate(@as(u64, @bitCast(std.Io.Clock.now(.awake, self.io.*).toMilliseconds())));
-    for (self.scene.?.presented.items) |s| s.sendFrameDone(now_ms);
+    for (presented) |s| s.sendFrameDone(now_ms);
 
+    view.frames_rendered += 1;
     if (self.perf) {
         log.info(perf_frame_fmt, self.io, self.log_cfg, "perf", .{
-            self.frames_rendered,
+            view.frames_rendered,
             (perf.sync - perf.t0) / 1000,
             (perf.cursor - perf.sync) / 1000,
             (perf.render - perf.cursor) / 1000,
@@ -3338,42 +4342,31 @@ fn finishFrame(self: *ServerState, out: *wayland.output.Output, perf: *FramePerf
         });
     }
 
-    // wp_presentation: every surface drawn this frame awaits its present.
-    // The output's wl_output global names the output for sync_output. For
-    // real-display backends (DRM/nested — Output.emits_present) present()
-    // QUEUES the feedbacks on the output's commit seq (out.commit_seq,
-    // the seq of the frame just committed): the output's presented event
-    // — the actual scanout/flip completion — delivers them with the
-    // backend's timestamp, flags and refresh; a frame that never presents
-    // is never reported. Headless/raylib have no present event:
-    // present() synthesizes immediately (the refresh/flags args are
-    // theirs alone — a synthetic present is the only path that uses
-    // them).
+    // wp_presentation: every surface drawn on this output awaits its
+    // present. THIS view's wl_output global names the output for
+    // sync_output. For real-display backends (DRM/nested —
+    // Output.emits_present) present() QUEUES the feedbacks on the output's
+    // commit seq (the seq of the frame just committed): the output's
+    // presented event — the actual scanout/flip completion — delivers them.
+    // Headless/raylib have no present event: present() synthesizes
+    // immediately.
     self.presentation.present(
-        self.scene.?.presented.items,
-        self.wl_output,
+        presented,
+        view.wl_output,
         out.commit_seq,
         @intCast(out.mode.refresh_msec),
         0,
     );
 
-    self.frames_rendered += 1;
-    // The frame was rendered + committed (the flip is in flight): clear
-    // the pending flag so the next flip event skips until a change.
-    self.repaint_pending = false;
+    // The frame was rendered + committed (the flip is in flight): clear the
+    // pending flag so the next flip event skips until a change.
+    view.repaint_pending = false;
     tracy.frameMark(null);
-    // `surfaces` is this frame's FRAME-DONE FAN-OUT: the count the
-    // sendFrameDone loop above walked, off the same scene.presented
-    // with no rebuild in between. It is NOT the drawn count —
-    // collectCanvasItems drops the cursor surface, drag icons, disabled
-    // nodes and (GLES2) non-identity buffer transforms. A frame logging
-    // surfaces=0 sent no callback at all, so it cannot be the frame a
-    // client's wl_callback.done rode: that callback always rides a frame
-    // that composited first (compositeFrame) and committed to the output
-    // second (presentFrame), both above.
-    log.debug("render frame={d} surfaces={d}", self.io, self.log_cfg, "server", .{
-        self.frames_rendered,
-        self.scene.?.presented.items.len,
+    // `presented` is this frame's FRAME-DONE FAN-OUT: the count the
+    // sendFrameDone loop above walked. It is NOT the drawn count — the
+    // canvas pass additionally drops the cursor surface and drag icons.
+    log.debug("render view {d}x{d} frame={d} surfaces={d}", self.io, self.log_cfg, "server", .{
+        out.mode.width, out.mode.height, view.frames_rendered, presented.len,
     });
 
     // Frame-done and presentation events were marshalled above; push them
@@ -3385,15 +4378,18 @@ fn finishFrame(self: *ServerState, out: *wayland.output.Output, perf: *FramePerf
     self.display.flushClients();
 
     // Progress: keep the watchdog from firing. A wedged loop stops instead
-    // of hanging tests. Guarded by watchdog_enabled: zio's setTimer arms
-    // an un-armed timer, so without this a disabled watchdog (interactive
+    // of hanging tests. Guarded by watchdog_enabled: zio's setTimer arms an
+    // un-armed timer, so without this a disabled watchdog (interactive
     // demo) would be re-armed by the first render and fire anyway.
     if (self.watchdog_enabled) {
         if (self.watchdog) |t| {
             self.loop.?.setTimer(t, .{ .duration = zio.Duration.fromMilliseconds(watchdog_timeout_ms) });
         }
     }
-    if (self.run_frames != 0 and self.frames_rendered >= self.run_frames) {
+    // The frame budget is a SESSION budget, so it sums across the views: a
+    // two-output server that stopped after the first output's N frames
+    // would never stop on its own.
+    if (self.run_frames != 0 and totalFrames(self) >= self.run_frames) {
         log.info("reached WAYLAND_RUN_FRAMES={d}, stopping", self.io, self.log_cfg, "server", .{self.run_frames});
         self.loop.?.stop();
     }
@@ -3428,16 +4424,17 @@ const PresentTearing = struct {
 /// hint is not silently upgraded into a command. Turning this on needs
 /// `tearing: bool` on output.Output.State plus DRM_MODE_PAGE_FLIP_ASYNC
 /// in backend/drm.zig; until then `honoured` is false by construction.
-fn consultTearingHints(self: *ServerState, out: *wayland.output.Output) PresentTearing {
+fn consultTearingHints(self: *ServerState, view: *OutputView) PresentTearing {
     const tc = self.tearing_control orelse return .{};
-    const scene = self.scene orelse return .{};
     var async_surfaces: u32 = 0;
-    for (scene.presented.items) |surface| {
+    // Only the surfaces THIS output is about to scan out: a surface that
+    // lives on the other output has no say in this frame's flip.
+    for (view.scene_output.presented.items) |surface| {
         if (tc.hintFor(surface) == .async) async_surfaces += 1;
     }
     // The output gate: the client's `.async` is a permission, honoured
     // only when the output actually tears (see outputTears).
-    const honoured = async_surfaces > 0 and outputTears(out);
+    const honoured = async_surfaces > 0 and outputTears(view.output);
     if (async_surfaces > 0 and !honoured) {
         log.debug(
             "tearing: {d} surface(s) request async presentation; this backend flips vsync'd, hint not honoured",
@@ -3523,90 +4520,125 @@ fn lockedFrameFor(self: *ServerState, out: *wayland.output.Output) LockedFrame {
 ///    state (Cursor.update/Cursor.footprints still position them for the
 ///    damage ring) but are no longer drawn by the scene.
 /// Composite the full canvas (background + camera-transformed surfaces +
-/// screen-space cursor) into the display framebuffer. The background +
-/// surfaces (the "base") are rendered into the persisted base_framebuffer
-/// first and copied out, so compositeFrame's cursor_repaint path can restore
-/// a cursor region from the base without recompositing the whole canvas
-/// (the ~450ms full-canvas bilinear in the VM).
-fn compositeCanvas(self: *ServerState, lock: LockedFrame) void {
-    ensureBaseFramebuffer(self);
-    compositeBase(self, lock);
-    copyWhole(self.base_framebuffer.?, self.framebuffer);
-    // ext_session_lock_v1:74-91 — a locked session draws no cursor.
-    // Cursor.update re-enables its scene nodes every frame, so hiding the
-    // cursor is the server not painting it (compositor/cursor.zig owns
-    // the nodes; main owns the draw).
-    if (!lock.cursor_hidden) self.cursor.?.draw(self.framebuffer);
+/// screen-space cursor) into the view's scanout target.
+///
+/// `gpu_target` non-null is the GPU DRM path: the canvas is drawn STRAIGHT
+/// into the leased scanout buffer — no CPU front, no read-back, no
+/// framebuffer copy. Null is a CPU backend: the base lands in the view's
+/// persisted base framebuffer (so the hover-cursor path can restore a
+/// region from it without recompositing), is copied to the scanout
+/// framebuffer, and the cursor is stamped on top.
+fn compositeCanvas(view: *OutputView, input: FrameInput, gpu_target: ?*gles2.Gles2Target) bool {
+    const lock = input.lock;
+    if (gpu_target != null) {
+        // The cursor rides in the SAME pass as the canvas (compositeBaseGles2
+        // draws it last, under the identity transform): a second pass would
+        // start with an implicit clear and erase the base.
+        if (!compositeBase(view, input, gpu_target)) return false;
+        view.capture_base_valid = false;
+        view.capture_frame_valid = false;
+        return true;
+    }
+    if (ensureBaseFramebuffer(view) == null) return false;
+    if (!compositeBase(view, input, null)) return false;
+    const base = view.base_framebuffer orelse return false;
+    copyWhole(base, view.framebuffer);
+    // ext_session_lock_v1:74-91 — a locked session draws no cursor. The
+    // cursor's scene nodes are re-enabled every frame by Cursor.update, so
+    // hiding it is the server not painting it.
+    if (!lock.cursor_hidden and input.pointer != null) compositeCursor(view, view.framebuffer);
+    return true;
 }
 
-/// Render the background + all mapped surfaces through the camera into the
-/// base framebuffer (the canvas WITHOUT the cursor). The expensive
-/// full-canvas bilinear; done only when the canvas actually changes.
+/// Render the background + every mapped surface through THIS view's
+/// camera: the canvas WITHOUT the cursor.
 ///
-/// `lock` is the session-lock decision for this frame (lockedFrameFor).
-/// While locked the fill is the OPAQUE lock color instead of the
-/// background and only lock surfaces reach the canvas pass — user
-/// content, the drag icon and the cursor are never drawn, which is the
-/// render half of the privilege boundary (ext_session_lock_v1:74-91).
-fn compositeBase(self: *ServerState, lock: LockedFrame) void {
-    if (self.base_framebuffer == null) return;
+/// `gpu_target` non-null draws into the leased GPU scanout buffer (and
+/// reads nothing back); null rasterizes into CPU storage, which is the
+/// view's persisted base on the pixman path and its FBO + read-back on the
+/// GLES2 CPU-scanout path.
+fn compositeBase(view: *OutputView, input: FrameInput, gpu_target: ?*gles2.Gles2Target) bool {
+    const self = view.state;
     switch (self.renderer_kind) {
-        .pixman => compositeBasePixman(self, lock),
-        .gles2 => compositeBaseGles2(self, lock),
+        .pixman => {
+            compositeBasePixman(view, input);
+            return true;
+        },
+        .gles2 => return compositeBaseGles2(view, input, gpu_target),
     }
 }
 
 /// The CPU canvas pass: fill the base framebuffer and rasterize the
-/// surfaces through the camera into it, byte for byte the output this
-/// server has always presented (WAYLAND_RENDERER unset or "pixman").
-fn compositeBasePixman(self: *ServerState, lock: LockedFrame) void {
-    const base = self.base_framebuffer orelse return;
-    // 1. Fill. Premultiplied ARGB8888, memory bytes B,G,R,A; the scene's
-    //    background rect drew the same color via addRect
-    //    (round(color*a*255) per channel with straight alpha a=1), so
-    //    the bytes are identical. A locked session fills with the opaque
-    //    lock color INSTEAD, before anything is drawn: an output with no
-    //    (or a too small) lock surface must never show what was there
-    //    before.
+/// surfaces through this view's camera into it, byte for byte the output
+/// this server has always presented (WAYLAND_RENDERER unset or "pixman").
+fn compositeBasePixman(view: *OutputView, input: FrameInput) void {
+    const self = view.state;
+    const base = ensureBaseFramebuffer(view) orelse return;
+    const lock = input.lock;
+    // 1. Fill. Premultiplied ARGB8888, memory bytes B,G,R,A — the same
+    //    bytes the GLES2 pass's screen-space fill produces. A locked
+    //    session fills with the opaque lock color INSTEAD, before anything
+    //    is drawn: an output with no (or a too small) lock surface must
+    //    never show what was there before.
     base.fill(premultipliedFill(lock));
     // A blank output draws NOTHING: the solid color stays (outputIsBlank
     // said the lock surface is missing, unmapped or smaller than the
-    // output, and composited lock content must never be stretched to
-    // cover the gap).
+    // output, and composited lock content must never be stretched to cover
+    // the gap).
     if (lock.blank) return;
 
-    // 2. Surfaces: world rect = the node's absolute position + the
+    // 2. Surfaces: world rect = the node's absolute scene position + the
     //    SURFACE size (the node dst is the surface size — the buffer size
     //    under the committed transform divided by the scale, set by the
-    //    library's SurfaceNode update). The item carries the surface's buffer
-    //    transform so the canvas pass samples the texture through it
-    //    (notes/124 gap 1; scale=1 + normal = today's 1:1 blit, byte
-    //    identical).
-    var items: std.ArrayList(CanvasItem) = .empty;
-    defer items.deinit(self.allocator);
-    collectCanvasItems(self, lock, .sampled, &items);
-    wayland.canvas.render(self.allocator, base, &self.camera, items.items, if (self.gestures.fast_render) 3 else 1);
+    //    library's SurfaceNode update). Each item carries the surface's
+    //    buffer transform and its raw buffer crop, and the CPU rasterizer
+    //    samples through them exactly like the GLES2 sampler does — the
+    //    eight standard transforms and a wp_viewport crop are drawn by
+    //    BOTH paths, not dropped by either.
+    view.items.clearRetainingCapacity();
+    collectCanvasItems(self, lock, view, &view.items);
+    // The progressive-quality stride belongs to the view the gesture is
+    // PINNED to: another output's canvas is not being dragged.
+    const fast = self.gestures.fast_render and self.gestures.view == view;
+    wayland.canvas.render(self.allocator, base, &view.camera, view.items.items, if (fast) 3 else 1);
 }
 
-/// The GLES2 canvas pass (WAYLAND_RENDERER=gles2): the same canvas —
-/// the same fill color, the same item list, the same camera — drawn by
-/// the GPU renderer, with the camera UPLOADED as the renderer's one
-/// scene -> target affine. The frame this produces is what the backends
-/// scan out; nothing here falls back to pixman.
-fn compositeBaseGles2(self: *ServerState, lock: LockedFrame) void {
-    const base = self.base_framebuffer orelse return;
-    const target = ensureGles2Target(self) orelse return;
-    // THE CAMERA IS THE UNIFORM: the shader maps every dst rect through
-    // u_transform (gles2.zig "# Transform"), so the world-space dst rects
-    // below land exactly where Camera.worldToScreen puts them — the M4
-    // camera reaches the GPU instead of being applied per CPU pixel.
-    gles2.Gles2Renderer.setTransform(self.renderer, cameraAffine(self.camera));
-    const pass = self.renderer.beginPass(target) orelse return;
+/// The GLES2 canvas pass (WAYLAND_RENDERER=gles2): the same canvas — the
+/// same fill colour, the same item list, the same per-view camera —
+/// rasterized by the GPU renderer.
+///
+/// ONE pass carries TWO coordinate spaces, which is what the mixed
+/// transform contract asks for:
+///   1. the background fill, the cursor and every OUTPUT-LOCAL overlay
+///      (the session-lock screen, a layer surface, the drag icon) are
+///      SCREEN space (identity transform, this view's own pixel rect) —
+///      none is affected by the canvas camera, and none needs a world
+///      coordinate at all;
+///   2. the ordinary surfaces are WORLD space, through the camera: their
+///      dst rect is the node's scene rect MINUS the camera centre,
+///      computed in f64 per item, and the affine carries the linear part
+///      plus the viewport centre. An f32 therefore never carries an
+///      absolute world coordinate, which is what keeps a surface a
+///      billion pixels out exactly where the f64 camera says it is.
+/// An item names its own space, and the transform is re-issued only when
+/// that space changes between two items.
+/// Nothing here falls back to pixman.
+fn compositeBaseGles2(view: *OutputView, input: FrameInput, gpu_target: ?*gles2.Gles2Target) bool {
+    const self = view.state;
+    const lock = input.lock;
+    // The GPU DRM path draws into the leased scanout buffer; every other
+    // path rasterizes into this view's own FBO.
+    const target = gpu_target orelse (ensureGles2Target(view) orelse return false);
+    // Only the CPU-scanout path reads back; the GPU path's target IS the
+    // scanout buffer.
+    const readback: ?*pixman.Framebuffer = if (gpu_target == null) ensureBaseFramebuffer(view) else null;
+    if (gpu_target == null and readback == null) return false;
 
-    // 1. Fill, in WORLD coordinates: the rect is scene space and the
-    //    scene space is the world, because the camera is the uniform.
-    //    Straight-alpha RGBA, the same colour the CPU path premultiplies
-    //    into its fill bytes (wlr_render_color,
+    gles2.Gles2Renderer.setTransform(self.renderer, .identity);
+    const pass = self.renderer.beginPass(target) orelse return false;
+
+    // 1. Fill, in SCREEN space. Straight-alpha RGBA, the same colour the
+    //    CPU path premultiplies into its fill bytes (wlr_render_color,
     //    include/wlr/render/pass.h:135-137). At a = 1 the two agree to
     //    within one unit per channel: the shader declares `precision
     //    mediump float` and converts the result to unorm8 at that
@@ -3614,148 +4646,636 @@ fn compositeBaseGles2(self: *ServerState, lock: LockedFrame) void {
     //    (0.1 * 255 = 25.5) can land one lower than the CPU path's
     //    round-half-away-from-zero. The tests pin both sides.
     const fill: [4]f32 = if (lock.locked) lock_blank_color else background_color;
-    pass.addRect(worldRectForOutput(self.camera), fill);
+    pass.addRect(OutputView.localRect(view).toFloatRect(), fill);
 
-    // A blank output draws NOTHING: the solid color stays (outputIsBlank
-    // said the lock surface is missing, unmapped or smaller than the
-    // output, and composited lock content must never be stretched to
-    // cover the gap).
+    // 2. Surfaces, each in the space its CanvasItem declares.
+    //
+    // `gestures.fast_render` has no counterpart here and is deliberately
+    // not consulted: it asks the CPU rasterizer for a strided, blocky
+    // composite during a camera drag, while the GLES2 sampler is already
+    // bilinear and costs no more per pixel — the knob exists to make a
+    // SOFTWARE rasterizer affordable, and honouring it here would only
+    // degrade the GPU path.
     if (!lock.blank) {
-        var items: std.ArrayList(CanvasItem) = .empty;
-        defer items.deinit(self.allocator);
-        collectCanvasItems(self, lock, .identity_only, &items);
-        // `gestures.fast_render` has no counterpart here and is
-        // deliberately not consulted: it asks the CPU rasterizer for a
-        // strided, blocky composite during a camera drag
-        // (compositeBasePixman's `quality` argument), while the GLES2
-        // sampler is already bilinear and costs no more per pixel — the
-        // knob exists to make a SOFTWARE rasterizer affordable, and
-        // honouring it here would only degrade the GPU path.
-        for (items.items) |item| {
-            pass.addTexture(
-                item.texture,
-                // The whole texture: `.identity_only` already dropped
-                // every surface whose buffer transform is not the
-                // identity, so sampling the full texture into the world
-                // rect IS that surface's 1:1 blit.
-                null,
-                .{
-                    .x = @floatCast(item.world_x),
-                    .y = @floatCast(item.world_y),
-                    .width = @floatCast(item.world_w),
-                    .height = @floatCast(item.world_h),
+        view.items.clearRetainingCapacity();
+        collectCanvasItems(self, lock, view, &view.items);
+        // `in_screen` starts true: the identity transform the fill was
+        // drawn with is already in force, and setTransform copies the
+        // matrix once per CHANGE, so a run of world items followed by a
+        // run of overlays costs exactly two matrices.
+        var in_screen = true;
+        for (view.items.items) |item| {
+            const want_screen = item.space == .screen;
+            if (want_screen != in_screen) {
+                in_screen = want_screen;
+                gles2.Gles2Renderer.setTransform(
+                    self.renderer,
+                    if (in_screen) .identity else cameraAffine(view.camera),
+                );
+            }
+            pass.addTexture(item.texture, .{
+                .dst = if (in_screen)
+                    // Already this output's own pixels.
+                    .{ .x = item.world_x, .y = item.world_y, .width = item.world_w, .height = item.world_h }
+                else
+                    // The camera subtraction happens HERE, in f64, before
+                    // the f32 narrowing the dst rect goes through.
+                    .{
+                        .x = item.world_x - view.camera.center_x,
+                        .y = item.world_y - view.camera.center_y,
+                        .width = item.world_w,
+                        .height = item.world_h,
+                    },
+                .src = item.src,
+                .transform = item.transform,
+                .alpha = item.opacity,
+            });
+        }
+    }
+    // 3. The cursor, back in SCREEN space and on top of everything: an
+    //    unrotated, unscaled overlay at its logical size (the same rule
+    //    the CPU path follows with an identity camera). A locked session
+    //    draws none.
+    if (gpu_target != null and !lock.cursor_hidden and input.pointer != null) {
+        if (ensureCursorGlTexture(self)) |tex| {
+            const at = cursorScreenRect(view, tex);
+            gles2.Gles2Renderer.setTransform(self.renderer, .identity);
+            pass.addTexture(tex, .{
+                .dst = .{
+                    .x = @floatFromInt(at.x),
+                    .y = @floatFromInt(at.y),
+                    .width = @floatFromInt(at.width),
+                    .height = @floatFromInt(at.height),
                 },
-                item.opacity,
-            );
+                .alpha = 1.0,
+            });
         }
     }
     pass.submit();
 
-    // 3. Scanout read-back. Every backend in this server scans out CPU
-    //    bytes — they cast the committed buffer to a *pixman.Framebuffer
-    //    (backend/raylib.zig:283, backend/wayland.zig:376,
-    //    backend/drm.zig) and headless ignores it — so the frame the
-    //    compositor presents is this read-back, not the FBO. It is the
-    //    same renderer -> CPU move wlroots' screencopy makes with
-    //    wlr_texture_read_back (render/texture.c:1177), and the byte
-    //    order is the CPU renderer's own (Gles2Target.readPixels).
-    const pixels = target.readPixels(self.allocator) catch |err| {
-        log.err("gles2 read-back failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
-    };
-    defer self.allocator.free(pixels);
-    if (pixels.len != base.data.len) {
-        log.err("gles2 read-back is {d} bytes, the base framebuffer {d}", self.io, self.log_cfg, "server", .{
-            pixels.len, base.data.len,
-        });
-        return;
+    // 4. Scanout read-back — CPU backends only. They cast the committed
+    //    buffer to a `*pixman.Framebuffer` (backend/raylib.zig,
+    //    backend/wayland.zig) and headless ignores it, so the frame the
+    //    compositor presents is this read-back, not the FBO. It reuses the
+    //    view's own base storage: no allocated buffer, no extra copy.
+    if (readback) |base| {
+        target.readPixelsInto(base) catch |err| {
+            log.err("gles2 read-back failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            return false;
+        };
     }
-    @memcpy(base.data, pixels);
+    return true;
 }
 
-/// Which wl_output_transforms the canvas pass can express.
-const SurfaceTransformPolicy = enum {
-    /// pixman: the CPU rasterizer samples each item through its
-    /// transform (canvas.zig's surfaceToTexture), so all nine are drawn.
-    sampled,
-    /// GLES2: one pass uploads ONE scene -> target affine — the camera
-    /// — and a pass's quads take their source from a crop rect, which
-    /// cannot express a rotated or mirrored buffer. The 90/180/270 and
-    /// flipped transforms are therefore dropped with a warning instead of
-    /// drawn wrongly; the identity transform (what every client has
-    /// unless it calls wl_surface.set_buffer_transform) is a plain 1:1
-    /// quad.
-    identity_only,
-};
+/// The cursor's texture in the SELECTED renderer's GL namespace.
+///
+/// The GPU passes draw the cursor as a texture, and this is the one place
+/// that uploads it: keyed on the CPU texture it came from, so a cursor
+/// change (a new client cursor surface) re-uploads ONCE and every frame
+/// after that reuses the same GL texture — no per-frame copy, no per-frame
+/// allocation, no read-back.
+fn ensureCursorGlTexture(self: *ServerState) ?*Texture {
+    const cursor = self.cursor orelse return null;
+    const source = cursor.texture orelse cursorFallbackTexture(self) orelse return null;
+    if (self.cursor_gl_source == source) return self.cursor_gl;
+    if (self.cursor_gl) |t| {
+        t.destroy();
+        self.cursor_gl = null;
+    }
+    // The cursor's textures are pixman ones (Cursor is handed the pixman
+    // renderer), so their payload is pixman memory — published as
+    // PixmanTextureData precisely so another module can read it.
+    const data: *pixman.PixmanTextureData = @ptrCast(@alignCast(source.data));
+    const bytes = @as(usize, @intCast(data.stride)) * @as(usize, @intCast(source.height));
+    if (data.pixels.len < bytes) return null;
+    const tex = gles2.Gles2Renderer.importMemory(
+        self.renderer,
+        source.width,
+        source.height,
+        data.stride,
+        data.pixels[0..bytes],
+    ) catch |err| {
+        log.err("cursor GL import failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return null;
+    };
+    self.cursor_gl = tex;
+    self.cursor_gl_source = source;
+    return tex;
+}
 
-/// The frames' canvas items, in array order (canvas.render composites in
-/// that order, so the last item draws on top): every mapped surface
-/// except the four the compositor refuses to draw as content — the
-/// client's cursor surface, the drag icon, a disabled (minimized) node
-/// and, while the session is locked, everything that is not a lock
-/// surface.
+/// The cursor's rect in `view`'s own pixels: the pointer minus the
+/// hotspot, at the cursor's logical size (buffer pixels divided by the
+/// client cursor's buffer scale). Never rotated or scaled by the canvas
+/// camera — the cursor is a screen overlay.
+fn cursorScreenRect(view: *OutputView, tex: *Texture) geom.Rect {
+    const self = view.state;
+    const seat = self.seat;
+    const cursor = self.cursor.?;
+    const x = seat.pointer_x - view.rect.x - seat.cursor_hotspot_x;
+    const y = seat.pointer_y - view.rect.y - seat.cursor_hotspot_y;
+    if (cursor.texture != null) {
+        const scale: i32 = if (cursor.client_scale > 1) cursor.client_scale else 1;
+        return .{
+            .x = x,
+            .y = y,
+            .width = @max(1, @divTrunc(tex.width, scale)),
+            .height = @max(1, @divTrunc(tex.height, scale)),
+        };
+    }
+    return .{ .x = x, .y = y, .width = wayland.cursor.cursor_size, .height = wayland.cursor.cursor_size };
+}
+
+/// The cursor stamped into `view`'s own CPU framebuffer, at the pointer's
+/// VIEW-LOCAL position.
+///
+/// Cursor.draw would place it at the seat's GLOBAL coordinates, which is
+/// right only for a view sitting at the desktop origin; with two outputs
+/// the second one's cursor would be drawn one screen-width too far right.
+/// The placement is therefore the compositor's policy, here, and the
+/// camera is the identity over this framebuffer — a screen overlay at
+/// constant size.
+fn compositeCursor(view: *OutputView, fb: *pixman.Framebuffer) void {
+    const self = view.state;
+    const cursor = self.cursor orelse return;
+    const tex = cursor.texture orelse cursorFallbackTexture(self) orelse return;
+    const at = cursorScreenRect(view, tex);
+    const item = CanvasItem{
+        .texture = tex,
+        .world_x = @floatFromInt(at.x),
+        .world_y = @floatFromInt(at.y),
+        .world_w = @floatFromInt(at.width),
+        .world_h = @floatFromInt(at.height),
+        .opacity = 1.0,
+        .space = .screen,
+    };
+    var items = [_]CanvasItem{item};
+    var cam = wayland.canvas.screenCamera(fb);
+    wayland.canvas.render(self.allocator, fb, &cam, &items, 1);
+}
+
+/// The cursor's fallback arrow texture, materialized on first use.
+///
+/// Cursor builds it lazily behind a private factory and its public draw
+/// composites in GLOBAL seat coordinates, so the one time the compositor
+/// needs the texture itself it draws into a ONE-PIXEL scratch framebuffer
+/// (nothing can land in it) and reads the texture back off the cursor.
+/// One tiny allocation for the session, never per frame.
+fn cursorFallbackTexture(self: *ServerState) ?*Texture {
+    const cursor = self.cursor orelse return null;
+    if (cursor.fallback_texture) |t| return t;
+    const scratch = pixman.Framebuffer.create(self.allocator, 1, 1) catch return null;
+    defer scratch.deinit();
+    cursor.draw(scratch);
+    return cursor.fallback_texture;
+}
+
+/// A FrameInput for code that drives the canvas pass directly instead of
+/// through a frame event (the render tests): this view's live lock
+/// decision, its current cursor footprints, and the pointer where the seat
+/// actually is.
+fn directFrameInput(view: *OutputView) FrameInput {
+    const self = view.state;
+    const gx = self.seat.pointer_x;
+    const gy = self.seat.pointer_y;
+    const pointer: ?geom.Point = if (view.rect.containsPoint(.{ .x = gx, .y = gy }))
+        .{ .x = gx - view.rect.x, .y = gy - view.rect.y }
+    else
+        null;
+    return .{
+        .view = view,
+        .lock = lockedFrameFor(self, view.output),
+        .cursor_fp = if (self.cursor) |c| c.update() else .{ .old = .{ null, null }, .new = .{ null, null } },
+        .scene_output = view.scene_output,
+        .pointer = pointer,
+    };
+}
+
+/// The frame's canvas items for ONE view, in SCENE TREE order — the
+/// bottom-most node first, so the last item draws on top and the order
+/// `Scene.pick` walks in reverse agrees with what is on screen.
+///
+/// The walk is the scene tree, not the tracked-surface table: a hash map
+/// has no order, and drawing in map order put a subsurface or a later
+/// popup UNDER an unrelated toplevel while the hit test found it on top.
+/// Every disabled subtree is pruned on the way down, which is what makes
+/// a minimized toplevel take its popups and subsurfaces with it.
+///
+/// Membership is the OUTPUT's camera, not the surface's placement: a
+/// placement picks where a surface sits in the world (and which output
+/// gets its configure sizes), while any camera whose visible world rect
+/// meets the node draws it. Two outputs looking at the same window show
+/// it at their own two different places.
+///
+/// Two kinds of surface are NOT world content and are emitted in the
+/// `.screen` space instead: the session-lock screen and every layer
+/// surface, which must COVER their output, and the drag icon, which must
+/// sit AT the pointer. The cursor's own wl_surface and anything that is
+/// not a lock surface while the session is locked are dropped here, the
+/// one place the canvas pass chooses what to draw.
 fn collectCanvasItems(
     self: *ServerState,
     lock: LockedFrame,
-    policy: SurfaceTransformPolicy,
+    view: *OutputView,
     items: *std.ArrayList(CanvasItem),
 ) void {
-    // The cursor's WlSurface is drawn ONLY as the cursor (Cursor.draw),
+    const scene = self.scene orelse return;
+    // The cursor's WlSurface is drawn ONLY as the cursor (compositeCursor),
     // never as a normal surface — matching wlroots (the cursor is a
     // separate plane, never a scene node) and niri (the cursor surface is
     // excluded from normal surface rendering via an early return on its
     // commit). Rendering it here too produced a SECOND cursor at the
     // surface's node position.
     const cursor_res = self.seat.cursorSurface();
-    const scene = self.scene orelse return;
-    var entry_it = scene.surface_nodes.valueIterator();
-    while (entry_it.next()) |sn| {
-        // ext_session_lock_v1:74-91 — while the session is locked "the
-        // only surfaces that should be rendered ... are the lock
-        // surfaces created through this interface". Everything else
-        // (user content, popups, drag icons, the client cursor surface)
-        // is skipped here, the one place the canvas pass chooses what to
-        // draw.
-        if (lock.locked) {
-            const sl = self.session_lock.?;
-            if (!sl.isLockSurface(sn.*.surface)) continue;
-        }
-        if (cursor_res) |cr| {
-            if (sn.*.surface.resource == cr) continue;
-        }
-        // A drag icon is drawn at the POINTER (syncDragIconNodes), never
-        // as content at its own node position — which is where it used to
-        // land, a drag "cursor" stuck at the scene origin.
-        if (isDragIconSurface(sn.*.surface)) continue;
-        const node = sn.*.node orelse continue;
-        // A disabled node is not on screen: the minimize policy hides a
-        // window that way (onToplevelMinimize).
-        if (!node.enabled) continue;
-        const bn = node.kind.buffer;
-        const texture = bn.texture orelse continue;
-        if (policy == .identity_only and sn.*.surface.current.transform != .normal) {
-            log.warn(
-                "gles2: surface skipped, wl_output_transform={s} has no counterpart in the GLES2 canvas pass",
-                self.io,
-                self.log_cfg,
-                "server",
-                .{@tagName(sn.*.surface.current.transform)},
-            );
-            continue;
-        }
-        const rect = node.absolutePosition();
-        items.append(self.allocator, .{
-            .texture = texture,
-            .world_x = @floatFromInt(rect.x),
-            .world_y = @floatFromInt(rect.y),
-            .world_w = @floatFromInt(rect.width),
-            .world_h = @floatFromInt(rect.height),
-            .opacity = 1.0,
-            .transform = sn.*.surface.current.transform,
-        }) catch |err| {
-            log.warn("canvas item append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        };
+    indexCanvasNodes(self);
+    collectSubtree(self, view, lock, cursor_res, scene.root, world_frame, items);
+}
+
+/// The tracked surface behind every scene node the canvas pass may draw
+/// — both the buffer node and the surface's container — rebuilt for the
+/// frame the pass is about to walk. The scene's own table is keyed by
+/// SURFACE and the tree walk needs the other direction; doing it once
+/// per view keeps the walk O(nodes) instead of scanning the whole table
+/// per node, and it is also what lets a descendant be drawn in the space
+/// it inherited without re-deriving it. Retained across frames: nothing
+/// is allocated once the map has grown.
+///
+/// The entry stores the EFFECTIVE space, inheritance included: every
+/// node a local-space container owns reads `.output`/`.pointer`/`.hidden`
+/// straight out of the index, so the walk below never has to carry the
+/// space down itself and cannot disagree with `localSpaceOf`.
+fn indexCanvasNodes(self: *ServerState) void {
+    self.canvas_index.clearRetainingCapacity();
+    var it = self.scene.?.surface_nodes.valueIterator();
+    while (it.next()) |sn| {
+        // Classifying ONCE per frame is what keeps the walk linear: the
+        // classifier resolves the surface's role through the session-lock
+        // and layer-shell registries and then walks its role-parent chain,
+        // and asking per node per output per frame would be quadratic.
+        const space = localSpaceOf(self, sn.*.surface);
+        if (sn.*.node) |node| indexCanvasNode(self, node, sn.*.surface, space);
+        if (sn.*.tree) |tree| indexCanvasNode(self, tree, sn.*.surface, space);
     }
+}
+
+fn indexCanvasNode(
+    self: *ServerState,
+    node: *wayland.scene.SceneNode,
+    surface: *Surface,
+    space: LocalSpace,
+) void {
+    self.canvas_index.put(self.allocator, node, .{ .surface = surface, .space = space }) catch |err| {
+        log.warn("canvas node index OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+    };
+}
+
+/// What the canvas index holds for one scene node: the tracked surface it
+/// belongs to (a buffer node and its container are indexed separately, to
+/// the same entry) and the space that surface is composited in.
+const CanvasNode = struct {
+    surface: *Surface,
+    space: LocalSpace,
+};
+
+/// The compositing space of a subtree, inherited from the surface that
+/// owns the container above it. A subsurface, an xdg_popup on a layer
+/// surface or a lock surface's child is composited WITH its overlay: the
+/// output-local rule is a property of the overlay, not of one buffer
+/// node, so nothing under one can slip back through the world camera.
+const LocalSpace = union(enum) {
+    /// Ordinary content, drawn through the output cameras.
+    world,
+    /// An overlay covering its output from that output's own (0, 0).
+    output: *wayland.output.Output,
+    /// An overlay anchored at the pointer, at its logical size.
+    pointer: *wayland.output.Output,
+    /// A local role with no output to be on yet: drawn nowhere, and not
+    /// on any camera either — an unpinned overlay is HIDDEN, never
+    /// world content.
+    hidden,
+};
+
+/// Where `surface` is composited, INHERITANCE INCLUDED. THE single
+/// classification the canvas pass, the hit test and the scene's
+/// output-membership policy all read, so the three can never disagree
+/// about what is on screen.
+///
+/// Output-local placement is a property of the OVERLAY, not of one buffer
+/// node: a wl_subsurface of a layer surface, an xdg_popup parented to it
+/// (xdg- or layer-parented) and a lock surface's child are all composited
+/// WITH their overlay, at their own offsets inside it. So this asks the
+/// surface's own role first and, when that role is ordinary world
+/// content, keeps asking up the ROLE-PARENT chain until an overlay is
+/// found. That chain is what stops a child from slipping back through the
+/// world camera — in geometry (appendCanvasItem), in the hit test
+/// (pickSurface) and in the scene's own membership/presentation/damage
+/// (classifySurfacePlacement, which the library calls with no idea about
+/// the scene tree).
+fn localSpaceOf(self: *ServerState, surface: *Surface) LocalSpace {
+    var cur: ?*Surface = surface;
+    // NO depth limit: the walk visits every role parent the protocol
+    // can create, however deeply nested, because a chain longer than
+    // any fixed bound is legal and the old cutoff silently dropped such
+    // a surface back into the world cameras — an output-local overlay
+    // drawn through a camera, hit through a camera, and presented on
+    // every output. The chain is ACYCLIC by construction, so the walk
+    // always terminates: both role modules take a parent that already
+    // exists (wl_subcompositor.get_subsurface, xdg_surface.get_popup)
+    // and reject one that is a descendant of the child
+    // (parentIsDescendant), so a parent can never reach its own child,
+    // and a dying parent leaves its link null (subsurface.inert,
+    // the popup role object destroyed with its parent) rather than
+    // dangling. There is no malformed tree for a cutoff to guard.
+    while (cur) |s| {
+        const own = ownLocalSpace(self, s);
+        if (isLocalSpace(own)) return own;
+        cur = roleParentSurface(s);
+    }
+    return .world;
+}
+
+/// The wl_surface `s`'s own protocol role hangs off: the parent of a
+/// wl_subsurface child, the parent of an xdg_popup. Null for a surface
+/// with no role parent (a plain surface, an xdg_toplevel, a layer or lock
+/// surface — those terminate the walk as overlays themselves).
+///
+/// Constant time: each role module recovers its own object from the wire
+/// resource the role was assigned with, so this is one pointer chase per
+/// hop and never a scan of a role registry. That is what keeps the
+/// per-surface, per-frame walk in `localSpaceOf` linear.
+fn roleParentSurface(s: *Surface) ?*Surface {
+    return wayland.subsurface.parentSurfaceOf(s) orelse wayland.shell.parentSurfaceOf(s);
+}
+
+/// Where `surface` is composited by ITS OWN role, with no inheritance: the
+/// drag icon follows the pointer, the session-lock screen and a layer
+/// surface cover their output, everything else is world content. Only
+/// `localSpaceOf` should call this — a caller that wants the space a
+/// surface is actually drawn in wants the inherited answer.
+fn ownLocalSpace(self: *ServerState, surface: *Surface) LocalSpace {
+    // The drag icon follows the POINTER, so the output it belongs to is
+    // whichever one the pointer is on right now.
+    if (isDragIconSurface(surface)) {
+        // The ROLE is permanent for the surface's lifetime, but the ICON
+        // is only on screen while its drag lives: data_device is what
+        // names the current one, and it stops naming it the moment the
+        // drag ends. Classifying on the role alone left the icon glued to
+        // the pointer after the drop — drawn, presented and a member of
+        // the output for as long as the client kept the surface alive.
+        // Hidden, not world content: the pixels the icon leaves behind
+        // must come back to the background.
+        if (self.data_device.currentDragIcon() != surface) return .hidden;
+        const view = viewAtGlobalPoint(self, self.seat.pointer_x, self.seat.pointer_y) orelse return .hidden;
+        return .{ .pointer = view.output };
+    }
+    if (self.session_lock) |sl| {
+        for (sl.lockSurfaces()) |ls| {
+            if (ls.surface != surface) continue;
+            return .{ .output = ls.output };
+        }
+    }
+    if (layerSurfaceForSurface(self, surface)) |ls| {
+        // The output the client named, resolved to the backend output
+        // behind its wl_output; otherwise the view the surface was
+        // placed on. No output at all = no view to draw it on.
+        if (ls.output) |res| {
+            for (self.output_views.items) |view| {
+                if (view.wl_output.owns(res)) return .{ .output = view.output };
+            }
+            return .hidden;
+        }
+        const view = viewForSurface(self, surface) orelse return .hidden;
+        return .{ .output = view.output };
+    }
+    return .world;
+}
+
+/// Whether a compositing space is output-local rather than world content.
+fn isLocalSpace(s: LocalSpace) bool {
+    return switch (s) {
+        .world => false,
+        .output, .pointer, .hidden => true,
+    };
+}
+
+
+/// The scene's output-placement policy, installed once (subscribe). It
+/// answers the ONE question the library asks about a tracked surface: is
+/// it world content an output camera shows, or an overlay that lives in
+/// one output's own pixels? `localSpaceOf` decides, inheritance
+/// included, so output membership, the presented list and damage
+/// projection cannot drift from what the canvas pass actually drew — and
+/// a subsurface or popup of an overlay is pinned with it, at any depth.
+///
+/// A local role with no output is `.output_local = null`: HIDDEN, never
+/// world content. Falling back to `.world` there would advertise an
+/// overlay to every camera on the desktop.
+fn classifySurfacePlacement(ctx: ?*anyopaque, surface: *Surface) wayland.scene.SurfacePlacement {
+    const self: *ServerState = @ptrCast(@alignCast(ctx.?));
+    return switch (localSpaceOf(self, surface)) {
+        .world => .world,
+        .output, .pointer => |out| .{ .output_local = out },
+        .hidden => .{ .output_local = null },
+    };
+}
+
+/// Point the scene's placement policy at this state, so the library
+/// classifies through the same rules the canvas pass draws by. A no-op
+/// while there is no scene: the policy is installed when the first
+/// output creates one.
+fn installScenePlacementPolicy(self: *ServerState) void {
+    const scene = self.scene orelse return;
+    scene.setSurfacePlacementPolicy(self, classifySurfacePlacement);
+}
+
+/// Drop the policy. Load-bearing before the ServerState is freed: the
+/// classifier names this state, and the library must not call it during
+/// teardown.
+fn clearScenePlacementPolicy(self: *ServerState) void {
+    const scene = self.scene orelse return;
+    scene.setSurfacePlacementPolicy(null, null);
+}
+
+/// An output-local subtree's placement: the space the whole subtree is
+/// composited in, and the world rect of the ROOT overlay that space came
+/// from. The root rect is what keeps a descendant where the client put
+/// it: an item's own `absolutePosition` already carries every ancestor's
+/// offset, so the anchor is subtracted back out and the anchor's own
+/// position applied instead.
+const LocalFrame = struct {
+    space: LocalSpace,
+    root: geom.FRect,
+};
+
+/// The frame the scene root is walked with: ordinary world content, with
+/// no overlay root above it.
+const world_frame: LocalFrame = .{
+    .space = .world,
+    .root = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+};
+
+/// Append the canvas items for `node`'s enabled subtree, in draw order:
+/// `node`'s own buffer first, then each child in order (a child-after-
+/// parent append is what puts a popup above its parent and a subsurface
+/// above the surface it belongs to). `frame` is what the containers above
+/// this node decided, and a node that OWNS a local overlay starts a new
+/// frame for its own subtree — that is what keeps a subsurface, popup or
+/// lock-surface child of an output-local overlay out of the world
+/// cameras and still at the offset the client gave it.
+fn collectSubtree(
+    self: *ServerState,
+    view: *OutputView,
+    lock: LockedFrame,
+    cursor_res: ?*wire.wl.Surface,
+    node: *wayland.scene.SceneNode,
+    frame: LocalFrame,
+    items: *std.ArrayList(CanvasItem),
+) void {
+    // A disabled node is not on screen, and neither is anything under it:
+    // the minimize policy disables the surface's whole container
+    // (onToplevelMinimize).
+    if (!node.enabled) return;
+    var here = frame;
+    if (self.canvas_index.get(node)) |entry| {
+        switch (entry.space) {
+            // An overlay ROOT starts the space its subtree is drawn in,
+            // anchored at THIS node. A DESCENDANT carries that same space
+            // in its own index entry (inheritance already ran in
+            // localSpaceOf) and must keep the anchor it was given: that is
+            // exactly what preserves the offset the client put a
+            // subsurface or popup at inside the overlay.
+            .output, .pointer => {
+                here = if (isLocalSpace(frame.space))
+                    .{ .space = entry.space, .root = frame.root }
+                else
+                    .{ .space = entry.space, .root = node.absolutePosition() };
+            },
+            .hidden => here = .{ .space = .hidden, .root = frame.root },
+            .world => {},
+        }
+    }
+    if (node.kind == .buffer) {
+        appendCanvasItem(self, view, lock, cursor_res, node, here, items);
+    }
+    for (node.children.items) |child| {
+        collectSubtree(self, view, lock, cursor_res, child, here, items);
+    }
+}
+
+/// One buffer node's item, or nothing when this view must not draw it.
+fn appendCanvasItem(
+    self: *ServerState,
+    view: *OutputView,
+    lock: LockedFrame,
+    cursor_res: ?*wire.wl.Surface,
+    node: *wayland.scene.SceneNode,
+    frame: LocalFrame,
+    items: *std.ArrayList(CanvasItem),
+) void {
+    const surface = (self.canvas_index.get(node) orelse return).surface;
+    // ext_session_lock_v1:74-91 — while the session is locked "the
+    // only surfaces that should be rendered ... are the lock surfaces
+    // created through this interface". Everything else (user content,
+    // popups, drag icons, the client cursor surface) is skipped here.
+    if (lock.locked) {
+        const sl = self.session_lock orelse return;
+        if (!sl.isLockSurface(surface)) return;
+    }
+    if (cursor_res) |cr| {
+        if (surface.resource == cr) return;
+    }
+    if (!surface.mapped) return;
+    const bn = node.kind.buffer;
+    const texture = bn.texture orelse return;
+    const rect = node.absolutePosition();
+    // The raw buffer -> surface map the draw has to invert, and the
+    // raw buffer-pixel crop the sampler reads: the library's
+    // SurfaceNode update already folded buffer_scale and the inverse
+    // transform into the crop when the client committed, so the
+    // compositor must NOT redo that conversion per frame. Null crop
+    // (no wp_viewport.set_source) means the whole texture, byte for
+    // byte what it always was.
+    const src: ?geom.FRect = bn.src;
+
+    switch (frame.space) {
+        // A local role with no output: nothing is drawn anywhere.
+        .hidden => return,
+        // An output-local overlay: drawn in THAT output's own pixels,
+        // never through a camera, at its logical size. Any other output
+        // draws nothing of it. The position is the node's ABSOLUTE scene
+        // rect minus the output's own origin: for the overlay's root that
+        // is where the compositor placed it, and for a descendant it is
+        // that same placement plus the offsets its ancestors carry — so a
+        // child keeps the geometry the client asked for instead of being
+        // restamped at the overlay's corner.
+        .output => |out| {
+            if (out != view.output) return;
+            appendItem(self, items, .{
+                .texture = texture,
+                .world_x = rect.x - @as(f64, @floatFromInt(view.rect.x)),
+                .world_y = rect.y - @as(f64, @floatFromInt(view.rect.y)),
+                .world_w = rect.width,
+                .world_h = rect.height,
+                .opacity = 1.0,
+                .src = src,
+                .transform = bn.transform,
+                .space = .screen,
+            });
+            return;
+        },
+        // The drag icon: AT THE POINTER, at logical size, on the output
+        // the pointer is on — the cursor's own rule. The anchor is the
+        // pointer, not the icon's scene node (syncDragIconNodes keeps that
+        // on the pointer's world point so damage and membership follow the
+        // pointer); a descendant of the icon is drawn at that anchor plus
+        // its offset from the icon's own rect.
+        .pointer => |out| {
+            if (out != view.output) return;
+            const at = dragIconRect(view) orelse return;
+            appendItem(self, items, .{
+                .texture = texture,
+                .world_x = @as(f64, @floatFromInt(at.x)) + (rect.x - frame.root.x),
+                .world_y = @as(f64, @floatFromInt(at.y)) + (rect.y - frame.root.y),
+                .world_w = rect.width,
+                .world_h = rect.height,
+                .opacity = 1.0,
+                .src = src,
+                .transform = bn.transform,
+                .space = .screen,
+            });
+            return;
+        },
+        .world => {},
+    }
+    // Ordinary world content: this camera draws it when it can see it.
+    if (!view.scene_output.visibleWorldRect().intersects(rect)) return;
+    appendItem(self, items, .{
+        .texture = texture,
+        .world_x = rect.x,
+        .world_y = rect.y,
+        .world_w = rect.width,
+        .world_h = rect.height,
+        .opacity = 1.0,
+        .src = src,
+        .transform = bn.transform,
+    });
+}
+
+/// Append one item, logging an out-of-memory failure: a frame that cannot
+/// hold an item simply does not draw that surface, which is the honest
+/// degradation and never a fault in the middle of a composite.
+fn appendItem(self: *ServerState, items: *std.ArrayList(CanvasItem), item: CanvasItem) void {
+    items.append(self.allocator, item) catch |err| {
+        log.warn("canvas item append OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+    };
+}
+
+/// Where the drag icon's top-left corner lands in `view`'s own pixels:
+/// the pointer, when it is on this view at all.
+fn dragIconRect(view: *OutputView) ?geom.Point {
+    const gx = view.state.seat.pointer_x;
+    const gy = view.state.seat.pointer_y;
+    if (!view.rect.containsPoint(.{ .x = gx, .y = gy })) return null;
+    return .{ .x = gx - view.rect.x, .y = gy - view.rect.y };
 }
 
 /// This frame's fill color as premultiplied ARGB8888 memory bytes
@@ -3771,37 +5291,42 @@ fn premultipliedFill(lock: LockedFrame) [4]u8 {
     };
 }
 
-/// The GLES2 canvas target, created on first use at the display
-/// framebuffer's size and re-created if that size changes (onNewOutput
-/// drops it on a mode change). Null when the target cannot be created;
-/// the frame then keeps the previous canvas instead of clearing it.
-fn ensureGles2Target(self: *ServerState) ?*gles2.Gles2Target {
-    if (self.gles2_target) |t| {
-        if (t.width == self.framebuffer.width and t.height == self.framebuffer.height) return t;
+/// The GLES2 canvas target for ONE view, created on first use at that
+/// view's scanout size and re-created if that size changes. Null when the
+/// target cannot be created; the frame then keeps the previous canvas
+/// instead of clearing it. Per view, because each output has its own size
+/// and its own FBO — two outputs never share one color texture.
+fn ensureGles2Target(view: *OutputView) ?*gles2.Gles2Target {
+    const w = view.output.mode.width;
+    const h = view.output.mode.height;
+    if (view.gles2_target) |t| {
+        if (t.width == w and t.height == h) return t;
         t.destroy();
-        self.gles2_target = null;
+        view.gles2_target = null;
     }
-    const t = gles2.Gles2Target.create(self.allocator, self.framebuffer.width, self.framebuffer.height) catch |err| {
-        log.err("gles2 target create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+    const t = gles2.Gles2Target.create(view.allocator, view.state.renderer, w, h) catch |err| {
+        log.err("gles2 target create failed: {s}", view.io, view.log_cfg, "server", .{@errorName(err)});
         return null;
     };
-    self.gles2_target = t;
+    view.gles2_target = t;
     return t;
 }
 
-/// Create the base framebuffer (matching the display framebuffer's size)
-/// on first use; freed in main's teardown.
-fn ensureBaseFramebuffer(self: *ServerState) void {
-    if (self.base_framebuffer != null) return;
+/// The view's persisted base (the canvas WITHOUT the cursor), created on
+/// first use at this view's size. Freed with the view.
+fn ensureBaseFramebuffer(view: *OutputView) ?*pixman.Framebuffer {
+    if (view.base_framebuffer) |fb| return fb;
     const fb = pixman.Framebuffer.create(
-        self.allocator,
-        self.framebuffer.width,
-        self.framebuffer.height,
+        view.allocator,
+        view.output.mode.width,
+        view.output.mode.height,
     ) catch |err| {
-        log.err("base framebuffer create failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
-        return;
+        log.err("base framebuffer create failed: {s}", view.io, view.log_cfg, "server", .{@errorName(err)});
+        return null;
     };
-    self.base_framebuffer = fb;
+    view.base_framebuffer = fb;
+    view.capture_base_valid = false;
+    return fb;
 }
 
 /// Copy a rect from src to dst (both output-sized, stride = width*4).
@@ -3889,9 +5414,24 @@ const surface_node_impl: wayland.surface_node.Impl = .{
 
 /// Import the surface's current buffer into a renderer texture (the
 /// scene node owns the copy).
+///
+/// A zwp_linux_dmabuf_v1 buffer is a NATIVE image: it is imported as an
+/// EGL image on the GPU and is never mapped, uploaded or copied. It
+/// only reaches this function at all because buildOutput hands the
+/// dmabuf module a device ONLY for the GPU renderer, so a pixman run
+/// never sees one. The CPU branch refuses explicitly rather than
+/// pretending: mapping the bo here would be a silent upload path behind
+/// a global that promises zero-copy.
 fn surfaceNodeImport(ctx: *anyopaque, s: *Surface, buf: *wayland.buffers.Buffer) ?*Texture {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
     _ = s;
+    if (buf.impl.get_dmabuf != null) {
+        if (self.renderer_kind != .gles2) {
+            log.err("surfnode: dmabuf buffer with the CPU renderer; no native path", self.io, self.log_cfg, "server", .{});
+            return null;
+        }
+        return importDmabufTexture(self, buf);
+    }
     const pixels = surfacePixels(self, buf) orelse {
         log.debug("surfnode: no pixels", self.io, self.log_cfg, "server", .{});
         return null;
@@ -3909,6 +5449,15 @@ fn surfaceNodeUpdate(
 ) bool {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
     _ = s;
+    // A native buffer names its own texture: updateDmabuf is true exactly
+    // when this texture still holds THIS buffer's EGL image, so a
+    // re-commit of the same bo is a no-op and a different bo (or a
+    // texture that was a memory upload) falls through to the re-import
+    // above. No mapping, no upload and no read-back on either path.
+    if (buf.impl.get_dmabuf != null) {
+        return self.renderer_kind == .gles2 and
+            gles2.Gles2Renderer.updateDmabuf(texture, buf);
+    }
     const pixels = surfacePixels(self, buf) orelse return false;
     const byte_len = @as(usize, @intCast(pixels.stride)) * @as(usize, @intCast(buf.height));
     // The same contract on both renderers — overwrite in place when the
@@ -3932,17 +5481,29 @@ fn surfaceNodeUpdate(
     };
 }
 
-/// Compositor policy before the node syncs from a commit: subsurface
-/// orphan recovery — a surface whose wl_subsurface died (the client
-/// destroyed the role object, or the parent surface died; subsurface.zig
-/// tears the entry down and clears the role) renders as a plain surface
-/// again. Its tree leaves the (possibly dead) parent tree for the root
-/// and shows on its next commit (wlroots recursively unmaps children
-/// with the parent, wlr_compositor.c:854-872, and the surface re-renders
-/// once its role object is gone).
+/// Compositor policy before the node syncs from a commit.
+///
+/// Two things, both keyed on this surface's container. A minimized
+/// window comes back: onToplevelMinimize disabled the container and a
+/// commit is the only event that can undo it (xdg-shell has no
+/// un-minimize). And a subsurface orphan recovers — a surface whose
+/// wl_subsurface died (the client destroyed the role object, or the
+/// parent surface died; subsurface.zig tears the entry down and clears
+/// the role) renders as a plain surface again, leaving the (possibly
+/// dead) parent tree for the root and showing on its next commit
+/// (wlroots recursively unmaps children with the parent,
+/// wlr_compositor.c:854-872).
 fn surfaceNodeBeforeUpdate(ctx: *anyopaque, sn: *wayland.surface_node.SurfaceNode) void {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
     if (sn.tree) |tree| {
+        // A commit is the restore path for a minimized window:
+        // onToplevelMinimize hid this whole container, and "the client
+        // drew again" is the only event that can bring it back (the
+        // protocol has no un-minimize). It runs before the orphan
+        // re-root below so a re-parented container ends up enabled
+        // either way; the per-frame subsurface sync re-asserts its own
+        // parenting decision afterwards.
+        tree.enable(true);
         if (subsurfaceFor(self, sn.surface) == null and tree.parent != self.scene.?.root) {
             self.scene.?.root.appendChild(self.allocator, tree) catch |err| {
                 // OOM: the subsurface tree is skipped this frame.
@@ -3994,6 +5555,29 @@ fn surfacePixels(_: *ServerState, buf: *wayland.buffers.Buffer) ?SurfacePixels {
     defer end(buf);
     const ptr = pixels orelse return null;
     return .{ .ptr = ptr, .stride = wire.shm.Buffer.getStride(shm) };
+}
+
+/// Import a client's zwp_linux_dmabuf_v1 buffer as a GPU texture through
+/// its native descriptors: one EGL image over the bo's own planes, with
+/// no CPU mapping, upload or copy anywhere on this path (the renderer's
+/// contract: it locks the Buffer and the texture keeps it until it is
+/// destroyed or replaced). Null on failure, with the reason logged —
+/// a surface that cannot import shows nothing, which is honest, and
+/// never a CPU fallback behind a zero-copy promise.
+fn importDmabufTexture(self: *ServerState, buf: *wayland.buffers.Buffer) ?*Texture {
+    const t0 = perfNs(self);
+    const tex = gles2.Gles2Renderer.importDmabuf(self.renderer, buf) catch |err| {
+        log.err("dmabuf import failed: {s} ({d}x{d})", self.io, self.log_cfg, "server", .{
+            @errorName(err), buf.width, buf.height,
+        });
+        return null;
+    };
+    if (self.perf) {
+        log.info("perf dmabuf-import={d}us buf={d}x{d}", self.io, self.log_cfg, "perf", .{
+            (perfNs(self) - t0) / 1000, buf.width, buf.height,
+        });
+    }
+    return tex;
 }
 
 /// Copy the surface's current buffer into a renderer texture (same import
@@ -4088,52 +5672,130 @@ fn wantNestedBackend(environ_map: *std.process.Environ.Map) bool {
 // M3: seat hit-test, screencopy sources, input bindings
 // ---------------------------------------------------------------------------
 
-/// Seat input is in SCREEN pixels; scene nodes — and every popup origin
-/// published by syncPopupNodes — are in WORLD pixels. This inverts the
-/// camera exactly as the seat's hit test does, and is installed into the
-/// shell through setScreenToWorld so an xdg_popup grab hit-tests its
+/// A global DESKTOP pixel as a WORLD (scene) point, through the camera of
+/// the output that pixel is on.
+///
+/// Two inversions compose, in this order: the desktop layout origin takes
+/// the position to the output's own pixels, then that output's camera
+/// takes it to world space. Both run in f64 and the result is never
+/// narrowed, so a point far from the origin keeps its fraction (the old
+/// path clamped it to i32 and lost it).
+///
+/// The VIEW is resolved from the given position, not from the seat's
+/// current pointer: this conversion is also what an xdg_popup grab uses for
+/// its inside/outside decision, which asks about a historical position.
+fn screenToWorldIn(view: *OutputView, gx: i32, gy: i32) geom.FPoint {
+    return view.camera.screenToWorld(
+        @as(f64, @floatFromInt(gx - view.rect.x)),
+        @as(f64, @floatFromInt(gy - view.rect.y)),
+    );
+}
+
+/// Seat input is in DESKTOP pixels; scene nodes — and every popup origin
+/// published by syncPopupNodes — are in WORLD pixels. This resolves the
+/// output the position is on and inverts ITS camera, and is installed into
+/// the shell through setScreenToWorld so an xdg_popup grab hit-tests its
 /// inside/outside decision in the same space the popup was placed in
 /// (xdg.zig popupGrabMotion / popupGrabButton). Without it the shell
 /// assumes the identity map, which is right only until the first zoom or
-/// pan (the camera is live: WAYLAND_CAMERA zoom is clamped to 0.1..16.0).
+/// pan (the camera is live: WAYLAND_CAMERA zoom is clamped to 0.1..16.0)
+/// or until a second output exists.
 fn screenToWorld(ctx: *anyopaque, sx: i32, sy: i32) geom.FPoint {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
-    return self.camera.screenToWorld(@floatFromInt(sx), @floatFromInt(sy));
+    const view = viewAtGlobalPoint(self, sx, sy) orelse
+        return .{ .x = @floatFromInt(sx), .y = @floatFromInt(sy) };
+    return screenToWorldIn(view, sx, sy);
 }
 
-/// Seat hit test: the topmost surface scene node under (x, y), mapped
-/// back to its surface with surface-local coordinates.
+/// Seat hit test: the topmost surface under the DESKTOP pixel (x, y),
+/// mapped back to its surface with surface-local coordinates.
+///
+/// One reverse scene-tree walk preserves draw order across both spaces.
+/// Each leaf is tested in the space it is drawn in: camera-inverted world
+/// coordinates or this output's own pixels. A non-covering local node
+/// cannot hide world content merely because its world rect overlaps it.
 fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
     const scene = self.scene orelse return null;
-    // M4: the pointer arrives in SCREEN coords, but the scene nodes live
-    // in world space — invert the camera first, then pick in world coords
-    // (surface-local coords are world coords too). The conversion is the
-    // ONE the shell was handed (setScreenToWorld in subscribe), so the
-    // seat's hit test and the popup grab's can never drift apart; with
-    // the default camera it is the identity mapping, so a no-op.
-    const pick = self.shell.worldFromScreen(x, y);
-    const node = scene.pick(pick.x, pick.y) orelse return null;
-    // Back-map the picked node to its surface through the library's
-    // surface→scene table.
-    const surface = wayland.surface_node.surfaceForNode(scene, node) orelse return null;
-    // ext_session_lock_manager_v1, wiring item 2: while the session is
-    // locked the pointer may only ever land on a lock surface. Returning
-    // null makes the seat send wl_pointer.leave and deliver nothing, so
-    // no client outside the lock sees motion, buttons or an enter (the
-    // XML requires input suppression, not merely a hidden screen). This
-    // is the lock-aware pick the module's contract asks the server to
-    // install through seat.setPick — the compositor's own hit test, not
-    // a second seat.
+    const view = viewAtGlobalPoint(self, x, y) orelse return null;
+    indexCanvasNodes(self);
+    return pickViewSubtree(self, view, scene.root, self.shell.worldFromScreen(x, y), .{
+        .x = @floatFromInt(x - view.rect.x),
+        .y = @floatFromInt(y - view.rect.y),
+    });
+}
+
+
+/// The output an output-local surface is pinned to, or null when its
+/// role names none (nothing to draw or hit test it on).
+fn pinnedOutput(self: *ServerState, surface: *Surface) ?*wayland.output.Output {
+    return switch (localSpaceOf(self, surface)) {
+        .world, .hidden => null,
+        .output, .pointer => |out| out,
+    };
+}
+
+/// Reverse of collectSubtree: children above their parent, later siblings
+/// above earlier ones. Input-transparent leaves fall through; disabled
+/// containers prune their children without clipping them to parent bounds.
+fn pickViewSubtree(
+    self: *ServerState,
+    view: *OutputView,
+    node: *wayland.scene.SceneNode,
+    world: geom.FPoint,
+    screen: geom.FPoint,
+) ?wayland.seat.Seat.PickResult {
+    if (!node.enabled or !node.pickable) return null;
+    var i = node.children.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (pickViewSubtree(self, view, node.children.items[i], world, screen)) |hit| return hit;
+    }
+    if (node.kind != .buffer or node.kind.buffer.texture == null) return null;
+    const entry = self.canvas_index.get(node) orelse return null;
+    const surface = entry.surface;
+    if (!surface.mapped) return null;
+    if (self.seat.cursorSurface()) |cursor| {
+        if (surface.resource == cursor) return null;
+    }
     if (self.session_lock) |sl| {
         if (sl.isLocked() and !sl.isLockSurface(surface)) return null;
     }
-    const rect = node.absolutePosition();
-    return .{
-        .surface = surface,
-        .sx = pick.x - rect.x,
-        .sy = pick.y - rect.y,
+    var rect = node.absolutePosition();
+    const point = switch (entry.space) {
+        .world => world,
+        .output => |out| local: {
+            if (out != view.output) return null;
+            rect.x -= @as(f64, @floatFromInt(view.rect.x));
+            rect.y -= @as(f64, @floatFromInt(view.rect.y));
+            break :local screen;
+        },
+        .pointer, .hidden => return null,
     };
+    if (!rect.containsPoint(point.x, point.y)) return null;
+    const sx = point.x - rect.x;
+    const sy = point.y - rect.y;
+    if (!surfaceAcceptsInput(surface, sx, sy)) return null;
+    return .{ .surface = surface, .sx = sx, .sy = sy };
+}
+
+/// wl_surface.set_input_region: does `surface` take pointer events at its
+/// own surface-local (sx, sy)? No committed region is an infinite input
+/// region (the whole surface); an empty one takes nothing — "an empty
+/// input region will make the surface unselectable", which is what
+/// turns the pointer over it into a miss and a leave. Region edges are
+/// summed saturating, because a client rect may run past INT32_MAX
+/// (geom.Rect.intersect does the same).
+fn surfaceAcceptsInput(surface: *Surface, sx: f64, sy: f64) bool {
+    const region = surface.current.input orelse return true;
+    for (region.items) |r| {
+        const x0: f64 = @floatFromInt(r.x);
+        const y0: f64 = @floatFromInt(r.y);
+        const x1: f64 = @floatFromInt(geom.addSat(r.x, r.width));
+        const y1: f64 = @floatFromInt(geom.addSat(r.y, r.height));
+        if (sx >= x0 and sy >= y0 and sx < x1 and sy < y1) return true;
+    }
+    return false;
 }
 
 /// L-D7: the live layer surface whose wl_surface is `surface`, or null.
@@ -4172,7 +5834,11 @@ fn restoreLayerFocus(self: *ServerState, seat: *wayland.seat.Seat, previous: ?*S
 /// grab is released — and the pre-grab focus restored — the moment the
 /// pointer is no longer over the grabbed layer.
 fn applyLayerKeyboardFocus(self: *ServerState, seat: *wayland.seat.Seat) void {
-    const over_ls = layerSurfaceForSurface(self, seat.pointer_focus);
+    // Through the OVERLAY, not the surface under the pointer: the pick
+    // answers with the topmost visible DESCENDANT (a subsurface, a popup
+    // of the panel), and every keyboard rule in layer-shell is stated
+    // about the layer surface itself.
+    const over_ls = layerSurfaceForSurface(self, layerRootOf(self, seat.pointer_focus));
     const interactive: u32 = if (over_ls) |ls| ls.current.keyboard_interactive else 0;
 
     switch (layerFocusDecision(over_ls != null, interactive, self.layer_kbd_grab != null)) {
@@ -4215,11 +5881,47 @@ fn applyLayerKeyboardFocus(self: *ServerState, seat: *wayland.seat.Seat) void {
 /// L-D7: click-to-focus gate for the seat. Layer surfaces with
 /// keyboard_interactivity=none must never receive keyboard focus: the
 /// move-based policy never gives it to them, so the seat's built-in
-/// click-to-focus must not either.
+/// click-to-focus must not either — and the property belongs to the
+/// OVERLAY, so a click that landed on one of the panel's own descendants
+/// (its menu, its toolbar, a wl_subsurface) is a click on the panel.
 fn layerKeyboardFocusAllowed(ctx: *anyopaque, surface: *Surface) bool {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
-    const ls = layerSurfaceForSurface(self, surface) orelse return true;
+    const ls = layerSurfaceForSurface(self, layerRootOf(self, surface)) orelse return true;
     return ls.current.keyboard_interactive != 0;
+}
+
+/// The layer surface whose output-local subtree `surface` belongs to: the
+/// surface itself when it is one, else the nearest role-parent that is
+/// (layerRootOf walks the same role-parent chain localSpaceOf does, so a
+/// subsurface or a layer-parented popup resolves to its overlay).
+/// Pointer focus is the topmost visible descendant, and every layer-shell
+/// keyboard rule is stated about the overlay — so both the pointer-move
+/// policy and the click-to-focus redirect resolve through this one walk.
+fn layerRootOf(self: *ServerState, surface: ?*Surface) ?*Surface {
+    var cur = surface;
+    while (cur) |s| {
+        if (layerSurfaceForSurface(self, s) != null) return s;
+        cur = roleParentSurface(s);
+    }
+    return null;
+}
+
+/// L-D7 after a click that landed on an overlay's DESCENDANT: the seat's
+/// click-to-focus gives the keyboard to whatever the pick returned, and
+/// that is now the topmost visible child of the panel. Move the focus up
+/// to the overlay, so the panel keeps the keyboard it asked for and keeps
+/// its exclusive grab (whose release policy is stated about the pointer
+/// leaving the LAYER, not one of its menus).
+///
+/// Runs on the button signal the seat emits AFTER its own focus work, and
+/// not from a keyboard_focus handler: setKeyboardFocus from inside one
+/// re-enters that signal's iteration — the same reason the lock block in
+/// onSeatButton gives.
+fn refocusLayerRoot(self: *ServerState, seat: *wayland.seat.Seat) void {
+    const focus = seat.keyboard_focus orelse return;
+    const root = layerRootOf(self, focus) orelse return;
+    if (root == focus) return;
+    seat.setKeyboardFocus(root);
 }
 
 /// The seat's click-to-focus gate: every surface that must never take
@@ -4399,16 +6101,18 @@ fn onNewLockSurface(
     const self: *ServerState = @fieldParentPtr("new_lock_surface_listener", listener);
     syncSurfaces(self);
     if (self.scene) |scene| {
-        if (wayland.surface_node.surfaceNodeFor(scene, ls.surface)) |sn| {
+        if (wayland.surface_node.surfaceNodeFor(scene, ls.surface) != null) {
             // The lock screen is configured to the output's logical size,
-            // so its node belongs at the output's origin. With one canvas
-            // at (0,0) that is the node's default; setting it explicitly
-            // keeps the placement correct if that ever changes.
-            const rect = outputRect(ls.output);
-            if (sn.node) |node| {
-                node.x = rect.x;
-                node.y = rect.y;
-            }
+            // so its node belongs on THAT output's canvas: the lock
+            // surface is pinned to the view it locks, and the tree
+            // placement pass below keeps it there.
+            const view = viewForOutput(self, ls.output) orelse return;
+            self.surface_place.put(self.allocator, ls.surface, .{
+                .view = view,
+                .placed = false,
+            }) catch |err| {
+                log.warn("lock surface placement OOM: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+            };
         }
     }
     requestRender(self);
@@ -4511,32 +6215,126 @@ fn dropCursorShapeSerials(self: *ServerState) void {
     self.cursor_shape_pointers = self.seat.pointers.items.len;
 }
 
-/// Capture source for zwlr_screencopy: the display framebuffer (cursor
-/// composited in) for overlay_cursor=1; the base framebuffer (canvas
-/// without the cursor, current because it is recomposited before the
-/// cursor draw in the same render) for overlay_cursor=0. Falls back to
-/// the display framebuffer when no base exists yet.
-fn getFramebuffer(ctx: *anyopaque, overlay_cursor: bool) ?*pixman.Framebuffer {
+/// Capture source for zwlr_screencopy: THIS OUTPUT's display framebuffer
+/// (cursor composited in) for overlay_cursor=1, THIS OUTPUT's base (the
+/// canvas without the cursor) for overlay_cursor=0.
+///
+/// The `out` argument is what makes a capture output-SPECIFIC: a client
+/// that names the second wl_output gets the second output's pixels, never
+/// the first one's.
+///
+/// On the GPU DRM path there is no CPU front to hand over, so the capture
+/// is produced by an EXPLICIT, LAZY read-back of this output alone:
+///   - overlay_cursor=1 re-renders the canvas and the cursor into this
+///     view's capture FBO and reads THAT back;
+///   - overlay_cursor=0 renders the base only — the cursor is never drawn
+///     into the capture pass at all, so "no cursor" is a real exclusion
+///     rather than a stale frame or another output's image;
+/// and the result is reused until this view composites again. No capture
+/// ever happens as a side effect of the scanout path.
+fn getFramebuffer(
+    ctx: *anyopaque,
+    out: *wayland.output.Output,
+    overlay_cursor: bool,
+) ?*pixman.Framebuffer {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
-    if (!overlay_cursor) {
-        if (self.base_framebuffer) |base| return base;
+    const view = viewForOutput(self, out) orelse return null;
+    if (!view.gpu) {
+        if (!overlay_cursor) {
+            if (view.base_framebuffer) |base| return base;
+        }
+        return view.framebuffer;
     }
-    return self.framebuffer;
+    return gpuCapture(self, view, overlay_cursor);
 }
 
-/// Resolve a client's wl_output resource to the output it belongs to.
+/// The explicit read-back one GPU-scanned-out view's capture needs.
+fn gpuCapture(
+    self: *ServerState,
+    view: *OutputView,
+    overlay_cursor: bool,
+) ?*pixman.Framebuffer {
+    if (overlay_cursor) {
+        if (view.capture_frame_valid) return view.capture_frame;
+    } else if (view.capture_base_valid) return view.capture_base;
+    const target = ensureCaptureTarget(view) orelse return null;
+    const fb = ensureCaptureFramebuffer(view, overlay_cursor) orelse return null;
+    var input = directFrameInput(view);
+    // The cursor is EXCLUDED by not drawing it, not by handing back a
+    // frame that happens not to have one in it.
+    if (!overlay_cursor) input.lock.cursor_hidden = true;
+    if (!compositeBaseGles2(view, input, target)) return null;
+    gles2.Gles2Renderer.finishRendering(self.renderer) catch |err| {
+        log.err("screencopy render completion failed: {s}", self.io, self.log_cfg, "server", .{@errorName(err)});
+        return null;
+    };
+    target.readPixelsInto(fb) catch |err| {
+        log.err("screencopy read-back failed on {d}x{d}: {s}", self.io, self.log_cfg, "server", .{
+            view.output.mode.width, view.output.mode.height, @errorName(err),
+        });
+        return null;
+    };
+    if (overlay_cursor) view.capture_frame_valid = true else view.capture_base_valid = true;
+    return fb;
+}
+
+/// The offscreen FBO a GPU view's captures are rendered into. Created on
+/// first use at this view's size, freed with the view — never shared with
+/// another output, so a capture can never pick up another output's pixels.
+fn ensureCaptureTarget(view: *OutputView) ?*gles2.Gles2Target {
+    const w = view.output.mode.width;
+    const h = view.output.mode.height;
+    if (view.capture_target) |t| {
+        if (t.width == w and t.height == h) return t;
+        t.destroy();
+        view.capture_target = null;
+    }
+    const t = gles2.Gles2Target.create(view.allocator, view.state.renderer, w, h) catch |err| {
+        log.err("capture target create failed: {s}", view.io, view.log_cfg, "server", .{@errorName(err)});
+        return null;
+    };
+    view.capture_target = t;
+    return t;
+}
+
+/// The CPU storage one capture kind reads into. Owned by the view and
+/// reused: a repeated capture of an unchanged canvas allocates nothing.
+fn ensureCaptureFramebuffer(view: *OutputView, overlay_cursor: bool) ?*pixman.Framebuffer {
+    const slot = if (overlay_cursor) &view.capture_frame else &view.capture_base;
+    if (slot.*) |fb| return fb;
+    const fb = pixman.Framebuffer.create(
+        view.allocator,
+        view.output.mode.width,
+        view.output.mode.height,
+    ) catch |err| {
+        log.err("capture framebuffer create failed: {s}", view.io, view.log_cfg, "server", .{@errorName(err)});
+        return null;
+    };
+    slot.* = fb;
+    return fb;
+}
+
+/// Resolve a client's wl_output resource to the output it belongs to, by
+/// asking EVERY view's global — with two outputs the first one is not the
+/// answer by default any more.
 fn outputFromResource(ctx: *anyopaque, resource: *wayland.server.wl.Output) ?*wayland.output.Output {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
-    const wl_output = self.wl_output orelse return null;
-    if (!wl_output.owns(resource)) return null;
-    return wl_output.output;
+    for (self.output_views.items) |view| {
+        if (view.wl_output.owns(resource)) return view.output;
+    }
+    return null;
 }
 
-/// A screencopy frame is waiting for its next commit: wake the renderer
-/// (the idle-frame skip would otherwise never render the copy).
-fn requestFrame(ctx: *anyopaque) void {
+/// A screencopy frame is waiting for its NEXT COMMIT on this output: wake
+/// that view's renderer (the idle-frame skip would otherwise never render
+/// the copy) and no other view's.
+fn requestFrame(ctx: *anyopaque, out: *wayland.output.Output) void {
     const self: *ServerState = @ptrCast(@alignCast(ctx));
-    requestRender(self);
+    const view = viewForOutput(self, out) orelse {
+        requestRender(self);
+        return;
+    };
+    requestRenderView(self, view);
 }
 
 /// Seat key signal: Mod4+Escape quits the server (keysym binding).
@@ -4626,10 +6424,22 @@ fn onSeatButton(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.sea
             return;
         }
     }
+    // L-D7 with a descendant under the pointer: the seat's click-to-focus
+    // just gave the keyboard to the topmost surface the pick returned,
+    // which is the panel's own child rather than the panel. Move it up to
+    // the overlay before the pan gesture below arms. Runs on the button
+    // signal the seat emits after its own focus work, for the same
+    // re-entrancy reason as the lock block above.
+    refocusLayerRoot(self, seat);
     if (seat.last_button != wayland.seat.btn_left) return;
     if (seat.last_button_pressed) {
         // Arm the pan anchor but DON'T start it (drag_active stays false):
         // a click without enough movement must keep click-to-focus.
+        // The gesture is PINNED to the output the pointer is on: a drag
+        // that starts on the second output pans THAT output's camera, and
+        // crossing into the first one mid-drag does not hand the camera
+        // over (the pinned view owns it until the release).
+        self.gestures.view = viewAtGlobalPoint(self, seat.pointer_x, seat.pointer_y);
         self.gestures.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
         self.gestures.drag_active = false;
         self.gestures.fast_render = false;
@@ -4668,7 +6478,7 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
     // restoreLayerFocus would otherwise put a stale user surface back.
     if (self.session_lock) |sl| {
         if (sl.isLocked()) {
-            self.cursor_repaint = false;
+            for (self.output_views.items) |view| view.cursor_repaint = false;
             return;
         }
     }
@@ -4678,27 +6488,31 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
     // compositor grab (camera drag, interactive move) the seat froze the
     // pointer focus, so this is a no-op there.
     applyLayerKeyboardFocus(self, seat);
-    // Interactive move: the toplevel's node follows the pointer delta
-    // (world coords — the screen delta divided by the zoom, matching the
-    // pick transform). The whole output is damaged so the partial upload
-    // cannot smear the old position.
+    // The output this move belongs to: the one the pointer is over. Every
+    // camera change below is applied to a PINNED view only, so a drag
+    // that starts on the second output never moves the first one's camera.
+    const view = viewAtGlobalPoint(self, seat.pointer_x, seat.pointer_y) orelse return;
+    // Interactive move: the toplevel's node follows the pointer delta in
+    // the PINNED view's world (the screen delta divided by ITS zoom,
+    // matching the pick transform). The whole output is damaged so the
+    // partial upload cannot smear the old position.
     if (self.gestures.moving_toplevel) |t| {
-        const wp = self.camera.screenToWorld(@floatFromInt(seat.pointer_x), @floatFromInt(seat.pointer_y));
+        const gesture_view = self.gestures.view orelse view;
+        const wp = screenToWorldIn(gesture_view, seat.pointer_x, seat.pointer_y);
         const dx = wp.x - self.gestures.move_anchor.x;
         const dy = wp.y - self.gestures.move_anchor.y;
         self.gestures.move_anchor = .{ .x = wp.x, .y = wp.y };
         if (self.scene) |scene| {
             if (wayland.surface_node.surfaceNodeFor(scene, t.xdg_surface.surface)) |sn| {
                 if (sn.node) |node| {
-                    node.x += @intFromFloat(@round(dx));
-                    node.y += @intFromFloat(@round(dy));
+                    // f64 node positions: the delta is applied exactly,
+                    // never rounded to a whole pixel first.
+                    node.setPosition(node.x + dx, node.y + dy);
                 }
             }
         }
-        if (self.scene_output) |so| {
-            so.addDamage(.{ .x = 0, .y = 0, .width = self.framebuffer.width, .height = self.framebuffer.height });
-        }
-        requestRender(self);
+        gesture_view.scene_output.addDamage(OutputView.localRect(gesture_view));
+        requestRenderView(self, gesture_view);
         return;
     }
     // A drag is armed (button held). If it hasn't crossed the threshold
@@ -4724,42 +6538,63 @@ fn onSeatPointerMove(listener: *wire.Listener(*wayland.seat.Seat), seat: *waylan
         const dx = seat.pointer_x - anchor.x;
         const dy = seat.pointer_y - anchor.y;
         if (!self.gestures.drag_active and dx * dx + dy * dy < drag_threshold_sq) {
-            self.cursor_repaint = true;
-            requestRender(self);
+            // A sub-threshold hover: repaint the cursor in the view it
+            // left (its old cursor pixels come back from the base) and in
+            // the view it is now over.
+            markCursorHover(self, self.gestures.view, view);
             return;
         }
-        // Above the threshold (or already dragging): pan the camera. The
-        // implicit pointer grab starts here: the client under the pointer
-        // must not see the motion (it would extend a text selection while
-        // the user pans the canvas).
+        // Above the threshold (or already dragging): pan the PINNED
+        // view's camera. The implicit pointer grab starts here: the
+        // client under the pointer must not see the motion (it would
+        // extend a text selection while the user pans the canvas).
+        const target = self.gestures.view orelse view;
         self.gestures.drag_active = true;
         self.gestures.fast_render = true;
         grabPointerForGesture(seat, &self.gestures);
-        self.camera.center_x -= @as(f64, @floatFromInt(dx)) / self.camera.zoom;
-        self.camera.center_y -= @as(f64, @floatFromInt(dy)) / self.camera.zoom;
+        target.camera.center_x -= @as(f64, @floatFromInt(dx)) / target.camera.zoom;
+        target.camera.center_y -= @as(f64, @floatFromInt(dy)) / target.camera.zoom;
         self.gestures.camera_drag = DragPoint{ .x = seat.pointer_x, .y = seat.pointer_y };
         log.debug("camera center -> {d},{d}", self.io, self.log_cfg, "camera", .{
-            self.camera.center_x, self.camera.center_y,
+            target.camera.center_x, target.camera.center_y,
         });
-        requestRender(self);
+        // The pan moved every pixel of the PINNED view and none of the
+        // others: only that view is asked to repaint.
+        requestRenderView(self, target);
         return;
     }
-    // No drag armed: hover — the canvas is static, so just move the
-    // cursor (repaint only the cursor region, not the full composite).
-    // A live drag icon moves the canvas too, so that frame must
-    // recomposite for the icon to follow the pointer.
+    // No drag armed: hover — the canvas is static, so just move the cursor
+    // (repaint only the cursor region, not the full composite). A live
+    // drag icon moves the canvas too, so that frame must recomposite for
+    // the icon to follow the pointer — on the view the pointer is over.
     if (self.data_device.currentDragIcon() != null) {
-        requestRender(self);
+        requestRenderView(self, view);
         return;
     }
-    self.cursor_repaint = true;
-    requestRender(self);
+    markCursorHover(self, null, view);
+}
+
+/// Ask the views involved in a hover for the cheap cursor-only repaint:
+/// the one the pointer just left (its old cursor pixels have to be
+/// restored from the base) and the one it is now over. Each gets its own
+/// flag, so neither view paints a cursor the user cannot see there.
+fn markCursorHover(self: *ServerState, from: ?*OutputView, to: *OutputView) void {
+    if (from) |old| {
+        if (old != to) {
+            old.cursor_repaint = true;
+            requestRenderView(self, old);
+        }
+    }
+    to.cursor_repaint = true;
+    requestRenderView(self, to);
 }
 
 /// M4 camera zoom: a vertical wheel notch (+1 discrete) multiplies the
-/// camera zoom by 1.25, -1 divides; clamped to [0.1, 16.0]. The zoom is
-/// a viewport property, so it applies regardless of pointer focus (the
-/// seat emits the axis signal for every axis event).
+/// SELECTED view's camera zoom by 1.25, -1 divides; clamped to
+/// [0.1, 16.0]. The zoom is a per-output viewport property, so a notch
+/// delivered over the second output zooms the second output — and it
+/// applies regardless of pointer focus (the seat emits the axis signal
+/// for every axis event).
 fn onSeatAxis(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.Seat) void {
     const self: *ServerState = @fieldParentPtr("seat_axis_listener", listener);
     // A locked session must not zoom the canvas under the lock client.
@@ -4767,15 +6602,16 @@ fn onSeatAxis(listener: *wire.Listener(*wayland.seat.Seat), seat: *wayland.seat.
         if (sl.isLocked()) return;
     }
     if (seat.last_axis != .vertical_scroll or seat.last_axis_discrete == 0) return;
+    const view = viewAtGlobalPoint(self, seat.pointer_x, seat.pointer_y) orelse return;
     const factor: f64 = if (seat.last_axis_discrete > 0) 1.25 else 1.0 / 1.25;
     var steps: i32 = seat.last_axis_discrete;
     if (steps < 0) steps = -steps;
-    var zoom = self.camera.zoom;
+    var zoom = view.camera.zoom;
     var i: i32 = 0;
     while (i < steps) : (i += 1) zoom *= factor;
-    self.camera.zoom = std.math.clamp(zoom, 0.1, 16.0);
-    log.debug("camera zoom -> {d}", self.io, self.log_cfg, "camera", .{self.camera.zoom});
-    requestRender(self);
+    view.camera.zoom = std.math.clamp(zoom, 0.1, 16.0);
+    log.debug("camera zoom -> {d}", self.io, self.log_cfg, "camera", .{view.camera.zoom});
+    requestRenderView(self, view);
 }
 
 /// Position every subsurface over its mapped parent and keep its tree
@@ -4815,8 +6651,9 @@ fn syncPopupNodes(self: *ServerState) void {
                     continue;
                 };
             }
-            popup_tree.x = p.geometry.x;
-            popup_tree.y = p.geometry.y;
+            // f64 scene positions: the popup's own geometry offset inside
+            // the parent's tree, unchanged in meaning.
+            popup_tree.setPosition(@floatFromInt(p.geometry.x), @floatFromInt(p.geometry.y));
             popup_tree.enable(true);
             // P1-5b: publish the popup's ABSOLUTE scene position. The
             // popup grab converts the seat's scene coordinates into
@@ -4844,21 +6681,28 @@ fn isDragIconSurface(s: *Surface) bool {
     return std.mem.eql(u8, role.name, "wl_data_device-icon");
 }
 
-/// Keep the drag icon's scene node at the pointer while its drag lives
+/// Keep the drag icon's scene node on the pointer while its drag lives
 /// (P2-12). Same pass shape as syncPopupNodes / syncSubsurfaceNodes: it
 /// runs every frame from renderFrame, before the composite, and is a
 /// no-op when no drag is running (a null check).
 ///
 /// The icon is an ordinary tracked surface (syncSurfaces tracks every
-/// compositor surface), so this pass positions its tree in SCENE
-/// coordinates — the space the seat reports the pointer in — at
-/// seat.pointer_x/pointer_y, and keeps the tree at the scene root (a
+/// compositor surface), so this pass keeps its tree at the scene ROOT (a
 /// role surface has no parent tree) so it stacks with the other
-/// top-level surfaces. An unmapped icon has no tree yet (SurfaceNode
-/// creates it on the first buffer commit), so an icon that has not
-/// committed costs nothing here. Once the drag ends the icon is no
-/// longer drawn at all: isDragIconSurface keeps the canvas pass from
-/// stamping it at the position it was left at.
+/// top-level surfaces, and positions it at the pointer's WORLD point on
+/// the output the pointer is over — the seat reports desktop pixels, and
+/// inverting that output's camera is what turns them into world. An
+/// unmapped icon has no tree yet (SurfaceNode creates it on the first
+/// buffer commit), so an icon that has not committed costs nothing here.
+///
+/// The DRAW is not this rect: the icon is composited as a `.screen`
+/// overlay at the pointer at its logical size (collectCanvasItem), which
+/// is where a drag icon belongs — a scaled icon under a zoomed camera is
+/// not a cursor. The node position is what keeps its damage, membership
+/// and hit test on the pointer. Once the drag ends the icon is drawn
+/// nowhere at all: data_device no longer names it, and `ownLocalSpace`
+/// classifies an icon no drag names as `.hidden` — the role alone is
+/// permanent and would otherwise keep the icon on screen.
 fn syncDragIconNodes(self: *ServerState) void {
     const scene = self.scene orelse return;
     const icon = self.data_device.currentDragIcon() orelse return;
@@ -4871,8 +6715,12 @@ fn syncDragIconNodes(self: *ServerState) void {
             return;
         };
     }
-    tree.x = self.seat.pointer_x;
-    tree.y = self.seat.pointer_y;
+    const view = viewAtGlobalPoint(self, self.seat.pointer_x, self.seat.pointer_y) orelse return;
+    const world = view.camera.screenToWorld(
+        @as(f64, @floatFromInt(self.seat.pointer_x - view.rect.x)),
+        @as(f64, @floatFromInt(self.seat.pointer_y - view.rect.y)),
+    );
+    tree.setPosition(world.x, world.y);
     tree.enable(true);
 }
 
@@ -4905,12 +6753,10 @@ fn syncSubsurfaceNodes(self: *ServerState) void {
                 ss.restack_committed = false;
                 ss.restack_sibling_id = 0;
             }
-            // Offset relative to the parent tree (which sits at the
-            // parent surface's origin; the old code summed the parent's
-            // absolute position, equal here because the trees are all at
-            // the root's (0,0) chain).
-            child_tree.x = ss.x;
-            child_tree.y = ss.y;
+            // Offset relative to the parent tree (which carries the view's
+            // desktop origin), in the f64 scene positions the cutover
+            // introduced.
+            child_tree.setPosition(@floatFromInt(ss.x), @floatFromInt(ss.y));
             child_tree.enable(true);
         } else {
             child_tree.enable(false);
@@ -5324,7 +7170,10 @@ const PolicyServer = struct {
     presentation: ?*wayland.presentation.Presentation = null,
     backend: ?*wayland.backend.Backend = null,
     output: ?*wayland.output.Output = null,
-    wl_output: ?*wayland.wl_output.WlOutput = null,
+    /// The output's OutputView, built by the production factory: a test
+    /// renders through the same camera, scene output, wl_output global
+    /// and target lifecycle main() uses, never a test-only stand-in.
+    view: ?*OutputView = null,
     scene: ?*wayland.scene.Scene = null,
     /// Backend / Output impl context (never dereferenced).
     dummy: u8 = 0,
@@ -5346,16 +7195,22 @@ const PolicyServer = struct {
     /// The pool of a createFilledBuffer buffer, retained like shm_pool so
     /// the buffer stays valid for the whole test.
     filled_pool: ?*client.wl.ShmPool = null,
+    /// The pool of a createFixtureBuffer buffer: its own slot so a
+    /// transform-parity test's fixture never displaces the retention
+    /// reference the other buffer helpers keep.
+    fixture_pool: ?*client.wl.ShmPool = null,
     /// A second SERVER-side client with nothing bound (the session-lock
     /// input assertions need a client that is NOT the lock client), plus
     /// its open peer fd: closing it would look like a disconnect at the
     /// next dispatch.
     idle_client: ?*wire.Client = null,
     idle_peer: ?std.posix.socket_t = null,
-
-    /// The display framebuffer handle. Real (the minimize policy reads
-    /// its size for the output damage) but never rendered into.
-    fb: ?*pixman.Framebuffer = null,
+    /// Extra outputs a two-output test added through addSecondOutput, and
+    /// that it has NOT destroyed: freed in deinit after their views are
+    /// gone. removeOutput takes the entry out of this list FIRST, because
+    /// Output.destroy frees the Output itself and a second destroy would
+    /// be a double free.
+    extra_outputs: std.ArrayList(*wayland.output.Output) = .empty,
 
     /// The compositor hit test for the tests: always the one surface the
     /// test armed it with (a drag's origin check needs the pointer to be
@@ -5370,7 +7225,10 @@ const PolicyServer = struct {
         if (ts.session_lock) |sl| {
             if (sl.isLocked() and !sl.isLockSurface(s)) return null;
         }
-        return .{ .surface = s, .sx = x, .sy = y };
+        // The harness pick echoes the DESKTOP pixel back: the surface-local
+        // coordinates are f64 now, and inventing a fraction here would be
+        // a test artifact rather than a compositor behaviour.
+        return .{ .surface = s, .sx = @floatFromInt(x), .sy = @floatFromInt(y) };
     }
 
     /// The default harness: pixman, the configuration every policy test
@@ -5553,30 +7411,18 @@ const PolicyServer = struct {
             .{ .width = 800, .height = 600, .refresh_msec = 16 },
         );
         errdefer if (ts.output) |o| o.destroy();
-        // No errdefer: Output's destroy signal owns the WlOutput global.
-        ts.wl_output = try wayland.wl_output.WlOutput.create(
-            allocator,
-            &ts.io,
-            &ts.log_cfg,
-            ts.display.?,
-            ts.output.?,
-            "test",
-            "test output",
-        );
+        // The scene is created up front (the harness owns it) and the
+        // OutputView is built through the PRODUCTION factory, so a test
+        // drives the same per-output wiring main() builds: camera, scene
+        // output, wl_output global, render and capture targets.
         ts.scene = try wayland.scene.Scene.init(allocator, &ts.io, &ts.log_cfg);
         errdefer if (ts.scene) |sc| sc.deinit();
         ts.scene.?.subcompositor = ts.subcompositor.?;
-        ts.scene.?.wl_output = ts.wl_output.?;
 
         // The real ServerState: the tests drive the production policy
         // functions, so the fields they read must be the real modules.
         const state = try allocator.create(ServerState);
         errdefer allocator.destroy(state);
-        // A real framebuffer object: the minimize policy damages the
-        // output through its size. Nothing composites into it here
-        // (in_render keeps the render loop out of the way).
-        ts.fb = try pixman.Framebuffer.create(allocator, 800, 600);
-        errdefer if (ts.fb) |fb| fb.deinit();
         state.* = .{
             .allocator = allocator,
             .io = &ts.io,
@@ -5604,7 +7450,6 @@ const PolicyServer = struct {
             .pixman_renderer = ts.pixman_renderer.?,
             .renderer_kind = kind,
             .backend = ts.backend.?,
-            .camera = default_camera,
             .camera_env = null,
             .scene = ts.scene.?,
             .seat = ts.seat.?,
@@ -5612,15 +7457,12 @@ const PolicyServer = struct {
             .data_device = ts.data_device.?,
             .primary_selection = ts.primary_selection.?,
             .presentation = ts.presentation.?,
-            .output = ts.output.?,
-            .wl_output = ts.wl_output.?,
             .toplevels = .empty,
             .layer_surfaces = .empty,
             .layer_popups = .empty,
             .new_output_listener = wire.Listener(*wayland.output.Output).init(onNewOutput),
             .new_input_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onNewInput),
             .input_removed_listener = wire.Listener(*wayland.backend.Backend.InputDevice).init(onInputRemoved),
-            .frame_listener = wire.Listener(*wayland.output.Output).init(onOutputFrame),
             .content_dirty_listener = wire.Listener(*wayland.scene.Scene).init(onSceneContentDirty),
             .new_toplevel_listener = wire.Listener(*wayland.shell.XdgToplevel).init(onNewToplevel),
             .new_popup_listener = wire.Listener(*wayland.shell.XdgPopup).init(onNewPopup),
@@ -5641,17 +7483,32 @@ const PolicyServer = struct {
             .new_lock_surface_listener = wire.Listener(*wayland.session_lock.LockSurface).init(onNewLockSurface),
             .lock_surface_gone_listener = wire.Listener(*wayland.session_lock.LockSurface).init(onLockSurfaceGone),
             .cursor_shape_changed_listener = wire.Listener(*wayland.cursor_shape.ShapeChange).init(onCursorShapeChanged),
-            // No frame is ever rendered here: requestRender (from the
-            // minimize policy) must only mark repaint_pending instead of
-            // driving the output's frame chain.
-            .in_render = true,
-            .framebuffer = ts.fb.?,
         };
         ts.state = state;
+
+        // The harness output's OutputView, built by the PRODUCTION
+        // factory: a test renders through the same camera, scene output,
+        // wl_output global and target lifecycle main() uses. No frame is
+        // ever PRESENTED here (the test backend's commit is a stub), so
+        // in_render stays set and requestRender only marks repaint_pending.
+        const view = createOutputView(state, ts.output.?) orelse return error.ViewCreateFailed;
+        ts.view = view;
+        view.in_render = true;
+        // The first output's enable commit, exactly as onNewOutput makes
+        // it (the frame test below needs `enabled` for sendFrame).
+        var init_state = wayland.output.Output.State.init(allocator);
+        defer init_state.deinit();
+        init_state.committed = wayland.output.Output.State.committed_enabled |
+            wayland.output.Output.State.committed_mode;
+        init_state.enabled = true;
+        init_state.mode = ts.output.?.mode;
+        try ts.output.?.commitState(&init_state);
 
         // The production subscriptions the tests exercise.
         ts.shell.?.events.new_toplevel.add(&state.new_toplevel_listener);
         ts.shell.?.events.new_popup.add(&state.new_popup_listener);
+        ts.layer_shell.?.events.new_layer_surface.add(&state.new_layer_surface_listener);
+        ts.layer_shell.?.events.new_popup.add(&state.new_layer_popup_listener);
         ts.seat.?.events.keyboard_focus.add(&state.seat_focus_listener);
         ts.seat.?.events.button.add(&state.seat_button_listener);
         ts.seat.?.events.pointer_move.add(&state.seat_pointer_move_listener);
@@ -5760,6 +7617,8 @@ const PolicyServer = struct {
             unlinkSessionLockListeners(state);
             unlinkOne(*wayland.shell.XdgToplevel, &state.new_toplevel_listener);
             unlinkOne(*wayland.shell.XdgPopup, &state.new_popup_listener);
+            unlinkOne(*wayland.layer_shell.LayerSurface, &state.new_layer_surface_listener);
+            unlinkOne(*wayland.shell.XdgPopup, &state.new_layer_popup_listener);
             unlinkOne(*wayland.seat.Seat, &state.seat_focus_listener);
             unlinkOne(*wayland.seat.Seat, &state.seat_button_listener);
             unlinkOne(*wayland.seat.Seat, &state.seat_pointer_move_listener);
@@ -5771,19 +7630,31 @@ const PolicyServer = struct {
             state.layer_surfaces.deinit(ts.allocator);
             state.layer_popups.deinit(ts.allocator);
             state.synth_clicked.deinit(ts.allocator);
-            // ensureBaseFramebuffer() lazily builds this (a test that
-            // composites has one); ServerState.deinit frees it in main(),
-            // so the harness has to as well.
-            if (state.base_framebuffer) |base| base.deinit();
-            // The GLES2 canvas target (a .gles2 harness only), freed
-            // before the renderer below, whose EGL context its GL
-            // objects belong to.
-            if (state.gles2_target) |t| t.destroy();
+            state.synth_pointed.deinit(ts.allocator);
+            // The cursor's GL import (a .gles2 harness that composited a
+            // GPU frame), freed before the renderer whose EGL context its
+            // GL objects belong to.
+            if (state.cursor_gl) |t| {
+                t.destroy();
+                state.cursor_gl = null;
+            }
+            // The output views, and with them every render target, the
+            // capture storage and the scene output each one owns — the
+            // same order main()'s freeStateResources uses.
+            cleanupSurfaceEntries(state);
+            freeOutputViews(state);
+            state.surface_place.deinit(ts.allocator);
+            state.canvas_index.deinit(ts.allocator);
+            clearScenePlacementPolicy(state);
             ts.allocator.destroy(state);
         }
+        ts.view = null;
         if (ts.scene) |sc| sc.deinit();
-        if (ts.fb) |fb| fb.deinit();
-        // The Output's destroy signal frees the WlOutput global.
+        // The extra outputs a two-output test added, after their views
+        // (freeOutputViews above already ran). Each Output's destroy
+        // signal frees the WlOutput global its view created for it.
+        for (ts.extra_outputs.items) |o| o.destroy();
+        ts.extra_outputs.deinit(ts.allocator);
         if (ts.output) |o| o.destroy();
         if (ts.backend) |b| b.destroy();
         if (ts.presentation) |p| p.deinit();
@@ -5856,6 +7727,74 @@ const PolicyServer = struct {
         }
     }
 
+    /// The harness's output view — the only one unless a test adds a
+    /// second output.
+    fn viewOf(ts: *PolicyServer) *OutputView {
+        return ts.view orelse unreachable;
+    }
+
+    /// A SECOND output on the harness: a real `Output` plus a real
+    /// `OutputView` through the production factory, laid out to the right
+    /// of the first — exactly what a hot-plugged connector produces. The
+    /// harness owns the extra Output and frees it in deinit.
+    fn addSecondOutput(ts: *PolicyServer, w: i32, h: i32) !*OutputView {
+        const out = try wayland.output.Output.create(
+            ts.allocator,
+            &ts.io,
+            &ts.log_cfg,
+            ts.backend.?,
+            &test_output_impl,
+            &ts.dummy,
+            .{ .width = w, .height = h, .refresh_msec = 16 },
+        );
+        errdefer out.destroy();
+        // The list owns it from here: a later failure must not destroy it
+        // twice, and deinit still frees whatever is left in the list.
+        try ts.extra_outputs.append(ts.allocator, out);
+        const view = createOutputView(ts.state.?, out) orelse return error.ViewCreateFailed;
+        view.in_render = true;
+        return view;
+    }
+
+    /// Take a view off the harness the way a backend unplug does: the
+    /// production destroy handler runs, so the layout, the surfaces and
+    /// any pinned gesture are re-homed exactly as in the running server.
+    fn removeOutput(ts: *PolicyServer, out: *wayland.output.Output) void {
+        // Output.destroy frees the Output, so it must leave the harness's
+        // ownership list first or deinit would destroy it again.
+        if (ts.output == out) ts.output = null;
+        for (ts.extra_outputs.items, 0..) |owned, i| {
+            if (owned == out) {
+                _ = ts.extra_outputs.orderedRemove(i);
+                break;
+            }
+        }
+        out.destroy();
+    }
+
+    /// Run one view's frame phases WITHOUT presenting: placement, damage
+    /// and the composite, with no output commit. The pixels the test then
+    /// inspects are the ones the frame really drew — through the same
+    /// canvas pass main() uses, including the read-back under
+    /// WAYLAND_RENDERER=gles2 — and the two cursor/present shortcuts are
+    /// cleared so the canvas is always recomposited.
+    fn renderView(ts: *PolicyServer, view: *OutputView) void {
+        const state = ts.state.?;
+        var perf: FramePerf = .{ .t0 = perfNs(state), .sync = 0, .cursor = 0, .render = 0, .present = 0 };
+        const input = beginFrame(view, &perf) orelse return;
+        accumulateFrameDamage(view, input);
+        view.frame_kick = false;
+        view.cursor_repaint = false;
+        _ = compositeFrame(view, input, null);
+    }
+
+    /// The canvas the last renderView left in this view's persisted base:
+    /// what the view is showing without the cursor.
+    fn baseOf(ts: *PolicyServer, view: *OutputView) !*pixman.Framebuffer {
+        _ = ts;
+        return view.base_framebuffer orelse error.BaseFramebufferMissing;
+    }
+
     /// Tear the ten new protocol modules down the way main() does (the
     /// globals removed, the modules freed in reverse dependency order)
     /// while the display and the client stay up. A test uses it to prove
@@ -5925,6 +7864,39 @@ const PolicyServer = struct {
         return ts.filled_pool.?.createBuffer(0, width, height, width * 4, .argb8888);
     }
 
+    /// An ARGB8888 shm buffer of the requested size split down the middle
+    /// between two OPAQUE grays (splitMemfd): the LEFT half is `left`, the
+    /// RIGHT half is `right`. For a surface whose exact PLACE is the thing
+    /// under test — a lock screen that must cover its output, a drag icon
+    /// that must sit at the pointer — a uniform fill proves nothing,
+    /// because a surface at the wrong place with the right colour still
+    /// passes. The pool is retained like createFilledBuffer's.
+    fn createSplitBuffer(
+        ts: *PolicyServer,
+        width: i32,
+        height: i32,
+        left: u8,
+        right: u8,
+    ) !*client.wl.Buffer {
+        const size: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+        const fd = try splitMemfd("policy-test-split", width, height, left, right);
+        defer _ = std.os.linux.close(fd);
+        ts.filled_pool = try ts.wl_shm.?.createPool(fd, @intCast(size));
+        return ts.filled_pool.?.createBuffer(0, width, height, width * 4, .argb8888);
+    }
+
+    /// A wl_buffer holding the four-quadrant fixture (fixture_w x
+    /// fixture_h, quadrantFixtureColor per texel). The pool is retained
+    /// in its own slot so the buffer stays valid for the whole test,
+    /// exactly like createBuffer's.
+    fn createFixtureBuffer(ts: *PolicyServer) !*client.wl.Buffer {
+        const size: usize = @as(usize, @intCast(fixture_w)) * @as(usize, @intCast(fixture_h)) * 4;
+        const fd = try quadrantMemfd("policy-test-fixture");
+        defer _ = std.os.linux.close(fd);
+        ts.fixture_pool = try ts.wl_shm.?.createPool(fd, @intCast(size));
+        return ts.fixture_pool.?.createBuffer(0, fixture_w, fixture_h, fixture_w * 4, .argb8888);
+    }
+
     /// A FRESH wl_registry roundtrip: libwayland sends the current global
     /// list to a newly created registry, which is how a test observes a
     /// global that appeared or disappeared since the last one. The
@@ -5984,6 +7956,18 @@ const PolicyServer = struct {
     }
 
     fn createToplevelWithAck(ts: *PolicyServer, auto_ack: bool) !*Toplevel {
+        return ts.createToplevelWithBufferAck(try ts.createBuffer(), auto_ack);
+    }
+
+    /// The same, with the buffer the surface first presents chosen by
+    /// the caller instead of the harness's solid-gray one. A
+    /// transform/scale/viewport test needs a buffer whose CONTENT
+    /// identifies where it ended up on screen; a solid fill cannot.
+    fn createToplevelWithBuffer(ts: *PolicyServer, buf: *client.wl.Buffer) !*Toplevel {
+        return ts.createToplevelWithBufferAck(buf, true);
+    }
+
+    fn createToplevelWithBufferAck(ts: *PolicyServer, buf: *client.wl.Buffer, auto_ack: bool) !*Toplevel {
         // Heap-allocated: the client listeners take the address of the
         // event state, so it must outlive this call (a returned-by-value
         // copy would leave them pointing at the dead local).
@@ -6011,7 +7995,7 @@ const PolicyServer = struct {
         try ts.pump();
         if (!auto_ack) ts.ackToplevelConfigure(out);
         // Attach a buffer + ack: the surface maps and gets a scene node.
-        out.wl_surface.attach(try ts.createBuffer(), 0, 0);
+        out.wl_surface.attach(buf, 0, 0);
         out.wl_surface.commit();
         try ts.pump();
         syncSurfaces(ts.state.?);
@@ -6324,12 +8308,19 @@ test "set_fullscreen fills the named output; set_minimized is recorded (P1-8)" {
     try testing.expect(!t.tl_events.carries(state_fullscreen));
     try testing.expect(!st.scheduled.fullscreen);
 
-    // Minimize: recorded on the toplevel state and taken off screen.
+    // Minimize: recorded on the toplevel state and taken off screen. The
+    // window is the harness's 64x64 gray square at the canvas origin, so
+    // "off screen" is what the NEXT FRAME shows: the compositor disables
+    // the surface's whole container (onToplevelMinimize — the container,
+    // not the buffer node, so a popup or subsurface goes down with it),
+    // and the canvas pass prunes a disabled subtree, leaving the
+    // background fill where the window was.
     t.toplevel.setMinimized();
     try ts.pump();
     try testing.expect(st.pending.minimized);
-    const sn = wayland.surface_node.surfaceNodeFor(ts.scene.?, ts.serverSurface(t.wl_surface)).?;
-    try testing.expect(!sn.node.?.enabled);
+    ts.renderView(ts.viewOf());
+    try expectFillPixel(framebufferPixel(try ts.baseOf(ts.viewOf()), 10, 10));
+    try expectFillPixel(framebufferPixel(try ts.baseOf(ts.viewOf()), 63, 63));
 }
 
 test "a keyboard-focus change publishes wl_toplevel.activated (P1-9)" {
@@ -6776,8 +8767,10 @@ test "syncPopupNodes publishes the popup's absolute scene origin (P1-5b)" {
         ts.scene.?,
         ts.serverSurface(parent.wl_surface),
     ).?.tree.?;
-    parent_tree.x = 300;
-    parent_tree.y = 150;
+    // f64 scene placement: the tree is positioned through setPosition, the
+    // same call the production sync makes, so the test moves the parent
+    // the way the compositor would.
+    parent_tree.setPosition(300, 150);
 
     syncPopupNodes(ts.state.?);
     const popup_tree = wayland.surface_node.surfaceNodeFor(
@@ -6787,8 +8780,8 @@ test "syncPopupNodes publishes the popup's absolute scene origin (P1-5b)" {
     const abs = popup_tree.absolutePosition();
     // The published origin is the popup's ABSOLUTE scene position: the
     // parent chain plus the parent-relative geometry.
-    try testing.expectEqual(parent_tree.x + p.geometry.x, p.origin.x);
-    try testing.expectEqual(parent_tree.y + p.geometry.y, p.origin.y);
+    try testing.expectEqual(parent_tree.x + @as(f64, @floatFromInt(p.geometry.x)), p.origin.x);
+    try testing.expectEqual(parent_tree.y + @as(f64, @floatFromInt(p.geometry.y)), p.origin.y);
     try testing.expectEqual(abs.x, p.origin.x);
     try testing.expectEqual(abs.y, p.origin.y);
 }
@@ -6824,11 +8817,14 @@ test "syncDragIconNodes puts the drag icon at the pointer and drops it (P2-12)" 
     ts.seat.?.pointerMotion(400, 300);
     syncDragIconNodes(ts.state.?);
     const icon_tree = wayland.surface_node.surfaceNodeFor(ts.scene.?, icon_surface).?.tree.?;
-    try testing.expectEqual(@as(i32, 400), icon_tree.x);
-    try testing.expectEqual(@as(i32, 300), icon_tree.y);
+    // The icon sits at the GLOBAL pointer: scene space IS the desktop,
+    // in f64. A view-local or narrowed position would land off by the
+    // view's origin or lose a fraction.
+    try testing.expectEqual(@as(f64, 400), icon_tree.x);
+    try testing.expectEqual(@as(f64, 300), icon_tree.y);
     const abs = icon_tree.absolutePosition();
-    try testing.expectEqual(@as(i32, 400), abs.x);
-    try testing.expectEqual(@as(i32, 300), abs.y);
+    try testing.expectEqual(@as(f64, 400), abs.x);
+    try testing.expectEqual(@as(f64, 300), abs.y);
 
     // The drag ends: the icon is no longer at the pointer, and the canvas
     // pass no longer composites it as content.
@@ -6837,8 +8833,8 @@ test "syncDragIconNodes puts the drag icon at the pointer and drops it (P2-12)" 
     try testing.expect(ts.data_device.?.currentDragIcon() == null);
     ts.seat.?.pointerMotion(500, 350);
     syncDragIconNodes(ts.state.?);
-    try testing.expectEqual(@as(i32, 400), icon_tree.x);
-    try testing.expectEqual(@as(i32, 300), icon_tree.y);
+    try testing.expectEqual(@as(f64, 400), icon_tree.x);
+    try testing.expectEqual(@as(f64, 300), icon_tree.y);
     try testing.expect(isDragIconSurface(icon_surface));
 }
 
@@ -6893,6 +8889,52 @@ fn filledMemfd(name: []const u8, size: usize, value: u8) !std.posix.fd_t {
     return fd;
 }
 
+/// The premultiplied ARGB8888 memory bytes of an opaque gray fill
+/// (`value` in every colour channel, alpha 0xFF) — the layout
+/// framebufferPixel reads and the canvas pass produces.
+fn grayBytes(value: u8) [4]u8 {
+    return .{ value, value, value, 0xFF };
+}
+
+/// A memfd of `width` x `height` opaque pixels split down the middle: the
+/// left half is the gray `left`, the right half the gray `right`.
+///
+/// Asymmetric on purpose. A surface that has to COVER an output, a drag
+/// icon that has to sit AT a point or a canvas that has to land at a
+/// camera-mapped pixel is invisible to a uniform fill wherever it really
+/// is; a split shows a shift or a wrong size as the boundary moving.
+fn splitMemfd(name: []const u8, width: i32, height: i32, left: u8, right: u8) !std.posix.fd_t {
+    const w: usize = @intCast(width);
+    const h: usize = @intCast(height);
+    const size: usize = w * h * 4;
+    const fd = try std.posix.memfd_create(name, std.os.linux.MFD.CLOEXEC);
+    errdefer _ = std.os.linux.close(fd);
+    const rc = std.os.linux.ftruncate(fd, @intCast(size));
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
+    const pixels = try std.posix.mmap(
+        null,
+        size,
+        std.posix.PROT{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED },
+        fd,
+        0,
+    );
+    defer std.posix.munmap(pixels);
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        var x: usize = 0;
+        while (x < w) : (x += 1) {
+            const value: u8 = if (x < w / 2) left else right;
+            const off = (y * w + x) * 4;
+            pixels[off + 0] = value;
+            pixels[off + 1] = value;
+            pixels[off + 2] = value;
+            pixels[off + 3] = 0xFF;
+        }
+    }
+    return fd;
+}
+
 test "the new protocol globals are advertised at their implemented version and gone with their modules" {
     const ts = try PolicyServer.init(testing.allocator);
     defer ts.deinit();
@@ -6941,14 +8983,17 @@ test "the new protocol globals are advertised at their implemented version and g
 test "the present path consults wp_tearing_control_v1 per surface per frame" {
     const ts = try PolicyServer.init(testing.allocator);
     defer ts.deinit();
+    // The present path is per OUTPUT now: the presented list belongs to
+    // this view's SceneOutput and the tearing consult names the view.
+    const view = ts.viewOf();
 
     const t = try ts.createToplevel();
     defer ts.allocator.destroy(t);
     const surface = ts.serverSurface(t.wl_surface);
 
     // Nothing opted in: no presented surface asks for async presentation.
-    wayland.surface_node.collectPresented(ts.scene.?);
-    try testing.expectEqual(@as(u32, 0), consultTearingHints(ts.state.?, ts.output.?).async_surfaces);
+    wayland.surface_node.collectPresented(ts.scene.?, view.scene_output);
+    try testing.expectEqual(@as(u32, 0), consultTearingHints(ts.state.?, view).async_surfaces);
 
     var capture: PolicyGlobalCapture = .{};
     const registry = try ts.readGlobals(&capture);
@@ -6961,13 +9006,13 @@ test "the present path consults wp_tearing_control_v1 per surface per frame" {
     // client's pending value and the present path must not see it
     // (TearingControl.hintFor reads the COMMITTED hint,
     // shell/tearing_control.zig:180-187).
-    try testing.expectEqual(@as(u32, 0), consultTearingHints(ts.state.?, ts.output.?).async_surfaces);
+    try testing.expectEqual(@as(u32, 0), consultTearingHints(ts.state.?, view).async_surfaces);
     t.wl_surface.commit();
     try ts.pump();
 
     // Committed: the frame's present path reads it for that surface...
-    wayland.surface_node.collectPresented(ts.scene.?);
-    const async_frame = consultTearingHints(ts.state.?, ts.output.?);
+    wayland.surface_node.collectPresented(ts.scene.?, view.scene_output);
+    const async_frame = consultTearingHints(ts.state.?, view);
     try testing.expectEqual(@as(u32, 1), async_frame.async_surfaces);
     // ...and the OUTPUT gate refuses to honour it: no backend in this
     // server flips asynchronously (outputTears), so a `.async` permission
@@ -6978,15 +9023,15 @@ test "the present path consults wp_tearing_control_v1 per surface per frame" {
     // not per output.
     const other = try ts.createToplevel();
     defer ts.allocator.destroy(other);
-    wayland.surface_node.collectPresented(ts.scene.?);
-    try testing.expectEqual(@as(u32, 1), consultTearingHints(ts.state.?, ts.output.?).async_surfaces);
+    wayland.surface_node.collectPresented(ts.scene.?, view.scene_output);
+    try testing.expectEqual(@as(u32, 1), consultTearingHints(ts.state.?, view).async_surfaces);
 
     // The client takes the permission back; the next frame reads vsync.
     control.setPresentationHint(.vsync);
     t.wl_surface.commit();
     try ts.pump();
-    wayland.surface_node.collectPresented(ts.scene.?);
-    try testing.expectEqual(@as(u32, 0), consultTearingHints(ts.state.?, ts.output.?).async_surfaces);
+    wayland.surface_node.collectPresented(ts.scene.?, view.scene_output);
+    try testing.expectEqual(@as(u32, 0), consultTearingHints(ts.state.?, view).async_surfaces);
     try testing.expectEqual(wayland.tearing_control.Hint.vsync, ts.tearing_control.?.hintFor(surface));
 }
 
@@ -7031,11 +9076,9 @@ test "a locked session denies input to every client but the lock one and blanks 
     const ts = try PolicyServer.init(testing.allocator);
     defer ts.deinit();
     const state = ts.state.?;
+    const view = ts.viewOf();
     const sl = ts.session_lock.?;
     const other_client = try ts.addIdleClient();
-    // The framebuffer compositeBase fills (no frame is ever rendered in
-    // these tests).
-    ensureBaseFramebuffer(state);
 
     // A mapped user toplevel: opaque 0x40 gray at the canvas origin.
     const t = try ts.createToplevel();
@@ -7046,11 +9089,11 @@ test "a locked session denies input to every client but the lock one and blanks 
     try testing.expect(!sl.isLocked());
     try testing.expect(sl.acceptsInput(ts.client.?));
     try testing.expect(sl.acceptsInput(other_client));
-    try testing.expectEqual(LockedFrame{ .locked = false, .blank = false }, lockedFrameFor(state, ts.output.?));
+    try testing.expectEqual(LockedFrame{ .locked = false, .blank = false }, lockedFrameFor(state, view.output));
     try testing.expect(keyboardFocusAllowed(state, user_surface));
     try testing.expect(pickSurface(state, 10, 10) != null);
-    compositeBase(state, .{ .locked = false, .blank = false });
-    try testing.expectEqual([4]u8{ 0x40, 0x40, 0x40, 0xFF }, framebufferPixel(state.base_framebuffer.?, 10, 10));
+    ts.renderView(view);
+    try testing.expectEqual([4]u8{ 0x40, 0x40, 0x40, 0xFF }, framebufferPixel(try ts.baseOf(view), 10, 10));
 
     // The lock client takes the session: a lock object plus a lock surface
     // covering the output.
@@ -7095,13 +9138,13 @@ test "a locked session denies input to every client but the lock one and blanks 
 
     // The output shows the lock surface and nothing else: the user
     // toplevel's gray is gone even where it used to be.
-    const locked = lockedFrameFor(state, ts.output.?);
+    const locked = lockedFrameFor(state, view.output);
     // A locked frame never paints the cursor (LockedFrame.cursor_hidden),
     // so the expectation spells the whole struct out.
     try testing.expectEqual(LockedFrame{ .locked = true, .blank = false, .cursor_hidden = true }, locked);
-    compositeBase(state, locked);
-    try testing.expectEqual([4]u8{ 0x80, 0x80, 0x80, 0xFF }, framebufferPixel(state.base_framebuffer.?, 10, 10));
-    try testing.expectEqual([4]u8{ 0x80, 0x80, 0x80, 0xFF }, framebufferPixel(state.base_framebuffer.?, 700, 500));
+    ts.renderView(view);
+    try testing.expectEqual([4]u8{ 0x80, 0x80, 0x80, 0xFF }, framebufferPixel(try ts.baseOf(view), 10, 10));
+    try testing.expectEqual([4]u8{ 0x80, 0x80, 0x80, 0xFF }, framebufferPixel(try ts.baseOf(view), 700, 500));
 
     // The lock surface stops covering its output (its object dies): the
     // fill stays opaque and NOTHING is drawn — user content must not come
@@ -7109,10 +9152,10 @@ test "a locked session denies input to every client but the lock one and blanks 
     lock_surface.destroy();
     try ts.pump();
     try testing.expect(sl.isLocked());
-    try testing.expectEqual(LockedFrame{ .locked = true, .blank = true, .cursor_hidden = true }, lockedFrameFor(state, ts.output.?));
-    compositeBase(state, .{ .locked = true, .blank = true });
-    try testing.expectEqual([4]u8{ 0, 0, 0, 0xFF }, framebufferPixel(state.base_framebuffer.?, 10, 10));
-    try testing.expectEqual([4]u8{ 0, 0, 0, 0xFF }, framebufferPixel(state.base_framebuffer.?, 700, 500));
+    try testing.expectEqual(LockedFrame{ .locked = true, .blank = true, .cursor_hidden = true }, lockedFrameFor(state, view.output));
+    ts.renderView(view);
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0xFF }, framebufferPixel(try ts.baseOf(view), 10, 10));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0xFF }, framebufferPixel(try ts.baseOf(view), 700, 500));
     // Input stays suppressed: unlocking is the only way out.
     try testing.expect(!sl.acceptsInput(other_client));
 
@@ -7120,7 +9163,7 @@ test "a locked session denies input to every client but the lock one and blanks 
     lock.unlockAndDestroy();
     try ts.pump();
     try testing.expect(!sl.isLocked());
-    try testing.expectEqual(LockedFrame{ .locked = false, .blank = false }, lockedFrameFor(state, ts.output.?));
+    try testing.expectEqual(LockedFrame{ .locked = false, .blank = false }, lockedFrameFor(state, view.output));
     try testing.expect(keyboardFocusAllowed(state, user_surface));
     try testing.expect(!state.cursor_hidden);
     try testing.expect(sl.acceptsInput(other_client));
@@ -7470,7 +9513,7 @@ test "a locked session refuses an interactive move request" {
 fn pickIgnoringLock(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
     const ts: *PolicyServer = @ptrCast(@alignCast(ctx));
     const s = ts.pick_surface orelse return null;
-    return .{ .surface = s, .sx = x, .sy = y };
+    return .{ .surface = s, .sx = @floatFromInt(x), .sy = @floatFromInt(y) };
 }
 
 // ---------------------------------------------------------------------------
@@ -7931,19 +9974,6 @@ test "with the resolver cleared a dmabuf buffer is no longer attached (F56)" {
     try testing.expect(!ts.toClient());
 }
 
-/// Enable the harness's output the way main()'s onNewOutput does: an
-/// enable-only commit. A capture of a DISABLED output fails the frame
-/// (wlroots :508-511), so every screencopy test needs it up first.
-fn enableHarnessOutput(ts: *PolicyServer) !void {
-    var init_state = wayland.output.Output.State.init(ts.allocator);
-    defer init_state.deinit();
-    init_state.committed = wayland.output.Output.State.committed_enabled |
-        wayland.output.Output.State.committed_mode;
-    init_state.enabled = true;
-    init_state.mode = ts.output.?.mode;
-    try ts.output.?.commitState(&init_state);
-}
-
 // ---------------------------------------------------------------------------
 // zwlr_screencopy_v1 -> zwp_linux_dmabuf_v1 destination
 // ---------------------------------------------------------------------------
@@ -7961,7 +9991,6 @@ test "without a dmabuf destination a screencopy frame advertises only shm" {
     // exactly what main() wires on a headless / raylib / nested run.
     const ts = try PolicyServer.init(testing.allocator);
     defer ts.deinit();
-    try enableHarnessOutput(ts);
 
     var capture: PolicyGlobalCapture = .{};
     const registry = try ts.readGlobals(&capture);
@@ -7996,7 +10025,6 @@ test "a screencopy dmabuf destination is wired only when the module has a device
 
     // The frame a client gets is unchanged: one shm buffer type, no
     // dmabuf, no failure.
-    try enableHarnessOutput(ts);
     var capture: PolicyGlobalCapture = .{};
     const registry = try ts.readGlobals(&capture);
     const entry = capture.find("zwlr_screencopy_manager_v1") orelse return error.GlobalMissing;
@@ -8019,7 +10047,6 @@ test "clearing the screencopy dmabuf destination removes the advertised buffer t
     const ts = try PolicyServer.init(testing.allocator);
     defer ts.deinit();
     const sc = ts.screencopy.?;
-    try enableHarnessOutput(ts);
 
     var capture: PolicyGlobalCapture = .{};
     const registry = try ts.readGlobals(&capture);
@@ -8146,11 +10173,11 @@ test "with no logind session the server arms no session poller and still runs" {
 test "an output comes up on a machine with no logind session at all" {
     // The other half of "still starts": the output the server drives is
     // unaffected by the absence of a session, which is the VM this
-    // compositor runs in today. The enable commit is main()'s own, from
-    // onNewOutput.
+    // compositor runs in today. The output is enabled by the same
+    // enable-only commit onNewOutput makes, which the harness factory
+    // performs when it builds its view.
     const ts = try PolicyServer.init(testing.allocator);
     defer ts.deinit();
-    try enableHarnessOutput(ts);
 
     const out = ts.output.?;
     try testing.expect(out.enabled);
@@ -8257,7 +10284,10 @@ const surface_bytes: [4]u8 = .{ 0x40, 0x40, 0x40, 0xFF };
 fn expectFillPixel(got: [4]u8) !void {
     for (background_bytes, got) |want, actual| {
         const diff = if (want > actual) want - actual else actual - want;
-        try testing.expect(diff <= 1);
+        testing.expect(diff <= 1) catch |err| {
+            std.debug.print("background pixel: got {any}, expected {any} (within one unit)\n", .{ got, background_bytes });
+            return err;
+        };
     }
 }
 
@@ -8276,90 +10306,29 @@ test "WAYLAND_RENDERER selects the renderer; an unknown value is rejected, not g
     try testing.expectEqual(@as(?RendererKind, null), parseRendererEnv(" pixman"));
 }
 
-test "the camera's world->screen map is the matrix the GLES2 shader uploads" {
-    // One case per factor the camera composes: the server default (a
-    // pure shift), a pan, a zoom, a rotation, and a rotated zoom.
-    const cases = [_]Camera{
-        default_camera,
-        .{ .center_x = -100, .center_y = 300, .zoom = 1, .rotation = 0, .screen_w = 800, .screen_h = 600 },
-        .{ .center_x = 12.5, .center_y = -7.25, .zoom = 2.5, .rotation = 0, .screen_w = 800, .screen_h = 600 },
-        .{ .center_x = 0, .center_y = 0, .zoom = 1, .rotation = 1.0471975511965976, .screen_w = 640, .screen_h = 480 },
-        .{ .center_x = 30, .center_y = -30, .zoom = 1.75, .rotation = -0.4, .screen_w = 1024, .screen_h = 768 },
-    };
-    const probes = [_][2]f64{
-        .{ 0, 0 },
-        .{ 123.5, -456.25 },
-        .{ -1000, 900 },
-        .{ 63.75, 63.75 },
-    };
-    for (cases) |cam| {
-        const a = cameraAffine(cam);
-        for (probes) |p| {
-            const want = cam.worldToScreen(p[0], p[1]);
-            // Affine.m is COLUMN-major (gles2.zig:188), which is the
-            // whole point of the test: the wrong order here is a
-            // transpose that still "works" and silently inverts every
-            // rotation.
-            const x: f32 = @floatCast(p[0]);
-            const y: f32 = @floatCast(p[1]);
-            const got_x = a.m[0] * x + a.m[3] * y + a.m[6];
-            const got_y = a.m[1] * x + a.m[4] * y + a.m[7];
-            try testing.expectApproxEqAbs(want.x, @as(f64, got_x), 0.05);
-            try testing.expectApproxEqAbs(want.y, @as(f64, got_y), 0.05);
-        }
-    }
-}
-
-test "the GLES2 background rect is the world rect the camera maps onto the whole output" {
-    // The server default's visible world rect IS the output.
-    try testing.expectEqual(
-        geom.Rect{ .x = 0, .y = 0, .width = output_width, .height = output_height },
-        worldRectForOutput(default_camera),
-    );
-    // A zoomed-out, rotated camera has no integral visible rect, so the
-    // fill rounds OUT. Rounding in would leave a bare corner; the forward
-    // image of a superset is still a superset, which is what makes the
-    // round-out safe. Every screen corner must land inside it.
-    const cam: Camera = .{
-        .center_x = 5,
-        .center_y = -3,
-        .zoom = 0.5,
-        .rotation = 0.3,
-        .screen_w = 800,
-        .screen_h = 600,
-    };
-    const rect = worldRectForOutput(cam);
-    for ([_][2]i32{ .{ 0, 0 }, .{ 800, 0 }, .{ 0, 600 }, .{ 800, 600 } }) |corner| {
-        const w = cam.screenToWorld(@floatFromInt(corner[0]), @floatFromInt(corner[1]));
-        try testing.expect(w.x >= @as(f64, @floatFromInt(rect.x)));
-        try testing.expect(w.y >= @as(f64, @floatFromInt(rect.y)));
-        try testing.expect(w.x <= @as(f64, @floatFromInt(rect.x + rect.width)));
-        try testing.expect(w.y <= @as(f64, @floatFromInt(rect.y + rect.height)));
-    }
-}
-
 test "WAYLAND_RENDERER=pixman composites the canvas byte for byte as before" {
     const ts = try PolicyServer.init(testing.allocator);
     defer ts.deinit();
     const state = ts.state.?;
+    const view = ts.viewOf();
     // The default: one renderer, and it is the CPU one.
     try testing.expectEqual(RendererKind.pixman, state.renderer_kind);
     try testing.expect(state.renderer == state.pixman_renderer);
 
     const t = try ts.createToplevel();
     defer ts.allocator.destroy(t);
-    ensureBaseFramebuffer(state);
-    compositeBase(state, .{});
+    ts.renderView(view);
+    const base = try ts.baseOf(view);
 
     // The 64x64 opaque gray toplevel at the canvas origin, and the
     // background fill everywhere else. These are the exact bytes the
     // server has produced for this canvas since the canvas pass landed;
     // a refactor that changed the fill math, the item order or the
     // sampling would move one of them.
-    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 10, 10));
-    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 63, 63));
-    try testing.expectEqual(background_bytes, framebufferPixel(state.base_framebuffer.?, 64, 64));
-    try testing.expectEqual(background_bytes, framebufferPixel(state.base_framebuffer.?, 700, 500));
+    try testing.expectEqual(surface_bytes, framebufferPixel(base, 10, 10));
+    try testing.expectEqual(surface_bytes, framebufferPixel(base, 63, 63));
+    try testing.expectEqual(background_bytes, framebufferPixel(base, 64, 64));
+    try testing.expectEqual(background_bytes, framebufferPixel(base, 700, 500));
 }
 
 test "WAYLAND_RENDERER=gles2 composites the same canvas through the GLES2 renderer" {
@@ -8369,6 +10338,7 @@ test "WAYLAND_RENDERER=gles2 composites the same canvas through the GLES2 render
     const ts = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
     defer ts.deinit();
     const state = ts.state.?;
+    const view = ts.viewOf();
     // The selected renderer is the GLES2 one; the cursor's pixman twin is
     // a second, independent object (the cursor's draw path is pixman's).
     try testing.expectEqual(RendererKind.gles2, state.renderer_kind);
@@ -8376,18 +10346,18 @@ test "WAYLAND_RENDERER=gles2 composites the same canvas through the GLES2 render
 
     const t = try ts.createToplevel();
     defer ts.allocator.destroy(t);
-    ensureBaseFramebuffer(state);
-    compositeBase(state, .{});
+    ts.renderView(view);
+    const base = try ts.baseOf(view);
 
     // The GLES2 pass really composited: it filled the background and
     // stamped the surface's GL texture through the camera. The surface
     // pixels are the CPU pass's bytes exactly — an opaque texture over
     // the fill — and the fill is the same colour within the shader's
     // mediump rounding (expectFillPixel).
-    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 10, 10));
-    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 63, 63));
-    try expectFillPixel(framebufferPixel(state.base_framebuffer.?, 64, 64));
-    try expectFillPixel(framebufferPixel(state.base_framebuffer.?, 700, 500));
+    try testing.expectEqual(surface_bytes, framebufferPixel(base, 10, 10));
+    try testing.expectEqual(surface_bytes, framebufferPixel(base, 63, 63));
+    try expectFillPixel(framebufferPixel(base, 64, 64));
+    try expectFillPixel(framebufferPixel(base, 700, 500));
 }
 
 test "the GLES2 canvas pass draws through the camera uniform" {
@@ -8396,17 +10366,16 @@ test "the GLES2 canvas pass draws through the camera uniform" {
 
     const ts = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
     defer ts.deinit();
-    const state = ts.state.?;
+    const view = ts.viewOf();
     const t = try ts.createToplevel();
     defer ts.allocator.destroy(t);
-    ensureBaseFramebuffer(state);
 
     // A zoom-2 camera centred on the world origin: the 64x64 toplevel at
     // world (0,0) belongs on output [400, 528) x [300, 428), exactly what
     // Camera.worldToScreen says for its corners. Without the affine the
     // surface would sit 1:1 at the origin; with a transposed or
     // mis-ordered one the probes below would land outside the image.
-    state.camera = .{
+    view.camera = .{
         .center_x = 0,
         .center_y = 0,
         .zoom = 2,
@@ -8414,12 +10383,1437 @@ test "the GLES2 canvas pass draws through the camera uniform" {
         .screen_w = 800,
         .screen_h = 600,
     };
-    compositeBase(state, .{});
+    ts.renderView(view);
+    const base = try ts.baseOf(view);
 
-    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 400, 300));
-    try testing.expectEqual(surface_bytes, framebufferPixel(state.base_framebuffer.?, 527, 427));
+    try testing.expectEqual(surface_bytes, framebufferPixel(base, 400, 300));
+    try testing.expectEqual(surface_bytes, framebufferPixel(base, 527, 427));
     // One output pixel outside the mapped quad, still inside the fill:
     // background, on both sides of the image.
-    try expectFillPixel(framebufferPixel(state.base_framebuffer.?, 399, 299));
-    try expectFillPixel(framebufferPixel(state.base_framebuffer.?, 528, 428));
+    try expectFillPixel(framebufferPixel(base, 399, 299));
+    try expectFillPixel(framebufferPixel(base, 528, 428));
+}
+
+// ---------------------------------------------------------------------------
+// Buffer-transform parity, wp_viewport crop/scale, camera-aware input and a
+// camera far enough out that a world pixel does not fit in an f32.
+// ---------------------------------------------------------------------------
+
+/// The wire enum wl_surface.set_buffer_transform takes, re-exported by
+/// the generated client bindings as wl_output's Transform.
+const wire_transform = client.wl.Output.Transform;
+
+/// The compositor's own Transform for a wire value. The two enums carry
+/// the same protocol values (wayland.xml's wl_output.transform), so this
+/// is the numeric identity — not a hand-written table that could drift.
+fn geomTransform(t: wire_transform) geom.Transform {
+    return @enumFromInt(@intFromEnum(t));
+}
+
+/// Every wl_output.transform in protocol order — the eight standard
+/// values a client may commit.
+const standard_transforms = [_]wire_transform{
+    .normal,
+    .@"90",
+    .@"180",
+    .@"270",
+    .flipped,
+    .flipped_90,
+    .flipped_180,
+    .flipped_270,
+};
+
+/// The fixture buffer's size: 32x16, deliberately NOT square. A
+/// 90-degree buffer transform swaps the surface's width and height, so
+/// a non-square fixture makes "was the rotation applied at all?"
+/// visible in the surface's drawn footprint as well as in its colours.
+const fixture_w: i32 = 32;
+const fixture_h: i32 = 16;
+
+/// The fixture's four solid quadrants as premultiplied ARGB8888 memory
+/// bytes (B, G, R, A) — the layout both the shm buffer and the
+/// composited framebuffer use.
+const fixture_red: [4]u8 = .{ 0, 0, 255, 255 };
+const fixture_green: [4]u8 = .{ 0, 255, 0, 255 };
+const fixture_blue: [4]u8 = .{ 255, 0, 0, 255 };
+const fixture_white: [4]u8 = .{ 255, 255, 255, 255 };
+
+/// The fixture colour at buffer texel (x, y).
+///
+/// Four QUADRANT BLOCKS, not a per-pixel pattern: a block is 16x8
+/// texels, so a probe at its centre lands strictly inside it under
+/// every sampler this server has (the CPU bilinear loop reads a pixel's
+/// top-left corner, pixman and the GLES2 shader read its centre, and a
+/// f32 `mediump` add is a third of a unit). The answer therefore never
+/// depends on a filter's edge convention, while WHICH block is on
+/// screen still separates all eight transforms from one another. The
+/// channels are saturated primaries for the same reason: a 0 or a 255
+/// survives any of those round trips intact.
+fn quadrantFixtureColor(x: i32, y: i32) [4]u8 {
+    const right = x >= fixture_w / 2;
+    const bottom = y >= fixture_h / 2;
+    if (bottom) return if (right) fixture_white else fixture_blue;
+    return if (right) fixture_green else fixture_red;
+}
+
+/// A memfd holding the four-quadrant fixture. The pattern is written
+/// through a private mapping of the same fd the wl_shm pool will mmap,
+/// so the server's texture import reads exactly these bytes.
+fn quadrantMemfd(name: []const u8) !std.posix.fd_t {
+    const size: usize = @as(usize, @intCast(fixture_w)) * @as(usize, @intCast(fixture_h)) * 4;
+    const fd = try std.posix.memfd_create(name, std.os.linux.MFD.CLOEXEC);
+    errdefer _ = std.os.linux.close(fd);
+    const rc = std.os.linux.ftruncate(fd, @intCast(size));
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
+    const pixels = try std.posix.mmap(
+        null,
+        size,
+        std.posix.PROT{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED },
+        fd,
+        0,
+    );
+    defer std.posix.munmap(pixels);
+    var y: i32 = 0;
+    while (y < fixture_h) : (y += 1) {
+        var x: i32 = 0;
+        while (x < fixture_w) : (x += 1) {
+            const texel = quadrantFixtureColor(x, y);
+            const off = (@as(usize, @intCast(y)) * @as(usize, @intCast(fixture_w)) +
+                @as(usize, @intCast(x))) * 4;
+            pixels[off + 0] = texel[0];
+            pixels[off + 1] = texel[1];
+            pixels[off + 2] = texel[2];
+            pixels[off + 3] = texel[3];
+        }
+    }
+    return fd;
+}
+
+/// The surface-local size a committed transform and scale imply for the
+/// fixture buffer, written straight from the wl_surface
+/// .set_buffer_transform / .set_buffer_scale definitions: the buffer
+/// size transformed (buffer -> surface) and divided by the scale.
+fn fixtureSurfaceSize(t: geom.Transform, scale: i32) geom.Size {
+    const swaps = t == .@"90" or t == .@"270" or t == .flipped_90 or t == .flipped_270;
+    return if (swaps)
+        .{ .w = @divTrunc(fixture_h, scale), .h = @divTrunc(fixture_w, scale) }
+    else
+        .{ .w = @divTrunc(fixture_w, scale), .h = @divTrunc(fixture_h, scale) };
+}
+
+/// The buffer texel a surface-local pixel samples under `t`, straight
+/// from the wl_output.transform definition (which maps buffer ->
+/// surface, so this is its inverse).
+///
+/// Written here rather than taken from the compositor's matrix helper
+/// on purpose: whether the canvas pass honours that definition is
+/// exactly what these tests measure, so the expectation must not be
+/// computed with the code under test.
+fn surfaceTexel(t: geom.Transform, sx: i32, sy: i32) geom.Point {
+    return switch (t) {
+        .normal => .{ .x = sx, .y = sy },
+        .@"90" => .{ .x = sy, .y = fixture_h - 1 - sx },
+        .@"180" => .{ .x = fixture_w - 1 - sx, .y = fixture_h - 1 - sy },
+        .@"270" => .{ .x = fixture_w - 1 - sy, .y = sx },
+        .flipped => .{ .x = fixture_w - 1 - sx, .y = sy },
+        .flipped_90 => .{ .x = sy, .y = sx },
+        .flipped_180 => .{ .x = sx, .y = fixture_h - 1 - sy },
+        .flipped_270 => .{ .x = fixture_w - 1 - sy, .y = fixture_h - 1 - sx },
+    };
+}
+
+/// The centre of quadrant `q` (0 = top-left, then clockwise) of a
+/// surface `size` surface-local pixels across.
+fn quadrantCentre(size: geom.Size, q: usize) geom.Point {
+    return .{
+        .x = if (q % 2 == 0) @divTrunc(size.w, 4) else size.w - @divTrunc(size.w, 4),
+        .y = if (q < 2) @divTrunc(size.h, 4) else size.h - @divTrunc(size.h, 4),
+    };
+}
+
+/// One output-pixel probe: where a surface's `q`-th quadrant centre is
+/// displayed through `cam`, and the fixture colour it must be showing.
+const Probe = struct {
+    x: i32,
+    y: i32,
+    color: [4]u8,
+};
+
+/// The probe for quadrant `q` of a surface carrying `t` at `scale`,
+/// whose node sits at world (`origin_x`, `origin_y`).
+fn quadrantProbeAt(
+    t: geom.Transform,
+    scale: i32,
+    cam: Camera,
+    origin_x: i32,
+    origin_y: i32,
+    q: usize,
+) Probe {
+    const centre = quadrantCentre(fixtureSurfaceSize(t, scale), q);
+    const world = cam.worldToScreen(
+        @as(f64, @floatFromInt(origin_x)) + @as(f64, @floatFromInt(centre.x)),
+        @as(f64, @floatFromInt(origin_y)) + @as(f64, @floatFromInt(centre.y)),
+    );
+    const texel = surfaceTexel(t, centre.x * scale, centre.y * scale);
+    return .{
+        .x = @intFromFloat(@floor(world.x)),
+        .y = @intFromFloat(@floor(world.y)),
+        .color = quadrantFixtureColor(texel.x, texel.y),
+    };
+}
+
+/// The same probe for a surface at the world origin.
+fn quadrantProbe(t: geom.Transform, scale: i32, cam: Camera, q: usize) Probe {
+    return quadrantProbeAt(t, scale, cam, 0, 0, q);
+}
+
+/// The IDENTITY mapping over a `w` x `h` framebuffer: the camera a
+/// `.screen` overlay is composited through, so a point at (x, y) is pixel
+/// (x, y). Written out here rather than taken from the canvas pass, so a
+/// probe against a screen-space item states the policy independently of
+/// the code under test.
+fn screenProbeCamera(w: i32, h: i32) Camera {
+    return .{
+        .center_x = @as(f64, @floatFromInt(w)) / 2.0,
+        .center_y = @as(f64, @floatFromInt(h)) / 2.0,
+        .zoom = 1,
+        .rotation = 0,
+        .screen_w = @floatFromInt(w),
+        .screen_h = @floatFromInt(h),
+    };
+}
+
+/// The per-channel allowance for a composited pixel: one unit is the
+/// GLES2 pass's `mediump` float -> unorm8 rounding (see expectFillPixel)
+/// plus the CPU pass's bilinear rounding. The fixture's channels are
+/// either 0 or 255, so a channel off by more than that means a
+/// DIFFERENT QUADRANT is on screen — never a softened expectation.
+const pixel_tolerance: u8 = 1;
+
+/// One client-committed surface state, driven through the wire so the
+/// two renderers can be asked for the same thing.
+const TransformCase = struct {
+    transform: wire_transform = .normal,
+    scale: i32 = 1,
+    /// wp_viewport.set_source in surface-local pixels (null = unset).
+    src: ?[4]i32 = null,
+    /// wp_viewport.set_destination (null = unset).
+    dst: ?[2]i32 = null,
+};
+
+/// Commit `c` on `s` the way a client would: the transform and scale
+/// requests, then — when the case names them — a wp_viewport's crop
+/// and destination, then the one commit that applies all of it.
+fn commitSurfaceState(ts: *PolicyServer, s: *client.wl.Surface, c: TransformCase) !void {
+    s.setBufferTransform(c.transform);
+    s.setBufferScale(c.scale);
+    if (c.src != null or c.dst != null) {
+        // wp_viewporter is a separate global from wl_compositor, so the
+        // harness's own bind list does not carry it: the case asks the
+        // registry for it here, the same roundtrip any other client
+        // does. Only ONE wp_viewport may exist per wl_surface
+        // (viewporter.xml), which holds because a case names a crop at
+        // most once.
+        var capture: PolicyGlobalCapture = .{};
+        const registry = try ts.readGlobals(&capture);
+        const entry = capture.find("wp_viewporter") orelse return error.GlobalMissing;
+        const viewporter = try registry.bind(entry.name, client.wp.Viewporter, entry.version);
+        try ts.pump();
+        const viewport = try viewporter.getViewport(s);
+        if (c.src) |src| {
+            viewport.setSource(
+                client.wl.Fixed.fromInt(@intCast(src[0])),
+                client.wl.Fixed.fromInt(@intCast(src[1])),
+                client.wl.Fixed.fromInt(@intCast(src[2])),
+                client.wl.Fixed.fromInt(@intCast(src[3])),
+            );
+        }
+        if (c.dst) |d| viewport.setDestination(d[0], d[1]);
+        try ts.pump();
+    }
+    s.commit();
+    try ts.pump();
+    try ts.pumpAcked();
+}
+
+/// Present the fixture on `ts` with `c` committed, run ONE REAL frame of
+/// the harness's view through `cam`, and return the base framebuffer
+/// (owned by the server, valid until it is torn down).
+///
+/// The frame is the production `renderView` path, not a hand-called
+/// composite: placement, damage accumulation and the canvas pass all run
+/// exactly as they do on the running server, so the pixels asserted
+/// afterwards are the ones it would scan out.
+fn compositeFixture(ts: *PolicyServer, c: TransformCase, cam: Camera) !*pixman.Framebuffer {
+    const t = try ts.createToplevelWithBuffer(try ts.createFixtureBuffer());
+    defer ts.allocator.destroy(t);
+    try commitSurfaceState(ts, t.wl_surface, c);
+    const view = ts.viewOf();
+    view.camera = cam;
+    ts.renderView(view);
+    return ts.baseOf(view);
+}
+
+/// Put a tracked surface's node at world (x, y) — the same f64 placement
+/// the shell writes. A client cannot ask for a world position this far
+/// out through the move gesture (it starts wherever the pointer is), and
+/// large-world placement is precisely what these tests need to set up.
+fn placeSurfaceNode(ts: *PolicyServer, surface: *Surface, x: i32, y: i32) void {
+    const sn = wayland.surface_node.surfaceNodeFor(ts.scene.?, surface) orelse return;
+    const node = sn.node orelse return;
+    node.setPosition(@floatFromInt(x), @floatFromInt(y));
+}
+
+/// Compare one composited pixel with `want`, `tol` units per channel,
+/// naming both on failure so a run says WHICH pixel of WHICH surface
+/// was wrong.
+fn expectPixelNear(got: [4]u8, want: [4]u8, tol: u8) !void {
+    for (0..4) |i| {
+        const w = want[i];
+        const g = got[i];
+        const diff = if (w > g) w - g else g - w;
+        testing.expect(diff <= tol) catch |err| {
+            std.debug.print(
+                "channel {d}: composited {any}, expected {any} (tolerance {d})\n",
+                .{ i, got, want, tol },
+            );
+            return err;
+        };
+    }
+}
+
+/// Drive `c` through the wire on a server of each renderer kind and
+/// check that both frames put the fixture's four quadrants on the same
+/// output pixels.
+///
+/// The pixman server is the CPU reference — the canvas pass this
+/// compositor has always produced, which samples through a surface's
+/// buffer transform. The expectation for WHERE each quadrant lands
+/// comes from the protocol (quadrantProbe), not from either renderer,
+/// so agreeing with the reference and agreeing with the protocol are
+/// two separate things this asserts.
+fn expectTransformParity(c: TransformCase, cam: Camera) !void {
+    lockGles2ServerTest();
+    defer unlockGles2ServerTest();
+
+    const cpu = try PolicyServer.init(testing.allocator);
+    defer cpu.deinit();
+    const cpu_fb = try compositeFixture(cpu, c, cam);
+
+    const gpu = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
+    defer gpu.deinit();
+    const gpu_fb = try compositeFixture(gpu, c, cam);
+
+    const t = geomTransform(c.transform);
+    for (0..4) |q| {
+        const p = quadrantProbe(t, c.scale, cam, q);
+        expectPixelNear(framebufferPixel(cpu_fb, p.x, p.y), p.color, pixel_tolerance) catch |err| {
+            std.debug.print("CPU frame, transform {s}, scale {d}, quadrant {d}\n", .{
+                @tagName(t), c.scale, q,
+            });
+            return err;
+        };
+        expectPixelNear(framebufferPixel(gpu_fb, p.x, p.y), p.color, pixel_tolerance) catch |err| {
+            std.debug.print("GPU frame, transform {s}, scale {d}, quadrant {d}\n", .{
+                @tagName(t), c.scale, q,
+            });
+            return err;
+        };
+        // ...and the two frames are the same frame, pixel for pixel,
+        // at that same output pixel.
+        try expectPixelNear(framebufferPixel(gpu_fb, p.x, p.y), framebufferPixel(cpu_fb, p.x, p.y), pixel_tolerance);
+    }
+}
+
+/// The transform-parity camera: the world origin at (400, 288) of the
+/// 800x600 harness framebuffer, zoom 1, no rotation — so an output
+/// pixel names exactly one displayed texel and the parity of the two
+/// renderers is not blurred by a resample.
+const parity_camera: Camera = .{
+    .center_x = 16,
+    .center_y = 12,
+    .zoom = 1,
+    .rotation = 0,
+    .screen_w = 800,
+    .screen_h = 600,
+};
+
+/// Panned, zoomed AND rotated: the camera's own three factors, so a
+/// probe only lands on the right texel when the whole world->screen
+/// affine is applied — and the buffer transform is still visible
+/// through it.
+const moved_camera: Camera = .{
+    .center_x = 6,
+    .center_y = 5,
+    .zoom = 1.5,
+    .rotation = 0.3,
+    .screen_w = 800,
+    .screen_h = 600,
+};
+
+test "the GLES2 canvas pass draws a client-committed buffer_transform of normal" {
+    try expectTransformParity(.{ .transform = .normal }, parity_camera);
+}
+
+test "the GLES2 canvas pass draws a client-committed buffer_transform of 90" {
+    try expectTransformParity(.{ .transform = .@"90" }, parity_camera);
+}
+
+test "the GLES2 canvas pass draws a client-committed buffer_transform of 180" {
+    try expectTransformParity(.{ .transform = .@"180" }, parity_camera);
+}
+
+test "the GLES2 canvas pass draws a client-committed buffer_transform of 270" {
+    try expectTransformParity(.{ .transform = .@"270" }, parity_camera);
+}
+
+test "the GLES2 canvas pass draws a client-committed buffer_transform of flipped" {
+    try expectTransformParity(.{ .transform = .flipped }, parity_camera);
+}
+
+test "the GLES2 canvas pass draws a client-committed buffer_transform of flipped_90" {
+    try expectTransformParity(.{ .transform = .flipped_90 }, parity_camera);
+}
+
+test "the GLES2 canvas pass draws a client-committed buffer_transform of flipped_180" {
+    try expectTransformParity(.{ .transform = .flipped_180 }, parity_camera);
+}
+
+test "the GLES2 canvas pass draws a client-committed buffer_transform of flipped_270" {
+    try expectTransformParity(.{ .transform = .flipped_270 }, parity_camera);
+}
+
+test "a panned, zoomed and rotated camera draws all eight buffer transforms through the GLES2 pass" {
+    for (standard_transforms) |t| {
+        try expectTransformParity(.{ .transform = t }, moved_camera);
+    }
+}
+
+test "wl_surface.set_buffer_scale divides the surface and both renderers draw the same quadrants" {
+    // The 32x16 fixture at scale 2 is a 16x8 surface: the four quadrants
+    // are 8x4, and each still shows its OWN colour, so a pass that
+    // ignored the scale would show a different picture, not just a
+    // different size.
+    try expectTransformParity(.{ .scale = 2 }, parity_camera);
+
+    lockGles2ServerTest();
+    defer unlockGles2ServerTest();
+    const gpu = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
+    defer gpu.deinit();
+    const fb = try compositeFixture(gpu, .{ .scale = 2 }, parity_camera);
+    // The surface really is 16x8 and no larger: one output pixel past
+    // its right edge and one past its bottom edge are the background
+    // fill again, not more surface.
+    try expectFillPixel(framebufferPixel(fb, 400, 288));
+    try expectFillPixel(framebufferPixel(fb, 384, 296));
+}
+
+test "wp_viewport.set_source crops the drawn content and set_destination stretches the crop" {
+    lockGles2ServerTest();
+    defer unlockGles2ServerTest();
+
+    const ts = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
+    defer ts.deinit();
+    // Crop the fixture's TOP half — buffer columns 8..24, which is the
+    // red block and the green one — and scale that 16x8 crop into a
+    // 32x32 surface (viewporter.xml: set_source's rectangle is in
+    // surface-local coordinates, after the buffer transform and scale;
+    // set_destination is the size the surface then takes).
+    const src: [4]i32 = .{ 8, 0, 16, 8 };
+    const dst: [2]i32 = .{ 32, 32 };
+    const fb = try compositeFixture(ts, .{ .src = src, .dst = dst }, parity_camera);
+
+    // parity_camera puts surface-local (sx, sy) on output (sx + 384,
+    // sy + 288). Everything the crop covers is the fixture's top half,
+    // stretched 2x across and 4x down, so the WHOLE surface is red on
+    // its left and green on its right — at every row, including the
+    // rows past the buffer's own 16.
+    const expect_red = [_][2]i32{ .{ 4, 20 }, .{ 4, 28 }, .{ 12, 30 } };
+    for (expect_red) |p| try expectPixelNear(framebufferPixel(fb, p[0] + 384, p[1] + 288), fixture_red, pixel_tolerance);
+    const expect_green = [_][2]i32{ .{ 20, 20 }, .{ 20, 28 } };
+    for (expect_green) |p| try expectPixelNear(framebufferPixel(fb, p[0] + 384, p[1] + 288), fixture_green, pixel_tolerance);
+
+    // Rows 16..31 of this surface exist ONLY because the destination
+    // stretched the crop: an uncropped 32x16 buffer would show the
+    // fixture's BOTTOM half (blue, white) down there.
+    try expectPixelNear(framebufferPixel(fb, 388, 316), fixture_red, pixel_tolerance);
+    try expectPixelNear(framebufferPixel(fb, 404, 316), fixture_green, pixel_tolerance);
+}
+
+test "wp_viewport.set_source at buffer_scale 2 crops BUFFER pixels, not surface-local ones" {
+    lockGles2ServerTest();
+    defer unlockGles2ServerTest();
+
+    const ts = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
+    defer ts.deinit();
+    // The 32x16 fixture at buffer_scale 2 is a 16x8 SURFACE, so
+    // set_source's rectangle is surface-local in a space half the size of
+    // the buffer. Two protocol rules are in play and the crop below is
+    // chosen to separate them:
+    //
+    // 1. The source is surface-local, so the buffer crop is the source
+    //    MULTIPLIED by the scale: (0, 2, 16, 4) surface-local is
+    //    (0, 4, 32, 8) in buffer texels — buffer rows 4..11.
+    // 2. With no set_destination, the destination size IS the source
+    //    size (viewporter.xml, set_destination: "If this request is not
+    //    sent, the destination size will be the source size"), so the
+    //    SURFACE is 16x4, not the buffer's 16x8, and the crop is
+    //    stretched to fill it.
+    //
+    // The fixture's own top/bottom boundary is buffer row 8, which inside
+    // those eight cropped rows is row 4 of 8 — the exact middle of the
+    // surface. A conversion that divided instead of multiplied would
+    // crop buffer rows 2..6 and paint the whole surface from the red
+    // block; one that ignored the destination rule would leave the
+    // surface 16x8 with the crop's rows unstretched.
+    const src: [4]i32 = .{ 0, 2, 16, 4 };
+    const fb = try compositeFixture(ts, .{ .scale = 2, .src = src }, parity_camera);
+
+    // parity_camera puts surface-local (sx, sy) on output (sx + 384,
+    // sy + 288). The crop is stretched 8 buffer rows onto 4 surface
+    // rows, so surface rows 0..1 come from buffer rows 4..7 (the
+    // fixture's TOP half) and rows 2..3 from buffer rows 8..11 (its
+    // BOTTOM half). x = 4 is in the left half of the crop, which is the
+    // fixture's red block above the boundary and its blue one below.
+    try expectPixelNear(framebufferPixel(fb, 4 + 384, 0 + 288), fixture_red, pixel_tolerance);
+    try expectPixelNear(framebufferPixel(fb, 4 + 384, 1 + 288), fixture_red, pixel_tolerance);
+    try expectPixelNear(framebufferPixel(fb, 4 + 384, 2 + 288), fixture_blue, pixel_tolerance);
+    try expectPixelNear(framebufferPixel(fb, 4 + 384, 3 + 288), fixture_blue, pixel_tolerance);
+    // The surface is 16x4 and no larger: past its bottom edge is the fill.
+    try expectFillPixel(framebufferPixel(fb, 4 + 384, 4 + 288));
+}
+
+test "the seat hit test reports the surface-local coordinate of the pixel the camera displays" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const cam: Camera = .{
+        .center_x = 16,
+        .center_y = 8,
+        .zoom = 2,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    const t = try ts.createToplevelWithBuffer(try ts.createFixtureBuffer());
+    defer ts.allocator.destroy(t);
+    try commitSurfaceState(ts, t.wl_surface, .{});
+    const state = ts.state.?;
+    const view = ts.viewOf();
+    view.camera = cam;
+    ts.renderView(view);
+
+    const surface = ts.serverSurface(t.wl_surface);
+    // Each quadrant's centre, in surface-local coordinates, taken out
+    // to the output pixel that displays it: the hit test on that pixel
+    // must name that surface-local point, on that surface.
+    for (0..4) |q| {
+        const centre = quadrantCentre(fixtureSurfaceSize(.normal, 1), q);
+        const world = cam.worldToScreen(@floatFromInt(centre.x), @floatFromInt(centre.y));
+        const px: i32 = @intFromFloat(@floor(world.x));
+        const py: i32 = @intFromFloat(@floor(world.y));
+        const picked = pickSurface(state, px, py) orelse return error.NothingPicked;
+        try testing.expectEqual(surface, picked.surface);
+        try testing.expectEqual(@as(f64, @floatFromInt(centre.x)), picked.sx);
+        try testing.expectEqual(@as(f64, @floatFromInt(centre.y)), picked.sy);
+    }
+    // One output pixel past the surface's right edge (the 32x16 surface
+    // ends at surface-local x = 32) hits nothing at all.
+    try testing.expect(pickSurface(state, 448, 284) == null);
+}
+
+test "the hit test's surface-local coordinates name the pixel a 90-degree buffer displays" {
+    lockGles2ServerTest();
+    defer unlockGles2ServerTest();
+
+    const ts = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
+    defer ts.deinit();
+    const cam: Camera = .{
+        .center_x = 8,
+        .center_y = 16,
+        .zoom = 2,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    const t = try ts.createToplevelWithBuffer(try ts.createFixtureBuffer());
+    defer ts.allocator.destroy(t);
+    try commitSurfaceState(ts, t.wl_surface, .{ .transform = .@"90" });
+    const state = ts.state.?;
+    const view = ts.viewOf();
+    view.camera = cam;
+    ts.renderView(view);
+
+    // The 90-degree transform makes the surface 16 wide and 32 high,
+    // and surface-local (4, 8) displays buffer texel (8, 11) — the
+    // fixture's BLUE quadrant. So the pixel the camera puts there must
+    // BE blue: the delivered surface-local coordinate and the pixel
+    // under the pointer are the same statement about the same place.
+    const world = cam.worldToScreen(4, 8);
+    const px: i32 = @intFromFloat(@floor(world.x));
+    const py: i32 = @intFromFloat(@floor(world.y));
+    const picked = pickSurface(state, px, py) orelse return error.NothingPicked;
+    try testing.expectEqual(ts.serverSurface(t.wl_surface), picked.surface);
+    try testing.expectEqual(@as(f64, 4), picked.sx);
+    try testing.expectEqual(@as(f64, 8), picked.sy);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(view), px, py), fixture_blue, pixel_tolerance);
+}
+
+/// A surface node a billion world pixels out. The offset is not a round
+/// number of 64, so an f32 cannot represent it back.
+const distant_origin_x: i32 = 1_000_000_000;
+const distant_origin_y: i32 = 1_000_000_037;
+
+/// A camera centred on that world position, with a FRACTIONAL centre:
+/// at 1e9 an f32's spacing is 64, so any path that narrows an absolute
+/// world coordinate to f32 before the camera origin is subtracted puts
+/// the surface tens of pixels from where Camera.worldToScreen says —
+/// while the f64 camera itself still resolves a unit step exactly.
+const distant_camera: Camera = .{
+    .center_x = 1_000_000_008.5,
+    .center_y = 1_000_000_041.25,
+    .zoom = 1,
+    .rotation = 0,
+    .screen_w = 800,
+    .screen_h = 600,
+};
+
+/// Run ONE REAL frame with the fixture on a surface placed at
+/// (distant_origin_x, distant_origin_y) through `distant_camera`, and
+/// return that view's base framebuffer.
+fn compositeDistantFixture(ts: *PolicyServer) !*pixman.Framebuffer {
+    const t = try ts.createToplevelWithBuffer(try ts.createFixtureBuffer());
+    defer ts.allocator.destroy(t);
+    placeSurfaceNode(ts, ts.serverSurface(t.wl_surface), distant_origin_x, distant_origin_y);
+    const view = ts.viewOf();
+    view.camera = distant_camera;
+    ts.renderView(view);
+    return ts.baseOf(view);
+}
+
+test "the CPU canvas pass keeps a distant surface's local geometry" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const fb = try compositeDistantFixture(ts);
+    for (0..4) |q| {
+        const p = quadrantProbeAt(.normal, 1, distant_camera, distant_origin_x, distant_origin_y, q);
+        try expectPixelNear(framebufferPixel(fb, p.x, p.y), p.color, pixel_tolerance);
+    }
+}
+
+test "the GLES2 canvas pass keeps a distant surface's local geometry" {
+    lockGles2ServerTest();
+    defer unlockGles2ServerTest();
+    const ts = try PolicyServer.initWithRenderer(testing.allocator, .gles2);
+    defer ts.deinit();
+    const fb = try compositeDistantFixture(ts);
+    for (0..4) |q| {
+        const p = quadrantProbeAt(.normal, 1, distant_camera, distant_origin_x, distant_origin_y, q);
+        try expectPixelNear(framebufferPixel(fb, p.x, p.y), p.color, pixel_tolerance);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two simultaneous outputs. Every view here is built by the production
+// factory and driven by the production frame path, so what these tests
+// read is what each output would really scan out and really answer to a
+// pointer with.
+// ---------------------------------------------------------------------------
+
+/// The DESKTOP pixel that displays world (wx, wy) on `view`: that view's
+/// own camera, then its own column of the desktop layout.
+fn desktopPixelOf(view: *const OutputView, wx: f64, wy: f64) geom.Point {
+    const local = view.camera.worldToScreen(wx, wy);
+    return .{
+        .x = view.rect.x + @as(i32, @intFromFloat(@floor(local.x))),
+        .y = view.rect.y + @as(i32, @intFromFloat(@floor(local.y))),
+    };
+}
+
+test "one client surface is drawn and picked through both outputs' own cameras" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const state = ts.state.?;
+    const first = ts.viewOf();
+    const second = try ts.addSecondOutput(800, 600);
+
+    // The layout the production factory produced: the second connector is
+    // the second column of the desktop, and scene space IS the desktop.
+    try testing.expectEqual(geom.Rect{ .x = 0, .y = 0, .width = 800, .height = 600 }, first.rect);
+    try testing.expectEqual(geom.Rect{ .x = 800, .y = 0, .width = 800, .height = 600 }, second.rect);
+
+    // ONE regular client surface — a plain xdg_toplevel, no layer, popup,
+    // cursor or drag role — mapped while the pointer is over output 1.
+    ts.seat.?.pointerMotion(100, 100);
+    const client_toplevel = try ts.createToplevelWithBuffer(try ts.createFixtureBuffer());
+    defer ts.allocator.destroy(client_toplevel);
+    ts.renderView(first);
+    const client_surface = ts.serverSurface(client_toplevel.wl_surface);
+
+    // Both cameras look at the SAME world rect — output 1 zoomed in on the
+    // surface, output 2 not — so the two canvases must show it at two
+    // different places. Placement says which output a surface BELONGS to;
+    // it does not decide which cameras may see it, and a camera whose
+    // visible world rect contains the surface has to draw it.
+    first.camera = .{
+        .center_x = 16,
+        .center_y = 8,
+        .zoom = 2,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    second.camera = .{
+        .center_x = 100,
+        .center_y = 100,
+        .zoom = 1,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    ts.renderView(first);
+    ts.renderView(second);
+
+    for (0..4) |q| {
+        const on_first = quadrantProbeAt(.normal, 1, first.camera, 0, 0, q);
+        try expectPixelNear(
+            framebufferPixel(try ts.baseOf(first), on_first.x, on_first.y),
+            on_first.color,
+            pixel_tolerance,
+        );
+        const on_second = quadrantProbeAt(.normal, 1, second.camera, 0, 0, q);
+        try expectPixelNear(
+            framebufferPixel(try ts.baseOf(second), on_second.x, on_second.y),
+            on_second.color,
+            pixel_tolerance,
+        );
+    }
+    // A pixel past each camera's own image of the surface is background on
+    // that output: the two cameras really do put it somewhere different.
+    try expectFillPixel(framebufferPixel(try ts.baseOf(first), 384, 260));
+    try expectFillPixel(framebufferPixel(try ts.baseOf(second), 308, 170));
+
+    // The pointer asks at the desktop pixel each output DISPLAYS the same
+    // surface-local point at, and both answer with that surface-local
+    // point on the same surface. A pick that inverted the other output's
+    // camera would land on a different world point and hit nothing.
+    for ([_][2]i32{ .{ 8, 4 }, .{ 24, 12 } }) |l| {
+        const px: f64 = @floatFromInt(l[0]);
+        const py: f64 = @floatFromInt(l[1]);
+
+        const at_first = desktopPixelOf(first, px, py);
+        const pick_first = pickSurface(state, at_first.x, at_first.y) orelse return error.NothingPickedOnFirst;
+        try testing.expectEqual(client_surface, pick_first.surface);
+        try testing.expectEqual(px, pick_first.sx);
+        try testing.expectEqual(py, pick_first.sy);
+
+        const at_second = desktopPixelOf(second, px, py);
+        try testing.expect(at_second.x >= second.rect.x);
+        try testing.expect(at_first.x != at_second.x);
+        const pick_second = pickSurface(state, at_second.x, at_second.y) orelse return error.NothingPickedOnSecond;
+        try testing.expectEqual(client_surface, pick_second.surface);
+        try testing.expectEqual(px, pick_second.sx);
+        try testing.expectEqual(py, pick_second.sy);
+    }
+    // A desktop pixel no camera shows the surface on hits nothing, and the
+    // hit test never reaches across the columns.
+    try testing.expect(pickSurface(state, 700, 550) == null);
+    try testing.expect(pickSurface(state, second.rect.x + 700, 550) == null);
+
+    // Camera B pans and camera A does not: output A still shows the
+    // fixture exactly where ITS camera puts it. (Asserted per quadrant
+    // through A's own camera rather than by comparing whole framebuffers:
+    // the probe states what the output must show, the byte compare only
+    // that nothing changed.)
+    second.camera.center_x = 300;
+    ts.renderView(first);
+    ts.renderView(second);
+    try testing.expectEqual(@as(f64, 16), first.camera.center_x);
+    for (0..4) |q| {
+        const kept = quadrantProbeAt(.normal, 1, first.camera, 0, 0, q);
+        try expectPixelNear(
+            framebufferPixel(try ts.baseOf(first), kept.x, kept.y),
+            kept.color,
+            pixel_tolerance,
+        );
+    }
+    // Output B shows the same surface at its NEW place, and background
+    // where it used to be.
+    for (0..4) |q| {
+        const moved = quadrantProbeAt(.normal, 1, second.camera, 0, 0, q);
+        try expectPixelNear(
+            framebufferPixel(try ts.baseOf(second), moved.x, moved.y),
+            moved.color,
+            pixel_tolerance,
+        );
+    }
+    try expectFillPixel(framebufferPixel(try ts.baseOf(second), 308, 204));
+
+    // Camera A pans off the surface entirely: output A shows background
+    // where the fixture used to be, the pointer no longer finds it there,
+    // and output B is still showing the same four quadrants through its
+    // own, unmoved camera.
+    first.camera.center_x = 900;
+    ts.renderView(first);
+    ts.renderView(second);
+    try expectFillPixel(framebufferPixel(try ts.baseOf(first), 384, 292));
+    try expectFillPixel(framebufferPixel(try ts.baseOf(first), 416, 308));
+    try testing.expect(pickSurface(state, 384, 292) == null);
+    for (0..4) |q| {
+        const b = quadrantProbeAt(.normal, 1, second.camera, 0, 0, q);
+        try expectPixelNear(
+            framebufferPixel(try ts.baseOf(second), b.x, b.y),
+            b.color,
+            pixel_tolerance,
+        );
+    }
+    // Output B still answers with the same surface-local point.
+    const still = desktopPixelOf(second, 8, 4);
+    const pick_still = pickSurface(state, still.x, still.y) orelse return error.NothingPickedOnSecond;
+    try testing.expectEqual(client_surface, pick_still.surface);
+    try testing.expectEqual(@as(f64, 8), pick_still.sx);
+    try testing.expectEqual(@as(f64, 4), pick_still.sy);
+}
+
+test "an unplugged output leaves the survivor's canvas, camera and input alone" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const state = ts.state.?;
+    const first = ts.viewOf();
+
+    ts.seat.?.pointerMotion(100, 100);
+    const survivor = try ts.createToplevelWithBuffer(try ts.createFixtureBuffer());
+    defer ts.allocator.destroy(survivor);
+    ts.renderView(first);
+    const survivor_surface = ts.serverSurface(survivor.wl_surface);
+
+    const second = try ts.addSecondOutput(800, 600);
+    const second_out = second.output;
+    ts.renderView(second);
+    ts.renderView(first);
+
+    // A camera of the survivor's own, recorded so the unplug can be shown
+    // not to have touched it.
+    first.camera = .{
+        .center_x = 16,
+        .center_y = 8,
+        .zoom = 2,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    ts.renderView(first);
+    const kept_rect = first.rect;
+    const kept_camera = first.camera;
+    // The survivor sits at the desktop origin, so its local pixel IS the
+    // desktop pixel here.
+    const probe = quadrantProbeAt(.normal, 1, kept_camera, 0, 0, 0);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(first), probe.x, probe.y), probe.color, pixel_tolerance);
+
+    // The connector is unplugged: the production destroy handler runs.
+    ts.seat.?.pointerMotion(100, 100);
+    ts.removeOutput(second_out);
+
+    try testing.expectEqual(@as(usize, 1), state.output_views.items.len);
+    try testing.expect(state.output_views.items[0] == first);
+    try testing.expectEqual(kept_rect, first.rect);
+    try testing.expectEqual(kept_camera, first.camera);
+    // The survivor's contents survive untouched — the same pixels, from
+    // the very same base framebuffer, with nothing composited in between.
+    try expectPixelNear(framebufferPixel(try ts.baseOf(first), probe.x, probe.y), probe.color, pixel_tolerance);
+    // And it still composites, and still routes input, on its own.
+    ts.renderView(first);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(first), probe.x, probe.y), probe.color, pixel_tolerance);
+    const picked = pickSurface(state, probe.x, probe.y) orelse return error.NothingPicked;
+    try testing.expectEqual(survivor_surface, picked.surface);
+
+    // The connector comes back: a new view at the right edge of the
+    // layout, with a camera of its own, drawing its own client surface.
+    const again = try ts.addSecondOutput(800, 600);
+    try testing.expectEqual(@as(usize, 2), state.output_views.items.len);
+    try testing.expectEqual(@as(i32, 800), again.rect.x);
+    ts.seat.?.pointerMotion(900, 100);
+    const replugged = try ts.createToplevelWithBuffer(try ts.createBuffer());
+    defer ts.allocator.destroy(replugged);
+    ts.renderView(again);
+    // The re-added output's camera is the identity over its own column, so
+    // the new surface's top-left corner is its local origin.
+    try testing.expectEqual(surface_bytes, framebufferPixel(try ts.baseOf(again), 10, 10));
+    // ...and the survivor is still exactly what it was.
+    try testing.expectEqual(kept_camera, first.camera);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(first), probe.x, probe.y), probe.color, pixel_tolerance);
+}
+
+test "framing one output advances only that output's damage and pacing" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const first = ts.viewOf();
+    const second = try ts.addSecondOutput(800, 600);
+
+    ts.seat.?.pointerMotion(900, 100);
+    const t = try ts.createToplevelWithBuffer(try ts.createBuffer());
+    defer ts.allocator.destroy(t);
+    ts.renderView(second);
+
+    // Nothing about the second output's frame may reach the first one's
+    // damage: that is checked below through the public takeDamage() the
+    // present path reads, never through the ring's private arrays.
+
+    // The production frame entry point, on the FIRST output only, after a
+    // camera move: the whole-output invalidation belongs to that output.
+    first.camera.center_x = 380;
+    renderFrame(first);
+
+    try testing.expectEqual(@as(u32, 1), first.frames_rendered);
+    try testing.expectEqual(@as(u32, 0), second.frames_rendered);
+    try testing.expect(!first.repaint_pending);
+    try testing.expect(second.repaint_pending);
+
+    // The damage this frame reported is in the FIRST output's own pixel
+    // space, and it is the whole of that output — never desktop
+    // coordinates, never a rect belonging to the other column.
+    const frame_damage = first.scene_output.takeDamage();
+    try testing.expect(frame_damage.len > 0);
+    var whole_output = false;
+    for (frame_damage) |r| {
+        try testing.expect(r.x >= 0 and r.y >= 0);
+        try testing.expect(r.x + r.width <= first.rect.width);
+        try testing.expect(r.y + r.height <= first.rect.height);
+        if (r.width == first.rect.width and r.height == first.rect.height) whole_output = true;
+    }
+    try testing.expect(whole_output);
+    // The other output advances on its own: framing it produces ITS own
+    // whole-output damage, in ITS pixel space, and leaves the first
+    // output's frame count where it was.
+    second.camera.center_x = 380;
+    renderFrame(second);
+    try testing.expectEqual(@as(u32, 1), first.frames_rendered);
+    var second_whole = false;
+    for (second.scene_output.takeDamage()) |r| {
+        try testing.expect(r.x >= 0 and r.y >= 0);
+        try testing.expect(r.x + r.width <= second.rect.width);
+        try testing.expect(r.y + r.height <= second.rect.height);
+        if (r.width == second.rect.width and r.height == second.rect.height) second_whole = true;
+    }
+    try testing.expect(second_whole);
+}
+
+test "the drag icon is a pointer-anchored screen overlay under any camera" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const view = ts.viewOf();
+
+    const origin = try ts.createToplevel();
+    defer ts.allocator.destroy(origin);
+    ts.pick_surface = ts.serverSurface(origin.wl_surface);
+
+    // An ASYMMETRIC drag icon — the four-quadrant fixture — so a pixel says
+    // which quadrant of the icon is on screen and where. A uniform icon
+    // looks the same wherever it lands, which is the only thing in
+    // question here.
+    ts.seat.?.pointerMotion(400, 300);
+    ts.seat.?.pointerButton(wayland.seat.btn_left, true);
+    try ts.pump();
+    const device = try ts.ddm.?.getDataDevice(ts.wl_seat.?);
+    const source = try ts.ddm.?.createDataSource();
+    source.offer("text/plain");
+    const icon_wl_surface = try ts.wl_compositor.?.createSurface();
+    try ts.pump();
+    icon_wl_surface.attach(try ts.createFixtureBuffer(), 0, 0);
+    icon_wl_surface.commit();
+    try ts.pump();
+    device.startDrag(source, origin.wl_surface, icon_wl_surface, ts.seat.?.last_serial);
+    try ts.pump();
+    syncSurfaces(ts.state.?);
+
+    // A zoom-2 camera centred on the pointer. A drag icon is a CURSOR,
+    // not a window: it is composited in the output's own pixels at its
+    // logical size, so this camera must not scale it or slide it. The
+    // expectation is therefore read through the IDENTITY mapping over the
+    // framebuffer (screenProbeCamera) — a point at (x, y) is pixel (x, y)
+    // — which is the policy under test and not the code under it.
+    view.camera = .{
+        .center_x = 400,
+        .center_y = 300,
+        .zoom = 2,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    const screen = screenProbeCamera(800, 600);
+    ts.renderView(view);
+    // The pointer is at the output-local pixel (400, 300), so the icon
+    // covers (400..432, 300..316) at 1:1.
+    for (0..4) |q| {
+        const p = quadrantProbeAt(.normal, 1, screen, 400, 300, q);
+        try expectPixelNear(framebufferPixel(try ts.baseOf(view), p.x, p.y), p.color, pixel_tolerance);
+    }
+    // ...and only there: one pixel left of it and one row below it are
+    // background, so the icon is neither scaled to 64x32 nor stretched
+    // over the canvas.
+    try expectFillPixel(framebufferPixel(try ts.baseOf(view), 399, 300));
+    try expectFillPixel(framebufferPixel(try ts.baseOf(view), 400, 316));
+
+    // The pointer moves: the icon follows it, and the place it left is
+    // background again.
+    ts.seat.?.pointerMotion(500, 300);
+    ts.renderView(view);
+    for (0..4) |q| {
+        const p = quadrantProbeAt(.normal, 1, screen, 500, 300, q);
+        try expectPixelNear(framebufferPixel(try ts.baseOf(view), p.x, p.y), p.color, pixel_tolerance);
+    }
+    try expectFillPixel(framebufferPixel(try ts.baseOf(view), 416, 308));
+
+    // The drag ends, so the icon is not on the canvas any more: the
+    // pixels it covered are background again.
+    ts.seat.?.pointerButton(wayland.seat.btn_left, false);
+    try ts.pump();
+    try testing.expect(ts.data_device.?.currentDragIcon() == null);
+    ts.renderView(view);
+    try expectFillPixel(framebufferPixel(try ts.baseOf(view), 508, 308));
+}
+
+test "the lock screen covers its output and takes fixed input under a nonidentity camera" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const state = ts.state.?;
+    const view = ts.viewOf();
+
+    // A camera that is NOT the identity: a 100 px pan puts the world's
+    // left edge 100 px off this output and its right edge 100 px past the
+    // far side. A surface that has to COVER the output is output-local by
+    // definition; drawing it through the canvas camera slides it and
+    // leaves the lock fill showing at an edge.
+    view.camera = .{
+        .center_x = 500,
+        .center_y = 300,
+        .zoom = 1,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+
+    var lock_events: LockClientEvents = .{};
+    var lock_surface_events: LockSurfaceClientEvents = .{};
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const entry = capture.find("ext_session_lock_manager_v1") orelse return error.GlobalMissing;
+    const manager = try registry.bind(entry.name, client.ext.SessionLockManagerV1, entry.version);
+    try ts.pump();
+    const lock = try manager.lock();
+    lock.setListener(*LockClientEvents, LockClientEvents.listener, &lock_events);
+    const lock_wl_surface = try ts.wl_compositor.?.createSurface();
+    const lock_surface = try lock.getLockSurface(lock_wl_surface, ts.wl_output_client.?);
+    lock_surface.setListener(*LockSurfaceClientEvents, LockSurfaceClientEvents.listener, &lock_surface_events);
+    try ts.pump();
+    lock_surface.ackConfigure(lock_surface_events.serial);
+    // A full-size ASYMMETRIC lock screen — dark gray left half, light gray
+    // right half — so WHERE it covers the output is observable, not just
+    // that something opaque is there.
+    lock_wl_surface.attach(try ts.createSplitBuffer(800, 600, 0x20, 0xE0), 0, 0);
+    lock_wl_surface.commit();
+    try ts.pump();
+    try testing.expectEqual(@as(usize, 1), lock_events.locked);
+    try testing.expectEqual(
+        LockedFrame{ .locked = true, .blank = false, .cursor_hidden = true },
+        lockedFrameFor(state, view.output),
+    );
+
+    ts.renderView(view);
+    const base = try ts.baseOf(view);
+
+    // The split sits at the OUTPUT's own middle...
+    try expectPixelNear(framebufferPixel(base, 10, 10), grayBytes(0x20), pixel_tolerance);
+    try expectPixelNear(framebufferPixel(base, 399, 300), grayBytes(0x20), pixel_tolerance);
+    try expectPixelNear(framebufferPixel(base, 400, 300), grayBytes(0xE0), pixel_tolerance);
+    // ...and the far corner is lock content, not the lock fill showing
+    // through a lock screen that was drawn through the canvas camera.
+    try expectPixelNear(framebufferPixel(base, 790, 590), grayBytes(0xE0), pixel_tolerance);
+
+    // Input is FIXED: a pointer at the output's own corner names that
+    // output-local pixel on the lock surface, with no camera scaling.
+    const far = pickSurface(state, 790, 590) orelse return error.LockSurfaceNotPicked;
+    try testing.expectEqual(ts.serverSurface(lock_wl_surface), far.surface);
+    try testing.expectEqual(@as(f64, 790), far.sx);
+    try testing.expectEqual(@as(f64, 590), far.sy);
+}
+
+/// The client's zwlr_layer_surface_v1 events. libwayland aborts on an event
+/// with no listener, and a layer surface may not attach a buffer before its
+/// configure is acked (layer-shell.xml, already_constructed), so a test
+/// that maps one needs the serial.
+const ClientLayerSurfaceEvents = struct {
+    serial: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    configures: usize = 0,
+
+    fn listener(
+        _: *client.zwlr.LayerSurfaceV1,
+        event: client.zwlr.LayerSurfaceV1.Event,
+        self: *ClientLayerSurfaceEvents,
+    ) void {
+        switch (event) {
+            .configure => |c| {
+                self.configures += 1;
+                self.serial = c.serial;
+                self.width = c.width;
+                self.height = c.height;
+            },
+            .closed => {},
+        }
+    }
+};
+
+// An overlay's child keeps its offset and stays in that output's own
+// pixels, membership and presentation under a rotated world camera.
+// Its asymmetric colours distinguish that placement from a world draw.
+test "a subsurface of a layer surface keeps its offset, stays on that output and is not world-pickable" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const state = ts.state.?;
+    const view = ts.viewOf();
+
+    // Centred on the child's own world origin (the layer surface's tree is
+    // at the output's desktop origin, so the child's world rect is
+    // (16, 8, 32, 16) once its offset is applied) and rotated off axis.
+    view.camera = .{
+        .center_x = 16,
+        .center_y = 8,
+        .zoom = 1,
+        .rotation = 0.3,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+
+    // A 64x48 panel on THIS output: dark grey on the left half, light on
+    // the right, so the layer's own pixels are distinguishable from both
+    // the background fill and the fixture's quadrants.
+    const layer_wl = try ts.wl_compositor.?.createSurface();
+    try ts.pump();
+    const layer_surface = try ts.layer_shell_client.?.getLayerSurface(
+        layer_wl,
+        ts.wl_output_client.?,
+        .top,
+        "overlay",
+    );
+    var layer_events: ClientLayerSurfaceEvents = .{};
+    layer_surface.setListener(*ClientLayerSurfaceEvents, ClientLayerSurfaceEvents.listener, &layer_events);
+    // Top-left anchoring places the panel at this output's own origin.
+    layer_surface.setAnchor(@bitCast(@as(u32, 1 | 4)));
+    layer_surface.setSize(64, 48);
+    try ts.pump();
+    // The first commit is buffer-less; that is what draws the arrange's
+    // configure the client acks.
+    layer_wl.commit();
+    try ts.pump();
+    layer_surface.ackConfigure(layer_events.serial);
+    try ts.pump();
+
+    // The child, offset 16,8 INSIDE the panel. set_position is applied when
+    // the PARENT commits (wl_subsurface.set_position: "double-buffered
+    // state on the parent surface"), so the panel's buffer commit below is
+    // what moves the child.
+    const child_wl = try ts.wl_compositor.?.createSurface();
+    try ts.pump();
+    var capture: PolicyGlobalCapture = .{};
+    const registry = try ts.readGlobals(&capture);
+    const subco_entry = capture.find("wl_subcompositor") orelse return error.GlobalMissing;
+    const subco = try registry.bind(subco_entry.name, client.wl.Subcompositor, subco_entry.version);
+    try ts.pump();
+    // wl_subcompositor.get_subsurface takes no placement argument: the
+    // generated binding is get_subsurface(surface, parent), and stacking
+    // is the separate wl_subsurface.place_above / place_below request.
+    const subsurface = try subco.getSubsurface(child_wl, layer_wl);
+    subsurface.setPosition(16, 8);
+    try ts.pump();
+
+    layer_wl.attach(try ts.createSplitBuffer(64, 48, 0x20, 0xE0), 0, 0);
+    layer_wl.commit();
+    try ts.pump();
+    child_wl.attach(try ts.createFixtureBuffer(), 0, 0);
+    child_wl.commit();
+    // Default subsurfaces are synchronized; the parent applies the
+    // child's cached buffer state on its next commit.
+    layer_wl.commit();
+    try ts.pump();
+    syncSurfaces(state);
+
+    const layer_surface_ptr = ts.serverSurface(layer_wl);
+    const child_surface = ts.serverSurface(child_wl);
+    try testing.expect(layer_surface_ptr != child_surface);
+
+    ts.renderView(view);
+    const base = try ts.baseOf(view);
+    const screen = screenProbeCamera(800, 600);
+
+    // 1. RENDERING: the child is at the panel's origin plus the client's
+    //    offset, in this output's own pixels, at its logical 32x16.
+    for (0..4) |q| {
+        const p = quadrantProbeAt(.normal, 1, screen, 16, 8, q);
+        expectPixelNear(framebufferPixel(base, p.x, p.y), p.color, pixel_tolerance) catch |err| {
+            std.debug.print("child quadrant {d} at ({d},{d})\n", .{ q, p.x, p.y });
+            return err;
+        };
+    }
+    // The panel's own pixels survive around the child: one inside its left
+    // half and one inside its right half, both clear of the child.
+    try expectPixelNear(framebufferPixel(base, 8, 8), grayBytes(0x20), pixel_tolerance);
+    try expectPixelNear(framebufferPixel(base, 56, 40), grayBytes(0xE0), pixel_tolerance);
+    // ...and the child was NOT also drawn through the camera. The camera
+    // is centred on the child's own world origin, so the world projection
+    // of the child's rect STARTS at this output's centre — the probe has
+    // to be the middle of that projected quad, not its corner, or it
+    // lands on the same child pixels the screen-space draw already put
+    // there. (32, 16) is the child's world centre; the camera puts it
+    // ~(410, 312), far outside the (16, 8, 32, 16) rect the screen pass
+    // drew, so a fill there means the camera never drew it.
+    const world_draw = view.camera.worldToScreen(32, 16);
+    const draw_px: i32 = @intFromFloat(@floor(world_draw.x));
+    const draw_py: i32 = @intFromFloat(@floor(world_draw.y));
+    try testing.expect(draw_px > 48 or draw_py > 24);
+    try expectFillPixel(framebufferPixel(base, draw_px, draw_py));
+
+    // 2. PICKING: the scene tree really does hold the child at the world
+    //    point the camera displays, and the compositor's hit test still
+    //    refuses it there — an output-local descendant is not world
+    //    content.
+    const child_node = wayland.surface_node.surfaceNodeFor(ts.scene.?, child_surface).?.node.?;
+    const world_probe = view.camera.worldToScreen(24, 12);
+    const world_px: i32 = @intFromFloat(@floor(world_probe.x));
+    const world_py: i32 = @intFromFloat(@floor(world_probe.y));
+    const scene_hit = ts.scene.?.pick(24, 12) orelse return error.ChildNotInScene;
+    try testing.expectEqual(child_node, scene_hit);
+    try testing.expect(pickSurface(state, world_px, world_py) == null);
+    // The panel itself is hit in its OWN pixels: the pointer there never
+    // travels through a camera either.
+    const panel_hit = pickSurface(state, 8, 8) orelse return error.PanelNotPicked;
+    try testing.expectEqual(layer_surface_ptr, panel_hit.surface);
+    try testing.expectEqual(@as(f64, 8), panel_hit.sx);
+    try testing.expectEqual(@as(f64, 8), panel_hit.sy);
+
+    // ...and the DESCENDANT is the topmost thing at its OWN pixels: the
+    // pointer at the screen-local (24, 12) is inside the child's
+    // (16, 8, 32, 16) rect and inside the panel's 64x48, and the child is
+    // drawn over the panel, so the child is what the client must be told
+    // — with the offset inside the CHILD, never inside the panel it is
+    // composited with. The panel's own pixels outside the child still
+    // name the panel (8, 8 above), so this is stacking, not a subtree
+    // hit test answering for its parent.
+    const child_hit = pickSurface(state, 24, 12) orelse return error.ChildNotPicked;
+    try testing.expectEqual(child_surface, child_hit.surface);
+    try testing.expectEqual(@as(f64, 8), child_hit.sx);
+    try testing.expectEqual(@as(f64, 4), child_hit.sy);
+
+    // 3. MEMBERSHIP: the child is presented on the overlay's output, and
+    //    on no other one.
+    const other = try ts.addSecondOutput(800, 600);
+    ts.renderView(view);
+    ts.renderView(other);
+    var pinned = false;
+    for (view.scene_output.presented.items) |s| {
+        if (s == child_surface) pinned = true;
+    }
+    try testing.expect(pinned);
+    for (other.scene_output.presented.items) |s| {
+        try testing.expect(s != child_surface);
+        try testing.expect(s != layer_surface_ptr);
+    }
+    // ...and the same offset on the OTHER output resolves to nothing: the
+    // per-output pin draws and hits the child on the overlay's output
+    // alone, and the world pass refuses it wherever it sits in world
+    // space, so a pointer on a second connector never lands on it.
+    try testing.expect(pickSurface(state, other.rect.x + 24, other.rect.y + 12) == null);
+}
+
+test "a fractional cursor footprint reaches the hover restore whole, on whichever output the pointer is on" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const view = ts.viewOf();
+    const out = OutputView.localRect(view);
+
+    // Cursor.footprints reports f64 WORLD rects, so a cursor whose world
+    // position carries a fraction reaches the restore with it. The origin
+    // floors and the far edges ceil: the restore covers EVERY pixel the
+    // footprint touched, so no row or column of the old cursor survives
+    // the move.
+    const fractional: geom.FRect = .{ .x = 10.25, .y = 20.75, .width = 4, .height = 3 };
+    try testing.expectEqual(
+        geom.Rect{ .x = 10, .y = 20, .width = 5, .height = 4 },
+        localRectOf(view, fractional),
+    );
+
+    // A footprint running off the output is cut AT the edge, in f64: the
+    // covered pixels are the ones the output really had.
+    try testing.expectEqual(
+        geom.Rect{ .x = out.width - 3, .y = 0, .width = 3, .height = 2 },
+        localRectOf(view, .{
+            .x = @as(f64, @floatFromInt(out.width)) - 2.5,
+            .y = 0,
+            .width = 5,
+            .height = 2,
+        }),
+    );
+
+    // A world footprint a billion pixels out is not on this output and
+    // contributes NOTHING — no rect at all, not a strip on the near edge.
+    try testing.expectEqual(geom.Rect.empty(), localRectOf(view, .{
+        .x = 1_000_000_000.25,
+        .y = 1_000_000_000.75,
+        .width = 8,
+        .height = 8,
+    }));
+
+    // Footprints are DESKTOP coords. The same surface-local footprint on a
+    // SECOND connector lands at the same output-local rect there, because
+    // the shift is that view's own layout origin and not the origin of
+    // whichever view happens to be first.
+    const second = try ts.addSecondOutput(800, 600);
+    try testing.expectEqual(
+        geom.Rect{ .x = 10, .y = 20, .width = 5, .height = 4 },
+        localRectOf(second, .{
+            .x = @as(f64, @floatFromInt(second.rect.x)) + fractional.x,
+            .y = @as(f64, @floatFromInt(second.rect.y)) + fractional.y,
+            .width = fractional.width,
+            .height = fractional.height,
+        }),
+    );
+}
+
+test "an interactive move keeps a fractional world position a billion pixels out" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const state = ts.state.?;
+    const seat = ts.seat.?;
+    const view = ts.viewOf();
+
+    const t = try ts.createToplevel();
+    defer ts.allocator.destroy(t);
+    ts.pick_surface = ts.serverSurface(t.wl_surface);
+    // The node a billion world pixels out. At 1e9 an f32's spacing is 64,
+    // so this position and its halves cannot survive any narrowing to f32
+    // or any rounding of the drag delta.
+    placeSurfaceNode(ts, ts.serverSurface(t.wl_surface), distant_origin_x, distant_origin_y);
+    // Zoom 2 makes one pointer pixel exactly half a world pixel.
+    view.camera = .{
+        .center_x = 400,
+        .center_y = 300,
+        .zoom = 2,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+
+    seat.pointerMotion(400, 300);
+    try ts.pump();
+    t.toplevel.move(ts.wl_seat.?, seat.serialFor(ts.client.?));
+    try ts.pump();
+    try testing.expect(state.gestures.moving_toplevel != null);
+
+    const node = wayland.surface_node.surfaceNodeFor(ts.scene.?, ts.serverSurface(t.wl_surface)).?.node.?;
+    // One pointer pixel at zoom 2 is half a world pixel, applied exactly.
+    seat.pointerMotion(401, 300);
+    try ts.pump();
+    try testing.expectEqual(@as(f64, @floatFromInt(distant_origin_x)) + 0.5, node.x);
+    try testing.expectEqual(@as(f64, @floatFromInt(distant_origin_y)), node.y);
+    // Three pointer pixels across and one down: +1.5 and +0.5 world
+    // pixels, still exact.
+    seat.pointerMotion(403, 301);
+    try ts.pump();
+    try testing.expectEqual(@as(f64, @floatFromInt(distant_origin_x)) + 1.5, node.x);
+    try testing.expectEqual(@as(f64, @floatFromInt(distant_origin_y)) + 0.5, node.y);
+}
+
+test "overlapping client pixels and pointer focus follow scene tree stacking" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const first = try ts.createToplevelWithBuffer(try ts.createSplitBuffer(32, 16, 0x20, 0x20));
+    defer ts.allocator.destroy(first);
+    const second = try ts.createToplevelWithBuffer(try ts.createSplitBuffer(32, 16, 0xE0, 0xE0));
+    defer ts.allocator.destroy(second);
+    const view = ts.viewOf();
+    ts.renderView(view);
+    const scene = ts.scene.?;
+    const first_surface = ts.serverSurface(first.wl_surface);
+    const second_surface = ts.serverSurface(second.wl_surface);
+    const first_tree = wayland.surface_node.surfaceNodeFor(scene, first_surface).?.tree.?;
+    const second_tree = wayland.surface_node.surfaceNodeFor(scene, second_surface).?.tree.?;
+
+    try scene.root.appendChild(ts.allocator, first_tree);
+    ts.renderView(view);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(view), 8, 4), grayBytes(0x20), pixel_tolerance);
+    const first_pick = pickSurface(ts.state.?, 8, 4) orelse return error.NothingPicked;
+    try testing.expectEqual(first_surface, first_pick.surface);
+
+    try scene.root.appendChild(ts.allocator, second_tree);
+    ts.renderView(view);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(view), 8, 4), grayBytes(0xE0), pixel_tolerance);
+    const second_pick = pickSurface(ts.state.?, 8, 4) orelse return error.NothingPicked;
+    try testing.expectEqual(second_surface, second_pick.surface);
+}
+
+test "an unmapped desktop can accept a new client and recover after the last output reconnects" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const first = ts.viewOf();
+    ts.removeOutput(first.output);
+    const top = try ts.createToplevelWithBuffer(try ts.createSplitBuffer(32, 16, 0x20, 0xE0));
+    defer ts.allocator.destroy(top);
+    top.toplevel.setMaximized();
+    try ts.pump();
+    syncSurfaces(ts.state.?);
+    syncSurfacePlacement(ts.state.?);
+    try testing.expect(pickSurface(ts.state.?, 8, 4) == null);
+    const reconnected = try ts.addSecondOutput(800, 600);
+    ts.renderView(reconnected);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(reconnected), 8, 4), grayBytes(0x20), pixel_tolerance);
+    const picked = pickSurface(ts.state.?, 8, 4) orelse return error.NothingPicked;
+    try testing.expectEqual(ts.serverSurface(top.wl_surface), picked.surface);
+}
+
+test "mixed world and output-local pixels and input follow one scene stacking order" {
+    const ts = try PolicyServer.init(testing.allocator);
+    defer ts.deinit();
+    const view = ts.viewOf();
+    const layer_wl = try ts.wl_compositor.?.createSurface();
+    try ts.pump();
+    const layer = try ts.layer_shell_client.?.getLayerSurface(layer_wl, ts.wl_output_client.?, .background, "background");
+    var events: ClientLayerSurfaceEvents = .{};
+    layer.setListener(*ClientLayerSurfaceEvents, ClientLayerSurfaceEvents.listener, &events);
+    layer.setAnchor(@bitCast(@as(u32, 1 | 4)));
+    layer.setSize(64, 48);
+    layer_wl.commit();
+    try ts.pump();
+    layer.ackConfigure(events.serial);
+    layer_wl.attach(try ts.createSplitBuffer(64, 48, 0x20, 0x20), 0, 0);
+    layer_wl.commit();
+    try ts.pump();
+    const layer_surface = ts.serverSurface(layer_wl);
+
+    const top = try ts.createToplevelWithBuffer(try ts.createSplitBuffer(32, 16, 0xE0, 0xE0));
+    defer ts.allocator.destroy(top);
+    const world_surface = ts.serverSurface(top.wl_surface);
+    ts.renderView(view);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(view), 8, 4), grayBytes(0xE0), pixel_tolerance);
+    try testing.expectEqual(world_surface, (pickSurface(ts.state.?, 8, 4) orelse return error.NothingPicked).surface);
+
+    // Reordering the scene, not the role registry, moves the layer above.
+    const layer_tree = wayland.surface_node.surfaceNodeFor(ts.scene.?, layer_surface).?.tree.?;
+    try ts.scene.?.root.appendChild(ts.allocator, layer_tree);
+    ts.renderView(view);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(view), 8, 4), grayBytes(0x20), pixel_tolerance);
+    try testing.expectEqual(layer_surface, (pickSurface(ts.state.?, 8, 4) orelse return error.NothingPicked).surface);
+
+    // The scene's top local node is NOT at the camera-projected window.
+    // Picking world coordinates first would incorrectly let it hide this hit.
+    view.camera.center_x = 16;
+    view.camera.center_y = 8;
+    view.camera.zoom = 2;
+    view.camera.rotation = 0.3;
+    ts.renderView(view);
+    try expectPixelNear(framebufferPixel(try ts.baseOf(view), 400, 300), grayBytes(0xE0), pixel_tolerance);
+    const world_hit = pickSurface(ts.state.?, 400, 300) orelse return error.NothingPicked;
+    try testing.expectEqual(world_surface, world_hit.surface);
+    try testing.expectApproxEqAbs(@as(f64, 16), world_hit.sx, 0.000001);
+    try testing.expectApproxEqAbs(@as(f64, 8), world_hit.sy, 0.000001);
 }

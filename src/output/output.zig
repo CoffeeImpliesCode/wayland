@@ -6,6 +6,16 @@
 //! the new state becomes current and the `commit` signal fires. The backend
 //! drives `frame` signals when a new frame can be rendered.
 //!
+//! Teardown runs in two phases. `destroy` belongs to the CONSUMERS: every
+//! listener must still find the output, its globals and its clients' live
+//! wire objects intact, because that is exactly when a real
+//! wl_surface.leave, a discarded presentation feedback or a screencopy
+//! frame error has to be delivered. `finalize` fires next — after every
+//! destroy listener has run, before the impl hook and before the Output is
+//! freed — and belongs to OWNERS of state hanging off the output (the
+//! wl_output global): they hand their wire objects back to their clients
+//! and let go of the output here.
+//!
 //! Imports: utils/*, core/wire.zig, backend/backend.zig (sibling module).
 
 const std = @import("std");
@@ -14,6 +24,8 @@ const damage_mod = @import("../utils/damage.zig");
 const log_mod = @import("../utils/log.zig");
 const wire = @import("../core/wire.zig");
 const backend_mod = @import("../backend/backend.zig");
+const pixman = @import("../renderer/pixman.zig");
+const gpu_frame = @import("gpu_frame.zig");
 
 /// A video mode an output can run at.
 pub const Mode = struct {
@@ -68,8 +80,19 @@ pub const Output = struct {
         /// callback); headless/raylib never fire it — the compositor
         /// synthesizes presents for them instead.
         presented: wire.Signal(*PresentEvent),
-        /// The output is being destroyed.
+        ///
+        /// The output is being destroyed: consumers only. Every listener
+        /// still sees a fully valid Output and the live wire objects its
+        /// clients hold, so this is where teardown work that reaches a
+        /// client must happen.
         destroy: wire.Signal(*Output),
+        /// The output died and every destroy listener has run: ownership
+        /// finalizers only. State that outlives the Output (the
+        /// wl_output global and the client resources it owns) is handed
+        /// back to its clients and released here, while `*Output` is still
+        /// readable. Fires before impl.destroy and before the Output's own
+        /// memory is freed.
+        finalize: wire.Signal(*Output),
     },
 
     /// Payload of the commit signal: what was applied and when.
@@ -106,6 +129,14 @@ pub const Output = struct {
     /// bit is set in `committed`; `damage` rides along for the impl to
     /// consume during commit.
     pub const State = struct {
+        pub const Buffer = union(enum) {
+            /// Borrowed host pixels, copied or uploaded synchronously.
+            cpu: *pixman.Framebuffer,
+            /// Backend-owned slot acquired for this output. Successful
+            /// commit consumes the lease; failure requires caller cancellation.
+            gpu: *gpu_frame.GpuFrame,
+        };
+
         pub const committed_enabled: u32 = 1 << 0;
         pub const committed_scale: u32 = 1 << 1;
         pub const committed_transform: u32 = 1 << 2;
@@ -118,9 +149,9 @@ pub const Output = struct {
         scale: f32 = 1.0,
         transform: geom.Transform = .normal,
         mode: ?Mode = null,
-        /// Renderer framebuffer handle for the next present; ownership
-        /// passes to the impl during commit.
-        buffer: ?*anyopaque = null,
+        /// The pixels presented by this commit. CPU memory remains borrowed;
+        /// a GPU writing lease transfers only after a successful commit.
+        buffer: ?Buffer = null,
         /// Damage attached to this state update (read by the impl).
         damage: damage_mod.Damage,
 
@@ -181,11 +212,17 @@ pub const Output = struct {
         self.events.commit.init();
         self.events.presented.init();
         self.events.destroy.init();
+        self.events.finalize.init();
         return self;
     }
 
+    /// Destroy the output in two ordered phases: consumers run first
+    /// (events.destroy), then ownership finalizers (events.finalize), then
+    /// the impl hook, then the Output itself. Frees `output` — a second
+    /// destroy is a use-after-free, not a no-op.
     pub fn destroy(output: *Output) void {
         output.events.destroy.emit(output);
+        output.events.finalize.emit(output);
         output.impl.destroy(output.allocator, output.data);
         const allocator = output.allocator;
         allocator.destroy(output);
@@ -507,8 +544,9 @@ test "state apply and signals" {
     var state3 = Output.State.init(allocator);
     defer state3.deinit();
     state3.committed = Output.State.committed_buffer;
-    const dummy: u8 = 0;
-    state3.buffer = @ptrCast(@constCast(&dummy));
+    const framebuffer = try pixman.Framebuffer.create(allocator, 1, 1);
+    defer framebuffer.deinit();
+    state3.buffer = .{ .cpu = framebuffer };
     try out.commitState(&state3);
     try std.testing.expect(out.frame_pending);
     out.sendFrame();
@@ -556,8 +594,9 @@ test "frame_pending: no emit while disabled, guard on buffer commits" {
     var state = Output.State.init(allocator);
     defer state.deinit();
     state.committed = Output.State.committed_buffer;
-    const dummy: u8 = 0;
-    state.buffer = @ptrCast(@constCast(&dummy));
+    const framebuffer = try pixman.Framebuffer.create(allocator, 1, 1);
+    defer framebuffer.deinit();
+    state.buffer = .{ .cpu = framebuffer };
     try out.commitState(&state);
     try std.testing.expect(out.frame_pending);
     out.sendFrame();
@@ -696,8 +735,9 @@ test "commit seq advances per enabled buffer commit" {
     var state = Output.State.init(allocator);
     defer state.deinit();
     state.committed = Output.State.committed_buffer;
-    const dummy: u8 = 0;
-    state.buffer = @ptrCast(@constCast(&dummy));
+    const framebuffer = try pixman.Framebuffer.create(allocator, 1, 1);
+    defer framebuffer.deinit();
+    state.buffer = .{ .cpu = framebuffer };
     try out.commitState(&state);
     try std.testing.expectEqual(@as(u64, 1), out.commit_seq);
     try out.commitState(&state);
@@ -737,8 +777,9 @@ test "backend-fired presented event carries seq flags refresh" {
     defer state.deinit();
     state.committed = Output.State.committed_enabled | Output.State.committed_buffer;
     state.enabled = true;
-    const dummy: u8 = 0;
-    state.buffer = @ptrCast(@constCast(&dummy));
+    const framebuffer = try pixman.Framebuffer.create(allocator, 1, 1);
+    defer framebuffer.deinit();
+    state.buffer = .{ .cpu = framebuffer };
     try out.commitState(&state);
     try std.testing.expectEqual(@as(u64, 1), out.commit_seq);
 

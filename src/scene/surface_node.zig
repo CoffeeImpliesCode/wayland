@@ -8,8 +8,8 @@
 //! commits, detach on unmap, full teardown on destroy. The compositor
 //! keeps only policy: which surfaces get bindings (the trackSurface call
 //! sites), where the nodes are placed (tree/node x/y), and what the
-//! damage is (addDamage translates the surface's committed damage through
-//! the node).
+//! damage is (addDamage projects the surface's committed damage through
+//! the node and the output's camera).
 //!
 //! The renderer-specific part — turning the surface's current buffer into
 //! a texture — is delegated to the Impl (import + an optional in-place
@@ -18,14 +18,22 @@
 //! recovery) and destroyed (compositor-side cleanup at surface death,
 //! e.g. seat focus + presentation feedback).
 //!
-//! Enter/leave (note 135 O20): the scene knows which output a node is on.
-//! At attach the node computes the first scene output whose rect its
-//! absolute rect intersects and drives surface.setEntered; at detach it
-//! drives setLeft. The surface module emits its enter/leave signals on
-//! the change; the binding's listeners send the wl_surface.enter/leave
-//! wire events to the surface's client (via the scene's wl_output global;
-//! a client that never bound wl_output gets none, mirroring wlroots
-//! wlr_surface_send_enter/leave, wlr_compositor.c:1071-1128).
+//! World space is f64 end to end: the node's position, the world rect
+//! absolutePosition reports, the raw-buffer crop, and the projection
+//! into an output's screen pixels. Narrowing happens once, at the pixel
+//! boundary (SceneOutput.projectWorldRect), and never on a coordinate
+//! that is still far from the origin.
+//!
+//! Output membership (note 135 O20): a surface is on EVERY output whose
+//! view its node intersects, not just the first one. The binding
+//! maintains that whole set — setEntered per output gained, leaveOutput
+//! per output lost — and re-evaluates it whenever the node's geometry
+//! changes, not only at attach/detach. The surface module emits the
+//! enter/leave signals on the change; the binding's listeners send the
+//! wl_surface.enter/leave wire events for the ACTUAL output, through that
+//! output's own wl_output global, to every bound resource of the same
+//! client (a client that never bound wl_output gets none, mirroring
+//! wlroots wlr_surface_send_enter/leave, wlr_compositor.c:1071-1128).
 //!
 //! Imports: utils/*, core/wire.zig, buffers/*, compositor/* (surface,
 //! subsurface), output/*, scene/scene.zig.
@@ -36,6 +44,7 @@ const log = @import("../utils/log.zig");
 const wire = @import("../core/wire.zig");
 const matrix = @import("../utils/matrix.zig");
 const scene_mod = @import("scene.zig");
+const camera_mod = @import("camera.zig");
 const surface_mod = @import("../compositor/surface.zig");
 const subsurface_mod = @import("../compositor/subsurface.zig");
 const role_mod = @import("../compositor/role.zig");
@@ -111,9 +120,10 @@ pub const SurfaceNode = struct {
     /// the surface was still hidden).
     map_listener: wire.Listener(*Surface),
     /// wl_surface.enter/leave signal listeners (the surface module emits
-    /// the signals on the output association changing; these send the
-    /// wl_surface.enter/leave wire events — the per-output enter/leave
-    /// emission hook).
+    /// the signals on ONE output's membership changing; these send that
+    /// output's wl_surface.enter/leave wire events). The signal payload
+    /// names the output, so an event for one output never rides
+    /// another's global.
     enter_listener: wire.Listener(*output_mod.Output),
     leave_listener: wire.Listener(*output_mod.Output),
 
@@ -132,13 +142,12 @@ pub const SurfaceNode = struct {
             return;
         };
         const size = surfaceSize(s, buf);
-        // The wp_viewport source crop (F-AX-12), in surface-local
-        // coordinates (after buffer_transform + buffer_scale,
-        // viewporter.xml). Texture pixels = src x buffer_scale under the
-        // inverse transform: at this compositor's scale 1 / no transform
-        // it is a direct pass-through. Scale > 1 must multiply by
-        // current.scale (and inverse-transform) before setting bn.src.
-        const src: ?geom.FRect = if (s.current.viewport.has_src) s.current.viewport.src else null;
+        // The texture's source crop, in RAW BUFFER pixels: the
+        // wp_viewport source is surface-local (F-AX-12), so it is
+        // multiplied by buffer_scale and inverse-transformed back into
+        // buffer space here, once. The renderer samples buffer texels
+        // through `transform`, so the crop is never applied twice.
+        const src = rawSrcCrop(s, buf);
         if (sn.node) |node| {
             // Same-size commit: update the texture in place (no alloc, no
             // texture churn — the per-frame hot path). The dst rect is
@@ -151,7 +160,9 @@ pub const SurfaceNode = struct {
                         bn.dst_width = size.w;
                         bn.dst_height = size.h;
                         bn.src = src;
+                        bn.transform = s.current.transform;
                         node.enable(true);
+                        sn.updateOutputs();
                         return;
                     }
                 }
@@ -169,6 +180,7 @@ pub const SurfaceNode = struct {
             bn.dst_width = size.w;
             bn.dst_height = size.h;
             bn.src = src;
+            bn.transform = s.current.transform;
             node.enable(true);
         } else {
             // First map: create the tree container (under the parent
@@ -195,15 +207,15 @@ pub const SurfaceNode = struct {
             node.kind.buffer.dst_width = size.w;
             node.kind.buffer.dst_height = size.h;
             node.kind.buffer.src = src;
+            node.kind.buffer.transform = s.current.transform;
             sn.node = node;
-
-            // The surface maps on the output(s) its node intersects:
-            // drive the surface's enter tracking (setEntered emits
-            // events.enter on the change; the enter listener sends the
-            // wire event). Idempotent — node creation happens exactly
-            // once per map.
-            sn.updateOutputs();
         }
+        // The node's geometry can have changed (buffer size, viewport
+        // destination, a fresh map), and the compositor moves nodes
+        // between commits too, so the output membership is recomputed on
+        // every sync — not only when the node appears or disappears.
+        // Idempotent: an unchanged membership fires nothing.
+        sn.updateOutputs();
     }
 
     /// Remove (and free) the surface's scene nodes; the binding keeps
@@ -223,10 +235,6 @@ pub const SurfaceNode = struct {
         // two nodes this binding owns. On OOM the cascade still frees a
         // tree that could not be lifted — a catastrophic-memory path.
         sn.liftForeignTrees();
-        // The surface left the output(s): drive the surface's leave
-        // tracking (setLeft emits events.leave on the change; idempotent
-        // when the surface was never entered).
-        sn.updateOutputs();
         if (sn.node) |node| {
             if (node.kind.buffer.texture) |texture| texture.destroy();
             node.destroy(scene.allocator);
@@ -236,6 +244,11 @@ pub const SurfaceNode = struct {
             tree.destroy(scene.allocator);
             sn.tree = null;
         }
+        // The nodes are gone, so the surface is on no output: recompute
+        // the membership AFTER the world rect stopped existing (setLeft
+        // emits events.leave per lost output; idempotent when the
+        // surface was never entered).
+        sn.updateOutputs();
     }
 
     /// Move every tree under `sn.tree` that belongs to ANOTHER surface's
@@ -286,16 +299,49 @@ pub const SurfaceNode = struct {
         sn.scene.allocator.destroy(sn);
     }
 
-    /// The node's surface is presented this frame (it has an active
-    /// node): append it to the frame's presented list. OOM logs and
-    /// skips. A hidden subsurface (unmapped parent chain) gets no
-    /// frame_done/presentation feedback: it is skipped even though its
-    /// scene node exists (created buffer-driven while hidden,
-    /// wayland.xml:3254-3258).
-    pub fn appendPresented(sn: *SurfaceNode, list: *std.ArrayList(*Surface)) void {
-        if (sn.node == null) return;
-        if (!sn.surface.mapped) return;
-        list.append(sn.scene.allocator, sn.surface) catch |err| {
+    const Visibility = union(enum) {
+        hidden,
+        world: geom.FRect,
+        output_local: *output_mod.Output,
+
+        fn visibleOn(self: *const Visibility, so: *const SceneOutput) bool {
+            if (!so.live) return false;
+            return switch (self.*) {
+                .hidden => false,
+                .world => |world| so.visibleWorldRect().intersects(world),
+                .output_local => |output| so.output == output,
+            };
+        }
+    };
+
+    /// One policy decision for every output in this update. Rendering,
+    /// output membership and presentation must agree about hidden trees.
+    fn visibility(sn: *const SurfaceNode) Visibility {
+        if (!sn.surface.isEffectivelyMapped()) return .hidden;
+        const node = sn.node orelse return .hidden;
+        var ancestor: ?*SceneNode = node;
+        while (ancestor) |parent| : (ancestor = parent.parent) {
+            if (!parent.enabled) return .hidden;
+        }
+        return switch (sn.scene.surfacePlacement(sn.surface)) {
+            .world => .{ .world = node.absolutePosition() },
+            .output_local => |output| if (output) |pinned|
+                .{ .output_local = pinned }
+            else
+                .hidden,
+        };
+    }
+
+    /// The node's surface is presented THIS frame on `so`: append it to
+    /// that output's presented list. Skipped when it has no node, is not
+    /// mapped (a hidden subsurface is skipped even though its scene node
+    /// exists — created buffer-driven while hidden,
+    /// wayland.xml:3254-3258), or when `so`'s view does not show it.
+    /// OOM logs and skips.
+    pub fn appendPresented(sn: *SurfaceNode, so: *SceneOutput) void {
+        const shown = sn.visibility();
+        if (!shown.visibleOn(so)) return;
+        so.presented.append(sn.scene.allocator, sn.surface) catch |err| {
             log.warn(
                 "presented list append OOM: {s}",
                 sn.scene.io,
@@ -306,20 +352,34 @@ pub const SurfaceNode = struct {
         };
     }
 
-    /// Translate the surface's committed damage (surface coordinates) by
-    /// the node's absolute position into output coordinates, clipped to
-    /// the output (damage is a hint; clipping is safe).
-    pub fn addDamage(sn: *SurfaceNode, so: *SceneOutput, out_rect: Rect) void {
-        const node = sn.node orelse return;
-        const abs = node.absolutePosition();
+    /// Queue this commit's damage for one visible output. World content
+    /// uses the view's camera; pinned overlays use its desktop origin
+    /// without a camera. Clip in f64 before narrowing to output pixels.
+    /// Called once per commit per output, not by every rendered frame.
+    pub fn addDamage(sn: *SurfaceNode, so: *SceneOutput) void {
+        const shown = sn.visibility();
+        if (!shown.visibleOn(so)) return;
+        const abs = switch (shown) {
+            .world => |world| world,
+            .output_local => sn.node.?.absolutePosition(),
+            .hidden => unreachable,
+        };
         for (sn.surface.current.surface_damage.rects.items) |rect| {
-            const translated: Rect = .{
-                .x = addSat(abs.x, rect.x),
-                .y = addSat(abs.y, rect.y),
-                .width = rect.width,
-                .height = rect.height,
+            var damage: geom.FRect = .{
+                .x = abs.x + @as(f64, @floatFromInt(rect.x)),
+                .y = abs.y + @as(f64, @floatFromInt(rect.y)),
+                .width = @floatFromInt(rect.width),
+                .height = @floatFromInt(rect.height),
             };
-            if (out_rect.intersect(translated)) |visible| so.addDamage(visible);
+            switch (shown) {
+                .world => if (so.projectWorldRect(damage)) |screen| so.addDamage(screen),
+                .output_local => {
+                    damage.x -= so.x;
+                    damage.y -= so.y;
+                    if (damage.intersect(so.screenBounds())) |screen| so.addDamage(screen.toPixelRect());
+                },
+                .hidden => unreachable,
+            }
         }
     }
 
@@ -361,59 +421,63 @@ pub const SurfaceNode = struct {
         return null;
     }
 
-    /// Recompute the surface's output association: the first scene
-    /// output whose rect the node's absolute rect intersects (the
-    /// surface is being rendered on it). Drives the surface module's
-    /// enter/leave tracking (setEntered/setLeft emit the enter/leave
-    /// signals on the change; the listeners below send the wire events).
-    /// Called at attach and detach; idempotent.
+    /// Recompute the surface's output association across EVERY scene
+    /// output: the surface is on each output whose view shows its node,
+    /// and on no other. Per output gained, setEntered fires the enter
+    /// signal; per output lost, leaveOutput fires the leave signal (both
+    /// idempotent per output, and the listeners below send the wire
+    /// events for the output the signal names). A view with no node (or a
+    /// view whose visible world rect misses it) drops every membership.
+    ///
+    /// Called on every commit sync, at map and at detach, and by
+    /// updateOutputAssociations after the compositor moves a node or
+    /// changes a camera. Idempotent: an unchanged set fires nothing.
     fn updateOutputs(sn: *SurfaceNode) void {
         const s = sn.surface;
-        // A surface whose effective map is gated off (subsurface under an
-        // unmapped parent) is on NO output: no wl_surface.enter while
-        // hidden (wayland.xml:3254-3258). The surface module's map signal
-        // (map_listener) re-runs this when the gate passes, so a child
-        // that maps via parent-chain propagation gets its enter tracking.
-        if (!s.isEffectivelyMapped()) {
+        const shown = sn.visibility();
+        if (shown == .hidden) {
             s.setLeft();
             return;
         }
-        var on_output: ?*output_mod.Output = null;
-        if (sn.node) |node| {
-            const rect = node.absolutePosition();
-            for (sn.scene.scene_outputs.items) |so| {
-                const out_rect: Rect = .{
-                    .x = so.x,
-                    .y = so.y,
-                    .width = so.output.width,
-                    .height = so.output.height,
-                };
-                if (out_rect.intersect(rect) != null) {
-                    on_output = so.output;
-                    break;
-                }
+        for (sn.scene.scene_outputs.items) |so| {
+            if (!so.live) continue;
+            if (shown.visibleOn(so)) {
+                if (!s.hasOutput(so.output)) s.setEntered(so.output);
+            } else if (s.hasOutput(so.output)) {
+                s.leaveOutput(so.output);
             }
         }
-        if (on_output) |out| s.setEntered(out) else s.setLeft();
     }
 
-    /// Send wl_surface.enter/leave to the surface's client: the wl_output
-    /// resource that client bound. A surface's events go only to its
-    /// owner, and a client that never bound wl_output gets none (wlroots
-    /// wlr_surface_send_enter/leave, wlr_compositor.c:1071-1128, iterate
-    /// the output's resources and match on the client). Single-output
-    /// scene: the one WlOutput is the only output that can enter/leave.
-    fn sendEnter(sn: *SurfaceNode, enter: bool) void {
-        const wl_output = sn.scene.wl_output orelse return;
-        const client = sn.surface.resource.getClient();
+    /// Send wl_surface.enter/leave for `out` to the surface's client:
+    /// the resources of THAT output's global that the client bound —
+    /// every one of them, since a client may hold several. A surface's
+    /// events go only to its owner, and a client that never bound
+    /// wl_output gets none (wlroots wlr_surface_send_enter/leave,
+    /// wlr_compositor.c:1071-1128, iterate the output's resources and
+    /// match on the client). The event for one output never rides another
+    /// output's global: the view is looked up by the output the signal
+    /// carried.
+    ///
+    /// The resources reached through the wl_output stay valid for the
+    /// whole output-destroy phase: the wl_output module withdraws its
+    /// global there but only frees itself (and only then turns the
+    /// resources inert) in Output.events.finalize, which runs after
+    /// every destroy listener. So a membership dropped by the output's
+    /// own death still reaches the client here. The view must be found
+    /// before it drops its wl_output, which is why the scene revokes
+    /// memberships while the view is still live (SceneOutput).
+    fn sendEnter(sn: *SurfaceNode, out: *output_mod.Output, enter: bool) void {
+        const so = sceneOutputFor(sn.scene, out) orelse return;
+        const wl_output = so.wl_output orelse return;
+        const surface_client = sn.surface.resource.getClient();
         for (wl_output.resources.items) |res| {
-            if (res.getClient() != client) continue;
+            if (res.getClient() != surface_client) continue;
             if (enter) {
                 sn.surface.resource.sendEnter(res);
             } else {
                 sn.surface.resource.sendLeave(res);
             }
-            break;
         }
     }
 };
@@ -492,24 +556,36 @@ fn surfaceNodeOwner(scene: *Scene, node: *SceneNode) ?*SurfaceNode {
     return null;
 }
 
-/// Build the frame's presented list (presentation feedback targets):
-/// every tracked surface with an active node, into `scene.presented`
-/// (cleared first). The compositor reads scene.presented after this.
-pub fn collectPresented(scene: *Scene) void {
-    scene.presented.clearRetainingCapacity();
-    var it = scene.surface_nodes.valueIterator();
-    while (it.next()) |sn| sn.*.appendPresented(&scene.presented);
+/// The scene output view of `out`, or null when no view carries it (an
+/// output without a view is not in the scene's output list).
+pub fn sceneOutputFor(scene: *Scene, out: *output_mod.Output) ?*SceneOutput {
+    for (scene.scene_outputs.items) |so| {
+        if (so.live and so.output == out) return so;
+    }
+    return null;
 }
 
-/// The per-frame surface damage pass: translate every presented node's
-/// committed damage into `so`'s output coordinates, clipped to
-/// `out_rect`, and accumulate it into `so`'s damage ring. Mirrors the
-/// old compositor-side loop (wlr_scene_output_commit's damage
-/// translation); the node provides the translation.
-pub fn addSurfaceDamage(scene: *Scene, so: *SceneOutput, out_rect: Rect) void {
+/// Build ONE output's frame presented list (presentation feedback
+/// targets): every tracked surface that is mapped and whose node this
+/// output's view shows, into `so.presented` — which is cleared first, and
+/// is this output's list alone (a surface shown on two outputs appears in
+/// both lists, and one shown on neither appears in neither).
+pub fn collectPresented(scene: *Scene, so: *SceneOutput) void {
+    so.presented.clearRetainingCapacity();
     var it = scene.surface_nodes.valueIterator();
-    while (it.next()) |sn| sn.*.addDamage(so, out_rect);
+    while (it.next()) |sn| sn.*.appendPresented(so);
 }
+
+/// Recompute every tracked surface's output membership. The compositor
+/// calls this after anything that moves nodes or moves a view WITHOUT a
+/// commit: a camera pan/zoom/rotation (which changes what every view
+/// shows), a node placement, an output hotplug (SceneOutput.create /
+/// destroy). Commit, map and unmap already maintain their own surface.
+pub fn updateOutputAssociations(scene: *Scene) void {
+    var it = scene.surface_nodes.valueIterator();
+    while (it.next()) |sn| sn.*.updateOutputs();
+}
+
 
 /// Detach and free every tracked binding (the scene's teardown). The
 /// compositor may destroy its surfaces after the scene, so the surface
@@ -531,6 +607,7 @@ pub fn untrackAll(scene: *Scene) void {
 fn onCommit(listener: *wire.Listener(*Surface), _: *Surface) void {
     const sn: *SurfaceNode = @fieldParentPtr("commit_listener", listener);
     sn.update();
+    for (sn.scene.scene_outputs.items) |so| sn.addDamage(so);
     // The commit→present wake (note 137 F1): a content commit must
     // schedule a composite, or interactive clients' updates starve
     // behind the idle-frame skip (the frame_kick would present the
@@ -568,27 +645,20 @@ fn onDestroy(listener: *wire.Listener(*Surface), _: *Surface) void {
     sn.destroy();
 }
 
-/// wl_surface.enter signal (the surface gained the output; fired by the
-/// surface module at attach): send wl_surface.enter to the client.
-fn onEnter(listener: *wire.Listener(*output_mod.Output), _: *output_mod.Output) void {
+/// wl_surface.enter signal: the surface gained ONE output (fired by the
+/// surface module's setEntered for that output): send wl_surface.enter
+/// for it to the client.
+fn onEnter(listener: *wire.Listener(*output_mod.Output), out: *output_mod.Output) void {
     const sn: *SurfaceNode = @fieldParentPtr("enter_listener", listener);
-    sn.sendEnter(true);
+    sn.sendEnter(out, true);
 }
 
-/// wl_surface.leave signal (the surface lost the output; fired at
-/// detach): send wl_surface.leave to the client.
-fn onLeave(listener: *wire.Listener(*output_mod.Output), _: *output_mod.Output) void {
+/// wl_surface.leave signal: the surface lost ONE output (fired by
+/// leaveOutput/setLeft for that output): send wl_surface.leave for it to
+/// the client.
+fn onLeave(listener: *wire.Listener(*output_mod.Output), out: *output_mod.Output) void {
     const sn: *SurfaceNode = @fieldParentPtr("leave_listener", listener);
-    sn.sendEnter(false);
-}
-
-/// Saturating i32 add: surface damage rects are client-controlled and may
-/// overflow when translated by the node position. Damage is a hint, so a
-/// saturated value is a safe over-report (clipped to the output below).
-fn addSat(a: i32, b: i32) i32 {
-    return std.math.add(i32, a, b) catch blk: {
-        break :blk if (b < 0) std.math.minInt(i32) else std.math.maxInt(i32);
-    };
+    sn.sendEnter(out, false);
 }
 
 /// The surface size of `buf` under the surface's committed transform and
@@ -623,6 +693,29 @@ fn surfaceSize(s: *Surface, buf: *Buffer) geom.Size {
         };
     }
     return size;
+}
+
+/// The node's texture source crop in RAW BUFFER pixels: null when the
+/// surface has no wp_viewport source (the whole texture).
+///
+/// A wp_viewport source names SURFACE-local coordinates (after the
+/// buffer transform and the buffer scale, viewporter.xml). A texture
+/// crop names buffer texels, so the source is scaled up by buffer_scale
+/// and then mapped back through the INVERSE transform — the box the
+/// compositor presents is the box the renderer samples
+/// (utils/matrix.surfaceBoxToBuffer). Doing it once here is what keeps
+/// the renderer from applying the crop twice.
+fn rawSrcCrop(s: *Surface, buf: *Buffer) ?geom.FRect {
+    const vp = s.current.viewport;
+    if (!vp.has_src) return null;
+    const scale: f64 = @floatFromInt(s.current.scale);
+    const surface_local: geom.FRect = .{
+        .x = vp.src.x * scale,
+        .y = vp.src.y * scale,
+        .width = vp.src.width * scale,
+        .height = vp.src.height * scale,
+    };
+    return matrix.surfaceBoxToBuffer(surface_local, s.current.transform, buf.width, buf.height);
 }
 
 // --- Tests --------------------------------------------------------------
@@ -865,7 +958,6 @@ test "SurfaceNode damage translation: position offset, output clipping, overflow
     defer created[1].destroy();
     const so = try SceneOutput.create(allocator, io, &log_cfg, scene, out);
     defer so.destroy();
-    const out_rect: Rect = .{ .x = 0, .y = 0, .width = 800, .height = 600 };
 
     var tw = try surface_mod.TestWire.init();
     const comp = try surface_mod.testCompositor(allocator, io, &log_cfg);
@@ -894,7 +986,7 @@ test "SurfaceNode damage translation: position offset, output clipping, overflow
     // zero area and is dropped (geom.intersect, x1 <= x0).
     try s.current.surface_damage.add(.{ .x = 650, .y = 0, .width = 500, .height = 100 });
 
-    sn.addDamage(so, out_rect);
+    sn.addDamage(so);
     so.damage_ring.rotate();
     const rects = so.takeDamage();
     // Translated by the node position; the off-output part is clipped.
@@ -903,7 +995,7 @@ test "SurfaceNode damage translation: position offset, output clipping, overflow
     try testing.expectEqual(Rect{ .x = 750, .y = 50, .width = 50, .height = 100 }, rects[1]);
 }
 
-test "SurfaceNode damage translation saturates on overflow" {
+test "SurfaceNode damage off the far side of the world is dropped, not folded onto the output" {
     const allocator = testing.allocator;
     var io_storage = std.Io.Threaded.global_single_threaded.io();
     const io: *std.Io = &io_storage;
@@ -917,7 +1009,6 @@ test "SurfaceNode damage translation saturates on overflow" {
     defer created[1].destroy();
     const so = try SceneOutput.create(allocator, io, &log_cfg, scene, out);
     defer so.destroy();
-    const out_rect: Rect = .{ .x = 0, .y = 0, .width = 800, .height = 600 };
 
     var tw = try surface_mod.TestWire.init();
     const comp = try surface_mod.testCompositor(allocator, io, &log_cfg);
@@ -935,19 +1026,169 @@ test "SurfaceNode damage translation saturates on overflow" {
     s.attachBuffer(&buffer);
     s.commit();
 
-    // Client-controlled damage near i32 max: the translation saturates
-    // instead of trapping, and the (fully off-output) rect is dropped by
-    // the output clip — the same handling the old compositor-side loop
-    // had (addSat only prevents the wrap trap; the hint then clips).
+    // Client-controlled damage at the far end of the i32 range: the world
+    // rect is f64, so nothing saturates or wraps on the way out, and the
+    // screen clip drops the rect that lands nowhere near this output. A
+    // narrowing step BEFORE the clip would fold it onto the output's
+    // right edge and report damage the output never had.
     try s.current.surface_damage.add(.{
         .x = std.math.maxInt(i32) - 5,
         .y = 10,
         .width = 100,
         .height = 100,
     });
-    sn.addDamage(so, out_rect);
+    sn.addDamage(so);
     so.damage_ring.rotate();
     try testing.expectEqual(@as(usize, 0), so.takeDamage().len);
+}
+
+test "SurfaceNode damage projects through a rotated camera at a distant world origin" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    const scene = try makeScene(allocator, io, &log_cfg);
+    defer scene.deinit();
+    const created = try makeOutput(allocator, io, &log_cfg);
+    const out = created[0];
+    defer out.destroy();
+    defer created[1].destroy();
+    const so = try SceneOutput.create(allocator, io, &log_cfg, scene, out);
+    defer so.destroy();
+
+    var tw = try surface_mod.TestWire.init();
+    const comp = try surface_mod.testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try surface_mod.testSurface(allocator, io, &log_cfg, comp, &tw);
+    var ctx: TestCtx = .{ .allocator = allocator };
+
+    const sn = try trackSurface(scene, s, &test_impl, &ctx);
+    var buffer: Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    s.commit();
+
+    // The world is 5e9 px out — where one f64 ulp is ~1e-6 and an f32
+    // translation would cancel to nothing — with a quarter-pixel zoom and
+    // a 90-degree rotation. The damage must land on the pixels the camera
+    // shows, which is only computable if every step stays f64.
+    var cam = camera_mod.Camera{
+        .center_x = 5_000_000_000.5,
+        .center_y = 5_000_000_000.25,
+        .zoom = 1,
+        .rotation = std.math.pi / 2.0,
+        .screen_w = @floatFromInt(out.width),
+        .screen_h = @floatFromInt(out.height),
+    };
+    so.camera = &cam;
+
+    // The node's world origin IS the camera centre, so the whole surface
+    // (10x10 surface px, node at (0,0)) is drawn around screen centre
+    // (400, 300). Its damage rect (0,0,10,10) rotates with it.
+    sn.node.?.setPosition(cam.center_x, cam.center_y);
+    try s.current.surface_damage.add(.{ .x = 0, .y = 0, .width = 10, .height = 10 });
+    sn.addDamage(so);
+    so.damage_ring.rotate();
+    const rects = so.takeDamage();
+    try testing.expectEqual(@as(usize, 1), rects.len);
+    // Under R(-90) a world offset (dx, dy) lands at screen
+    // (400 + dy, 300 - dx). The node's 10x10 world rect spans
+    // dx,dy in [0,10], so its screen AABB is x 400..410, y 290..300.
+    try testing.expectEqual(Rect{ .x = 400, .y = 290, .width = 10, .height = 10 }, rects[0]);
+
+    // Pan the camera away: the surface leaves the view and its damage
+    // stops landing on this output entirely (the membership pass the
+    // compositor drives after a camera change drops the enter too).
+    cam.center_x += 10_000;
+    updateOutputAssociations(scene);
+    try testing.expect(!s.hasOutput(out));
+    s.current.surface_damage.clear();
+    try s.current.surface_damage.add(.{ .x = 0, .y = 0, .width = 10, .height = 10 });
+    sn.addDamage(so);
+    so.damage_ring.rotate();
+    try testing.expectEqual(@as(usize, 0), so.takeDamage().len);
+}
+
+test "SurfaceNode texture crop is the raw buffer rect: viewport source through scale and transform" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    const scene = try makeScene(allocator, io, &log_cfg);
+    defer scene.deinit();
+
+    var tw = try surface_mod.TestWire.init();
+    const comp = try surface_mod.testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try surface_mod.testSurface(allocator, io, &log_cfg, comp, &tw);
+    var ctx: TestCtx = .{ .allocator = allocator };
+
+    var buffer: Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    buffer.width = 64;
+    buffer.height = 64;
+    const sn = try trackSurface(scene, s, &test_impl, &ctx);
+
+    // A plain crop on an untransformed, unscaled surface passes through:
+    // surface-local and buffer pixels are the same numbers.
+    s.current.viewport = .{
+        .has_src = true,
+        .src = .{ .x = 8, .y = 8, .width = 32, .height = 32 },
+        .has_dst = true,
+        .dst = .{ .w = 32, .h = 32 },
+    };
+    s.attachBuffer(&buffer);
+    s.commit();
+    const bn = sn.node.?.kind.buffer;
+    try testing.expectEqual(geom.FRect{ .x = 8, .y = 8, .width = 32, .height = 32 }, bn.src.?);
+    try testing.expectEqual(geom.Transform.normal, bn.transform);
+
+    // buffer_scale 2: the source is surface-local, so each edge is two
+    // buffer texels further out. Publishing the unscaled rect here would
+    // sample the wrong quadrant of the buffer.
+    s.current.scale = 2;
+    s.current.viewport = .{
+        .has_src = true,
+        .src = .{ .x = 4, .y = 4, .width = 16, .height = 16 },
+        .has_dst = true,
+        .dst = .{ .w = 16, .h = 16 },
+    };
+    s.commit();
+    try testing.expectEqual(
+        geom.FRect{ .x = 8, .y = 8, .width = 32, .height = 32 },
+        sn.node.?.kind.buffer.src.?,
+    );
+    try testing.expectEqual(@as(i32, 16), sn.node.?.kind.buffer.dst_width);
+
+    // A 90-degree buffer transform: the crop is still named in buffer
+    // pixels, so the surface box is mapped back through the INVERSE
+    // transform. Surface (0,0,32,16) on a 64x64 buffer under 90 is buffer
+    // (0, 32, 16, 32) — and the node records the transform for the
+    // renderer's own mapping.
+    s.current.scale = 1;
+    s.current.transform = .@"90";
+    s.current.viewport = .{
+        .has_src = true,
+        .src = .{ .x = 0, .y = 0, .width = 32, .height = 16 },
+        .has_dst = true,
+        .dst = .{ .w = 32, .h = 16 },
+    };
+    s.commit();
+    try testing.expectEqual(
+        geom.FRect{ .x = 0, .y = 32, .width = 16, .height = 32 },
+        sn.node.?.kind.buffer.src.?,
+    );
+    try testing.expectEqual(geom.Transform.@"90", sn.node.?.kind.buffer.transform);
+
+    // No wp_viewport source: no crop at all (the whole buffer).
+    s.current.transform = .normal;
+    s.current.viewport = .{};
+    s.commit();
+    try testing.expect(sn.node.?.kind.buffer.src == null);
 }
 
 test "SurfaceNode drives enter at attach and leave at detach (output association)" {
@@ -986,27 +1227,159 @@ test "SurfaceNode drives enter at attach and leave at detach (output association
     surface_mod.testBuffer(allocator, &buffer);
     s.attachBuffer(&buffer);
     s.commit();
-    try testing.expect(s.outputs == null);
+    try testing.expect(!s.hasOutput(out));
 
     // The output covers the node: the next map enters it (the surface
     // module's setEntered fires events.enter; the binding's listener
-    // sends the wire event — scene.wl_output is null in this fixture, so
-    // the wire send is a no-op; the surface module test covers the
+    // sends the wire event — the fixture's view has no wl_output global,
+    // so the wire send is a no-op; the surface module test covers the
     // signal side).
     so.x = 0;
     so.y = 0;
     s.attachBuffer(null);
     s.commit();
-    try testing.expect(s.outputs == null);
+    try testing.expect(!s.hasOutput(out));
     s.attachBuffer(&buffer);
     s.commit();
-    try testing.expect(s.outputs == out);
+    try testing.expect(s.hasOutput(out));
 
     // Unmap leaves the output.
     s.attachBuffer(null);
     s.commit();
     try testing.expect(!s.mapped);
-    try testing.expect(s.outputs == null);
+    try testing.expect(!s.hasOutput(out));
+}
+
+test "a surface spanning two outputs is on both, and leaves only the one it leaves" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    const scene = try makeScene(allocator, io, &log_cfg);
+    defer scene.deinit();
+    const first = try makeOutput(allocator, io, &log_cfg);
+    const second = try makeOutput(allocator, io, &log_cfg);
+    // Registered backend-first so LIFO teardown destroys each output
+    // BEFORE its backend; the views' own defers, registered later, run
+    // before both.
+    defer first[1].destroy();
+    defer first[0].destroy();
+    defer second[1].destroy();
+    defer second[0].destroy();
+
+    var tw = try surface_mod.TestWire.init();
+    const comp = try surface_mod.testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try surface_mod.testSurface(allocator, io, &log_cfg, comp, &tw);
+    var ctx: TestCtx = .{ .allocator = allocator };
+
+    // Two views side by side in world space: left (0..800, 0..600) and
+    // right (800..1600, 0..600).
+    const so_left = try SceneOutput.create(allocator, io, &log_cfg, scene, first[0]);
+    defer so_left.destroy();
+    const so_right = try SceneOutput.create(allocator, io, &log_cfg, scene, second[0]);
+    defer so_right.destroy();
+    so_right.x = 800;
+    so_right.y = 0;
+
+    const sn = try trackSurface(scene, s, &test_impl, &ctx);
+    var buffer: Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    s.commit();
+
+    // The node starts on the left view only.
+    try testing.expect(s.hasOutput(first[0]));
+    try testing.expect(!s.hasOutput(second[0]));
+
+    // Straddle the seam: a 10px surface at x=795 lands on both views, and
+    // it must be entered on BOTH — the first match used to win.
+    sn.node.?.setPosition(795, 10);
+    updateOutputAssociations(scene);
+    try testing.expect(s.hasOutput(first[0]));
+    try testing.expect(s.hasOutput(second[0]));
+
+    // Both views present it: the presented lists are per output, so a
+    // surface on both appears in both and each list is cleared on its own
+    // rebuild.
+    collectPresented(scene, so_left);
+    collectPresented(scene, so_right);
+    try testing.expectEqual(@as(usize, 1), so_left.presented.items.len);
+    try testing.expectEqual(@as(usize, 1), so_right.presented.items.len);
+    try testing.expect(so_left.presented.items[0] == s);
+    try testing.expect(so_right.presented.items[0] == s);
+
+    // Move it fully onto the right view: only the left membership goes,
+    // and only the left view stops presenting it.
+    sn.node.?.setPosition(900, 10);
+    updateOutputAssociations(scene);
+    try testing.expect(!s.hasOutput(first[0]));
+    try testing.expect(s.hasOutput(second[0]));
+    collectPresented(scene, so_left);
+    collectPresented(scene, so_right);
+    try testing.expectEqual(@as(usize, 0), so_left.presented.items.len);
+    try testing.expectEqual(@as(usize, 1), so_right.presented.items.len);
+
+    // Unmapping leaves every output at once.
+    sn.node.?.setPosition(795, 10);
+    updateOutputAssociations(scene);
+    try testing.expect(s.hasOutput(first[0]));
+    try testing.expect(s.hasOutput(second[0]));
+    s.attachBuffer(null);
+    s.commit();
+    try testing.expect(!s.hasOutput(first[0]));
+    try testing.expect(!s.hasOutput(second[0]));
+}
+
+test "a destroyed output detaches its view and drops every membership through it" {
+    const allocator = testing.allocator;
+    var io_storage = std.Io.Threaded.global_single_threaded.io();
+    const io: *std.Io = &io_storage;
+    var log_cfg: log.Config = .{ .min_level = .err };
+
+    const scene = try makeScene(allocator, io, &log_cfg);
+    defer scene.deinit();
+    const created = try makeOutput(allocator, io, &log_cfg);
+    const out = created[0];
+    defer created[1].destroy();
+
+    var tw = try surface_mod.TestWire.init();
+    const comp = try surface_mod.testCompositor(allocator, io, &log_cfg);
+    defer allocator.destroy(comp);
+    defer tw.deinit();
+    const s = try surface_mod.testSurface(allocator, io, &log_cfg, comp, &tw);
+    var ctx: TestCtx = .{ .allocator = allocator };
+
+    const so = try SceneOutput.create(allocator, io, &log_cfg, scene, out);
+    const sn = try trackSurface(scene, s, &test_impl, &ctx);
+    var buffer: Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    s.commit();
+    try testing.expect(s.hasOutput(out));
+    try testing.expectEqual(@as(usize, 1), scene.scene_outputs.items.len);
+
+    // Unplug: the output dies first. Its view must leave the scene's
+    // output list at once, so nothing iterates a dangling output, and the
+    // surface must not stay entered on an output that no longer exists.
+    // The view itself is freed by its owner afterwards, which is what
+    // keeps this free in one place whatever the listener order is.
+    out.destroy();
+    try testing.expect(!so.live);
+    try testing.expectEqual(@as(usize, 0), scene.scene_outputs.items.len);
+    try testing.expect(!s.hasOutput(out));
+
+    // The freed view leaves nothing behind: the scene is still usable and
+    // the surface stays unmapped until the next commit.
+    so.destroy();
+    sn.updateOutputs();
+    try testing.expect(!s.hasOutput(out));
+    s.attachBuffer(&buffer);
+    s.commit();
+    try testing.expect(s.mapped);
+    try testing.expect(!s.hasOutput(out));
 }
 
 test "SurfaceNode subsurface trees nest under the parent's tree" {
@@ -1188,7 +1561,7 @@ test "hidden subsurface is not presented" {
     try role_mod.assignRole(child, &gate_role, null);
 
     const child_sn = try trackSurface(scene, child, &test_impl, &ctx);
-    _ = try trackSurface(scene, parent, &test_impl, &ctx);
+    const parent_sn = try trackSurface(scene, parent, &test_impl, &ctx);
 
     // The child commits a buffer while the parent is unmapped: it does
     // NOT map (parent gate), so it gets no enter and is not presented —
@@ -1199,9 +1572,9 @@ test "hidden subsurface is not presented" {
     child.commit();
     try testing.expect(!child.mapped);
     try testing.expect(child_sn.node != null);
-    try testing.expect(child.outputs == null);
-    collectPresented(scene);
-    try testing.expectEqual(@as(usize, 0), scene.presented.items.len);
+    try testing.expect(!child.hasOutput(out));
+    collectPresented(scene, so);
+    try testing.expectEqual(@as(usize, 0), so.presented.items.len);
 
     // The parent maps: the child's effective map follows (the real
     // subsurface parent_map_listener drives child.updateMapped here), the
@@ -1212,12 +1585,16 @@ test "hidden subsurface is not presented" {
     parent.attachBuffer(&parent_buffer);
     parent.commit();
     try testing.expect(parent.mapped);
+    // The compositor's subsurface placement pass moves the disabled
+    // placeholder under its now-mapped parent before presentation.
+    try parent_sn.tree.?.appendChild(allocator, child_sn.tree.?);
+    child_sn.tree.?.enable(true);
     child.updateMapped();
     try testing.expect(child.mapped);
-    try testing.expect(child.outputs == out);
-    collectPresented(scene);
+    try testing.expect(child.hasOutput(out));
+    collectPresented(scene, so);
     var child_presented = false;
-    for (scene.presented.items) |p| {
+    for (so.presented.items) |p| {
         if (p == child) child_presented = true;
     }
     try testing.expect(child_presented);
@@ -1229,7 +1606,569 @@ test "hidden subsurface is not presented" {
     try testing.expect(!parent.mapped);
     child.updateMapped();
     try testing.expect(!child.mapped);
-    try testing.expect(child.outputs == null);
-    collectPresented(scene);
-    try testing.expectEqual(@as(usize, 0), scene.presented.items.len);
+    try testing.expect(!child.hasOutput(out));
+    collectPresented(scene, so);
+    try testing.expectEqual(@as(usize, 0), so.presented.items.len);
+}
+
+// --- Real-wire output teardown --------------------------------------------
+//
+// wl_surface.leave is the only way a client learns an output went away, and
+// it must name THAT output's wl_output object — never another output's, and
+// never nothing. The harness below is deliberately wire-level: a real
+// display, real wl_compositor and wl_output globals, a real libwayland
+// client that binds every output and owns the wl_surface, and a client-side
+// listener that decodes every enter/leave by the wl_output object it named.
+// A copied Signal payload would still pass while the wire event is dropped.
+
+const client = @import("protocol").client;
+const display_mod = @import("../core/display.zig");
+const compositor_mod = @import("../compositor/compositor.zig");
+const wl_output_mod = @import("../output/wl_output.zig");
+const test_pump = @import("../utils/test_pump.zig");
+const posix = std.posix;
+
+/// Outputs the harness runs: two monitors, plus one replugged later.
+const wire_slots = 3;
+
+fn ignoreWireOutputEvents(_: *client.wl.Output, _: client.wl.Output.Event, _: *u8) void {}
+
+/// The client's registry listener: the globals this harness must bind.
+/// wl_output globals are recorded in announcement order, which is the order
+/// the server created them in.
+const WireCapture = struct {
+    compositor_name: ?u32 = null,
+    output_names: [wire_slots]u32 = undefined,
+    output_count: usize = 0,
+
+    fn listener(registry: *client.wl.Registry, event: client.wl.Registry.Event, data: *WireCapture) void {
+        _ = registry;
+        switch (event) {
+            .global => |g| {
+                const iface = std.mem.span(g.interface);
+                if (std.mem.eql(u8, iface, "wl_compositor")) {
+                    data.compositor_name = g.name;
+                } else if (std.mem.eql(u8, iface, "wl_output")) {
+                    if (data.output_count < data.output_names.len) {
+                        data.output_names[data.output_count] = g.name;
+                        data.output_count += 1;
+                    }
+                }
+            },
+            // A withdrawn global says nothing about the surface; the
+            // wl_surface.leave that follows it is what the test reads.
+            .global_remove => {},
+        }
+    }
+};
+
+/// The client's wl_surface listener: which wl_output object each real
+/// enter/leave event named. Object identity is the whole point — a leave
+/// carrying the wrong output, or none at all, is the defect.
+const WireSurfaceEvents = struct {
+    entered: [8]?*client.wl.Output = .{null} ** 8,
+    enter_count: usize = 0,
+    left: [8]?*client.wl.Output = .{null} ** 8,
+    leave_count: usize = 0,
+
+    fn entersFor(e: *const WireSurfaceEvents, name: *client.wl.Output) usize {
+        return countNamed(e.entered[0..e.enter_count], name);
+    }
+
+    fn leavesFor(e: *const WireSurfaceEvents, name: *client.wl.Output) usize {
+        return countNamed(e.left[0..e.leave_count], name);
+    }
+
+    fn countNamed(list: []const ?*client.wl.Output, name: *client.wl.Output) usize {
+        var n: usize = 0;
+        for (list) |o| {
+            if (o == name) n += 1;
+        }
+        return n;
+    }
+
+    fn listener(surface: *client.wl.Surface, event: client.wl.Surface.Event, data: *WireSurfaceEvents) void {
+        _ = surface;
+        switch (event) {
+            .enter => |e| {
+                if (data.enter_count < data.entered.len) {
+                    data.entered[data.enter_count] = e.output;
+                    data.enter_count += 1;
+                }
+            },
+            .leave => |e| {
+                if (data.leave_count < data.left.len) {
+                    data.left[data.leave_count] = e.output;
+                    data.leave_count += 1;
+                }
+            },
+            else => {},
+        }
+    }
+};
+
+/// Display + compositor + two monitors (each with a wl_output global) + the
+/// scene + one in-memory client that binds every output and owns the
+/// wl_surface under test. The harness owns the whole graph because its
+/// teardown order is the contract: views, then the scene, then the client
+/// (whose wl_surface destructor runs the binding teardown), then the
+/// outputs, then the display.
+const WireHarness = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_cfg: log.Config,
+    ctx: TestCtx,
+    /// Backing byte for the fake output/backend impls; never dereferenced.
+    dummy: u8 = 0,
+    display: ?*display_mod.CompositorDisplay = null,
+    compositor: ?*compositor_mod.Compositor = null,
+    compositor_proxy: ?*client.wl.Compositor = null,
+    scene: ?*Scene = null,
+    client_wire: ?*wire.Client = null,
+    c_display: ?*client.wl.Display = null,
+    registry: ?*client.wl.Registry = null,
+    capture: WireCapture = .{},
+    /// Listener data for the bound wl_output proxies (ignored).
+    proxy_data: u8 = 0,
+    out: [wire_slots]?*output_mod.Output = .{null} ** wire_slots,
+    backend: [wire_slots]?*backend_mod.Backend = .{null} ** wire_slots,
+    wl_output: [wire_slots]?*wl_output_mod.WlOutput = .{null} ** wire_slots,
+    view: [wire_slots]?*SceneOutput = .{null} ** wire_slots,
+    /// The client's wl_output proxies, in bind order.
+    proxy: [wire_slots]?*client.wl.Output = .{null} ** wire_slots,
+    events: WireSurfaceEvents = .{},
+    surface: ?*Surface = null,
+
+    fn init(allocator: std.mem.Allocator) !*WireHarness {
+        const h = try allocator.create(WireHarness);
+        h.* = .{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .log_cfg = .{ .min_level = .err },
+            .ctx = .{ .allocator = allocator },
+        };
+        // deinit frees h, so it is the only teardown errdefer.
+        errdefer h.deinit();
+        h.display = try display_mod.CompositorDisplay.init(allocator, &h.io, &h.log_cfg);
+        try h.display.?.initShm();
+        h.compositor = try compositor_mod.Compositor.init(allocator, &h.io, &h.log_cfg, h.display.?);
+        h.scene = try makeScene(allocator, &h.io, &h.log_cfg);
+        try h.addOutput(0);
+        try h.addOutput(1);
+
+        var fds: [2]posix.socket_t = undefined;
+        const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+        if (posix.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+        h.client_wire = wire.Client.create(h.display.?.getServer(), fds[0]) orelse return error.ClientCreateFailed;
+        h.c_display = client.wl.Display.connectToFd(fds[1]) catch return error.ClientConnectFailed;
+        h.registry = try h.c_display.?.getRegistry();
+        h.registry.?.setListener(*WireCapture, WireCapture.listener, &h.capture);
+        try h.pump();
+        const compositor_name = h.capture.compositor_name orelse return error.GlobalMissing;
+        if (h.capture.output_count < 2) return error.GlobalMissing;
+        h.compositor_proxy = try h.registry.?.bind(compositor_name, client.wl.Compositor, 7);
+        try h.bindOutput(0);
+        try h.bindOutput(1);
+        try h.pump();
+        return h;
+    }
+
+    fn deinit(h: *WireHarness) void {
+        const allocator = h.allocator;
+        // Views first: each SceneOutput reads the scene's allocator and its
+        // own output, so both must still be live.
+        for (&h.view) |*slot| {
+            if (slot.*) |so| {
+                slot.* = null;
+                so.destroy();
+            }
+        }
+        // Then the scene, while its bindings still exist.
+        if (h.scene) |s| {
+            h.scene = null;
+            s.deinit();
+        }
+        // The client next: its wl_surface destructor runs the surface
+        // teardown against the live compositor.
+        if (h.c_display) |d| d.disconnect();
+        if (h.client_wire) |c| {
+            h.client_wire = null;
+            c.destroy();
+        }
+        if (h.compositor) |c| {
+            h.compositor = null;
+            c.deinit();
+        }
+        // Outputs: each destroy withdraws its wl_output global and then
+        // frees it in the finalize phase, after every destroy listener.
+        // Backends go last.
+        for (&h.out) |*slot| {
+            if (slot.*) |out| {
+                slot.* = null;
+                out.destroy();
+            }
+        }
+        for (&h.backend) |*slot| {
+            if (slot.*) |b| {
+                slot.* = null;
+                b.destroy();
+            }
+        }
+        if (h.display) |d| {
+            h.display = null;
+            d.deinit();
+        }
+        allocator.destroy(h);
+    }
+
+    fn addOutput(h: *WireHarness, index: usize) !void {
+        const backend = try backend_mod.Backend.init(h.allocator, &h.io, &h.log_cfg, &fake_backend_impl, &h.dummy);
+        h.backend[index] = backend;
+        h.out[index] = try output_mod.Output.create(
+            h.allocator,
+            &h.io,
+            &h.log_cfg,
+            backend,
+            &fake_output_impl,
+            &h.dummy,
+            .{ .width = 800, .height = 600, .refresh_msec = 16 },
+        );
+        h.wl_output[index] = try wl_output_mod.WlOutput.create(
+            h.allocator,
+            &h.io,
+            &h.log_cfg,
+            h.display.?,
+            h.out[index].?,
+            "WL-1",
+            "scene wire test output",
+        );
+    }
+
+    fn bindOutput(h: *WireHarness, index: usize) !void {
+        const proxy = try h.registry.?.bind(
+            h.capture.output_names[index],
+            client.wl.Output,
+            wl_output_mod.output_version,
+        );
+        proxy.setListener(*u8, ignoreWireOutputEvents, &h.proxy_data);
+        h.proxy[index] = proxy;
+    }
+
+    /// The SceneOutput view of slot `index`, placed at world (x, y), with
+    /// that output's wl_output global attached: the enter/leave events for
+    /// this output ride this object and no other.
+    fn addView(h: *WireHarness, index: usize, x: f64, y: f64) !*SceneOutput {
+        const so = try SceneOutput.create(h.allocator, &h.io, &h.log_cfg, h.scene.?, h.out[index].?);
+        h.view[index] = so;
+        so.x = x;
+        so.y = y;
+        so.wl_output = h.wl_output[index];
+        return so;
+    }
+
+    /// The client creates the wl_surface on the wire; the server side is
+    /// the Compositor's Surface, whose resource belongs to this client.
+    fn createSurface(h: *WireHarness) !*Surface {
+        const proxy = try h.compositor_proxy.?.createSurface();
+        proxy.setListener(*WireSurfaceEvents, WireSurfaceEvents.listener, &h.events);
+        try h.pump();
+        const c = h.compositor.?;
+        if (c.surfaces.items.len == 0) return error.SurfaceMissing;
+        h.surface = c.surfaces.items[c.surfaces.items.len - 1];
+        return h.surface.?;
+    }
+
+    fn destroyOutput(h: *WireHarness, index: usize) void {
+        const out = h.out[index].?;
+        h.out[index] = null;
+        out.destroy();
+    }
+
+    /// The view's owner frees the view (its output is gone or going).
+    fn destroyView(h: *WireHarness, index: usize) void {
+        const so = h.view[index].?;
+        h.view[index] = null;
+        so.destroy();
+    }
+
+    fn pump(h: *WireHarness) !void {
+        try test_pump.roundtrip(h.c_display, h.display.?, 0);
+        if (h.c_display) |d| {
+            var fds = [_]posix.pollfd{.{ .fd = d.getFd(), .events = posix.POLL.IN, .revents = 0 }};
+            if (try posix.poll(&fds, 0) > 0) {
+                if (d.dispatch() != .SUCCESS) {
+                    // The server already destroyed this client.
+                    h.client_wire = null;
+                    return error.ClientDispatchFailed;
+                }
+            }
+        }
+    }
+};
+
+/// Which of the two output-destroy listeners runs first. Both link onto the
+/// SAME output.events.destroy signal, and the order they were added in
+/// decides whether the membership is revoked while the view is still
+/// resolvable. The client's leave must not depend on it.
+const LeaveOrder = enum { view_first, membership_first };
+
+fn runUnplugLeaves(allocator: std.mem.Allocator, order: LeaveOrder) !void {
+    var h = try WireHarness.init(allocator);
+    defer h.deinit();
+    const scene = h.scene.?;
+
+    const out0 = h.out[0].?;
+    const out1 = h.out[1].?;
+    const proxy0 = h.proxy[0].?;
+    const proxy1 = h.proxy[1].?;
+
+    const s = try h.createSurface();
+    const sn = try trackSurface(scene, s, &test_impl, &h.ctx);
+
+    if (order == .view_first) {
+        // Both views exist before the surface maps, so each SceneOutput's
+        // destroy listener is linked on its output BEFORE the surface's
+        // own output association is.
+        _ = try h.addView(0, 0, 0);
+        _ = try h.addView(1, 800, 0);
+    }
+
+    var buffer: Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    s.commit();
+    try testing.expect(s.mapped);
+
+    if (order == .membership_first) {
+        // The membership forms while the output still has no view, so the
+        // association's destroy listener is linked BEFORE the
+        // SceneOutput's. The view arrives a moment later, as a hotplug
+        // does; the order must not change what the client is told.
+        s.setEntered(out0);
+        _ = try h.addView(0, 0, 0);
+        _ = try h.addView(1, 800, 0);
+    }
+
+    // The surviving view, so the post-unplug assertions can read it.
+    const so1 = h.view[1].?;
+
+    // Straddle the seam: a 10px node at x=795 lands on both views.
+    sn.node.?.setPosition(795, 10);
+    updateOutputAssociations(scene);
+    try testing.expect(s.hasOutput(out0));
+    try testing.expect(s.hasOutput(out1));
+
+    try h.pump();
+    // The client really is on output 1: an enter named its own wl_output.
+    try testing.expectEqual(@as(usize, 1), h.events.entersFor(proxy1));
+    // In the view-first order output 0's view existed too, so that enter
+    // was a real wire event as well.
+    if (order == .view_first) try testing.expectEqual(@as(usize, 1), h.events.entersFor(proxy0));
+    try testing.expectEqual(@as(usize, 0), h.events.leave_count);
+
+    // Unplug: the output dies first. Its view detaches, the membership
+    // through it goes, and the client must hear about it on THAT output's
+    // wl_output object.
+    h.destroyOutput(0);
+    try testing.expect(!s.hasOutput(out0));
+    try testing.expect(s.hasOutput(out1));
+    try testing.expectEqual(@as(usize, 1), scene.scene_outputs.items.len);
+
+    try h.pump();
+    try testing.expectEqual(@as(usize, 1), h.events.leavesFor(proxy0));
+    try testing.expectEqual(@as(usize, 0), h.events.leavesFor(proxy1));
+    try testing.expectEqual(@as(usize, 1), h.events.leave_count);
+
+    // The surviving view still presents the surface: one output leaving
+    // must not take the other output's membership with it.
+    collectPresented(scene, so1);
+    try testing.expectEqual(@as(usize, 1), so1.presented.items.len);
+    try testing.expect(so1.presented.items[0] == s);
+
+    // The view's owner frees the view now that its output is gone.
+    h.destroyView(0);
+
+    // Replug: a fresh output at the left with its own wl_output global and
+    // a fresh view. The surface enters it again with a real enter event,
+    // so the teardown above did not leave the enter path dead.
+    try h.addOutput(2);
+    try h.pump();
+    try h.bindOutput(2);
+    // The bind must reach the server before the enter: the enter names
+    // the server-side resource this bind creates.
+    try h.pump();
+    _ = try h.addView(2, 0, 0);
+    updateOutputAssociations(scene);
+    try testing.expect(s.hasOutput(h.out[2].?));
+    try h.pump();
+    try testing.expectEqual(@as(usize, 1), h.events.entersFor(h.proxy[2].?));
+    // The unplug produced no further leave on either remaining output.
+    try testing.expectEqual(@as(usize, 1), h.events.leave_count);
+    try testing.expectEqual(@as(usize, 0), h.events.leavesFor(proxy1));
+}
+
+test "destroying an output sends the client wl_surface.leave for that output only (view destroy listener linked first)" {
+    try runUnplugLeaves(testing.allocator, .view_first);
+}
+
+test "destroying an output sends the client wl_surface.leave for that output only (membership destroy listener linked first)" {
+    try runUnplugLeaves(testing.allocator, .membership_first);
+}
+
+fn runViewDestroyLeaves(allocator: std.mem.Allocator) !void {
+    var h = try WireHarness.init(allocator);
+    defer h.deinit();
+    const scene = h.scene.?;
+
+    const out0 = h.out[0].?;
+    const out1 = h.out[1].?;
+    const proxy0 = h.proxy[0].?;
+    const proxy1 = h.proxy[1].?;
+
+    const s = try h.createSurface();
+    const sn = try trackSurface(scene, s, &test_impl, &h.ctx);
+    _ = try h.addView(0, 0, 0);
+    const so1 = try h.addView(1, 800, 0);
+
+    var buffer: Buffer = undefined;
+    surface_mod.testBuffer(allocator, &buffer);
+    s.attachBuffer(&buffer);
+    s.commit();
+    sn.node.?.setPosition(795, 10);
+    updateOutputAssociations(scene);
+    try testing.expect(s.hasOutput(out0));
+    try testing.expect(s.hasOutput(out1));
+
+    try h.pump();
+    try testing.expectEqual(@as(usize, 1), h.events.entersFor(proxy0));
+    try testing.expectEqual(@as(usize, 1), h.events.entersFor(proxy1));
+    try testing.expectEqual(@as(usize, 0), h.events.leave_count);
+
+    // The view's owner tears the view down while the output is still
+    // alive: the membership it carried must be revoked with a leave on
+    // that output's own wl_output, not dropped on the floor.
+    h.destroyView(0);
+    try testing.expectEqual(@as(usize, 1), scene.scene_outputs.items.len);
+
+    try h.pump();
+    try testing.expectEqual(@as(usize, 1), h.events.leavesFor(proxy0));
+    try testing.expectEqual(@as(usize, 0), h.events.leavesFor(proxy1));
+    try testing.expectEqual(@as(usize, 1), h.events.leave_count);
+    try testing.expect(!s.hasOutput(out0));
+    try testing.expect(s.hasOutput(out1));
+    collectPresented(scene, so1);
+    try testing.expectEqual(@as(usize, 1), so1.presented.items.len);
+    try testing.expect(so1.presented.items[0] == s);
+
+    // Unplug afterwards: the membership is already gone, so there is
+    // nothing left to tell the client a second time.
+    h.destroyOutput(0);
+    try h.pump();
+    try testing.expectEqual(@as(usize, 1), h.events.leave_count);
+    try testing.expectEqual(@as(usize, 0), h.events.leavesFor(proxy1));
+}
+
+test "destroying the scene output view sends the client wl_surface.leave for that output only" {
+    try runViewDestroyLeaves(testing.allocator);
+}
+
+test "output-local membership, presentation and damage follow pinning and ancestor visibility" {
+    const h = try WireHarness.init(testing.allocator);
+    defer h.deinit();
+    const scene = h.scene.?;
+    const first = try h.addView(0, 0, 0);
+    const second = try h.addView(1, 800, 0);
+    var camera = camera_mod.Camera{
+        .center_x = 1e12,
+        .center_y = -1e12,
+        .zoom = 2,
+        .rotation = std.math.pi / 2.0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    first.camera = &camera;
+    second.camera = &camera;
+    const Pin = struct {
+        output: ?*output_mod.Output,
+
+        fn classify(ctx: ?*anyopaque, _: *Surface) scene_mod.SurfacePlacement {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return .{ .output_local = self.output };
+        }
+    };
+    var pin = Pin{ .output = h.out[0].? };
+    scene.setSurfacePlacementPolicy(&pin, Pin.classify);
+    defer scene.setSurfacePlacementPolicy(null, null);
+    const surface = try h.createSurface();
+    const sn = try trackSurface(scene, surface, &test_impl, &h.ctx);
+    var buffer: Buffer = undefined;
+    surface_mod.testBuffer(testing.allocator, &buffer);
+    surface.attachBuffer(&buffer);
+    surface.commit();
+    try h.pump();
+    try testing.expectEqual(@as(usize, 1), h.events.entersFor(h.proxy[0].?));
+    try testing.expectEqual(@as(usize, 0), h.events.entersFor(h.proxy[1].?));
+    collectPresented(scene, first);
+    collectPresented(scene, second);
+    try testing.expectEqualSlices(*Surface, &.{surface}, first.presented.items);
+    try testing.expectEqualSlices(*Surface, &.{}, second.presented.items);
+
+    camera.center_x += 1000;
+    updateOutputAssociations(scene);
+    try h.pump();
+    try testing.expectEqual(@as(usize, 1), h.events.entersFor(h.proxy[0].?));
+    try testing.expectEqual(@as(usize, 0), h.events.leave_count);
+
+    // A commit queues only the damaged local pixels on the pinned output,
+    // independent of the camera and without replacing unrelated damage.
+    const partial = Rect{ .x = 4, .y = 5, .width = 2, .height = 3 };
+    first.addDamage(partial);
+    second.addDamage(partial);
+    try surface.pending.surface_damage.add(.{ .x = 1, .y = 2, .width = 3, .height = 4 });
+    surface.commit();
+    first.damage_ring.rotate();
+    second.damage_ring.rotate();
+    const Damage = struct {
+        fn contains(rects: []const Rect, x: i32, y: i32) bool {
+            // This is the output consumer's whole-damage representation.
+            if (rects.len == 0) return true;
+            for (rects) |rect| {
+                if (rect.containsPoint(.{ .x = x, .y = y })) return true;
+            }
+            return false;
+        }
+    };
+    const damage = first.takeDamage();
+    try testing.expect(Damage.contains(damage, 1, 2));
+    try testing.expect(Damage.contains(damage, 3, 5));
+    try testing.expect(Damage.contains(damage, 4, 5));
+    try testing.expect(!Damage.contains(damage, 0, 0));
+    try testing.expect(!Damage.contains(damage, 6, 5));
+    try testing.expectEqualSlices(Rect, &.{partial}, second.takeDamage());
+
+    const container = try SceneNode.create(testing.allocator, scene.root, .tree);
+    try container.appendChild(testing.allocator, sn.tree.?);
+    container.enable(false);
+    updateOutputAssociations(scene);
+    try h.pump();
+    try testing.expectEqual(@as(usize, 1), h.events.leavesFor(h.proxy[0].?));
+    collectPresented(scene, first);
+    try testing.expectEqualSlices(*Surface, &.{}, first.presented.items);
+    first.addDamage(partial);
+    sn.addDamage(first);
+    first.damage_ring.rotate();
+    try testing.expectEqualSlices(Rect, &.{partial}, first.takeDamage());
+
+    container.enable(true);
+    updateOutputAssociations(scene);
+    try h.pump();
+    try testing.expectEqual(@as(usize, 2), h.events.entersFor(h.proxy[0].?));
+    pin.output = null;
+    updateOutputAssociations(scene);
+    try h.pump();
+    try testing.expectEqual(@as(usize, 2), h.events.leavesFor(h.proxy[0].?));
+    collectPresented(scene, first);
+    collectPresented(scene, second);
+    try testing.expectEqualSlices(*Surface, &.{}, first.presented.items);
+    try testing.expectEqualSlices(*Surface, &.{}, second.presented.items);
 }

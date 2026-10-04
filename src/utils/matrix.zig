@@ -8,6 +8,12 @@
 //! *buffer* dimensions; a transform of the 90-degree family therefore puts
 //! the result inside a `height` x `width` region on the surface.
 //!
+//! `boxTransformF` is the f64 twin of `boxTransform` for boxes with a
+//! sub-pixel edge, and `surfaceBoxToBuffer` is its inverse direction (a
+//! surface-space box back to buffer pixels) — the mapping a renderer
+//! texture crop needs, since the crop is named in buffer texels while a
+//! wp_viewport source arrives surface-local.
+//!
 //! `boxTransform` is a 1:1 port of wlrroots' `wlr_box_transform`
 //! (freedesktop-wlroots util/box.c:105-145): same switch, same arithmetic.
 
@@ -63,6 +69,78 @@ pub fn boxTransform(box: geom.Rect, transform: geom.Transform, width: i32, heigh
         },
     }
     return out;
+}
+
+/// Transform a FRACTIONAL buffer-space box into surface space: the f64
+/// twin of `boxTransform`, for boxes that carry a sub-pixel edge (a
+/// wp_viewport source is fractional by protocol). Same switch, same
+/// arithmetic, same `width`/`height` meaning (the buffer dimensions).
+pub fn boxTransformF(
+    box: geom.FRect,
+    transform: geom.Transform,
+    width: i32,
+    height: i32,
+) geom.FRect {
+    const w: f64 = @floatFromInt(width);
+    const h: f64 = @floatFromInt(height);
+    var out = box;
+    if (transform.is90Degrees()) {
+        out.width = box.height;
+        out.height = box.width;
+    }
+    switch (transform) {
+        .normal => {
+            out.x = box.x;
+            out.y = box.y;
+        },
+        .@"90" => {
+            out.x = h - box.y - box.height;
+            out.y = box.x;
+        },
+        .@"180" => {
+            out.x = w - box.x - box.width;
+            out.y = h - box.y - box.height;
+        },
+        .@"270" => {
+            out.x = box.y;
+            out.y = w - box.x - box.width;
+        },
+        .flipped => {
+            out.x = w - box.x - box.width;
+            out.y = box.y;
+        },
+        .flipped_90 => {
+            out.x = box.y;
+            out.y = box.x;
+        },
+        .flipped_180 => {
+            out.x = box.x;
+            out.y = h - box.y - box.height;
+        },
+        .flipped_270 => {
+            out.x = h - box.y - box.height;
+            out.y = w - box.x - box.width;
+        },
+    }
+    return out;
+}
+
+/// Transform a surface-space box back into BUFFER space — the exact
+/// inverse of `boxTransformF` for the same buffer and transform.
+///
+/// `width`/`height` are the BUFFER dimensions; the surface-space region
+/// the buffer covers is `transform.transformedSize(width, height)`, so
+/// that region is what the inverse map is fed. A renderer texture crop
+/// is named in buffer pixels, so this is the direction a surface-local
+/// wp_viewport source has to travel (see scene/surface_node.zig).
+pub fn surfaceBoxToBuffer(
+    box: geom.FRect,
+    transform: geom.Transform,
+    width: i32,
+    height: i32,
+) geom.FRect {
+    const surface = transform.transformedSize(width, height);
+    return boxTransformF(box, transform.inverse(), surface.w, surface.h);
 }
 
 /// Transform a surface-space point back into buffer space.
@@ -172,5 +250,91 @@ test "transformPoint: surface -> buffer direction" {
     for (cases) |c| {
         const got: geom.Point = transformPoint(c.sx, c.sy, c.t, 100, 50);
         try std.testing.expectEqual(c.want, got);
+    }
+}
+
+test "surfaceBoxToBuffer inverts boxTransformF for every transform" {
+    // Buffer 100x50, an offset fractional buffer box, and every standard
+    // transform: the surface box the compositor presents, mapped back,
+    // must be the box it started from — the wp_viewport crop depends on
+    // exactly this, at sub-pixel precision.
+    const buffer: geom.FRect = .{ .x = 10.25, .y = 20.75, .width = 30.5, .height = 15.25 };
+    const transforms = [_]geom.Transform{
+        .normal,  .@"90",       .@"180",      .@"270",
+        .flipped, .flipped_90,  .flipped_180, .flipped_270,
+    };
+    for (transforms) |t| {
+        const surface = boxTransformF(buffer, t, 100, 50);
+        const back = surfaceBoxToBuffer(surface, t, 100, 50);
+        try std.testing.expectApproxEqRel(buffer.x, back.x, 1e-12);
+        try std.testing.expectApproxEqRel(buffer.y, back.y, 1e-12);
+        try std.testing.expectApproxEqRel(buffer.width, back.width, 1e-12);
+        try std.testing.expectApproxEqRel(buffer.height, back.height, 1e-12);
+    }
+    // The full buffer maps onto the full surface region in both
+    // directions, for every transform (the region the buffer covers is
+    // the one the inverse is fed).
+    for (transforms) |t| {
+        const size = t.transformedSize(100, 50);
+        const full: geom.FRect = .{ .x = 0, .y = 0, .width = 100, .height = 50 };
+        const surface = boxTransformF(full, t, 100, 50);
+        try std.testing.expectEqual(geom.FRect{ .x = 0, .y = 0, .width = size.w, .height = size.h }, surface);
+        const back = surfaceBoxToBuffer(surface, t, 100, 50);
+        try std.testing.expectEqual(full, back);
+    }
+    // Rotating swaps the region: a 90-degree surface crop lives in the
+    // 50x100 surface region, and its buffer crop lies inside the 100x50
+    // buffer. Inverting wlr_box_transform's 90 branch (util/box.c:125-128)
+    // on BOXES rather than points — forward s.x = height - b.y - b.h,
+    // s.y = b.x, s.w = b.h, s.h = b.w, so b.y = H - s.x - s.WIDTH,
+    // b.x = s.y, b.w = s.h, b.h = s.w — for surface (10,10,20,30) in a
+    // 50x100 region: b.x = 10, b.y = 50 - 10 - 20 = 20, b.w = 30,
+    // b.h = 20. The subtracted term is the surface box's WIDTH: the
+    // rotated box's extent along x is the source box's height, so the
+    // inverse must consume the extent, never the other axis.
+    // Forward check: boxTransformF({10,20,30,20}, .@"90", 100, 50) is
+    // x = 50 - 20 - 20 = 10, y = 10, w = 20, h = 30 — the box it came
+    // from.
+    const crop: geom.FRect = .{ .x = 10, .y = 10, .width = 20, .height = 30 };
+    try std.testing.expectEqual(
+        geom.FRect{ .x = 10, .y = 20, .width = 30, .height = 20 },
+        surfaceBoxToBuffer(crop, .@"90", 100, 50),
+    );
+}
+
+test "surfaceBoxToBuffer names the buffer pixel transformPoint names" {
+    // The two entry points answer the same question at pixel
+    // granularity — which buffer pixel a surface pixel shows — through
+    // different arithmetic: `transformPoint` is the hand-pinned
+    // pixel-granular inverse table of wlr_box_transform, and
+    // `surfaceBoxToBuffer` is the box form of the same map. For a unit
+    // surface box they must agree on every pixel of the region the
+    // buffer covers, for all eight transforms including the flipped
+    // ones, whose axis bounds are easy to get subtly wrong.
+    const width = 7;
+    const height = 3;
+    const transforms = [_]geom.Transform{
+        .normal,  .@"90",       .@"180",      .@"270",
+        .flipped, .flipped_90,  .flipped_180, .flipped_270,
+    };
+    for (transforms) |t| {
+        const region = t.transformedSize(width, height);
+        var sy: i32 = 0;
+        while (sy < region.h) : (sy += 1) {
+            var sx: i32 = 0;
+            while (sx < region.w) : (sx += 1) {
+                const unit: geom.FRect = .{ .x = @floatFromInt(sx), .y = @floatFromInt(sy), .width = 1, .height = 1 };
+                const got = surfaceBoxToBuffer(unit, t, width, height);
+                const want = transformPoint(sx, sy, t, width, height);
+                std.testing.expectEqual(want.x, @as(i32, @intFromFloat(@floor(got.x)))) catch |err| {
+                    std.debug.print("{s} surface ({d}, {d})\n", .{ @tagName(t), sx, sy });
+                    return err;
+                };
+                std.testing.expectEqual(want.y, @as(i32, @intFromFloat(@floor(got.y)))) catch |err| {
+                    std.debug.print("{s} surface ({d}, {d})\n", .{ @tagName(t), sx, sy });
+                    return err;
+                };
+            }
+        }
     }
 }

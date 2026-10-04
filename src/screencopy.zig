@@ -137,14 +137,14 @@ pub const Screencopy = struct {
     /// Framebuffer of the captured output. `overlay_cursor` selects the
     /// cursor-composited framebuffer (true) or the cursor-less base
     /// (false).
-    get_framebuffer: *const fn (ctx: *anyopaque, overlay_cursor: bool) ?*pixman.Framebuffer,
+    get_framebuffer: *const fn (ctx: *anyopaque, output: *Output, overlay_cursor: bool) ?*pixman.Framebuffer,
     fb_ctx: *anyopaque,
     /// Resolve a wl_output resource to the Output it belongs to; null
     /// when it is not this compositor's output.
     output_from_resource: *const fn (ctx: *anyopaque, resource: *server.wl.Output) ?*Output,
     output_ctx: *anyopaque,
     /// Wake the renderer so a deferred copy gets its next output commit.
-    request_frame: *const fn (ctx: *anyopaque) void,
+    request_frame: *const fn (ctx: *anyopaque, output: *Output) void,
     request_ctx: *anyopaque,
     /// Completed captures: incremented once per served `copy` request
     /// (pixels fully copied into the client's buffer, before the frame
@@ -181,11 +181,11 @@ pub const Screencopy = struct {
         log_cfg: *const log.Config,
         display: *display_mod.CompositorDisplay,
         shm: *shm_mod.ShmState,
-        get_framebuffer: *const fn (ctx: *anyopaque, overlay_cursor: bool) ?*pixman.Framebuffer,
+        get_framebuffer: *const fn (ctx: *anyopaque, output: *Output, overlay_cursor: bool) ?*pixman.Framebuffer,
         fb_ctx: *anyopaque,
         output_from_resource: *const fn (ctx: *anyopaque, resource: *server.wl.Output) ?*Output,
         output_ctx: *anyopaque,
-        request_frame: *const fn (ctx: *anyopaque) void,
+        request_frame: *const fn (ctx: *anyopaque, output: *Output) void,
         request_ctx: *anyopaque,
     ) error{ OutOfMemory, GlobalCreateFailed }!*Screencopy {
         const self = try allocator.create(Screencopy);
@@ -386,7 +386,7 @@ fn capture(
         failed.sendFailed();
         return;
     }
-    const src_fb = sc.get_framebuffer(sc.fb_ctx, true) orelse {
+    const src_fb = sc.get_framebuffer(sc.fb_ctx, output, true) orelse {
         // No framebuffer yet: fail the frame without killing the client.
         const failed = server.zwlr.ScreencopyFrameV1.create(cli, 1, frame_id) catch return;
         failed.sendFailed();
@@ -612,7 +612,7 @@ fn copyRequest(
     // (wlroots :440).
     state.output.events.commit.add(&state.commit_listener);
     state.output.events.destroy.add(&state.output_destroy_listener);
-    state.screencopy.request_frame(state.screencopy.request_ctx);
+    state.screencopy.request_frame(state.screencopy.request_ctx, state.output);
 }
 
 /// The client's copy destination, resolved from the wl_buffer it sent.
@@ -727,7 +727,7 @@ fn onFrameOutputCommit(listener: *wire.Listener(*CommitEvent), event: *CommitEve
         if (state.client.damage.isEmpty()) return;
     }
 
-    const src = state.screencopy.get_framebuffer(state.screencopy.fb_ctx, state.overlay_cursor) orelse {
+    const src = state.screencopy.get_framebuffer(state.screencopy.fb_ctx, state.output, state.overlay_cursor) orelse {
         frameFailed(state);
         return;
     };
@@ -1675,12 +1675,12 @@ fn commitOutputDamage(ts: *TestServer, rect: ?geom.Rect) !void {
         Output.State.committed_buffer;
     state.enabled = true;
     state.mode = .{ .width = 64, .height = 64, .refresh_msec = 16 };
-    state.buffer = @ptrCast(ts.fb.?);
+    state.buffer = .{ .cpu = ts.fb.? };
     if (rect) |r| try state.damage.add(r);
     try ts.output.?.commitState(&state);
 }
 
-fn getFramebuffer(ctx: *anyopaque, _: bool) ?*pixman.Framebuffer {
+fn getFramebuffer(ctx: *anyopaque, _: *Output, _: bool) ?*pixman.Framebuffer {
     const ts: *TestServer = @ptrCast(@alignCast(ctx));
     return ts.fb;
 }
@@ -1692,7 +1692,7 @@ fn outputFromResource(ctx: *anyopaque, resource: *server.wl.Output) ?*Output {
     return ts.output;
 }
 
-fn requestFrame(ctx: *anyopaque) void {
+fn requestFrame(ctx: *anyopaque, _: *Output) void {
     const ts: *TestServer = @ptrCast(@alignCast(ctx));
     ts.frame_requests += 1;
 }

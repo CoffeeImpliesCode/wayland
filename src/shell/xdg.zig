@@ -77,16 +77,6 @@ const log_tag = "xdg";
 /// value is the same point in world pixels.
 pub const ScreenToWorldFn = *const fn (ctx: *anyopaque, sx: i32, sy: i32) geom.FPoint;
 
-/// f64 → i32 with saturation: a camera zoomed far out maps a screen
-/// point far outside the i32 range and @intFromFloat traps on that in
-/// ReleaseSafe. Same guard the server's pick applies (main.zig:3697-3704).
-fn clampToI32(v: f64) i32 {
-    return @intFromFloat(@min(
-        @max(v, @as(f64, std.math.minInt(i32))),
-        @as(f64, std.math.maxInt(i32)),
-    ));
-}
-
 // ---------------------------------------------------------------------------
 // XdgShell: the xdg_wm_base global.
 // ---------------------------------------------------------------------------
@@ -189,12 +179,11 @@ pub const XdgShell = struct {
 
     /// The seat's screen coordinates (x, y) in world pixels. Without an
     /// installed conversion this is the identity — see the field doc.
-    pub fn worldFromScreen(self: *const XdgShell, x: i32, y: i32) geom.Point {
-        const world = if (self.screen_to_world) |f|
+    pub fn worldFromScreen(self: *const XdgShell, x: i32, y: i32) geom.FPoint {
+        return if (self.screen_to_world) |f|
             f(self.screen_to_world_ctx.?, x, y)
         else
-            geom.FPoint{ .x = @floatFromInt(x), .y = @floatFromInt(y) };
-        return .{ .x = clampToI32(world.x), .y = clampToI32(world.y) };
+            .{ .x = @floatFromInt(x), .y = @floatFromInt(y) };
     }
 
     pub fn deinit(self: *XdgShell) void {
@@ -1441,7 +1430,7 @@ pub const XdgPopup = struct {
     /// forwards. (0,0) until the first sync, which leaves the
     /// conversion a no-op: a popup the scene has not placed yet is
     /// treated as sitting at the scene's top-left.
-    origin: geom.Point = .{ .x = 0, .y = 0 },
+    origin: geom.FPoint = .{ .x = 0, .y = 0 },
     /// The xdg_surface this popup is attached to (null = layer-shell parent).
     parent: ?*XdgSurface = null,
     /// The layer surface this popup is attached to when the parent is a
@@ -1506,7 +1495,7 @@ pub const XdgPopup = struct {
     /// (wayland.xml:2224-2232) — the two spaces differ by the camera,
     /// which the popup grab converts through before subtracting
     /// (see localPointFromScreen).
-    pub fn setPopupOrigin(popup: *XdgPopup, x: i32, y: i32) void {
+    pub fn setPopupOrigin(popup: *XdgPopup, x: f64, y: f64) void {
         popup.origin = .{ .x = x, .y = y };
     }
 
@@ -1514,12 +1503,12 @@ pub const XdgPopup = struct {
     /// origin plus the configured size. `geometry.x/y` are parent-
     /// relative and are NOT added here — the origin already absorbs
     /// the parent's own scene position.
-    fn absoluteRect(popup: *const XdgPopup) geom.Rect {
+    fn absoluteRect(popup: *const XdgPopup) geom.FRect {
         return .{
             .x = popup.origin.x,
             .y = popup.origin.y,
-            .width = popup.geometry.width,
-            .height = popup.geometry.height,
+            .width = @floatFromInt(popup.geometry.width),
+            .height = @floatFromInt(popup.geometry.height),
         };
     }
 
@@ -1538,7 +1527,7 @@ pub const XdgPopup = struct {
     /// popup still has a well-defined surface-local position, and the
     /// protocol carries it as such (wayland.xml:2206-2209, the enter
     /// event's "surface-local x coordinate").
-    fn localPointFromScreen(popup: *const XdgPopup, x: i32, y: i32) geom.Point {
+    fn localPointFromScreen(popup: *const XdgPopup, x: i32, y: i32) geom.FPoint {
         const world = popup.xdg_surface.shell.worldFromScreen(x, y);
         return .{ .x = world.x - popup.origin.x, .y = world.y - popup.origin.y };
     }
@@ -1829,8 +1818,8 @@ fn popupGrabMotion(seat: *seat_mod.Seat, grab: *const seat_mod.PointerGrab, x: i
     const popup = g.popup;
     const wl_client = popup.resource.getClient();
     const local = popup.localPointFromScreen(x, y);
-    const fx = wire.wl.Fixed.fromInt(@intCast(local.x));
-    const fy = wire.wl.Fixed.fromInt(@intCast(local.y));
+    const fx = wire.wl.Fixed.fromDouble(local.x);
+    const fy = wire.wl.Fixed.fromDouble(local.y);
     if (!g.pointer_entered) {
         g.pointer_entered = true;
         const serial = seat.serialFor(wl_client);
@@ -2576,12 +2565,41 @@ fn positionerDestroy(pos_res: *server.xdg.Positioner, state: *PositionerState) v
 // The "xdg_surface" wl_surface role implementation.
 // ---------------------------------------------------------------------------
 
-/// Recover the XdgSurface from the wl_surface in a role hook. The hooks only
-/// fire while the surface's role is ours, so role_resource is the xdg_surface
-/// wire resource and its user data is our XdgSurface.
+/// Recover the XdgSurface from the wl_surface in a role hook, or null
+/// when the surface carries no xdg_surface role.
+///
+/// The ROLE CHECK is load-bearing wherever the surface did not acquire
+/// the role through us: `role_resource` is whatever wire resource
+/// granted the surface its CURRENT role, so a layer surface's, a lock
+/// surface's or a wl_subsurface's resource would be read as an
+/// `*XdgSurface` and its user data dereferenced as one. Only the role
+/// hooks are guaranteed to run with our own resource, and they are the
+/// callers below the accessors.
 fn xdgFromSurface(surface: *surface_mod.Surface) ?*XdgSurface {
+    if (surface.role != &xdg_surface_role) return null;
     const role_resource = surface.role_resource orelse return null;
-    return @ptrCast(@alignCast(role_resource.getUserData()));
+    return @ptrCast(@alignCast(role_resource.getUserData() orelse return null));
+}
+
+/// The wl_surface an xdg_popup `surface` is parented to — the xdg_surface
+/// it was created from, or the layer surface it was attached to with
+/// zwlr_layer_shell_v1's get_popup — or null when `surface` carries no
+/// xdg_popup role (a plain surface, or an xdg_toplevel, or an xdg_surface
+/// whose role object is already gone).
+///
+/// This is the ROLE-PARENT link a compositor policy needs: whether a
+/// surface is composited WITH its parent (a popup of an output-local
+/// overlay inherits that overlay's placement, and must never be treated
+/// as ordinary world content) cannot be answered from the surface alone.
+/// It is CONSTANT TIME — the xdg_surface is the user data of the wire
+/// resource the surface's role was assigned with, and the popup hangs off
+/// that object — so a compositor can walk a whole chain per surface per
+/// frame without a registry scan.
+pub fn parentSurfaceOf(surface: *surface_mod.Surface) ?*surface_mod.Surface {
+    const xdg = xdgFromSurface(surface) orelse return null;
+    const popup = xdg.popup orelse return null;
+    if (popup.parent) |p| return p.surface;
+    return popup.layer_parent;
 }
 
 /// Runs after the pending state has been applied, on every commit. Performs
@@ -5406,6 +5424,23 @@ test "popup grab converts seat coordinates to surface-local ones (X04b)" {
 fn testCameraScreenToWorld(ctx: *anyopaque, sx: i32, sy: i32) geom.FPoint {
     const cam: *const camera_mod.Camera = @ptrCast(@alignCast(ctx));
     return cam.screenToWorld(@floatFromInt(sx), @floatFromInt(sy));
+}
+
+test "screen to world conversion preserves distant fractional positions" {
+    const ts = try TestServer.init(std.testing.allocator);
+    defer ts.deinit();
+    var camera: camera_mod.Camera = .{
+        .center_x = 1099511627776.25,
+        .center_y = -1099511627776.5,
+        .zoom = 4,
+        .rotation = 0,
+        .screen_w = 800,
+        .screen_h = 600,
+    };
+    ts.shell.?.setScreenToWorld(testCameraScreenToWorld, &camera);
+    const point = ts.shell.?.worldFromScreen(401, 302);
+    try std.testing.expectEqual(@as(f64, 1099511627776.5), point.x);
+    try std.testing.expectEqual(@as(f64, -1099511627776.0), point.y);
 }
 
 /// The output pixel at which `cam` renders the world point (wx, wy) —

@@ -10,10 +10,10 @@
 //!      reason libseat exists at all: libseat opens a logind session and
 //!      takes the device on it (libseat/session.c session_logind_create ->
 //!      sd_login_open_session + sd_login_take_device).
-//!   2. A **VT switch** to a virtual terminal this process controls,
-//!      acknowledged by the DRM driver, and restored on shutdown
-//!      (libseat session-vt.c session_vt_activate, session_vt_wait_for_ack,
-//!      session_vt_restore).
+//!   2. A **VT switch**: VT_ACTIVATE on a console descriptor this module
+//!      owns, a bounded confirmation read back from the console itself, and
+//!      an exact restore of the VT the console was on when the session
+//!      opened.
 //!   3. A **udev monitor** on the `drm` subsystem, so a connector arriving
 //!      or leaving drives the same enumeration the initial modeset used
 //!      (wlroots backend/drm/backend.c udev_handle DRM_ADD / DRM_REMOVE /
@@ -75,27 +75,40 @@
 //!   - no /dev/tty0 -> there is no console to switch: activateVt answers
 //!     error.NoConsole, the session keeps the VT it already had, and the
 //!     backend proceeds.
-//!   - a VT_ACTIVATE that is never acknowledged -> error.AckTimeout AFTER
-//!     the console has been put back; the backend proceeds.
+//!   - a VT_ACTIVATE the console refuses, or a switch the console never
+//!     reports as active -> error.ActivateFailed / error.SwitchUnconfirmed.
+//!     The backend proceeds on the VT it already has, and the session claims
+//!     NO console: `console_vt` stays 0, so no later log or decision can
+//!     report an activated session that was never confirmed.
 //! The only outcome the backend must treat as "do not take the card" is
 //! `Plan.blocked` from `planAcquire` - and even that is reported, not
 //! fatal, because the alternative (a compositor that refuses to start
 //! because somebody else's session is on the seat) is worse.
 //!
-//! # Kernel uapi spoken here, cited
-//!   VT_ACTIVATE, VT_ACK, VT_RELDISP      uapi/linux/vt.h
-//!   struct vt_event                     uapi/linux/vt.h
-//!   the VT ack on a DRM fd             drm_fops.c drm_handle_vt_event: the
-//!                                      DRM core registers a console
-//!                                      notifier per open card and queues a
-//!                                      `struct vt_event` to the client,
-//!                                      which is the read libseat's
-//!                                      session_vt_wait_for_ack() performs.
+//! # Kernel UAPI spoken here, cited
+//! Pinned against linux-headers 6.18.7 (include/linux/vt.h) and the kernel
+//! sources at tag v6.18 (drivers/tty/vt/vt_ioctl.c):
+//!   VT_ACTIVATE   0x5606  "make vt active"      case VT_ACTIVATE: set_console(arg)
+//!   VT_GETSTATE   0x5603  "get global vt state" case VT_GETSTATE: v_active = fg_console + 1
+//!   VT_WAITACTIVE 0x5607  "wait for vt active"  vt_waitactive(): blocks, no timeout
+//!   VT_RELDISP    0x5605  "release display"     completes a switch a VT_PROCESS VT postponed
+//!   VT_WAITEVENT  0x560E  "wait for an event"   vt_event_wait_ioctl(): blocks, no timeout
+//!   struct vt_stat { __u16 v_active; __u16 v_signal; __u16 v_state; }
+//!   MIN_NR_CONSOLES 1, MAX_NR_CONSOLES 63
+//!
+//! ## What a card fd does NOT carry
+//! The DRM core's read path (drm_file.c drm_read) delivers DRM events -
+//! vblank and page-flip completions, plus whatever a driver queues - and
+//! reads them "like a pipe" (`@offset is ignored`). Console state is not one
+//! of them, and the UAPI has no VT_ACK at all: `struct vt_event` is the
+//! console's OWN event structure for VT_WAITEVENT, delivered by the console
+//! driver. So every VT question here is asked of the console descriptor and
+//! never by reading the card fd.
 //!
 //! # Imports
 //! utils/log.zig and std only. This module deliberately does NOT import the
 //! DRM shim, so it stays compilable (and testable) on its own: the DRM
-//! backend passes in the card minor and the fd whose VT_ACK to wait for.
+//! backend passes in the card minor and the VT it wants to hold.
 
 const std = @import("std");
 const log_mod = @import("../utils/log.zig");
@@ -124,15 +137,18 @@ pub const Error = error{
 };
 
 /// Why the VT half of the session failed. All three are non-fatal: the
-/// session runs on the console VT it found, with the old VT restored.
+/// session keeps running, and the console is put back on the VT it was
+/// found on by `restoreVt`.
 pub const VtError = error{
     /// /dev/tty0 could not be opened: there is no VT to switch to.
     NoConsole,
     /// VT_ACTIVATE was refused by the console driver.
     ActivateFailed,
-    /// The DRM driver never acknowledged the switch (or something else was
-    /// on the fd, so the ack could not be read).
-    AckTimeout,
+    /// The console never reported the target VT as active inside the
+    /// confirmation budget. VT_ACTIVATE had already returned by then, so
+    /// this is NOT proof that the console stayed where it was - only that
+    /// this session will not claim it.
+    SwitchUnconfirmed,
 };
 
 /// Why the udev monitor could not be brought up. Non-fatal: the initial
@@ -146,44 +162,59 @@ pub const HotplugError = error{
 };
 
 // ---------------------------------------------------------------------------
-// VT constants and the console fd
+// The Linux VT console UAPI, and the console descriptor it is spoken on
 // ---------------------------------------------------------------------------
 
-/// `VT_ACTIVATE` - make this VT the active one (uapi/linux/vt.h: "Set the
-/// virtual terminal to be the active one"). The VT number is the ioctl's
-/// unsigned long argument, exactly as libseat passes it.
-const vt_activate: u32 = 0x5603;
-/// `VT_RELDISP` - "the console is being redrawn"; the notification that
-/// precedes VT_ACK during a switch (uapi/linux/vt.h: "#define VT_RELDISP 3").
-const vt_reldisp: c_int = 3;
-/// `VT_ACK` - "the VT has been switched" (uapi/linux/vt.h:
-/// "#define VT_ACK 4"). The `count` a struct vt_event carries when the
-/// driver has finished.
-const vt_ack: c_int = 4;
+/// `VT_ACTIVATE` - "make vt active" (uapi/linux/vt.h: "#define VT_ACTIVATE
+/// 0x5606 /* make vt active */"). The VT number is the ioctl's unsigned long
+/// argument, 1-based: 2 is tty2. The kernel refuses 0, and anything past
+/// MAX_NR_CONSOLES, with -ENXIO (drivers/tty/vt/vt_ioctl.c, case VT_ACTIVATE:
+/// `if (arg == 0 || arg > MAX_NR_CONSOLES) return -ENXIO`).
+const vt_activate: u32 = 0x5606;
 
-/// `struct vt_event` (uapi/linux/vt.h):
-///     struct vt_event { int count; int sigio; };
-/// Eight bytes, no padding.
-const VtEvent = extern struct {
-    count: c_int,
-    sigio: c_int,
+/// `VT_GETSTATE` - "get global vt state info" (uapi/linux/vt.h: "#define
+/// VT_GETSTATE 0x5603 /* get global vt state info */"). The console's answer
+/// is `v_active`, which the kernel fills with `fg_console + 1`: the VT the
+/// machine is showing RIGHT NOW, in the same 1-based numbering VT_ACTIVATE
+/// takes (vt_ioctl.c, case VT_GETSTATE: `put_user(fg_console + 1,
+/// &vtstat->v_active)`). It answers immediately and asks for no capability,
+/// which is what makes it the one VT query a blocking code path may make.
+const vt_getstate: u32 = 0x5603;
+
+/// `struct vt_stat` (uapi/linux/vt.h):
+///     struct vt_stat { __u16 v_active; __u16 v_signal; __u16 v_state; };
+/// Six bytes, no padding. The kernel writes `v_active` and `v_state` only -
+/// two separate put_user calls in case VT_GETSTATE - and never touches
+/// `v_signal`, so this struct is zeroed before every ioctl and only
+/// `v_active` is read back.
+const VtStat = extern struct {
+    v_active: u16,
+    v_signal: u16,
+    v_state: u16,
 };
 
 /// `/dev/tty0` - the "current foreground VT" alias every VT-aware program
-/// opens (fs/console.c registers tty0 for exactly that).
+/// opens (fs/console.c registers tty0 for exactly that). Root-only on a
+/// hardened host, which is why its absence is a non-fatal case here rather
+/// than a startup failure.
 const console_node = "/dev/tty0";
 /// Where the kernel publishes the active VT number (drivers/tty/vt.c
 /// registers the `active` attribute on tty0).
 const active_vt_sysfs = "/sys/class/tty/tty0/active";
-/// How long to wait for a VT_ACK before giving up (ms). A real ack lands in
-/// well under a millisecond; the timeout exists so a driver that never
-/// answers cannot wedge start().
-const vt_ack_timeout_ms: i32 = 1000;
-/// How many vt_events one switch may consume before the ack is declared
-/// lost. A switch produces VT_RELDISP then VT_ACK, and a second VT_ACK when
-/// logind activates the session, so a handful is normal; the bound stops a
-/// driver that streams events from spinning start().
-const max_vt_events: usize = 8;
+
+/// How long one VT switch may take to become CONFIRMED (ms), measured on the
+/// monotonic clock. VT_ACTIVATE is not proof of a switch: a VT under process
+/// control postpones it until that process calls VT_RELDISP (vt_ioctl.c,
+/// case VT_RELDISP: "if a vt is under process control, the kernel will not
+/// switch to it immediately"), and a console with VT_LOCKSWITCH set never
+/// switches at all. A second is long enough for a postponed switch that is
+/// going to happen and short enough that neither start() nor a resume can be
+/// wedged by one that is not.
+const vt_confirm_budget_ms: i64 = 1000;
+/// Gap between two VT_GETSTATE confirmations (ms). Small enough that a
+/// confirmed switch is reported at once, large enough that confirming one is
+/// not a spin.
+const vt_confirm_interval_ms: i64 = 5;
 
 // ---------------------------------------------------------------------------
 // Pure decision logic - no fds, no logind, unit-testable on any machine
@@ -255,9 +286,9 @@ pub const Plan = struct {
     /// Create a logind session, mark it ours (Type=wayland, TTY=ttyN), take
     /// the DRM device on it, and watch PrepareForSleep.
     open_session: bool = false,
-    /// VT_ACTIVATE the target VT and wait for the DRM driver's VT_ACK
-    /// before taking DRM master. False when there is no VT to switch to, and
-    /// false when there is no VT to switch BACK from (planVtSwitch).
+    /// VT_ACTIVATE the target VT and confirm it ON THE CONSOLE before taking
+    /// DRM master. False when there is no VT to switch to, and false when
+    /// there is no VT to switch BACK from (planVtSwitch).
     switch_vt: bool = false,
     /// Do not touch the card: logind says this seat will not host us.
     /// Reported, not fatal to the process.
@@ -361,41 +392,26 @@ pub fn planVtSwitch(seat: Seat, target: u16, previous: u16) bool {
     return needsVtSwitch(previous, target);
 }
 
-/// Which VT switch is being done. There are exactly two call sites and they
-/// differ in exactly one thing - whether the DRM fd may be read from - so
-/// they are named rather than merged.
-pub const SwitchMode = enum {
-    /// The first takeover, from `Session.open`, before any commit.
-    startup,
-    /// Re-activation from `reacquire`, after the machine woke up: long
-    /// after the first page flip was queued. Not spelled `resume`, which is
-    /// a Zig keyword.
-    wakeup,
-};
-
-/// Must a VT switch in `mode` wait for the driver's VT_ACK on the DRM fd?
+/// The VT the console must be handed back to when the session ends, or 0 to
+/// leave the console exactly where it is.
 ///
-/// Only the startup switch may. `waitVtAck` reads that fd RAW, and the DRM
-/// core queues every event of an open card - page-flip completions and
-/// `struct vt_event` alike - onto ONE queue per `drm_file` behind ONE read
-/// offset (drm_fops.c drm_queue_event / drm_handle_event; the queue is
-/// `struct drm_file_priv`'s `event_list`, drained by drm_read). Before the
-/// first flip the VT event is the only thing the fd can produce, which is
-/// the window libseat takes for the same reason (libseat session-vt.c
-/// session_vt_wait_for_ack). After it, the same raw read either never
-/// produces a VT event or stops between two records and leaves the backend's
-/// own drmHandleEvent drain (drm.zig dispatch) mid-event.
+/// One decision, from the two numbers the session recorded, because the
+/// switch and the restore must not read the VT from different sources - a
+/// restore that picked its own target could put the console somewhere the
+/// user cannot log into. Three vetoes, all load-bearing:
 ///
-/// So the resume switch does not wait. It does not have to: VT_ACTIVATE is
-/// synchronous - the kernel has already moved the console when the ioctl
-/// returns (drivers/tty/vt.c do_activate_vt) - and logind activates the
-/// session that owns the VT from the kernel's own `SWITCH=1` uevent
-/// (vt_switch -> kobject_uevent_env, consumed by src/login/logind-seat.c
-/// seat_active_session_changed), which `switchVt` also asks for directly.
-/// A switch nobody acked is cosmetic; a flip event eaten by the ack wait is
-/// a stuck output.
-pub fn waitsForVtAck(mode: SwitchMode) bool {
-    return mode == .startup;
+///   1. `previous == 0`: nothing anywhere named the VT the console was on
+///      (planVtSwitch refuses the switch for the same reason), so there is
+///      nowhere to put it back.
+///   2. `target == 0`: no VT was ever requested - a daemon, a pty - so none
+///      may be given back; activating `previous` would itself be a console
+///      switch nobody asked for.
+///   3. `target == previous`: the console already is where it has to end up,
+///      and re-activating it only produces a redisplay.
+pub fn restoreTargetVt(target: u16, previous: u16) u16 {
+    if (target == 0 or previous == 0) return 0;
+    if (target == previous) return 0;
+    return previous;
 }
 
 /// Where the compositor is in the suspend/resume handshake with logind.
@@ -429,8 +445,8 @@ pub const SleepWork = struct {
     /// opener, and a suspend that lost the master comes back with the
     /// console sitting on top of our output.
     drop_master: bool = false,
-    /// Take the device back, re-activate the VT and wait for its ack, then
-    /// re-acquire DRM master and re-arm the flip pipeline.
+    /// Take the device back, re-activate the VT and confirm it on the
+    /// console, then re-acquire DRM master and re-arm the flip pipeline.
     reacquire: bool = false,
 };
 
@@ -832,11 +848,6 @@ pub const Options = struct {
     /// Manager.TakeDevice/ReleaseDevice so logind knows which device this
     /// session holds, and keeps the console's session off it.
     drm_minor: u32 = 0,
-    /// The DRM fd. A VT switch is acknowledged by a `struct vt_event`
-    /// carrying VT_ACK on this fd, because the DRM core registers a console
-    /// notifier for every open card (drm_fops.c drm_handle_vt_event).
-    /// -1 with `target_vt` == 0 is the normal VM case.
-    vt_ack_fd: std.posix.fd_t = -1,
     /// VT to hand the console to. 0 means "decide": WAYLAND_VT, else the VT
     /// of this process's controlling terminal, else no switch at all.
     target_vt: u16 = 0,
@@ -886,8 +897,13 @@ pub const Session = struct {
     /// /dev/tty0 for VT_ACTIVATE. Holds at most one descriptor for the life
     /// of the session, whoever asks.
     console: Console = .{},
-    /// The DRM fd a VT_ACK arrives on; -1 disables the ack wait.
-    ack_fd: std.posix.fd_t = -1,
+    /// The VT the console is CONFIRMED on, 0 when this session never
+    /// confirmed one. Only `switchVt` and `restoreVt` write it, and only
+    /// after VT_GETSTATE answered with this VT - so every log that talks
+    /// about the console reads this instead of `target_vt`, and a switch
+    /// that was never confirmed cannot be reported as an activated
+    /// session.
+    console_vt: u16 = 0,
 
     /// Every heap string this session owns, in allocation order. Each is
     /// `[:0]const u8` because every one of them is handed to libsystemd or
@@ -1001,32 +1017,44 @@ pub const Session = struct {
 
     /// Put the console back on the VT it was on when the session opened.
     ///
-    /// Called from `close`, and safe to call twice. Best-effort by design:
-    /// a console left on the wrong VT locks the user out of their machine,
-    /// so a failure is logged as an error - but it is never allowed to stop
-    /// the rest of the teardown (device release, session termination, bus
-    /// close), which would leave the seat worse off than before.
-    pub fn restoreVt(self: *Session) void {
-        defer self.console.close();
+    /// Run once per session, from `release` (which `close` runs), and before
+    /// the console descriptor is closed. Best-effort by design: a console
+    /// left on the wrong VT locks the user out of their machine, so a
+    /// failure - a refused ioctl, or a restore the console never confirms -
+    /// is logged as an error, but it is never allowed to stop the rest of
+    /// the teardown (device release, session termination, bus close), which
+    /// would leave the seat worse off than before.
+    fn restoreVt(self: *Session) void {
+        const back_to = restoreTargetVt(self.target_vt, self.previous_vt);
+        if (back_to == 0) return;
         if (self.console.fd < 0) return;
-        if (self.previous_vt == 0) return;
-        if (self.target_vt == 0 or self.target_vt == self.previous_vt) return;
-        activateVt(self, self.previous_vt) catch {
+        activateVt(self, back_to) catch {
             log_mod.err(
                 "drm: could not put the console back on tty{d}; switch to it by hand",
                 self.io,
                 self.log_cfg,
                 "drm",
-                .{self.previous_vt},
+                .{back_to},
             );
             return;
         };
+        confirmVtActive(self, back_to) catch |err| {
+            log_mod.err(
+                "drm: console did not report tty{d} after the restore ({s}); switch to it by hand",
+                self.io,
+                self.log_cfg,
+                "drm",
+                .{ back_to, @errorName(err) },
+            );
+            return;
+        };
+        self.console_vt = back_to;
         log_mod.info(
             "drm: console restored to tty{d}",
             self.io,
             self.log_cfg,
             "drm",
-            .{self.previous_vt},
+            .{back_to},
         );
     }
 
@@ -1054,6 +1082,9 @@ pub const Session = struct {
             // Even a lost bus must not cost the user their console.
             self.restoreVt();
         }
+        // The console descriptor is the session's alone for its whole life -
+        // every resume reuses it - so it is closed here, exactly once.
+        self.console.close();
         for (self.owned.items) |s| self.allocator.free(s[0 .. s.len + 1]);
         self.owned.deinit(self.allocator);
         self.own_session_id = "";
@@ -1085,7 +1116,6 @@ pub const Session = struct {
             .on_sleep = opts.on_sleep,
             .ctx = opts.ctx,
             .drm_minor = opts.drm_minor,
-            .ack_fd = opts.vt_ack_fd,
         };
         // One teardown for every failure below; it runs before
         // allocator.destroy because errdefers unwind in reverse.
@@ -1145,9 +1175,11 @@ pub const Session = struct {
         self.takeDevice();
         openConsole(self);
 
-        // Only now is it safe to move the console: the session owns the VT,
-        // logind knows about it, and any failure leaves the console exactly
-        // where it was (restoreVt runs from the errdefer).
+        // The console may be moved only now: the session owns the VT and
+        // logind knows about it, and every exit path from here hands the
+        // console back to the VT it was found on (release -> restoreVt) -
+        // including a switch the console never confirmed, which is why that
+        // one claims nothing at all.
         //
         // The VT to move it BACK to came from the same read as the plan's,
         // so the switch and the restore cannot disagree about where the
@@ -1170,7 +1202,10 @@ pub const Session = struct {
             );
         }
         if (self.plan.switch_vt) {
-            self.switchVt(.startup) catch |err| {
+            self.switchVt() catch |err| {
+                // Not fatal, and not a switch that did not happen either:
+                // `console_vt` is still 0, so nothing below claims a console
+                // this session never saw the machine put on.
                 log_mod.warn(
                     "drm: VT switch to tty{d} failed ({s}); continuing on the current VT",
                     io,
@@ -1181,15 +1216,20 @@ pub const Session = struct {
             };
         }
         self.phase = .running;
+        var vt_buf: [16]u8 = undefined;
+        const console_state: []const u8 = if (self.console_vt != 0)
+            std.fmt.bufPrint(&vt_buf, "tty{d}", .{self.console_vt}) catch "tty?"
+        else
+            "none";
         log_mod.info(
-            "drm: logind session {s} on {s} (vt={d}, device={s})",
+            "drm: logind session {s} on {s} (console={s}, device={s})",
             io,
             log_cfg,
             "drm",
             .{
                 self.own_session_id,
                 self.seat.name,
-                self.target_vt,
+                console_state,
                 if (self.device_taken) "taken" else "not taken",
             },
         );
@@ -1488,7 +1528,7 @@ pub const Session = struct {
         // would take a VT it cannot hand back.
         if (self.previous_vt == 0) return;
         openConsole(self);
-        self.switchVt(.wakeup) catch |err| {
+        self.switchVt() catch |err| {
             log_mod.warn(
                 "drm: could not re-activate tty{d} after resume ({s})",
                 self.io,
@@ -1499,16 +1539,25 @@ pub const Session = struct {
         };
     }
 
-    /// VT_ACTIVATE the target VT, wait for the DRM driver's VT_ACK, then ask
+    /// VT_ACTIVATE our VT, confirm the console is really on it, then ask
     /// logind to make this session the seat's active one.
     ///
-    /// Whether the ack is waited for at all is `mode`'s decision, and it is
-    /// the only thing the two call sites differ in: `waitsForVtAck` says
-    /// why a raw read on the DRM fd is sound during start() and unsound
-    /// during a resume.
-    fn switchVt(self: *Session, mode: SwitchMode) VtError!void {
+    /// Nothing on this path reads the card fd: the DRM core's read path
+    /// carries DRM events, never console state (see the module header).
+    fn switchVt(self: *Session) VtError!void {
+        // Any claim this session held on the console is dropped first. From
+        // here the console is either confirmed on `target_vt` or not ours,
+        // and a switch that fails must not leave the previous claim
+        // standing - after a resume in particular the console may have been
+        // taken by somebody else while we slept.
+        self.console_vt = 0;
         try activateVt(self, self.target_vt);
-        if (waitsForVtAck(mode)) try waitVtAck(self);
+        // VT_ACTIVATE returning is not proof that the console moved: a VT
+        // under process control postpones the switch until that process
+        // calls VT_RELDISP (vt_ioctl.c, case VT_RELDISP). The console's own
+        // answer is VT_GETSTATE, and it answers immediately.
+        try confirmVtActive(self, self.target_vt);
+        self.console_vt = self.target_vt;
         // logind's own activation of the session that now owns the VT is a
         // separate, asynchronous step. Asking for it explicitly makes the
         // takeover deterministic instead of waiting for the seat uevent the
@@ -1614,61 +1663,99 @@ fn activateVt(self: *Session, vt: u16) VtError!void {
     }
 }
 
-/// Read the console's VT notifications until VT_ACK.
+/// Does a `VT_GETSTATE` answer of `v_active` confirm that VT `target` is now
+/// the console the machine is showing?
 ///
-/// VT_RELDISP arrives first ("the console is being redrawn") and VT_ACK
-/// after it means the new VT is really live (uapi/linux/vt.h: "#define
-/// VT_ACK 4" is sent when the VT switch has completed). The loop accepts at
-/// most `max_vt_events` notifications and then gives up, so a driver that
-/// never acknowledges cannot wedge start().
+/// The kernel fills `v_active` with `fg_console + 1` (vt_ioctl.c, case
+/// VT_GETSTATE), the same 1-based numbering VT_ACTIVATE takes, so the
+/// comparison is exact. 0 is what a zeroed struct answers before the ioctl
+/// has written anything, and 0 is not a VT: it must never be read as "the
+/// console is on some VT we do not recognize, which is close enough".
+pub fn confirmsSwitch(v_active: u16, target: u16) bool {
+    return target != 0 and v_active == target;
+}
+
+/// `VT_GETSTATE`'s answer: the VT the console is showing right now, or null
+/// when the console would not say.
 ///
-/// This reads the ack fd RAW, which is only sound before the first page
-/// flip: `waitsForVtAck` is where that is decided, and it is why a resume
-/// never reaches this function.
-fn waitVtAck(self: *Session) VtError!void {
-    if (self.ack_fd < 0) return;
-    var fds = [_]std.posix.pollfd{.{
-        .fd = self.ack_fd,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    var seen: usize = 0;
-    while (seen < max_vt_events) : (seen += 1) {
-        fds[0].revents = 0;
-        const ready = std.posix.poll(&fds, vt_ack_timeout_ms) catch return error.AckTimeout;
-        if (ready == 0) return error.AckTimeout;
-        // SAFETY: `ev` is fully written by std.posix.read before use; the
-        // struct is two c_int with no padding, so a full read fills it.
-        var ev: VtEvent = undefined;
-        const n = std.posix.read(self.ack_fd, std.mem.asBytes(&ev)) catch return error.AckTimeout;
-        if (n != @sizeOf(VtEvent)) return error.AckTimeout;
-        if (ev.count == vt_ack) {
+/// `struct vt_stat` is zeroed first, because the kernel writes `v_active`
+/// and `v_state` only (two put_user calls in case VT_GETSTATE) and leaves
+/// `v_signal` untouched.
+fn consoleActiveVt(self: *Session) ?u16 {
+    var stat: VtStat = .{ .v_active = 0, .v_signal = 0, .v_state = 0 };
+    const rc = std.os.linux.ioctl(self.console.fd, vt_getstate, @intFromPtr(&stat));
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => return stat.v_active,
+        else => |err| {
             log_mod.debug(
-                "drm: VT_ACK after {d} console event(s)",
+                "drm: VT_GETSTATE on the console failed ({s})",
                 self.io,
                 self.log_cfg,
                 "drm",
-                .{seen + 1},
+                .{@tagName(err)},
             );
-            return;
-        }
-        if (ev.count != vt_reldisp) {
-            // Not a console notification: something else is queued on this
-            // fd. Stop rather than consume more of it.
-            return error.AckTimeout;
-        }
+            return null;
+        },
     }
-    return error.AckTimeout;
 }
 
-/// The /dev/tty0 descriptor the VT_ACTIVATE ioctls go through.
+/// Confirm that the console is on `vt` by asking the console, for at most
+/// `vt_confirm_budget_ms` of monotonic time.
 ///
-/// At most one, for the life of the session, whoever asks: `reacquire` runs
-/// on every resume and the only closer is `restoreVt`, which closes one
-/// descriptor. An open that did not check first leaked a /dev/tty0 per
-/// suspend/resume cycle until RLIMIT_NOFILE ran out, and from then on the
-/// open failed, `activateVt` answered error.NoConsole and VT re-activation
-/// stopped working - the precise outcome `reacquire` is written to avoid.
+/// `VT_WAITACTIVE` (0x5607) and `VT_WAITEVENT` (0x560E) answer the same
+/// question exactly - vt_ioctl.c implements both over `vt_event_wait()`,
+/// which blocks in `wait_event_interruptible` with no timeout - so a console
+/// with VT_LOCKSWITCH set, or a VT whose holder never calls VT_RELDISP, would
+/// block here forever. VT_GETSTATE never blocks and wants no capability, so
+/// the answer is polled against a monotonic deadline with `io`'s own sleep in
+/// between: no extra descriptor, no thread, no unbounded wait, and nothing
+/// that depends on another component having drained anything first.
+///
+/// error.SwitchUnconfirmed means "the console did not report `vt` in time",
+/// never "the console did not move": VT_ACTIVATE already returned by the
+/// time this runs, and the caller must not claim the opposite.
+fn confirmVtActive(self: *Session, vt: u16) VtError!void {
+    if (self.console.fd < 0) return error.NoConsole;
+    const deadline_ms = std.Io.Clock.now(.awake, self.io.*).toMilliseconds() + vt_confirm_budget_ms;
+    while (true) {
+        if (consoleActiveVt(self)) |active| {
+            if (confirmsSwitch(active, vt)) {
+                log_mod.debug(
+                    "drm: console reports tty{d} active",
+                    self.io,
+                    self.log_cfg,
+                    "drm",
+                    .{vt},
+                );
+                return;
+            }
+        }
+        if (std.Io.Clock.now(.awake, self.io.*).toMilliseconds() >= deadline_ms) {
+            log_mod.warn(
+                "drm: console still on tty{d} {d}ms after VT_ACTIVATE tty{d}; the switch is unconfirmed",
+                self.io,
+                self.log_cfg,
+                "drm",
+                .{ consoleActiveVt(self) orelse 0, vt_confirm_budget_ms, vt },
+            );
+            return error.SwitchUnconfirmed;
+        }
+        std.Io.sleep(self.io.*, .fromMilliseconds(vt_confirm_interval_ms), .awake) catch {
+            return error.SwitchUnconfirmed;
+        };
+    }
+}
+
+/// The one /dev/tty0 descriptor every VT_ACTIVATE and VT_GETSTATE ioctl in
+/// this file goes through.
+///
+/// At most one, for the whole life of the session, whoever asks:
+/// `reacquire` runs on every resume, and the only closer is `release`, which
+/// closes exactly one descriptor. An open that did not check first leaked a
+/// /dev/tty0 per suspend/resume cycle until RLIMIT_NOFILE ran out, and from
+/// then on the open failed, `activateVt` answered error.NoConsole and VT
+/// re-activation stopped working - the precise outcome `reacquire` is
+/// written to avoid.
 const Console = struct {
     /// -1 when there is no console to talk to.
     fd: std.posix.fd_t = -1,
@@ -1696,9 +1783,10 @@ const Console = struct {
     }
 };
 
-/// Open /dev/tty0 for VT_ACTIVATE. Best-effort: a machine with no VT (a
-/// container, a kernel built without virtual terminals) simply does not get
-/// a switch, and says so whenever it finds none.
+/// Open /dev/tty0 for the VT_ACTIVATE and VT_GETSTATE ioctls. Best-effort: a
+/// machine with no VT (a container, a kernel built without virtual
+/// terminals) - or one whose /dev/tty0 this process may not open - simply
+/// does not get a switch, and says so whenever it finds none.
 fn openConsole(self: *Session) void {
     // Already open (the common case on a resume): nothing to do, and no
     // second descriptor to leak.
@@ -2172,19 +2260,31 @@ test "the VT the session holds is the one its plan was made from" {
     try testing.expectEqual(Reason.no_session_manager, vm.plan.reason);
 }
 
-test "only the startup switch waits for the VT ack" {
-    // start() runs before the first commit, so the DRM fd can only produce
-    // the console's VT event (drm_fops.c queues one event list per drm_file,
-    // and no flip has been committed yet). The ack is worth reading.
-    try testing.expect(waitsForVtAck(.startup));
+test "a VT_GETSTATE answer confirms a switch only for the console's own VT" {
+    // v_active is fg_console + 1, the same 1-based numbering VT_ACTIVATE
+    // takes, so the console reporting our VT is the confirmation - and it
+    // is the ONLY VT that can confirm this switch.
+    try testing.expect(confirmsSwitch(2, 2));
+    try testing.expect(!confirmsSwitch(1, 2));
+    // A zeroed struct - the answer to an ioctl that wrote nothing - confirms
+    // nothing, and in particular must not confirm a target of 0: VT_ACTIVATE
+    // refuses 0 with -ENXIO, so no switch can ever end there.
+    try testing.expect(!confirmsSwitch(0, 0));
+    try testing.expect(!confirmsSwitch(0, 2));
+}
 
-    // A resume runs long after the first flip was queued: the same fd also
-    // carries page-flip completions behind the same read offset, so the raw
-    // read would either never see the VT event or stop between records and
-    // break the backend's own drmHandleEvent drain. VT_ACTIVATE is
-    // synchronous and logind re-activates the VT from the kernel's uevent,
-    // so nothing is waited for.
-    try testing.expect(!waitsForVtAck(.wakeup));
+test "the console is handed back only to a VT it was actually taken from" {
+    // Taken from tty1 for tty2: tty1 is where it goes back, exactly.
+    try testing.expectEqual(@as(u16, 1), restoreTargetVt(2, 1));
+    // Nowhere to put it back - nothing named the VT the console was on, so
+    // every exit path would leave it stranded on the compositor's own VT.
+    try testing.expectEqual(@as(u16, 0), restoreTargetVt(2, 0));
+    // We never asked to move it (a daemon, a pty): no VT was taken, so none
+    // may be handed back - activating `previous` would itself be a console
+    // switch nobody requested.
+    try testing.expectEqual(@as(u16, 0), restoreTargetVt(0, 1));
+    // Already on the VT a restore would pick: nothing to move.
+    try testing.expectEqual(@as(u16, 0), restoreTargetVt(3, 3));
 }
 
 test "suspend releases, resume re-acquires, repeats do nothing" {

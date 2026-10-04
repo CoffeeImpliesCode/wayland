@@ -116,6 +116,11 @@ fn testState(_: *output.Output, state: *const output.Output.State) error{Invalid
         output.Output.State.committed_mode |
         output.Output.State.committed_buffer;
     if (state.committed & ~supported != 0) return error.InvalidState;
+    if (state.committed & output.Output.State.committed_buffer != 0) {
+        if (state.buffer) |buffer| {
+            if (buffer == .gpu) return error.InvalidState;
+        }
+    }
 }
 
 fn commit(out: *output.Output, state: *const output.Output.State) error{CommitFailed}!void {
