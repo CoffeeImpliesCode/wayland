@@ -80,6 +80,8 @@ configures.
 
 Edit protocol XML rather than generated bindings. Keep reusable compositor logic
 in `src/` and application policy in `src/server/`.
+Unlink signal listeners before freeing their storage, including inside destroy
+callbacks.
 
 ## License
 

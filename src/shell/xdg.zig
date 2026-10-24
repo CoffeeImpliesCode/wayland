@@ -3037,6 +3037,8 @@ pub const AutoConfigureListeners = struct {
     fn onToplevelDestroy(listener: *wire.Listener(*XdgToplevel), t: *XdgToplevel) void {
         const acl: *AutoConfigureListeners = @fieldParentPtr("destroy", listener);
         const allocator = t.allocator;
+        acl.initial_commit.link.remove();
+        acl.destroy.link.remove();
         allocator.destroy(acl);
     }
     fn onPopupInitial(listener: *wire.Listener(*XdgPopup), p: *XdgPopup) void {
@@ -3046,6 +3048,8 @@ pub const AutoConfigureListeners = struct {
     fn onPopupDestroy(listener: *wire.Listener(*XdgPopup), p: *XdgPopup) void {
         const acl: *AutoConfigureListeners = @fieldParentPtr("popup_destroy", listener);
         const allocator = p.allocator;
+        acl.popup_initial_commit.link.remove();
+        acl.popup_destroy.link.remove();
         allocator.destroy(acl);
     }
 };
@@ -3505,10 +3509,11 @@ test "xdg popup configure and positioner errors" {
     try std.testing.expect(p.xdg_surface.configured);
 
     // Destroy the popup: role object torn down, surface unmapped.
+    const server_xdg_surface = p.xdg_surface;
     popup.destroy();
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 0), ts.shell.?.popups.items.len);
-    try std.testing.expect(p.xdg_surface.role == .none);
+    try std.testing.expect(server_xdg_surface.role == .none);
 
     // An incomplete positioner (size never set) is rejected with the wm_base
     // invalid_positioner error (code 5) posted on the xdg_wm_base resource —

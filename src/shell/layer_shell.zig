@@ -64,7 +64,7 @@ const anchor_mask: u32 = anchor_top | anchor_bottom | anchor_left | anchor_right
 const Layer = server.zwlr.LayerShellV1.Layer;
 
 fn layerIsValid(value: c_int) bool {
-    return value >= @intFromEnum(Layer.background) and value <= @intFromEnum(Layer.overlay);
+    return value >= @backingInt(Layer.background) and value <= @backingInt(Layer.overlay);
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +162,7 @@ fn layerShellRequest(
 
 fn layerShellGetLayerSurface(layer_shell: *server.zwlr.LayerShellV1, shell: *LayerShell, r: anytype) void {
     // Validate the layer before creating anything (wlroots order).
-    if (!layerIsValid(@intFromEnum(r.layer))) {
+    if (!layerIsValid(@backingInt(r.layer))) {
         layer_shell.postError(.invalid_layer, "invalid layer value");
         return;
     }
@@ -219,7 +219,7 @@ fn layerShellGetLayerSurface(layer_shell: *server.zwlr.LayerShellV1, shell: *Lay
     shell.events.new_layer_surface.emit(ls);
     log.info("new layer surface on wl_surface {*} layer={d} namespace={s}", shell.io, shell.log_cfg, log_tag, .{
         surface,
-        @intFromEnum(ls.current.layer),
+        @backingInt(ls.current.layer),
         ls.namespace.?,
     });
 }
@@ -467,12 +467,12 @@ pub const LayerSurface = struct {
     /// v3 and older coerce any nonzero value to exclusive (on_demand does
     /// not exist there; wlroots: pending.keyboard_interactive = !!value).
     fn setKeyboardInteractivity(ls: *LayerSurface, value: server.zwlr.LayerSurfaceV1.KeyboardInteractivity) void {
-        const v: c_int = @intFromEnum(value);
+        const v: c_int = @backingInt(value);
         if (ls.resource.getVersion() < 4) {
             ls.pending.keyboard_interactive = if (v != 0) 1 else 0;
             return;
         }
-        if (v < 0 or v > @intFromEnum(server.zwlr.LayerSurfaceV1.KeyboardInteractivity.on_demand)) {
+        if (v < 0 or v > @backingInt(server.zwlr.LayerSurfaceV1.KeyboardInteractivity.on_demand)) {
             ls.resource.postError(.invalid_keyboard_interactivity, "wrong keyboard interactivity value");
             return;
         }
@@ -613,14 +613,14 @@ fn layerSurfaceRequest(
         .get_popup => |r| ls.getPopup(r.popup),
         .ack_configure => |r| ls.ackConfigure(r.serial),
         .set_layer => |r| {
-            if (!layerIsValid(@intFromEnum(r.layer))) {
+            if (!layerIsValid(@backingInt(r.layer))) {
                 // invalid_layer lives on the shell error enum, but wlroots,
                 // smithay and KWin all post it on the layer-surface resource
                 // ("XXX: this sends a zwlr_layer_shell_v1 error to a
                 // zwlr_layer_surface_v1 object", wlr_layer_shell_v1.c:260);
                 // GTK-style clients expect it there. L4, 2026-08-10.
                 const raw: *wire.Resource = @ptrCast(ls.resource);
-                raw.postError(@intFromEnum(server.zwlr.LayerShellV1.Error.invalid_layer), "invalid layer value");
+                raw.postError(@backingInt(server.zwlr.LayerShellV1.Error.invalid_layer), "invalid layer value");
                 return;
             }
             ls.pending.layer = r.layer;
@@ -696,7 +696,7 @@ fn layerSurfaceClientCommit(surface: *surface_mod.Surface) void {
     if (!ls.configured and surface.pending.buffer != null) {
         const raw: *wire.Resource = @ptrCast(ls.resource);
         raw.postError(
-            @intFromEnum(server.zwlr.LayerShellV1.Error.already_constructed),
+            @backingInt(server.zwlr.LayerShellV1.Error.already_constructed),
             "layer_surface has a buffer before being configured",
         );
         return;
@@ -941,6 +941,8 @@ const LayerAutoArranger = struct {
     fn onDestroy(listener: *wire.Listener(*LayerSurface), ls: *LayerSurface) void {
         const holder: *ArrangerHolder = @fieldParentPtr("destroy", listener);
         const allocator = ls.allocator;
+        holder.initial_commit.link.remove();
+        holder.destroy.link.remove();
         allocator.destroy(holder);
     }
 };
@@ -1158,7 +1160,7 @@ test "layer surface: invalid keyboard interactivity is invalid_keyboard_interact
     try ts.pump();
 
     // on_demand (2) is the highest valid value on v4+; 3 is invalid (3).
-    layer_surface.setKeyboardInteractivity(@enumFromInt(3));
+    layer_surface.setKeyboardInteractivity(@fromBackingInt(@intCast(3)));
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     try std.testing.expectEqual(@as(c_int, 3), wl_display_get_protocol_error(ts.c_display.?, null, null));
 }
@@ -1457,12 +1459,13 @@ test "layer surface: get_popup parents a NULL-parent xdg_popup; layer unmap dism
 
     // Unmapping the layer surface dismisses the popup with it: popup_done,
     // then the popup role object goes away (wlroots layer_surface_reset).
+    const server_popup_surface = server_popup.xdg_surface.surface;
     wl_surface.attach(null, 0, 0);
     wl_surface.commit();
     try ts.pump();
     try std.testing.expectEqual(@as(usize, 1), popup_events.done_count);
     try std.testing.expectEqual(@as(usize, 0), ls.popups.items.len);
-    try std.testing.expect(!server_popup.xdg_surface.surface.mapped);
+    try std.testing.expect(!server_popup_surface.mapped);
 }
 
 test "layer surface: get_popup on an already-parented xdg_popup posts -1" {
@@ -1584,7 +1587,7 @@ test "layer surface: invalid set_layer posts invalid_layer on the surface resour
 
     // 99 is outside {background..overlay}: invalid_layer (1), posted on the
     // LAYER SURFACE resource (wlroots/smithay/KWin parity, L4).
-    layer_surface.setLayer(@enumFromInt(99));
+    layer_surface.setLayer(@fromBackingInt(@intCast(99)));
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     const err = protocolError(ts);
     try std.testing.expectEqual(@as(c_int, 1), err.code);

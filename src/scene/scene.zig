@@ -649,6 +649,7 @@ pub const SceneOutput = struct {
 /// that frees it before this runs cannot double-free it.
 fn onOutputDestroy(listener: *wire.Listener(*output_mod.Output), _: *output_mod.Output) void {
     const so: *SceneOutput = @fieldParentPtr("destroy_listener", listener);
+    listener.link.remove();
     so.revokeMemberships();
     so.live = false;
     so.camera = null;
@@ -741,7 +742,6 @@ fn dummyTextureDestroy(texture: *texture_mod.Texture) void {
 }
 
 const dummy_texture_impl: texture_mod.Texture.Impl = .{ .destroy = dummyTextureDestroy };
-
 
 test "scene tree construction, append, remove, enable" {
     const allocator = testing.allocator;
@@ -1119,8 +1119,6 @@ test "output view allocation failures leave output destruction safe" {
     try testing.checkAllAllocationFailures(testing.allocator, allocationFailureOutputLifecycle, .{});
 }
 
-
-
 test "absolutePosition keeps fractional world coords at far-from-origin nodes" {
     const allocator = testing.allocator;
     var io_impl: std.Io.Threaded = .init_single_threaded;
@@ -1302,4 +1300,3 @@ test "pick hit-tests a surface far from the origin at fractional edges" {
     try testing.expect(scene.pick(origin_x + 0.25, origin_y + 20) == far);
     try testing.expect(scene.pick(origin_x - 0.25, origin_y + 20) == null);
 }
-

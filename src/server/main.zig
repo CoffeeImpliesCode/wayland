@@ -3143,6 +3143,14 @@ fn onToplevelDestroy(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *w
         _ = endPointerGestures(tl.state.seat, &tl.state.gestures);
         log.info("interactive move cancelled (toplevel destroyed)", tl.state.io, tl.state.log_cfg, "server", .{});
     }
+    tl.set_title.link.remove();
+    tl.set_app_id.link.remove();
+    tl.request_minimize.link.remove();
+    tl.request_maximize.link.remove();
+    tl.request_fullscreen.link.remove();
+    tl.request_move.link.remove();
+    tl.initial_commit.link.remove();
+    tl.destroy.link.remove();
     tl.state.allocator.destroy(tl);
 }
 
@@ -3254,6 +3262,8 @@ fn onLayerDestroy(
 ) void {
     _ = ls;
     const ll: *LayerListeners = @fieldParentPtr("destroy", listener);
+    ll.initial_commit.link.remove();
+    ll.destroy.link.remove();
     ll.state.allocator.destroy(ll);
 }
 
@@ -3328,6 +3338,8 @@ fn onPopupInitialCommit(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *w
 fn onPopupDestroy(listener: *wire.Listener(*wayland.shell.XdgPopup), p: *wayland.shell.XdgPopup) void {
     _ = p;
     const pl: *PopupListeners = @fieldParentPtr("destroy", listener);
+    pl.initial_commit.link.remove();
+    pl.destroy.link.remove();
     pl.state.allocator.destroy(pl);
 }
 

@@ -399,13 +399,7 @@ fn onOutputPresented(
     deliverPresented(st.presentation, ev);
 }
 
-/// The output died: its queued feedbacks can never present — discard
-/// them (wlroots feedback_handle_output_destroy, presentation_time.c:
-/// 301-308), then drop the present state. Freeing the listener struct
-/// inside its own notify is safe — the emit cursor has moved past it
-/// (same pattern as wl_output's onOutputDestroy). The presented listener
-/// is still linked into the dying signal's list, which is never
-/// traversed again.
+/// Discard queued feedbacks and unlink listeners before freeing their storage.
 fn onOutputDestroyed(listener: *wire.Listener(*output_mod.Output), out: *output_mod.Output) void {
     const st: *OutputPresentState = @fieldParentPtr("destroy_listener", listener);
     const p = st.presentation;
@@ -418,6 +412,8 @@ fn onOutputDestroyed(listener: *wire.Listener(*output_mod.Output), out: *output_
         if (fb.queued_output == out) fb.resource.destroySendDiscarded();
     }
     _ = p.present_states.remove(out);
+    st.presented_listener.link.remove();
+    st.destroy_listener.link.remove();
     p.allocator.destroy(st);
 }
 

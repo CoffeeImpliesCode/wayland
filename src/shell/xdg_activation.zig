@@ -1064,10 +1064,11 @@ test "activation external tokens: create/activate and add/find (XA-3)" {
     try std.testing.expectEqual(@as(usize, 1), ts.activation.?.tokens.items.len);
     try std.testing.expectEqual(@as(usize, 32), ext.getName().len);
     try std.testing.expect(ext.resource == null);
+    const expected_name = ext.getName()[0..32].*;
 
     ts.activation.?.activateToken(ext, srv_surface);
     try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqualStrings(ext.getName(), std.mem.sliceTo(&capture.token, 0));
+    try std.testing.expectEqualStrings(&expected_name, std.mem.sliceTo(&capture.token, 0));
     try std.testing.expectEqual(@as(usize, 0), ts.activation.?.tokens.items.len);
 
     // addToken: a known out-of-band name, findable and activatable.
