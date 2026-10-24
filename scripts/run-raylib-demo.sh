@@ -7,7 +7,7 @@
 #
 # Requires: `zig build` done, `devenv shell` run at least once (the devenv
 # env provides LD_LIBRARY_PATH for raylib/wayland/xorg — no manual paths),
-# and the weston clients built (default path below, overridable).
+# and weston-simple-shm on PATH (or WAYLAND_DEMO_CLIENT set to its path).
 #
 # Ctrl-C (or client exit) stops both processes.
 
@@ -16,7 +16,6 @@ cd "$(dirname "$0")/.."
 
 FRAMES="${1:-0}"
 SERVER_BIN=./zig-out/bin/wayland-server
-CLIENT_BIN="${WAYLAND_DEMO_CLIENT:-~/projects/freedesktop-wayland-weston/build/clients/weston-simple-shm}"
 SERVER_OUT="$(mktemp)"
 
 # The devenv shell env supplies LD_LIBRARY_PATH/PKG_CONFIG_PATH from the
@@ -25,6 +24,7 @@ if [ -f .devenv/shell-env.sh ]; then
     # shellcheck disable=SC1091
     source .devenv/shell-env.sh
 fi
+CLIENT_BIN="${WAYLAND_DEMO_CLIENT:-$(command -v weston-simple-shm || true)}"
 
 # SDL needs a reachable display: prefer the session wayland socket.
 if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -S "/run/user/$(id -u)/wayland-1" ]; then
