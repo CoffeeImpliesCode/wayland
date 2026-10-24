@@ -582,7 +582,7 @@ pub const Tablet = struct {
         errdefer allocator.destroy(hw);
         hw.* = .{ .manager = self, .desc = desc };
         if (desc.name) |name| {
-            hw.name = try allocator.dupeZ(u8, name);
+            hw.name = try allocator.dupeSentinel(u8, name, 0);
         }
         errdefer if (hw.name) |name| allocator.free(name);
         // TabletHw.paths is []const [:0]const u8, so its elements are
@@ -607,7 +607,7 @@ pub const Tablet = struct {
             var copied: usize = 0;
             errdefer for (buffer[0..copied]) |path| allocator.free(path);
             for (desc.paths) |src| {
-                buffer[copied] = try allocator.dupeZ(u8, src);
+                buffer[copied] = try allocator.dupeSentinel(u8, src, 0);
                 copied += 1;
             }
         }
@@ -678,7 +678,7 @@ pub const Tablet = struct {
         errdefer allocator.destroy(hw);
         hw.* = .{ .manager = self, .desc = desc };
         if (desc.path) |path| {
-            hw.path = try allocator.dupeZ(u8, path);
+            hw.path = try allocator.dupeSentinel(u8, path, 0);
         }
         errdefer if (hw.path) |path| allocator.free(path);
         try self.pads.append(allocator, hw);

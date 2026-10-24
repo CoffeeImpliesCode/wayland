@@ -144,14 +144,14 @@ pub const RaylibInput = struct {
     /// Per-key poll state, persistent across polls (the arrays would
     /// reset every call otherwise and the release debounce could never
     /// confirm — keys stuck down forever).
-    prev_down: [512]bool = [_]bool{false} ** 512,
-    pending_up: [512]bool = [_]bool{false} ** 512,
-    release_age: [512]u8 = [_]u8{255} ** 512,
+    prev_down: [512]bool = @splat(false),
+    pending_up: [512]bool = @splat(false),
+    release_age: [512]u8 = @splat(255),
     /// Last sampled button states (0=left, 1=right, 2=middle): the poll
     /// diffs IsMouseButtonDown against these instead of raylib's
     /// press/release transitions, so a button release can never be
     /// missed (a stuck camera-drag "move state" after the release).
-    prev_button: [3]bool = [_]bool{false} ** 3,
+    prev_button: [3]bool = @splat(false),
 };
 
 pub fn create(allocator: std.mem.Allocator, seat: *seat_mod.Seat) error{OutOfMemory}!*RaylibInput {

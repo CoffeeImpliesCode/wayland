@@ -6,7 +6,7 @@
 //! the runner's `--listen=-` protocol args. This root declares no main, so
 //! the test runner becomes the entry. The comptime import plus the
 //! refAllDecls test below still force full analysis of main.zig's decls
-//! (AGENTS.md gate-5: unused decls still type-check), and any `test`
+//! and any `test`
 //! blocks added to main.zig run here.
 //!
 //! The module deps (wayland, zio, tracy, build_options, tracy_impl,
@@ -116,7 +116,7 @@ const DecorationEvents = struct {
         switch (event) {
             .configure => |c| {
                 data.configure_count += 1;
-                data.mode = @intFromEnum(c.mode);
+                data.mode = @backingInt(c.mode);
             },
         }
     }

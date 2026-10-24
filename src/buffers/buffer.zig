@@ -549,7 +549,7 @@ test "data ptr access roundtrip via impl" {
 
 /// Test fixture: impl state observed by the test impl.
 const TestBufferData = struct {
-    bytes: [16]u8 = [_]u8{0} ** 16,
+    bytes: [16]u8 = @splat(0),
     destroyed: bool = false,
 };
 

@@ -883,7 +883,7 @@ fn sourceRequest(src_res: *server.wl.DataSource, request: server.wl.DataSource.R
             for (src.mime_types.items) |m| {
                 if (std.mem.eql(u8, m, mime)) return;
             }
-            const copy = mgr.allocator.dupeZ(u8, mime) catch {
+            const copy = mgr.allocator.dupeSentinel(u8, mime, 0) catch {
                 src_res.postNoMemory();
                 return;
             };
@@ -1750,7 +1750,7 @@ const SourceActionsSequence = struct {
     /// 2 = selection). Fixed-size: a test delivers at most one offer with
     /// one mime; the initial focus delivery contributes one NULL
     /// selection at most.
-    kinds: [8]u8 = [_]u8{0} ** 8,
+    kinds: [8]u8 = @splat(0),
     kind_count: usize = 0,
     source_actions_count: usize = 0,
     last_source_actions: u32 = 0,

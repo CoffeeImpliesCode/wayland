@@ -2,10 +2,8 @@
 
 let
   # wmww/wayland-debug: filter + breakpoint CLI over WAYLAND_DEBUG output
-  # (notes/140 §3). Pure Python 3.8+; gdb mode additionally needs a
-  # debug-symbol libwayland (see libwayland_debug_symbols.md upstream) —
-  # run/pipe/file modes work with the stock libwayland. Pinned to master
-  # 110592a (2026-08-12).
+  # Pure Python 3.8+; gdb mode additionally needs debug-symbol libwayland.
+  # Run, pipe, and file modes work with the stock library.
   wayland-debug-pkg = pkgs.stdenv.mkDerivation {
     pname = "wayland-debug";
     version = "master-110592a";
@@ -35,12 +33,11 @@ let
   };
 in
 {
-  # zig 0.16 + wayland dev environment (house convention).
+  # Zig 0.17.0 is selected from build.zig.zon by the anyzig shim.
   # Debug backend (raylib window) follows the house patterns:
   # - skript: debug symbols, SDL platform, static link
   # - vain2-old: explicit X11 runtime deps
   packages = with pkgs; [
-    zig
     pkg-config
     wayland
     wayland-protocols
@@ -63,7 +60,7 @@ in
     xorg.libXi
     xorg.libXcursor
     xorg.libXext
-    # Protocol/client debugging tools (notes/140-wayland-debug-tools.md).
+    # Protocol/client debugging tools.
     # All are real Wayland clients — run them against our server (or a
     # reference compositor) to exercise the wire from outside.
     wayland-utils # wayland-info (globals/versions), wayland-display
@@ -79,10 +76,6 @@ in
   env = {
     # .pc files live in the dev output; the zig build links via pkg-config.
     PKG_CONFIG_PATH = "${pkgs.wayland.dev}/lib/pkgconfig:${pkgs.wayland-protocols}/lib/pkgconfig:${(pkgs.raylib.overrideAttrs { enableDebugging = true; dontStrip = true; separateDebugInfo = true; platform = "SDL"; static = true; })}/lib/pkgconfig";
-    # PKG_CONFIG_PATH = "${pkgs.wayland.dev}"
-    # Library path overrides (house pattern, cf. ~/projects/skript) so built
-    # binaries find runtime libs (libraylib, X11, SDL) outside nix default paths.
-    # LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [ pkgs.wayland pkgs.libxkbcommon (pkgs.raylib.overrideAttrs { enableDebugging = true; dontStrip = true; separateDebugInfo = true; platform = "SDL"; static = true; }) pkgs.xorg.libX11 pkgs.xorg.libXi pkgs.xorg.libXcursor pkgs.xorg.libXext ]}";
     LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath config.packages}";
     # INCLUDE_DIRECTORIES = "${pkgs.lib.makeIncludePath [ pkgs.wayland pkgs.libxkbcommon (pkgs.raylib.overrideAttrs { enableDebugging = true; dontStrip = true; separateDebugInfo = true; platform = "SDL"; static = true; }) pkgs.xorg.libX11 pkgs.xorg.libXi pkgs.xorg.libXcursor pkgs.xorg.libXext ]}";
     INCLUDE_DIRECTORIES = "${pkgs.lib.makeIncludePath config.packages}";
@@ -92,6 +85,13 @@ in
     # against the project cwd, which the build runner keeps.
     ZIG_GLOBAL_CACHE_DIR = ".zig-global-cache";
   };
+
+  enterShell = ''
+    if ! command -v zig >/dev/null 2>&1 || [ "$(zig version)" != "0.17.0" ]; then
+      echo "Zig 0.17.0 must be on PATH" >&2
+      exit 1
+    fi
+  '';
 
   scripts.gate.exec = "zig-gate";
 }

@@ -117,7 +117,7 @@ pub const Attributes = struct {
     /// to agree from version 5 (:251-252); wlroots enforces it on every
     /// version (params_add, :181-189) and so do we.
     modifier: u64 = 0,
-    planes: [max_planes]Plane = [_]Plane{.{}} ** max_planes,
+    planes: [max_planes]Plane = @splat(.{}),
     /// How many planes are actually set; `planes[i].fd` is authoritative
     /// for "which" ones (indices must be consecutive from 0).
     n_planes: u8 = 0,
@@ -688,7 +688,7 @@ fn singlePlaneSet(size: usize) !Attributes {
         .height = 64,
         .format = drm_format_xrgb8888,
         .modifier = drm_format_mod_linear,
-        .planes = [_]Plane{.{}} ** max_planes,
+        .planes = @splat(.{}),
         .n_planes = 1,
     };
     attrs.planes[0] = .{ .fd = try fakeObject(size), .offset = 0, .stride = 256 };

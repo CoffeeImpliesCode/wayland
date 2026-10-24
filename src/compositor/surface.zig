@@ -61,8 +61,7 @@
 //!   protocol promise (wayland.xml, get_release) and outlives both this
 //!   surface and the client-side callback object.
 //!
-//! Cross-module: src/buffers/buffer.zig + src/buffers/shm.zig (buffers
-//! agent). Expected API (confirmed 2026-08-07):
+//! Cross-module: src/buffers/buffer.zig + src/buffers/shm.zig:
 //!   pub const Buffer = struct {
 //!       impl: *const Impl,
 //!       data: *anyopaque,
@@ -1009,12 +1008,12 @@ pub const Surface = struct {
     }
 
     fn handleSetBufferTransform(s: *Surface, transform: server.wl.Output.Transform) void {
-        const value: i32 = @intFromEnum(transform);
+        const value: i32 = @backingInt(transform);
         if (value < 0 or value > 7) {
             s.resource.postError(.invalid_transform, "invalid wl_surface.set_buffer_transform value");
             return;
         }
-        s.pending.transform = @enumFromInt(@as(u32, @intCast(value)));
+        s.pending.transform = @fromBackingInt(@intCast(@as(u32, @intCast(value))));
         s.pending.committed.transform = true;
     }
 
@@ -1969,7 +1968,7 @@ test "get_release waits for retained renderer usage and sends done on final unlo
 
     var bytes: [128]u8 = undefined;
     const before = std.os.linux.recvfrom(tw.peer_fd, &bytes, bytes.len, std.os.linux.MSG.DONTWAIT, null, null);
-    try testing.expectEqual(-@as(isize, @intFromEnum(std.os.linux.E.AGAIN)), @as(isize, @bitCast(before)));
+    try testing.expectEqual(-@as(isize, @backingInt(std.os.linux.E.AGAIN)), @as(isize, @bitCast(before)));
     buffer.unlock();
     tw.server.flushClients();
     const after = std.os.linux.recvfrom(tw.peer_fd, &bytes, bytes.len, std.os.linux.MSG.DONTWAIT, null, null);
@@ -2006,7 +2005,7 @@ test "a get_release callback survives its surface and completes when the reader 
     var bytes: [128]u8 = undefined;
     tw.server.flushClients();
     const before = std.os.linux.recvfrom(tw.peer_fd, &bytes, bytes.len, std.os.linux.MSG.DONTWAIT, null, null);
-    try testing.expectEqual(-@as(isize, @intFromEnum(std.os.linux.E.AGAIN)), @as(isize, @bitCast(before)));
+    try testing.expectEqual(-@as(isize, @backingInt(std.os.linux.E.AGAIN)), @as(isize, @bitCast(before)));
 
     buffer.unlock();
     tw.server.flushClients();
@@ -2724,7 +2723,6 @@ test "destroying a displayed buffer while another attachment is pending clears o
     pending.unlock();
     defer s.destroy();
 }
-
 
 test "attach of an unknown buffer type posts an error and keeps the previous pending" {
     // F56: a wl_buffer the internal shm pipeline never created fails the

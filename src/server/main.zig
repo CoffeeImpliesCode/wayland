@@ -2290,7 +2290,6 @@ fn totalFrames(state: *ServerState) u32 {
     return total;
 }
 
-
 // ---------------------------------------------------------------------------
 // Listeners
 // ---------------------------------------------------------------------------
@@ -3097,8 +3096,8 @@ fn onToplevelMinimize(listener: *wire.Listener(*wayland.shell.XdgToplevel), t: *
     }
     if (!damaged) requestRender(self);
 }
- 
- fn onToplevelMove(listener: *wire.Listener(*wayland.shell.MoveRequest), req: *wayland.shell.MoveRequest) void {
+
+fn onToplevelMove(listener: *wire.Listener(*wayland.shell.MoveRequest), req: *wayland.shell.MoveRequest) void {
     const tl: *ToplevelListeners = @fieldParentPtr("request_move", listener);
     const self = tl.state;
     const seat = req.seat;
@@ -3226,7 +3225,7 @@ fn onNewLayerSurface(
     ls.events.destroy.add(&ll.destroy);
     log.info("new layer surface (namespace={s} layer={d}) total={d}", self.io, self.log_cfg, "server", .{
         ls.namespace orelse "(none)",
-        @intFromEnum(ls.current.layer),
+        @backingInt(ls.current.layer),
         self.layer_surfaces.items.len,
     });
 }
@@ -5057,7 +5056,6 @@ fn isLocalSpace(s: LocalSpace) bool {
     };
 }
 
-
 /// The scene's output-placement policy, installed once (subscribe). It
 /// answers the ONE question the library asks about a tracked surface: is
 /// it world content an output camera shows, or an overlay that lives in
@@ -5724,7 +5722,6 @@ fn pickSurface(ctx: *anyopaque, x: i32, y: i32) ?wayland.seat.Seat.PickResult {
         .y = @floatFromInt(y - view.rect.y),
     });
 }
-
 
 /// The output an output-local surface is pinned to, or null when its
 /// role names none (nothing to draw or hit test it on).
@@ -6901,7 +6898,7 @@ const ClientToplevelEvents = struct {
     configures: usize = 0,
     width: i32 = 0,
     height: i32 = 0,
-    states: [13]u32 = [_]u32{0} ** 13,
+    states: [13]u32 = @splat(0),
     states_len: usize = 0,
 
     fn listener(toplevel: *client.xdg.Toplevel, event: client.xdg.Toplevel.Event, data: *ClientToplevelEvents) void {
@@ -7078,12 +7075,12 @@ const PolicyGlobalCapture = struct {
     /// as missing that the server had just advertised.
     const max_interface_len = 64;
     const Entry = struct {
-        interface: [max_interface_len]u8 = [_]u8{0} ** max_interface_len,
+        interface: [max_interface_len]u8 = @splat(0),
         interface_len: usize = 0,
         name: u32 = 0,
         version: u32 = 0,
     };
-    entries: [max_globals]Entry = [_]Entry{.{}} ** max_globals,
+    entries: [max_globals]Entry = @splat(.{}),
     len: usize = 0,
 
     fn listener(_: *client.wl.Registry, event: client.wl.Registry.Event, self: *PolicyGlobalCapture) void {
@@ -10407,7 +10404,7 @@ const wire_transform = client.wl.Output.Transform;
 /// the same protocol values (wayland.xml's wl_output.transform), so this
 /// is the numeric identity — not a hand-written table that could drift.
 fn geomTransform(t: wire_transform) geom.Transform {
-    return @enumFromInt(@intFromEnum(t));
+    return @fromBackingInt(@intCast(@backingInt(t)));
 }
 
 /// Every wl_output.transform in protocol order — the eight standard

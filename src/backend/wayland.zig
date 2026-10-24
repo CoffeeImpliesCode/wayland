@@ -25,7 +25,7 @@
 //! buffer carries — no swizzle needed (same layout raylib uploads; the
 //! parent's shm client interprets the bytes).
 //!
-//! For the orchestrator's integration agent: the parent must advertise
+//! The parent compositor must advertise
 //! wl_compositor (v7), wl_shm (>= v2, argb8888 format) and xdg_wm_base
 //! (v7). The backend binds wl_shm at the advertised version, the others
 //! at 7. create() waits for the initial xdg configure (5s timeout) before

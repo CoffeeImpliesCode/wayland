@@ -537,7 +537,7 @@ const DrmOutput = struct {
     /// drmModeModeInfo) without re-enumerating the device. The mode blob
     /// this produced is still alive too, so no blob is recreated.
     crtc_mode: c.drmModeModeInfo = .{},
- };
+};
 
 const DrmBackendData = struct {
     allocator: std.mem.Allocator,
@@ -1900,10 +1900,10 @@ fn allocGpuSlot(
 
     var fb_id: u32 = 0;
     const planes: usize = slot.frame.attributes.n_planes;
-    var handles: [dmabuf.max_planes]u32 = .{0} ** dmabuf.max_planes;
-    var pitches: [dmabuf.max_planes]u32 = .{0} ** dmabuf.max_planes;
-    var offsets: [dmabuf.max_planes]u32 = .{0} ** dmabuf.max_planes;
-    var fb_modifiers: [dmabuf.max_planes]u64 = .{0} ** dmabuf.max_planes;
+    var handles: [dmabuf.max_planes]u32 = @splat(0);
+    var pitches: [dmabuf.max_planes]u32 = @splat(0);
+    var offsets: [dmabuf.max_planes]u32 = @splat(0);
+    var fb_modifiers: [dmabuf.max_planes]u64 = @splat(0);
     var p: usize = 0;
     while (p < planes) : (p += 1) {
         handles[p] = gbm_c.gbm_bo_get_handle_for_plane(bo, @intCast(p)).u32;
@@ -3635,7 +3635,7 @@ test "row copy handles dumb stride padding" {
         1, 2,  3,  4,  5,  6,  7,  8,
         9, 10, 11, 12, 13, 14, 15, 16,
     };
-    var dst = [_]u8{0} ** 32;
+    var dst: [32]u8 = @splat(0);
     copyRows(&src, 8, &dst, 16, 2, 2);
 
     try testing.expectEqualSlices(u8, src[0..8], dst[0..8]);

@@ -91,7 +91,7 @@ pub const CompositorDisplay = struct {
     pub fn addSocketAuto(self: *CompositorDisplay) error{ AddSocketFailed, OutOfMemory }![]const u8 {
         var buf: [11]u8 = undefined;
         const name = try self.server.addSocketAuto(&buf);
-        const dup = try self.allocator.dupeZ(u8, name);
+        const dup = try self.allocator.dupeSentinel(u8, name, 0);
         if (self.socket_name) |old| self.allocator.free(old);
         self.socket_name = dup;
         return dup;

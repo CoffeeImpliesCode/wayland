@@ -27,7 +27,7 @@
 //! runs when the server sends presented/discarded or when the client's
 //! connection dies (libwayland destroys every resource of the client).
 //!
-//! Cross-module contract (types written by the M1 agents; do not drift):
+//! Cross-module contract:
 //! - compositor/surface.zig: `Surface { resource: *server.wl.Surface,
 //!   ... }`; the wl_surface wire resource user data is the *Surface.
 //! - compositor/compositor.zig: `Compositor { surfaces:
@@ -63,7 +63,7 @@ const WlOutput = wl_output_mod.WlOutput;
 /// POSIX clockid_t (u32, no enum — verified in wayland.zig
 /// `sendClockId(_clk_id: u32)`), so the value comes from std.posix:
 /// CLOCK_MONOTONIC = 1 on Linux.
-const clock_id_monotonic: u32 = @intFromEnum(std.posix.CLOCK.MONOTONIC);
+const clock_id_monotonic: u32 = @backingInt(std.posix.CLOCK.MONOTONIC);
 
 pub const presentation_version: u32 = server.wp.Presentation.generated_version;
 
@@ -814,7 +814,7 @@ test "bind wp_presentation sends clock_id" {
 
     // The presentation clock is CLOCK_MONOTONIC, the clock the library
     // timestamps with (std.Io.Clock.now(.awake)).
-    try std.testing.expectEqual(@as(?u32, @intFromEnum(std.posix.CLOCK.MONOTONIC)), events.clock_id);
+    try std.testing.expectEqual(@as(?u32, @backingInt(std.posix.CLOCK.MONOTONIC)), events.clock_id);
 }
 
 test "get_feedback then present delivers presented" {

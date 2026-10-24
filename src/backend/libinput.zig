@@ -1427,13 +1427,13 @@ const Libinput = struct {
     fn makeDevice(self: *Libinput, dev: *c.libinput_device, kind: InputKind, caps: u32) ?Device {
         const name_slice = std.mem.span(c.libinput_device_get_name(dev));
         const name = if (name_slice.len == 0) "unknown" else name_slice;
-        const owned_name = self.allocator.dupeZ(u8, name) catch {
+        const owned_name = self.allocator.dupeSentinel(u8, name, 0) catch {
             log_mod.warn("device {s}: name allocation failed", self.io, self.log_cfg, "libinput", .{name});
             return null;
         };
         errdefer self.allocator.free(owned_name);
         const sysname_slice = std.mem.span(c.libinput_device_get_sysname(dev));
-        const owned_sysname = self.allocator.dupeZ(u8, sysname_slice) catch {
+        const owned_sysname = self.allocator.dupeSentinel(u8, sysname_slice, 0) catch {
             log_mod.warn("device {s}: sysname allocation failed", self.io, self.log_cfg, "libinput", .{name});
             return null;
         };
@@ -2228,7 +2228,7 @@ fn openRestricted(path: [*:0]const u8, flags: c_int, user_data: ?*anyopaque) cal
     const rc = std.os.linux.open(path, o, 0);
     if (rc > std.math.maxInt(usize) / 2) {
         // The libinput_interface contract: negative errno on failure.
-        return -@as(c_int, @intFromEnum(std.os.linux.errno(rc)));
+        return -@as(c_int, @backingInt(std.os.linux.errno(rc)));
     }
     return @intCast(rc);
 }
@@ -2706,8 +2706,8 @@ test "a node is registered once and pruned on removal" {
     // A touch screen classifies as touch hardware, so it reaches the
     // registry (and the new_input announcement right behind the insert)
     // instead of being dropped.
-    const touch_name = try allocator.dupeZ(u8, "Virtual Touchscreen");
-    const touch_sysname = try allocator.dupeZ(u8, "event5");
+    const touch_name = try allocator.dupeSentinel(u8, "Virtual Touchscreen", 0);
+    const touch_sysname = try allocator.dupeSentinel(u8, "event5", 0);
     try testing.expect(try registry.insert(allocator, .{
         .handle = touch_handle,
         .kind = kindForCaps(capsBit(device_cap_touch)).?,
@@ -2721,8 +2721,8 @@ test "a node is registered once and pruned on removal" {
     // The same node seen a second time (libinput's udev context and this
     // backend's monitor both watch udev) must not become a second entry:
     // one physical device, one announcement.
-    const dup_name = try allocator.dupeZ(u8, "Virtual Touchscreen");
-    const dup_sysname = try allocator.dupeZ(u8, "event5");
+    const dup_name = try allocator.dupeSentinel(u8, "Virtual Touchscreen", 0);
+    const dup_sysname = try allocator.dupeSentinel(u8, "event5", 0);
     try testing.expect(!try registry.insert(allocator, .{
         .handle = @ptrFromInt(0x3000),
         .kind = .touch,
@@ -2736,8 +2736,8 @@ test "a node is registered once and pruned on removal" {
 
     // A second node registers beside it, so a removal targets exactly one
     // device.
-    const mouse_name = try allocator.dupeZ(u8, "Virtual Mouse");
-    const mouse_sysname = try allocator.dupeZ(u8, "event6");
+    const mouse_name = try allocator.dupeSentinel(u8, "Virtual Mouse", 0);
+    const mouse_sysname = try allocator.dupeSentinel(u8, "event6", 0);
     try testing.expect(try registry.insert(allocator, .{
         .handle = mouse_handle,
         .kind = .pointer,
@@ -3000,9 +3000,9 @@ const TabletFixture = struct {
     /// covers — while the descriptors handed to the tablet module are the
     /// same ones applyTabletInfo builds from a real device.
     fn addDevice(self: *TabletFixture, caps: u32) !usize {
-        const name = try self.allocator.dupeZ(u8, "Wacom Intuos Pro M");
+        const name = try self.allocator.dupeSentinel(u8, "Wacom Intuos Pro M", 0);
         errdefer self.allocator.free(name);
-        const sysname = try self.allocator.dupeZ(u8, "event7");
+        const sysname = try self.allocator.dupeSentinel(u8, "event7", 0);
         errdefer self.allocator.free(sysname);
         var entry: Device = .{
             .handle = @ptrFromInt(0x1000),

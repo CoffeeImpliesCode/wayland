@@ -93,7 +93,7 @@ pub const Framebuffer = struct {
         // per-4-byte stores.
         const total: usize = @as(usize, @intCast(fb.height)) * @as(usize, @intCast(fb.stride));
         if (@intFromPtr(fb.data.ptr) % @alignOf(u32) == 0) {
-            const pattern: u32 = @bitCast(color);
+            const pattern = std.mem.bytesToValue(u32, &color);
             const words = std.mem.bytesAsSlice(u32, fb.data[0..total]);
             for (words) |*w| w.* = pattern;
         } else {
@@ -184,7 +184,6 @@ pub fn forwardBox(t: geom.Transform, box: geom.FRect, tw: i32, th: i32) geom.FRe
 /// evaluate it at the pixel's CENTRE: that is what makes a 1:1 stamp
 /// land texel-exact (position `i + 0.5` -> index `i`) and a scaled
 /// draw land on the same texel in both backends.
-
 pub const TexelMap = struct {
     x_c: f64,
     x_dx: f64,

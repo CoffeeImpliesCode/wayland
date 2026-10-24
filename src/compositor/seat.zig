@@ -543,8 +543,8 @@ pub const Seat = struct {
     /// Fixed-point position of the last motion event actually sent
     /// (motion dedup, F8 — wlroots drops duplicate fixed-point
     /// positions, wlr_seat_pointer.c:252-263). Sentinel = never sent.
-    last_motion_fixed_x: Fixed = @enumFromInt(std.math.minInt(i32)),
-    last_motion_fixed_y: Fixed = @enumFromInt(std.math.minInt(i32)),
+    last_motion_fixed_x: Fixed = @fromBackingInt(@intCast(std.math.minInt(i32))),
+    last_motion_fixed_y: Fixed = @fromBackingInt(@intCast(std.math.minInt(i32))),
     /// wl_keyboard.repeat_info payload (get_keyboard, seat.zig:517) +
     /// the server-side repeat timing: delay before the first repeat (ms),
     /// rate in keys/second. Populated from Options; the compositor runs
@@ -1577,7 +1577,7 @@ pub const Seat = struct {
         const focus = self.pointer_focus orelse return;
         const focus_client = focus.resource.getClient();
         const time = nowMs(self);
-        const axis_idx: usize = @intCast(@intFromEnum(axis));
+        const axis_idx: usize = @intCast(@backingInt(axis));
 
         // axis_source once per frame (wlroots sent_axis_source dedup,
         // wlr_seat_pointer.c:334-342; only one axis_source event is
@@ -1973,7 +1973,7 @@ pub const Seat = struct {
             });
             return;
         }
-        const owned_name = self.allocator.dupeZ(u8, device.name) catch |err| {
+        const owned_name = self.allocator.dupeSentinel(u8, device.name, 0) catch |err| {
             log.warn("input device {s}: accounting allocation failed: {s}", self.io, self.log_cfg, "seat", .{
                 device.name, @errorName(err),
             });
@@ -2113,7 +2113,7 @@ pub const Seat = struct {
     /// name is duplicated into seat-owned storage (freed on the next set
     /// and at deinit).
     pub fn setName(self: *Seat, name: []const u8) void {
-        const owned = self.allocator.dupeZ(u8, name) catch |err| {
+        const owned = self.allocator.dupeSentinel(u8, name, 0) catch |err| {
             log.warn("setName allocation failed: {s}", self.io, self.log_cfg, "seat", .{@errorName(err)});
             return;
         };
@@ -2169,8 +2169,8 @@ pub const Seat = struct {
         // suppresses REPEATS of a position that was already delivered
         // (the E2E synth moves to the exact enter position; suppressing
         // that first motion starves the client's motion check).
-        self.last_motion_fixed_x = @enumFromInt(std.math.minInt(i32));
-        self.last_motion_fixed_y = @enumFromInt(std.math.minInt(i32));
+        self.last_motion_fixed_x = @fromBackingInt(@intCast(std.math.minInt(i32)));
+        self.last_motion_fixed_y = @fromBackingInt(@intCast(std.math.minInt(i32)));
         // Enter goes only to the surface's client's pointer resources
         // (wlroots: wlr_seat_pointer_enter loops over client->pointers,
         // wlr_seat_pointer.c:184-196). Sending a foreign surface to

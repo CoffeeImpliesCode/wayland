@@ -1165,7 +1165,7 @@ pub const Session = struct {
             // session, like tty2"); the kernel's VT devices are named
             // "tty%d" (drivers/tty/vt.c), and a VT is at most 2 digits.
             var buf: [8]u8 = undefined;
-            const tty = std.fmt.bufPrintZ(&buf, "tty{d}", .{self.target_vt}) catch unreachable;
+            const tty = std.fmt.bufPrintSentinel(&buf, "tty{d}", .{self.target_vt}, 0) catch unreachable;
             self.own_tty = try self.own(tty);
             try self.setProperty("TTY", self.own_tty);
         }
@@ -1304,7 +1304,7 @@ pub const Session = struct {
     /// Copy `text` into a NUL-terminated allocation this session owns, so
     /// a libsystemd string can outlive the call that produced it.
     fn own(self: *Session, text: []const u8) Error![:0]const u8 {
-        const copy = try self.allocator.dupeZ(u8, text);
+        const copy = try self.allocator.dupeSentinel(u8, text, 0);
         errdefer self.allocator.free(copy[0 .. copy.len + 1]);
         try self.owned.append(self.allocator, copy);
         return copy;

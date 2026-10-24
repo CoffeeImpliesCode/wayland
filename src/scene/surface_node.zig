@@ -586,7 +586,6 @@ pub fn updateOutputAssociations(scene: *Scene) void {
     while (it.next()) |sn| sn.*.updateOutputs();
 }
 
-
 /// Detach and free every tracked binding (the scene's teardown). The
 /// compositor may destroy its surfaces after the scene, so the surface
 /// destroy signals must not reach freed bindings.
@@ -1666,9 +1665,9 @@ const WireCapture = struct {
 /// enter/leave event named. Object identity is the whole point — a leave
 /// carrying the wrong output, or none at all, is the defect.
 const WireSurfaceEvents = struct {
-    entered: [8]?*client.wl.Output = .{null} ** 8,
+    entered: [8]?*client.wl.Output = @splat(null),
     enter_count: usize = 0,
-    left: [8]?*client.wl.Output = .{null} ** 8,
+    left: [8]?*client.wl.Output = @splat(null),
     leave_count: usize = 0,
 
     fn entersFor(e: *const WireSurfaceEvents, name: *client.wl.Output) usize {
@@ -1730,12 +1729,12 @@ const WireHarness = struct {
     capture: WireCapture = .{},
     /// Listener data for the bound wl_output proxies (ignored).
     proxy_data: u8 = 0,
-    out: [wire_slots]?*output_mod.Output = .{null} ** wire_slots,
-    backend: [wire_slots]?*backend_mod.Backend = .{null} ** wire_slots,
-    wl_output: [wire_slots]?*wl_output_mod.WlOutput = .{null} ** wire_slots,
-    view: [wire_slots]?*SceneOutput = .{null} ** wire_slots,
+    out: [wire_slots]?*output_mod.Output = @splat(null),
+    backend: [wire_slots]?*backend_mod.Backend = @splat(null),
+    wl_output: [wire_slots]?*wl_output_mod.WlOutput = @splat(null),
+    view: [wire_slots]?*SceneOutput = @splat(null),
     /// The client's wl_output proxies, in bind order.
-    proxy: [wire_slots]?*client.wl.Output = .{null} ** wire_slots,
+    proxy: [wire_slots]?*client.wl.Output = @splat(null),
     events: WireSurfaceEvents = .{},
     surface: ?*Surface = null,
 

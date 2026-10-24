@@ -5,28 +5,20 @@ const Scanner = @import("zig_wayland").Scanner;
 
 pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
-    // The demo server runs at ReleaseSafe (house directive): Debug is the
-    // slow mode (per-pixel loops with safety checks measured 55-70ms/frame
-    // vs ~32ms at ReleaseSafe). Pass -Doptimize=Debug for test runs.
-    //
-    // Not standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe }):
-    // that path registers only -Drelease, so -Doptimize is rejected as an
-    // unknown option and an unflagged build lands in .Debug. Register the
-    // option here and default to the intended mode, mirroring the std
-    // switch for the --release=* spellings.
-    const optimize = b.option(
-        std.builtin.OptimizeMode,
+    // Default to safe while accepting both -Doptimize and --release modes.
+    const optimize: std.lang.Optimize = b.option(
+        std.lang.Optimize,
         "optimize",
         "Prioritize performance, safety, or binary size",
-    ) orelse switch (b.release_mode) {
-        .off => std.builtin.OptimizeMode.ReleaseSafe,
-        .fast => std.builtin.OptimizeMode.ReleaseFast,
-        .safe => std.builtin.OptimizeMode.ReleaseSafe,
-        .small => std.builtin.OptimizeMode.ReleaseSmall,
+    ) orelse switch (b.graph.release_mode) {
+        .off => .safe,
+        .fast => .fast,
+        .safe => .safe,
+        .small => .small,
         .any => {
             std.debug.print(
-                "the project defaults to ReleaseSafe; pass " ++
-                    "-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall\n",
+                "the project defaults to safe; pass " ++
+                    "-Doptimize=debug|safe|fast|small\n",
                 .{},
             );
             std.process.exit(1);
@@ -253,7 +245,7 @@ pub fn build(b: *Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
 
     // ------------------------------------------------------------------
     // M1 test server + test client (src/server/).
@@ -356,7 +348,7 @@ pub fn build(b: *Build) void {
     const server_run_cmd = b.addRunArtifact(server_exe);
     server_run_step.dependOn(&server_run_cmd.step);
     server_run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| server_run_cmd.addArgs(args);
+    server_run_cmd.addPassthruArgs();
 
     // Test client: pure protocol client (libwayland-client via the protocol
     // module). Deliberately does NOT import the compositor library. A test
@@ -367,7 +359,7 @@ pub fn build(b: *Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/server/client.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "protocol", .module = protocol },
             },
@@ -385,7 +377,7 @@ pub fn build(b: *Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/server/rtprobe.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "protocol", .module = protocol },
             },
@@ -396,13 +388,13 @@ pub fn build(b: *Build) void {
     const probe_run_cmd = b.addRunArtifact(probe_exe);
     probe_run_step.dependOn(&probe_run_cmd.step);
     probe_run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| probe_run_cmd.addArgs(args);
+    probe_run_cmd.addPassthruArgs();
 
     const client_run_step = b.step("run-client", "Run the M1 test client");
     const client_run_cmd = b.addRunArtifact(client_exe);
     client_run_step.dependOn(&client_run_cmd.step);
     client_run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| client_run_cmd.addArgs(args);
+    client_run_cmd.addPassthruArgs();
 
     // ------------------------------------------------------------------
     // Tests
@@ -423,8 +415,7 @@ pub fn build(b: *Build) void {
     // on the runner's `--listen=-` protocol args. Give the test step its
     // own root module (src/server/main_test.zig, no main) so the test
     // runner becomes the entry; the comptime import + refAllDecls in that
-    // root still force full analysis of main.zig's decls (AGENTS.md
-    // gate-5: unused decls still type-check). The module mirrors the
+    // root still force full analysis of main.zig's decls. The module mirrors the
     // server root's imports (zio, tracy, build_options, tracy_impl,
     // raylib_c) and system links.
     const exe_test_module = b.createModule(.{

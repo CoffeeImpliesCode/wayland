@@ -415,7 +415,7 @@ const Handle = struct {
     /// killing the client; no property event goes out, so the handle
     /// stays clean and its pending `done` is not opened.
     fn zeroTerminated(h: *Handle, text: ?[]const u8) ?[:0]const u8 {
-        return h.binding.manager.allocator.dupeZ(u8, text orelse "") catch {
+        return h.binding.manager.allocator.dupeSentinel(u8, text orelse "", 0) catch {
             h.resource.getClient().postNoMemory();
             return null;
         };
@@ -434,19 +434,19 @@ const Handle = struct {
         var buf: [4]u32 = undefined;
         var n: usize = 0;
         if (st.maximized) {
-            buf[n] = @intFromEnum(server.zwlr.ForeignToplevelHandleV1.State.maximized);
+            buf[n] = @backingInt(server.zwlr.ForeignToplevelHandleV1.State.maximized);
             n += 1;
         }
         if (st.minimized) {
-            buf[n] = @intFromEnum(server.zwlr.ForeignToplevelHandleV1.State.minimized);
+            buf[n] = @backingInt(server.zwlr.ForeignToplevelHandleV1.State.minimized);
             n += 1;
         }
         if (st.activated) {
-            buf[n] = @intFromEnum(server.zwlr.ForeignToplevelHandleV1.State.activated);
+            buf[n] = @backingInt(server.zwlr.ForeignToplevelHandleV1.State.activated);
             n += 1;
         }
         if (h.resource.getVersion() >= 2 and st.fullscreen) {
-            buf[n] = @intFromEnum(server.zwlr.ForeignToplevelHandleV1.State.fullscreen);
+            buf[n] = @backingInt(server.zwlr.ForeignToplevelHandleV1.State.fullscreen);
             n += 1;
         }
         // libwayland marshals the array synchronously; a stack buffer is

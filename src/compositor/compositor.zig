@@ -1,7 +1,6 @@
 //! wl_compositor global: creates wl_surface and wl_region objects.
 //!
-//! Cross-module: src/core/display.zig (main agent). Expected API
-//! (confirmed 2026-08-07):
+//! Cross-module: src/core/display.zig:
 //!   pub const CompositorDisplay = struct {
 //!       allocator: std.mem.Allocator,
 //!       io: *std.Io,

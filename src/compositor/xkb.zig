@@ -108,7 +108,7 @@ pub const Xkb = struct {
     ) error{ XkbInitFailed, KeymapBuildFailed, KeymapMemfdFailed, OutOfMemory }!*Xkb {
         // xkb_rule_names.layout is a C string; Options.layout may be an
         // unterminated slice, so build a sentinel copy.
-        const layout_z = allocator.dupeZ(u8, options.layout) catch return error.OutOfMemory;
+        const layout_z = allocator.dupeSentinel(u8, options.layout, 0) catch return error.OutOfMemory;
         defer allocator.free(layout_z);
 
         const ctx = c.xkb_context_new(0) orelse return error.XkbInitFailed;
@@ -221,7 +221,7 @@ pub const Xkb = struct {
     ) error{ KeymapBuildFailed, KeymapMemfdFailed, OutOfMemory }!void {
         // xkb_rule_names.layout is a C string; callers may hand an
         // unterminated slice (environ values), so build a sentinel copy.
-        const layout_z = self.allocator.dupeZ(u8, layout) catch return error.OutOfMemory;
+        const layout_z = self.allocator.dupeSentinel(u8, layout, 0) catch return error.OutOfMemory;
         defer self.allocator.free(layout_z);
         var names: c.xkb_rule_names = .{
             .rules = null,

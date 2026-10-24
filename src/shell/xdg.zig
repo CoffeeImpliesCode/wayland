@@ -26,7 +26,7 @@
 //! which is what permits attaching a buffer in the first place (see
 //! `xdgSurfaceClientCommit`).
 //!
-//! Cross-module contract (types written by other M1 agents; do not drift):
+//! Cross-module contract:
 //! - compositor/role.zig: `SurfaceRole { name: []const u8,
 //!   client_commit: ?*const fn (*Surface) void, commit: ?*const fn (*Surface) void,
 //!   map: ?*const fn (*Surface) void, unmap: ?*const fn (*Surface) void,
@@ -763,19 +763,19 @@ pub const WmCapabilities = struct {
     pub fn toArray(c: WmCapabilities, out: *[4]u32) []u32 {
         var n: usize = 0;
         if (c.window_menu) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.WmCapabilities.window_menu);
+            out[n] = @backingInt(server.xdg.Toplevel.WmCapabilities.window_menu);
             n += 1;
         }
         if (c.maximize) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.WmCapabilities.maximize);
+            out[n] = @backingInt(server.xdg.Toplevel.WmCapabilities.maximize);
             n += 1;
         }
         if (c.fullscreen) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.WmCapabilities.fullscreen);
+            out[n] = @backingInt(server.xdg.Toplevel.WmCapabilities.fullscreen);
             n += 1;
         }
         if (c.minimize) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.WmCapabilities.minimize);
+            out[n] = @backingInt(server.xdg.Toplevel.WmCapabilities.minimize);
             n += 1;
         }
         return out[0..n];
@@ -1164,60 +1164,60 @@ pub const XdgToplevel = struct {
 fn stateValues(st: *const ToplevelState, out: *[13]u32, version: u32) []u32 {
     var n: usize = 0;
     if (st.maximized) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.maximized);
+        out[n] = @backingInt(server.xdg.Toplevel.State.maximized);
         n += 1;
     }
     if (st.fullscreen) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.fullscreen);
+        out[n] = @backingInt(server.xdg.Toplevel.State.fullscreen);
         n += 1;
     }
     if (st.resizing) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.resizing);
+        out[n] = @backingInt(server.xdg.Toplevel.State.resizing);
         n += 1;
     }
     if (st.activated) {
-        out[n] = @intFromEnum(server.xdg.Toplevel.State.activated);
+        out[n] = @backingInt(server.xdg.Toplevel.State.activated);
         n += 1;
     }
     if (version >= 2) {
         if (st.tiled_left) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_left);
+            out[n] = @backingInt(server.xdg.Toplevel.State.tiled_left);
             n += 1;
         }
         if (st.tiled_right) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_right);
+            out[n] = @backingInt(server.xdg.Toplevel.State.tiled_right);
             n += 1;
         }
         if (st.tiled_top) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_top);
+            out[n] = @backingInt(server.xdg.Toplevel.State.tiled_top);
             n += 1;
         }
         if (st.tiled_bottom) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.State.tiled_bottom);
+            out[n] = @backingInt(server.xdg.Toplevel.State.tiled_bottom);
             n += 1;
         }
     }
     if (version >= 6) {
         if (st.suspended) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.State.suspended);
+            out[n] = @backingInt(server.xdg.Toplevel.State.suspended);
             n += 1;
         }
     }
     if (version >= 7) {
         if (st.constrained_left) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_left);
+            out[n] = @backingInt(server.xdg.Toplevel.State.constrained_left);
             n += 1;
         }
         if (st.constrained_right) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_right);
+            out[n] = @backingInt(server.xdg.Toplevel.State.constrained_right);
             n += 1;
         }
         if (st.constrained_top) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_top);
+            out[n] = @backingInt(server.xdg.Toplevel.State.constrained_top);
             n += 1;
         }
         if (st.constrained_bottom) {
-            out[n] = @intFromEnum(server.xdg.Toplevel.State.constrained_bottom);
+            out[n] = @backingInt(server.xdg.Toplevel.State.constrained_bottom);
             n += 1;
         }
     }
@@ -1270,7 +1270,7 @@ fn toplevelRequest(toplevel_res: *server.xdg.Toplevel, request: server.xdg.Tople
             // (invalid_resize_edge on the toplevel); valid: none, top,
             // bottom, left, top_left, bottom_left, right, top_right,
             // bottom_right (XML enum values 0,1,2,4,5,6,8,9,10).
-            const edge = @intFromEnum(r.edges);
+            const edge = @backingInt(r.edges);
             switch (edge) {
                 0, 1, 2, 4, 5, 6, 8, 9, 10 => {},
                 else => {
@@ -2176,7 +2176,7 @@ const PositionerState = struct {
             .width = self.size.w,
             .height = self.size.h,
         };
-        const ae = positionerEdges(@intFromEnum(self.anchor));
+        const ae = positionerEdges(@backingInt(self.anchor));
         if (ae.top) {
             box.y += self.anchor_rect.y;
         } else if (ae.bottom) {
@@ -2191,7 +2191,7 @@ const PositionerState = struct {
         } else {
             box.x += self.anchor_rect.x + @divTrunc(self.anchor_rect.width, 2);
         }
-        const ge = positionerEdges(@intFromEnum(self.gravity));
+        const ge = positionerEdges(@backingInt(self.gravity));
         if (ge.top) {
             box.y -= box.height;
         } else if (!ge.bottom) {
@@ -2309,7 +2309,7 @@ fn unconstrainBySlide(
     offsets: *ConstraintOffsets,
 ) bool {
     const adj = adjustmentBits(rules.constraint_adjustment);
-    const ge = positionerEdges(@intFromEnum(rules.gravity));
+    const ge = positionerEdges(@backingInt(rules.gravity));
     const slide_x = (offsets.left > 0 or offsets.right > 0) and (adj & slide_x_bit) != 0;
     const slide_y = (offsets.top > 0 or offsets.bottom > 0) and (adj & slide_y_bit) != 0;
     if (!slide_x and !slide_y) return false;
@@ -2524,7 +2524,7 @@ fn positionerRequest(
         },
         .set_anchor => |r| {
             // Valid anchors are the 9 enum values 0..8 (none..bottom_right).
-            if (@intFromEnum(r.anchor) > @intFromEnum(server.xdg.Positioner.Anchor.bottom_right)) {
+            if (@backingInt(r.anchor) > @backingInt(server.xdg.Positioner.Anchor.bottom_right)) {
                 pos_res.postError(.invalid_input, "xdg_positioner.set_anchor: value not in the anchor enum");
                 return;
             }
@@ -2533,7 +2533,7 @@ fn positionerRequest(
         .set_gravity => |r| {
             // The XML explicitly requires invalid_input when the gravity is
             // not in the gravity enum (values 0..8).
-            if (@intFromEnum(r.gravity) > @intFromEnum(server.xdg.Positioner.Gravity.bottom_right)) {
+            if (@backingInt(r.gravity) > @backingInt(server.xdg.Positioner.Gravity.bottom_right)) {
                 pos_res.postError(.invalid_input, "xdg_positioner.set_gravity: value not in the gravity enum");
                 return;
             }
@@ -2795,18 +2795,18 @@ test "positioner geometry" {
 }
 
 test "positioner edge mapping" {
-    try std.testing.expectEqual(EdgeSet{}, positionerEdges(@intFromEnum(server.xdg.Positioner.Anchor.none)));
+    try std.testing.expectEqual(EdgeSet{}, positionerEdges(@backingInt(server.xdg.Positioner.Anchor.none)));
     try std.testing.expectEqual(
         EdgeSet{ .top = true },
-        positionerEdges(@intFromEnum(server.xdg.Positioner.Anchor.top)),
+        positionerEdges(@backingInt(server.xdg.Positioner.Anchor.top)),
     );
     try std.testing.expectEqual(
         EdgeSet{ .top = true, .left = true },
-        positionerEdges(@intFromEnum(server.xdg.Positioner.Anchor.top_left)),
+        positionerEdges(@backingInt(server.xdg.Positioner.Anchor.top_left)),
     );
     try std.testing.expectEqual(
         EdgeSet{ .bottom = true, .right = true },
-        positionerEdges(@intFromEnum(server.xdg.Positioner.Gravity.bottom_right)),
+        positionerEdges(@backingInt(server.xdg.Positioner.Gravity.bottom_right)),
     );
 }
 
@@ -2927,13 +2927,13 @@ const ToplevelEvents = struct {
     width: i32 = 0,
     height: i32 = 0,
     states_len: usize = 0,
-    states: [13]u32 = [_]u32{0} ** 13,
+    states: [13]u32 = @splat(0),
     bounds_count: usize = 0,
     bounds_width: i32 = 0,
     bounds_height: i32 = 0,
     caps_count: usize = 0,
     caps_len: usize = 0,
-    caps: [4]u32 = [_]u32{0} ** 4,
+    caps: [4]u32 = @splat(0),
 
     fn listener(toplevel: *client.xdg.Toplevel, event: client.xdg.Toplevel.Event, data: *ToplevelEvents) void {
         _ = toplevel;
@@ -3734,7 +3734,7 @@ test "resize with an invalid edge posts invalid_resize_edge" {
     const toplevel = try setupConfiguredToplevel(ts, &xs_events);
 
     // 3 is not a resize_edge variant (none=0, top=1, bottom=2, left=4, ...).
-    toplevel.resize(ts.wl_seat.?, 2, @enumFromInt(3));
+    toplevel.resize(ts.wl_seat.?, 2, @fromBackingInt(@intCast(3)));
     try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
     const err = protocolError(ts);
     try std.testing.expectEqual(@as(c_int, 0), err.code); // invalid_resize_edge
@@ -3769,7 +3769,7 @@ test "positioner rejects invalid anchor, gravity and constraint adjustments" {
         var ts = try TestServer.init(allocator);
         defer ts.deinit();
         const positioner = try ts.wm_base.?.createPositioner();
-        positioner.setAnchor(@enumFromInt(99));
+        positioner.setAnchor(@fromBackingInt(@intCast(99)));
         try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
         const err = protocolError(ts);
         try std.testing.expectEqual(@as(c_int, 0), err.code); // invalid_input
@@ -3781,7 +3781,7 @@ test "positioner rejects invalid anchor, gravity and constraint adjustments" {
         var ts = try TestServer.init(allocator);
         defer ts.deinit();
         const positioner = try ts.wm_base.?.createPositioner();
-        positioner.setGravity(@enumFromInt(99));
+        positioner.setGravity(@fromBackingInt(@intCast(99)));
         try std.testing.expectError(error.ClientDispatchFailed, ts.pump());
         const err = protocolError(ts);
         try std.testing.expectEqual(@as(c_int, 0), err.code); // invalid_input

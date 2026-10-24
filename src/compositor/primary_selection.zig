@@ -328,7 +328,7 @@ fn sourceRequest(
             for (src.mime_types.items) |m| {
                 if (std.mem.eql(u8, m, mime)) return;
             }
-            const copy = src.manager.allocator.dupeZ(u8, mime) catch {
+            const copy = src.manager.allocator.dupeSentinel(u8, mime, 0) catch {
                 src_res.postNoMemory();
                 return;
             };

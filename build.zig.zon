@@ -25,7 +25,7 @@
     .fingerprint = 0xa8d655ef2dfce33, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -33,16 +33,16 @@
     // internet connectivity.
     .dependencies = .{
         .zig_wayland = .{
-            .url = "https://codeberg.org/ifreund/zig-wayland/archive/v0.6.0.tar.gz",
-            .hash = "wayland-0.6.0-lQa1kqz8AQADQmdNJsNhLoNHcnEGEUjrOaPV-dtEnEmX",
+            .url = "git+https://codeberg.org/ifreund/zig-wayland#94db7ba4e0a6b4780a16dbc74c7a2c88f1ebf502",
+            .hash = "wayland-0.8.0-dev-lQa1kuf8AQCeoam8G-XPyaIYvIOk3_wgsspwi4nT_L5q",
         },
         .zio = .{
-            .url = "https://github.com/lalinsky/zio/archive/refs/tags/v0.17.0.tar.gz",
-            .hash = "zio-0.17.0-xHbVVI_jJQC3YbgU7JydwAV7MuASkOTd73YqBaKlFFUz",
+            .url = "git+https://github.com/lalinsky/zio#9b49086c72edbfbcef00acb557d6177bcaee1cb5",
+            .hash = "zio-0.19.0-xHbVVHNqLQCbtzv2oAZp_8CRYKcc76Om5t697j-vFskK",
         },
         .tracy = .{
-            .url = "git+https://codeberg.org/CoffeeImpliesCode/tracy_zig#b2ea5bf4b8fe80f7cd9226d0c4af88dc04e1e07b",
-            .hash = "tracy-1.0.0+0.13.1-R7l8BUBWAQAD_78ohq3IXQ6Wv9CDm2KLAGdjbMmd4p8r",
+            .url = "git+https://codeberg.org/CoffeeImpliesCode/tracy_zig#64a719c4cbbf263def148fa077c7c254c38aae4e",
+            .hash = "tracy-1.0.0+0.13.1-R7l8BeJUAQC55ED4MGX2oHOisHdnLIULkbBU7lwW2kCm",
         },
     },
     // Specifies the set of files and directories that are included in this package.
@@ -58,8 +58,6 @@
         "build.zig.zon",
         "src",
         "protocols",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "README.md",
     },
 }
