@@ -125,7 +125,7 @@ in
   #     src = builtins.fetchTarball
   #       "https://github.com/NixOS/nixpkgs/archive/${rev}.tar.gz";
   #   in (import (src + "/nixos/lib/eval-config.nix") {
-  #     specialArgs = { repoPath = ~/projects/wayland; };
+  #     specialArgs = { repoPath = ./.; };
   #     modules = [ ./scripts/vm.nix ];
   #   }).config.system.build.vm'
   #   ./result/bin/run-wlvm-vm
