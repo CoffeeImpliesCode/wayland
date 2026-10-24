@@ -6,3 +6,5 @@ codedb.snapshot
 .direnv/
 .no-auto-demo
 /agent-notes
+zig-pkg/
+/result*
