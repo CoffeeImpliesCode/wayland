@@ -85,5 +85,4 @@ callbacks.
 
 ## License
 
-No project-wide license is declared. Protocol XML files retain their upstream
-copyright and license notices.
+MIT, see [LICENSE](LICENSE). Third-party components keep their own licenses: see THIRD_PARTY_NOTICES.md
